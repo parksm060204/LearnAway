@@ -1,0 +1,847 @@
+import { Subject, Material, Concept, Problem, Attempt } from './types';
+
+export const INITIAL_SUBJECTS: Subject[] = [
+  {
+    id: 'subj-econ302',
+    name: '경제통계기초 (2026-2)',
+    code: '§2026-STAT-02',
+    semester: '2026-2',
+    examAt: '2026-10-12T10:00:00+09:00',
+    examEndTime: '12:00',
+    location: '301관 402호 (대강의실)',
+    timezone: 'Asia/Seoul',
+    scope: '제1장 ~ 제4장 [확률변수, 조건부 기댓값, 결합분포, 검정이론]',
+    chapters: [
+      '제1장 확률변수와 확률분포의 기초',
+      '제2장 결합확률밀도와 주변확률분포',
+      '제3장 조건부 기댓값과 반복 기댓값의 법칙',
+      '제4장 대수의 법칙, 중심극한정리 및 검정이론',
+    ],
+    lastEvaluatedAt: '2026-09-28T10:00:00+09:00',
+    engineName: 'REDCALL-EBBINGHAUS-DECAY-v4',
+    domain: 'math_stats',
+  },
+  {
+    id: 'subj-cs201',
+    name: '알고리즘 및 자료구조 (2026-2)',
+    code: '§2026-CS-04',
+    semester: '2026-2',
+    examAt: '2026-10-20T14:00:00+09:00',
+    examEndTime: '16:30',
+    location: '공학관 204호 (전산실습실)',
+    timezone: 'Asia/Seoul',
+    scope: '제1주차 ~ 제7주차 [분할정복, 동적계획법, 그래프 최단경로, NP-완전성 기초]',
+    chapters: [
+      '제1주차 점근적 표기법 및 분할정복 마스터 정리',
+      '제2주차 균형 이진탐색트리와 레드-블랙 트리 불변식',
+      '제3주차 동적 계획법 최적 부분 구조 증명',
+      '제4주차 그래프 순회 및 다익스트라 최단경로',
+      '제5주차 다항 시간 리덕션과 NP-완전성 증명',
+    ],
+    lastEvaluatedAt: '2026-09-28T10:00:00+09:00',
+    engineName: 'REDCALL-EBBINGHAUS-DECAY-v4',
+    domain: 'computer_science',
+  },
+];
+
+export const INITIAL_MATERIALS: Material[] = [
+  // ECON302 Materials
+  {
+    id: 'mat-econ-1',
+    subjectId: 'subj-econ302',
+    kind: 'pdf',
+    title: '통계학원론_3장_조건부분포.pdf',
+    sourceRefs: '제3장 p.40 ~ p.58',
+    pageCount: 19,
+    isConverted: true,
+    uploadedAt: '2026-09-18T14:20:00+09:00',
+    parsedMarkdown: `# 제3장 조건부분포 및 조건부 기댓값
+
+## 3.1 조건부 기댓값의 정의
+확률변수 $X, Y$가 결합확률밀도함수 $f_{X,Y}(x,y)$를 가질 때, 주어진 $X=x$에 대한 $Y$의 조건부 기댓값은 다음과 같이 정의된다:
+$$E[Y|X=x] = \\int_{-\\infty}^{\\infty} y f_{Y|X}(y|x) \\, dy$$
+
+## 3.2 반복 기댓값의 법칙 (Law of Iterated Expectations)
+$$E[E[Y|X]] = E[Y]$$
+단, 적분의 순서를 교환하기 위해서는 푸비니 정리(Fubini's Theorem)의 적용 요건인 절대수렴 조건이 만족되어야 한다:
+$$\\int_{-\\infty}^{\\infty} \\int_{-\\infty}^{\\infty} |y| f_{X,Y}(x,y) \\, dx \\, dy < \\infty$$`,
+  },
+  {
+    id: 'mat-econ-2',
+    subjectId: 'subj-econ302',
+    kind: 'pdf',
+    title: '통계학원론_4장_극한정리.pdf',
+    sourceRefs: '제4장 p.80 ~ p.102',
+    pageCount: 23,
+    isConverted: true,
+    uploadedAt: '2026-09-12T11:00:00+09:00',
+  },
+  {
+    id: 'mat-econ-3',
+    subjectId: 'subj-econ302',
+    kind: 'transcript',
+    title: '강의녹취_4차시_결합확률분포.txt',
+    sourceRefs: '강의녹취 4차시 22:15',
+    durationMinutes: 75,
+    isConverted: true,
+    uploadedAt: '2026-09-22T09:30:00+09:00',
+  },
+  {
+    id: 'mat-econ-4',
+    subjectId: 'subj-econ302',
+    kind: 'handout',
+    title: '필기노트_Handout_02_MLE.pdf',
+    sourceRefs: 'Handout #02 p.1 ~ p.8',
+    pageCount: 8,
+    isConverted: true,
+    uploadedAt: '2026-09-25T16:45:00+09:00',
+  },
+  // CS201 Materials
+  {
+    id: 'mat-cs-1',
+    subjectId: 'subj-cs201',
+    kind: 'pdf',
+    title: 'Introduction_to_Algorithms_Ch13_RBT.pdf',
+    sourceRefs: 'Ch 13 Red-Black Trees p.308 ~ p.338',
+    pageCount: 31,
+    isConverted: true,
+    uploadedAt: '2026-09-15T10:15:00+09:00',
+  },
+  {
+    id: 'mat-cs-2',
+    subjectId: 'subj-cs201',
+    kind: 'pdf',
+    title: 'CS201_05강_Dijkstra_Proof.pdf',
+    sourceRefs: '강의 교안 05강 p.1 ~ p.34',
+    pageCount: 34,
+    isConverted: true,
+    uploadedAt: '2026-09-19T13:40:00+09:00',
+  },
+  {
+    id: 'mat-cs-3',
+    subjectId: 'subj-cs201',
+    kind: 'transcript',
+    title: 'CS201_전사본_8차시_NP_Reductions.txt',
+    sourceRefs: '전사본 8차시 41:10',
+    durationMinutes: 90,
+    isConverted: true,
+    uploadedAt: '2026-09-23T18:00:00+09:00',
+  },
+];
+
+export const INITIAL_CONCEPTS: Concept[] = [
+  // ECON302 Concepts
+  {
+    id: 'c-econ-01',
+    subjectId: 'subj-econ302',
+    materialIds: ['mat-econ-1'],
+    title: '조건부 기댓값과 반복 기댓값의 법칙',
+    chapterRef: '통계학원론 3장 p.42 외',
+    firstLearnedAt: '2026-09-19T10:00:00+09:00',
+    firstLearnedDayOffset: -9,
+    lastAttemptAt: '2026-09-26T16:00:00+09:00',
+    lastAttemptDayOffset: -2,
+    baseScore: 88,
+    currentScore: 48.0,
+    status: 'review_target',
+    order: 1,
+    exerciseCount: 3,
+    events: [
+      {
+        id: 'ev-econ-01-1',
+        conceptId: 'c-econ-01',
+        at: '2026-09-19T10:00:00+09:00',
+        dayOffset: -9,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 88,
+        sourceRef: '통계학원론 3장 p.40',
+        notes: '조건부 확률밀도 및 조건부 기댓값 정의 정리 완료',
+      },
+      {
+        id: 'ev-econ-01-2',
+        conceptId: 'c-econ-01',
+        at: '2026-09-22T14:30:00+09:00',
+        dayOffset: -6,
+        kind: 'attempt',
+        title: '1차 풀이 (계산 유도형)',
+        resultScore: 72,
+        sourceRef: '통계학원론 3장 연습문제 3.4',
+        confidence: 3,
+        errorType: 'calc_or_impl_mistake',
+        hintCount: 1,
+        notes: '이변량 정규분포 조건부 기대치 도출 중 계수 전개 단순 오차 발생',
+      },
+      {
+        id: 'ev-econ-01-3',
+        conceptId: 'c-econ-01',
+        at: '2026-09-26T16:00:00+09:00',
+        dayOffset: -2,
+        kind: 'attempt',
+        title: '2차 서술평가 [기록선택]',
+        resultScore: 68,
+        confidence: 2,
+        errorType: 'condition_misinterpretation',
+        hintCount: 2,
+        sourceRef: '통계학원론_3장_조건부분포.pdf §p.45',
+        evaluationSummary:
+          '반복 기댓값의 법칙 E[E[Y|X]] = E[Y] 증명 과정에서 결합확률밀도함수 f_X,Y(x,y)의 이중적분 순서를 교환할 때, 푸비니 정리(Fubini\'s Theorem) 적용 요건인 절대수렴성 \\iint |y| f(x,y) dx dy < \\infty에 대한 정당화 단계 서술이 누락됨.',
+        rubricScores: [
+          {
+            criterionId: 'r1',
+            label: '1. 수식 전개 논리성',
+            score: 4.0,
+            maxScore: 5.0,
+            feedback: '기본적인 조건부 기댓값 정의 대입 및 적분식 전개는 논리적 흐름이 우수함.',
+          },
+          {
+            criterionId: 'r2',
+            label: '2. 정리 적용 엄밀성 (취약)',
+            score: 2.5,
+            maxScore: 5.0,
+            isVulnerable: true,
+            feedback: '푸비니 정리의 전제 조건인 가측함수 절대적분 가능성을 밝히지 않아 부분 감점.',
+          },
+          {
+            criterionId: 'r3',
+            label: '3. 최종 결론 수렴성',
+            score: 5.0,
+            maxScore: 5.0,
+            feedback: '주변확률밀도함수 f_Y(y)로의 환원 및 E[Y] 수렴 마무리가 완벽함.',
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'c-econ-02',
+    subjectId: 'subj-econ302',
+    materialIds: ['mat-econ-2'],
+    title: '체비쇼프 부등식과 대수의 법칙 유도',
+    chapterRef: '통계학원론 4장 p.88',
+    firstLearnedAt: '2026-09-07T10:00:00+09:00',
+    firstLearnedDayOffset: -21,
+    lastAttemptAt: '2026-09-22T11:00:00+09:00',
+    lastAttemptDayOffset: -6,
+    baseScore: 84,
+    currentScore: 54.0,
+    status: 'recommend_d1',
+    order: 2,
+    exerciseCount: 2,
+    events: [
+      {
+        id: 'ev-econ-02-1',
+        conceptId: 'c-econ-02',
+        at: '2026-09-07T10:00:00+09:00',
+        dayOffset: -21,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 84,
+        sourceRef: '통계학원론 4장 p.80',
+      },
+      {
+        id: 'ev-econ-02-2',
+        conceptId: 'c-econ-02',
+        at: '2026-09-22T11:00:00+09:00',
+        dayOffset: -6,
+        kind: 'attempt',
+        title: '1차 풀이 (증명 및 반례)',
+        resultScore: 74,
+        confidence: 4,
+        errorType: 'calc_or_impl_mistake',
+        sourceRef: '통계학원론 4장 p.88',
+        evaluationSummary: '마르코프 부등식을 이용한 체비쇼프 부등식 유도 및 표본평균 분산 수렴 설명 양호.',
+      },
+    ],
+  },
+  {
+    id: 'c-econ-03',
+    subjectId: 'subj-econ302',
+    materialIds: ['mat-econ-1'],
+    title: '베이즈 정리 및 사후확률 추론 모형',
+    chapterRef: '수리통계 보충자료 p.12',
+    firstLearnedAt: '2026-09-14T10:00:00+09:00',
+    firstLearnedDayOffset: -14,
+    lastAttemptAt: '2026-09-23T15:00:00+09:00',
+    lastAttemptDayOffset: -5,
+    baseScore: 86,
+    currentScore: 68.0,
+    status: 'stable',
+    order: 3,
+    exerciseCount: 2,
+    events: [
+      {
+        id: 'ev-econ-03-1',
+        conceptId: 'c-econ-03',
+        at: '2026-09-14T10:00:00+09:00',
+        dayOffset: -14,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 86,
+        sourceRef: '보충자료 p.12',
+      },
+      {
+        id: 'ev-econ-03-2',
+        conceptId: 'c-econ-03',
+        at: '2026-09-23T15:00:00+09:00',
+        dayOffset: -5,
+        kind: 'attempt',
+        title: '1차 풀이 (계산 유도형)',
+        resultScore: 80,
+        confidence: 4,
+        errorType: 'none',
+        sourceRef: '수리통계 보충자료 p.15',
+        evaluationSummary: '사전확률과 우도 함수의 곱에 비례하는 사후밀도 정규화 상수 계산 정확함.',
+      },
+    ],
+  },
+  {
+    id: 'c-econ-04',
+    subjectId: 'subj-econ302',
+    materialIds: ['mat-econ-3'],
+    title: '결합확률분포와 주변분포 유도 절차',
+    chapterRef: '강의녹취 4차시 22:15',
+    firstLearnedAt: '2026-09-21T10:00:00+09:00',
+    firstLearnedDayOffset: -7,
+    lastAttemptAt: '2026-09-27T17:00:00+09:00',
+    lastAttemptDayOffset: -1,
+    baseScore: 90,
+    currentScore: 88.0,
+    status: 'maintained',
+    order: 4,
+    exerciseCount: 1,
+    events: [
+      {
+        id: 'ev-econ-04-1',
+        conceptId: 'c-econ-04',
+        at: '2026-09-21T10:00:00+09:00',
+        dayOffset: -7,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 90,
+        sourceRef: '강의녹취 4차시',
+      },
+      {
+        id: 'ev-econ-04-2',
+        conceptId: 'c-econ-04',
+        at: '2026-09-27T17:00:00+09:00',
+        dayOffset: -1,
+        kind: 'attempt',
+        title: '1차 풀이 (논술형)',
+        resultScore: 88,
+        confidence: 5,
+        errorType: 'none',
+        sourceRef: '강의녹취 4차시 22:15',
+        evaluationSummary: '다변량 적분 경계 설정 및 변수변환 자코비안(Jacobian) 행렬식 전개 완벽.',
+      },
+    ],
+  },
+  {
+    id: 'c-econ-05',
+    subjectId: 'subj-econ302',
+    materialIds: ['mat-econ-4'],
+    title: '최대우도추정법(MLE) 로그우도 최적화',
+    chapterRef: '필기노트 Handout #02',
+    firstLearnedAt: '2026-09-25T10:00:00+09:00',
+    firstLearnedDayOffset: -3,
+    lastAttemptAt: '2026-09-28T09:00:00+09:00',
+    lastAttemptDayOffset: 0,
+    baseScore: 92,
+    currentScore: 92.0,
+    status: 'newly_learned',
+    order: 5,
+    exerciseCount: 1,
+    events: [
+      {
+        id: 'ev-econ-05-1',
+        conceptId: 'c-econ-05',
+        at: '2026-09-25T10:00:00+09:00',
+        dayOffset: -3,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 92,
+        sourceRef: 'Handout #02',
+      },
+    ],
+  },
+  // CS201 Concepts
+  {
+    id: 'c-cs-01',
+    subjectId: 'subj-cs201',
+    materialIds: ['mat-cs-1'],
+    title: '레드-블랙 트리 회전 및 삽입 불변식',
+    chapterRef: 'Introduction to Algorithms 13장 p.308',
+    firstLearnedAt: '2026-09-16T10:00:00+09:00',
+    firstLearnedDayOffset: -12,
+    lastAttemptAt: '2026-09-25T14:00:00+09:00',
+    lastAttemptDayOffset: -3,
+    baseScore: 85,
+    currentScore: 42.0,
+    status: 'review_target',
+    order: 1,
+    exerciseCount: 2,
+    events: [
+      {
+        id: 'ev-cs-01-1',
+        conceptId: 'c-cs-01',
+        at: '2026-09-16T10:00:00+09:00',
+        dayOffset: -12,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 85,
+        sourceRef: 'CLRS 13장 p.308',
+      },
+      {
+        id: 'ev-cs-01-2',
+        conceptId: 'c-cs-01',
+        at: '2026-09-25T14:00:00+09:00',
+        dayOffset: -3,
+        kind: 'attempt',
+        title: '1차 풀이 (구현 및 서술형)',
+        resultScore: 65,
+        confidence: 2,
+        errorType: 'method_selection_error',
+        hintCount: 2,
+        sourceRef: 'CLRS 13장 p.315',
+        evaluationSummary:
+          'Case 2(꺾인 형태)를 Case 3(직선 형태)으로 변환하기 위한 단일 회전 후 색상 변경 순서에서 조부모 노드의 블랙-하이트 불변식 유지 논거가 불완전함.',
+        rubricScores: [
+          {
+            criterionId: 'rcs1',
+            label: '1. 불변식 조건 서술 정확성',
+            score: 4.0,
+            maxScore: 5.0,
+            feedback: '5가지 RBT 불변식 명시는 충실함.',
+          },
+          {
+            criterionId: 'rcs2',
+            label: '2. 회전 변환 단계 엄밀성 (취약)',
+            score: 2.0,
+            maxScore: 5.0,
+            isVulnerable: true,
+            feedback: 'Left-Rotate 호출 시 서브트리 포인터 갱신과 조부모 참조 갱신 논리가 불분명.',
+          },
+          {
+            criterionId: 'rcs3',
+            label: '3. 시간복잡도 O(log n) 보증',
+            score: 4.5,
+            maxScore: 5.0,
+            feedback: '트리 높이 바운드 및 최대 2회 회전 완료 결론 도출 양호.',
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'c-cs-02',
+    subjectId: 'subj-cs201',
+    materialIds: ['mat-cs-2'],
+    title: '다익스트라 알고리즘 정당성 증명',
+    chapterRef: '강의 교안 05강 p.24',
+    firstLearnedAt: '2026-09-10T10:00:00+09:00',
+    firstLearnedDayOffset: -18,
+    lastAttemptAt: '2026-09-24T16:00:00+09:00',
+    lastAttemptDayOffset: -4,
+    baseScore: 82,
+    currentScore: 62.0,
+    status: 'recommend_d1',
+    order: 2,
+    exerciseCount: 2,
+    events: [
+      {
+        id: 'ev-cs-02-1',
+        conceptId: 'c-cs-02',
+        at: '2026-09-10T10:00:00+09:00',
+        dayOffset: -18,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 82,
+        sourceRef: '교안 05강 p.10',
+      },
+      {
+        id: 'ev-cs-02-2',
+        conceptId: 'c-cs-02',
+        at: '2026-09-24T16:00:00+09:00',
+        dayOffset: -4,
+        kind: 'attempt',
+        title: '1차 풀이 (복잡도 및 증명)',
+        resultScore: 78,
+        confidence: 4,
+        errorType: 'none',
+        sourceRef: '교안 05강 p.24',
+        evaluationSummary: '수학적 귀납법을 통한 d[u] = delta(s, u) 불변식 입증 우수함.',
+      },
+    ],
+  },
+  {
+    id: 'c-cs-03',
+    subjectId: 'subj-cs201',
+    materialIds: ['mat-cs-1'],
+    title: '동적 계획법 최적 부분 구조와 중복 부분 문제',
+    chapterRef: '알고리즘 연습 핸드아웃 #04',
+    firstLearnedAt: '2026-09-18T10:00:00+09:00',
+    firstLearnedDayOffset: -10,
+    lastAttemptAt: '2026-09-26T11:00:00+09:00',
+    lastAttemptDayOffset: -2,
+    baseScore: 88,
+    currentScore: 76.0,
+    status: 'stable',
+    order: 3,
+    exerciseCount: 1,
+    events: [
+      {
+        id: 'ev-cs-03-1',
+        conceptId: 'c-cs-03',
+        at: '2026-09-18T10:00:00+09:00',
+        dayOffset: -10,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 88,
+        sourceRef: '핸드아웃 #04',
+      },
+    ],
+  },
+  {
+    id: 'c-cs-04',
+    subjectId: 'subj-cs201',
+    materialIds: ['mat-cs-3'],
+    title: 'NP-완전성 리덕션 기법 (3-SAT to CLIQUE)',
+    chapterRef: '전사본 8차시 41:10',
+    firstLearnedAt: '2026-09-23T10:00:00+09:00',
+    firstLearnedDayOffset: -5,
+    lastAttemptAt: '2026-09-27T15:00:00+09:00',
+    lastAttemptDayOffset: -1,
+    baseScore: 89,
+    currentScore: 86.0,
+    status: 'maintained',
+    order: 4,
+    exerciseCount: 1,
+    events: [
+      {
+        id: 'ev-cs-04-1',
+        conceptId: 'c-cs-04',
+        at: '2026-09-23T10:00:00+09:00',
+        dayOffset: -5,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 89,
+        sourceRef: '전사본 8차시',
+      },
+    ],
+  },
+  {
+    id: 'c-cs-05',
+    subjectId: 'subj-cs201',
+    materialIds: ['mat-cs-2'],
+    title: '분할 정복 마스터 정리 적용 한계와 확장',
+    chapterRef: '코딩테스트 및 기출 해설 p.15',
+    firstLearnedAt: '2026-09-26T10:00:00+09:00',
+    firstLearnedDayOffset: -2,
+    baseScore: 94,
+    currentScore: 94.0,
+    status: 'newly_learned',
+    order: 5,
+    exerciseCount: 1,
+    events: [
+      {
+        id: 'ev-cs-05-1',
+        conceptId: 'c-cs-05',
+        at: '2026-09-26T10:00:00+09:00',
+        dayOffset: -2,
+        kind: 'initial_study',
+        title: '초기 학습',
+        resultScore: 94,
+        sourceRef: '기출 해설 p.15',
+      },
+    ],
+  },
+];
+
+export const INITIAL_PROBLEMS: Problem[] = [
+  // ECON302 Problems
+  {
+    id: 'prob-econ-01',
+    conceptIds: ['c-econ-01'],
+    subjectId: 'subj-econ302',
+    title: '조건부 기댓값과 반복 기댓값의 법칙',
+    type: 'essay_descriptive',
+    categoryLabel: '1. 대학 논술·서술형',
+    categoryNumber: 1,
+    promptText:
+      '확률변수 X, Y가 연속형일 때, E[E[Y|X]] = E[Y]임을 적분을 사용하여 단계별로 증명하고, 조건부 기댓값 E[Y|X]가 왜 상수 값이 아닌 X의 확률변수(함수)인지 논리적으로 서술하시오.',
+    mathFormula: 'E[E[Y|X]] = \\int_{-\\infty}^{\\infty} \\left( \\int_{-\\infty}^{\\infty} y f_{Y|X}(y|x) dy \\right) f_X(x) dx = E[Y]',
+    timeStandardMinutes: 15,
+    timeBreakdownDesc: '15분 (답안 작성 10분, 해설 대조 5분)',
+    coreEvaluationHighlight: '적분 순서 교환 정당화 요건 (푸비니 정리 명시)',
+    itemCountDesc: '서술 2문항, 엄밀 수식 증명 1문항',
+    sourceRefs: '통계학원론 3장 p.42 외',
+    hints: [
+      '힌트 1: E[Y|X]는 x가 주어졌을 때의 조건부 기댓값 g(x) = E[Y|X=x]를 확률변수 X에 대입한 합성 확률변수 g(X)입니다.',
+      '힌트 2: 결합밀도함수의 성질 f_{Y|X}(y|x) * f_X(x) = f_{X,Y}(x,y)를 대입하여 이중적분으로 변환합니다.',
+      '힌트 3: 적분 순서를 dx dy로 바꿀 때, 푸비니 정리(Fubini\'s Theorem)의 적용 조건인 \\iint |y| f(x,y) dx dy < \\infty 임을 반드시 명시해야 온전한 점수를 받습니다.',
+    ],
+    modelAnswer: `1. 조건부 기댓값 E[Y|X]의 확률변수성:
+- 표본공간의 각 실현값에 대해 X가 특정 실수 x를 취할 때, g(x) = E[Y|X=x] = \\int_{-\\infty}^\\infty y f_{Y|X}(y|x) dy 는 x에 대한 결정론적 실수 함수이다.
+- 따라서 E[Y|X]는 g(X)로 정의되며, 이는 임의의 표본점에서 X의 실현값에 따라 결과가 달라지는 확률변수이다. (상수가 아님)
+
+2. 반복 기댓값의 법칙 단계별 증명:
+E[E[Y|X]] = E[g(X)]
+= \\int_{-\\infty}^\\infty g(x) f_X(x) dx
+= \\int_{-\\infty}^\\infty \\left( \\int_{-\\infty}^\\infty y f_{Y|X}(y|x) dy \\right) f_X(x) dx
+
+조건부 확률밀도의 정의 f_{Y|X}(y|x) f_X(x) = f_{X,Y}(x,y)에 의해:
+= \\int_{-\\infty}^\\infty \\int_{-\\infty}^\\infty y f_{X,Y}(x,y) dy dx
+
+여기서 E[|Y|] < \\infty 라 가정하면 절대수렴성 \\iint |y| f_{X,Y}(x,y) dx dy < \\infty 가 성립하므로, 푸비니 정리(Fubini's Theorem)에 의해 적분 순서를 자유롭게 교환할 수 있다:
+= \\int_{-\\infty}^\\infty y \\left( \\int_{-\\infty}^\\infty f_{X,Y}(x,y) dx \\right) dy
+
+주변확률밀도의 정의 \\int_{-\\infty}^\\infty f_{X,Y}(x,y) dx = f_Y(y)를 대입하면:
+= \\int_{-\\infty}^\\infty y f_Y(y) dy = E[Y]
+
+따라서 E[E[Y|X]] = E[Y] 가 엄밀하게 성립한다. Q.E.D.`,
+    rubric: [
+      {
+        id: 'r1',
+        label: '1. 수식 전개 논리성',
+        maxScore: 5.0,
+        weight: 0.35,
+        description: '조건부 확률밀도 대입 및 결합확률밀도로의 환원 과정의 논리적 연결',
+      },
+      {
+        id: 'r2',
+        label: '2. 정리 적용 엄밀성',
+        maxScore: 5.0,
+        weight: 0.35,
+        description: '푸비니 정리(Fubini\'s Theorem)와 절대수렴성 전제 조건 명시 여부',
+      },
+      {
+        id: 'r3',
+        label: '3. 최종 결론 수렴성',
+        maxScore: 5.0,
+        weight: 0.30,
+        description: '주변밀도 적분을 통한 E[Y] 도출 및 확률변수로서의 성격 규명 완성도',
+      },
+    ],
+  },
+  {
+    id: 'prob-econ-02',
+    conceptIds: ['c-econ-01'],
+    subjectId: 'subj-econ302',
+    title: '이변량 정규분포의 조건부 기댓값 도출',
+    type: 'calc_derivation',
+    categoryLabel: '2. 계산 유도형',
+    categoryNumber: 2,
+    promptText:
+      '이변량 정규분포 (X, Y) ~ N_2(mu_X, mu_Y, sigma_X^2, sigma_Y^2, rho)에서, 조건부 기댓값 E[Y|X=x] = mu_Y + rho * (sigma_Y / sigma_X) * (x - mu_X)를 결합밀도함수의 완전제곱식 전개를 통해 엄밀히 유도하시오.',
+    mathFormula: 'E[Y|X=x] = \\mu_Y + \\rho \\frac{\\sigma_Y}{\\sigma_X} (x - \\mu_X)',
+    timeStandardMinutes: 20,
+    timeBreakdownDesc: '20분 (식 전개 15분, 검토 5분)',
+    coreEvaluationHighlight: '지수부 y에 대한 2차식 표준화 및 분산 계산',
+    itemCountDesc: '유도 1문항, 분산 계산 1문항',
+    sourceRefs: '통계학원론 3장 p.48',
+    hints: [
+      '힌트 1: f_{Y|X}(y|x) = f_{X,Y}(x,y) / f_X(x) 형태를 이용합니다.',
+      '힌트 2: 지수항에서 y에 대해 완전제곱식을 만들고 (y - [mu_Y + rho*(sigma_Y/sigma_X)*(x-mu_X)])^2 형태로 묶어냅니다.',
+    ],
+    modelAnswer: '결합밀도의 지수부를 y에 대해 정리하면 정규분포 N(mu_Y + rho*(sigma_Y/sigma_X)*(x-mu_X), sigma_Y^2(1-rho^2))의 형태가 유도된다.',
+    rubric: [
+      { id: 'rc1', label: '1. 밀도함수 비율 식 수립', maxScore: 5.0, weight: 0.3, description: 'f(x,y)/f(x) 정확한 식 작성' },
+      { id: 'rc2', label: '2. 완전제곱식 변형 대수학', maxScore: 5.0, weight: 0.4, description: '지수부 y 정리 및 중심축 추출' },
+      { id: 'rc3', label: '3. 평균 및 분산 확정', maxScore: 5.0, weight: 0.3, description: '조건부 평균식 최종 도출' },
+    ],
+  },
+  {
+    id: 'prob-econ-03',
+    conceptIds: ['c-econ-01'],
+    subjectId: 'subj-econ302',
+    title: '무상관과 독립성의 차이 증명 및 반례',
+    type: 'proof_counterexample',
+    categoryLabel: '3. 증명 및 반례',
+    categoryNumber: 3,
+    promptText:
+      '공분산 Cov(X, Y) = 0 (무상관)이지만 두 확률변수 X, Y가 독립이 아닌 구체적인 연속형 반례(예: X ~ U(-1, 1), Y = X^2)를 제시하고, 그에 대해 E[XY] = E[X]E[Y] 성립과 f_{X,Y}(x,y) != f_X(x)f_Y(y)를 수학적으로 증명하시오.',
+    mathFormula: 'Cov(X, Y) = 0 \\not\\Rightarrow X \\perp Y',
+    timeStandardMinutes: 15,
+    timeBreakdownDesc: '15분 (반례 설정 5분, 증명 10분)',
+    coreEvaluationHighlight: '대칭성에 의한 기댓값 0 계산 및 지지집합(support) 종속성',
+    itemCountDesc: '반례 제시 1문항, 독립성 반박 증명 1문항',
+    sourceRefs: '수리통계학 핸드아웃 p.22',
+    hints: [
+      '힌트 1: X가 원점에 대칭인 균등분포일 때, 홀수차 적률 E[X] = 0, E[X^3] = 0이 됨을 활용합니다.',
+      '힌트 2: P(Y > 1/4 | X = 0)과 P(Y > 1/4)의 불일치를 보이면 독립이 아님을 즉시 증명할 수 있습니다.',
+    ],
+    modelAnswer: 'E[X] = 0, E[XY] = E[X^3] = 0 이므로 Cov(X,Y)=0. 그러나 Y는 X가 정해지면 결정론적 함수이므로 조건부 확률과 무조건부 확률이 달라 독립이 아니다.',
+    rubric: [
+      { id: 'rp1', label: '1. 반례 설정 타당성', maxScore: 5.0, weight: 0.3, description: '적절한 대칭 분포 선택' },
+      { id: 'rp2', label: '2. 공분산 0 계산 증명', maxScore: 5.0, weight: 0.3, description: '대칭성 기반 적률 소거 논증' },
+      { id: 'rp3', label: '3. 비독립성 엄밀 반박', maxScore: 5.0, weight: 0.4, description: '사건 확률 불일치 또는 지지영역 논증' },
+    ],
+  },
+  {
+    id: 'prob-econ-04',
+    conceptIds: ['c-econ-01'],
+    subjectId: 'subj-econ302',
+    title: '적분 순서 교환 오류 검증 및 교정',
+    type: 'error_spotting',
+    categoryLabel: '4. 오류 검증형',
+    categoryNumber: 4,
+    promptText:
+      '어느 학생이 f(x,y) = (x^2 - y^2)/(x^2 + y^2)^2 (0 < x, y < 1)에 대해 이중적분을 계산하며 "적분 순서를 바꿔도 결과는 항상 같다"고 주장하였습니다. 이 주장의 오류를 지적하고, 푸비니 정리가 불성립하는 수학적 근거를 절대수렴성을 계산하여 규명하시오.',
+    mathFormula: '\\int_0^1 \\int_0^1 f(x,y) dx dy \\neq \\int_0^1 \\int_0^1 f(x,y) dy dx',
+    timeStandardMinutes: 15,
+    timeBreakdownDesc: '15분 (오류 지점 판별 7분, 반례 계산 8분)',
+    coreEvaluationHighlight: '절대값 적분의 발산 증명 (푸비니-토넬리 정리 위반)',
+    itemCountDesc: '오류 분석 1문항, 교정 풀이 1문항',
+    sourceRefs: '해석학 및 수리통계 고급 연습 p.31',
+    hints: [
+      '힌트 1: 극좌표 변환(r, theta)을 적용하여 |f(x,y)|의 적분을 원점 부근에서 적분해 보세요.',
+      '힌트 2: 순차적분 결과가 각각 pi/4와 -pi/4로 서로 다름을 보이면 적분 순서 교환 불가가 확인됩니다.',
+    ],
+    modelAnswer: '원점 근방에서 피적분함수의 절대적분이 무한대로 발산하므로 푸비니 정리의 전제조건이 파괴되어 적분 순서 교환이 불가능하다.',
+    rubric: [
+      { id: 're1', label: '1. 오류 지점 특정', maxScore: 5.0, weight: 0.3, description: '절대수렴 미확인 지점 명시' },
+      { id: 're2', label: '2. 반례 순차적분 계산', maxScore: 5.0, weight: 0.4, description: '두 적분값의 부호 차이 도출' },
+      { id: 're3', label: '3. 정론 교정 서술', maxScore: 5.0, weight: 0.3, description: '토넬리/푸비니 정리 적용 한계 명시' },
+    ],
+  },
+
+  // CS201 Problems
+  {
+    id: 'prob-cs-01',
+    conceptIds: ['c-cs-01'],
+    subjectId: 'subj-cs201',
+    title: '레드-블랙 트리 삽입 불변식 복구 메커니즘',
+    type: 'impl_descriptive',
+    categoryLabel: '1. 구현 및 서술형',
+    categoryNumber: 1,
+    promptText:
+      '레드-블랙 트리(Red-Black Tree)에서 신규 노드 z를 삽입(RED)한 후 부모 노드가 RED일 때 발생하는 불변식 위반(Property 4: Red-Red 충돌)의 3가지 Case를 삼촌 노드(Uncle)의 색상 및 기하학적 형태에 따라 분류하고, 각 경우의 회전(Rotation) 및 색상 재지정(Recoloring) 알고리즘을 상세 서술하시오.',
+    codeSnippet: `void rb_insert_fixup(RBTree* T, Node* z) {
+  while (z->parent->color == RED) {
+    if (z->parent == z->parent->parent->left) {
+      Node* y = z->parent->parent->right; // uncle
+      if (y->color == RED) {
+        // Case 1: 삼촌 노드가 RED
+        z->parent->color = BLACK;
+        y->color = BLACK;
+        z->parent->parent->color = RED;
+        z = z->parent->parent;
+      } else {
+        if (z == z->parent->right) {
+          // Case 2: 삼촌 노드 BLACK, z가 오른쪽 자식 (꺾인 형태)
+          z = z->parent;
+          left_rotate(T, z);
+        }
+        // Case 3: 삼촌 노드 BLACK, z가 왼쪽 자식 (직선 형태)
+        z->parent->color = BLACK;
+        z->parent->parent->color = RED;
+        right_rotate(T, z->parent->parent);
+      }
+    }
+  }
+  T->root->color = BLACK;
+}`,
+    timeStandardMinutes: 20,
+    timeBreakdownDesc: '20분 (케이스 분석 10분, 의사코드/서술 10분)',
+    coreEvaluationHighlight: '조부모 기준 Black-Height 불변식 유지와 최대 2회 회전 완료 논증',
+    itemCountDesc: '케이스 분류 서술 1문항, 불변식 증명 1문항',
+    sourceRefs: 'CLRS 13장 p.315 ~ p.322',
+    hints: [
+      '힌트 1: 삼촌 노드가 RED인 경우(Case 1)는 회전 없이 부모와 삼촌을 BLACK으로, 조부모를 RED로 변경한 후 z를 조부모로 승격시킵니다.',
+      '힌트 2: 삼촌 노드가 BLACK이고 꺾인 구조(Case 2)는 단일 회전을 통해 직선 구조(Case 3)로 축약합니다.',
+      '힌트 3: Case 3는 색상 교환 후 반대 방향 회전을 1회 수행함으로써 전체 루프가 즉시 종료됩니다.',
+    ],
+    modelAnswer: 'Case 1은 색상 반전 후 z가 2레벨 상승, Case 2는 좌회전으로 Case 3로 전환, Case 3는 우회전 및 색상 교환으로 Black-height를 보존하며 루프를 탈출한다.',
+    rubric: [
+      { id: 'rcs_1', label: '1. 3가지 Case 분류 정확성', maxScore: 5.0, weight: 0.35, description: '삼촌 노드 색상 및 형태 기준 분류' },
+      { id: 'rcs_2', label: '2. 회전/색상 변경 단계 서술', maxScore: 5.0, weight: 0.35, description: 'Left/Right Rotate 및 포인터 전이 논리' },
+      { id: 'rcs_3', label: '3. 불변식 보존 및 종료성', maxScore: 5.0, weight: 0.30, description: 'Black-Height 불변 및 최대 2회 회전 증명' },
+    ],
+  },
+  {
+    id: 'prob-cs-02',
+    conceptIds: ['c-cs-01'],
+    subjectId: 'subj-cs201',
+    title: '우선순위 큐 기반 다익스트라 최적화 비교',
+    type: 'algorithm_optimization',
+    categoryLabel: '2. 알고리즘 최적화 설명',
+    categoryNumber: 2,
+    promptText:
+      '다익스트라 알고리즘을 단순 인접 행렬(O(V^2))에서 이진 힙(Binary Heap) 및 피보나치 힙(Fibonacci Heap)을 활용한 우선순위 큐 구조로 변경했을 때의 점근적 수행 시간(O((V+E)log V) vs O(V log V + E))을 각 연산(Extract-Min, Decrease-Key)의 호출 횟수와 결부하여 논리적으로 서술하시오.',
+    timeStandardMinutes: 15,
+    timeBreakdownDesc: '15분 (연산 분석 7분, 복잡도 대조 8분)',
+    coreEvaluationHighlight: 'Decrease-Key 연산의 E회 호출 및 분할 상환(amortized) O(1) 비용 명시',
+    itemCountDesc: '수행시간 분석 1문항, 그래프 밀도별 선택 기준 1문항',
+    sourceRefs: 'CS201 교안 05강 p.18',
+    hints: [
+      '힌트 1: Extract-Min은 총 V번 호출되며, Decrease-Key는 간선의 이완(Relaxation) 시마다 최대 E번 발생합니다.',
+      '힌트 2: 피보나치 힙에서 Decrease-Key는 상환 O(1)이므로 총 E * O(1) + V * O(log V)가 됩니다.',
+    ],
+    modelAnswer: '이진 힙은 Decrease-Key가 O(log V)라 O(E log V)인 반면, 피보나치 힙은 상환 O(1)로 줄여 O(V log V + E)를 달성한다.',
+    rubric: [
+      { id: 'ro1', label: '1. 연산별 빈도 분석', maxScore: 5.0, weight: 0.3, description: 'V회 Extract-Min, E회 Decrease-Key 분리' },
+      { id: 'ro2', label: '2. 자료구조별 시간 증명', maxScore: 5.0, weight: 0.4, description: '힙 구조별 복잡도 도출 과정' },
+      { id: 'ro3', label: '3. 밀도별 Trade-off 평가', maxScore: 5.0, weight: 0.3, description: 'Dense vs Sparse 그래프 비교' },
+    ],
+  },
+  {
+    id: 'prob-cs-03',
+    conceptIds: ['c-cs-01'],
+    subjectId: 'subj-cs201',
+    title: '마스터 정리 적용 불능 점화식 분석',
+    type: 'complexity_proof',
+    categoryLabel: '3. 시간/공간 복잡도 증명',
+    categoryNumber: 3,
+    promptText:
+      '점화식 T(n) = 2T(n/2) + n log n 에 대해 표준 마스터 정리를 직접 적용할 수 없는 다항식 비율 차이(polynomial difference)의 부재를 수식으로 증명하고, 재귀 트리(Recursion Tree) 방법을 사용하여 엄밀한 Theta(n log^2 n) 바운드를 도출하시오.',
+    mathFormula: 'T(n) = 2T(n/2) + \\Theta(n \\log n) \\implies T(n) = \\Theta(n \\log^2 n)',
+    timeStandardMinutes: 20,
+    timeBreakdownDesc: '20분 (적용 불가 증명 8분, 트리 합 계산 12분)',
+    coreEvaluationHighlight: 'f(n)/n^(log_b a) = log n 이 n^epsilon보다 천천히 증가함 증명',
+    itemCountDesc: '적용 한계 증명 1문항, 레벨별 비용 합산 1문항',
+    sourceRefs: 'CLRS 4장 p.94',
+    hints: [
+      '힌트 1: a=2, b=2이므로 n^{log_b a} = n^1 = n 입니다.',
+      '힌트 2: f(n) = n log n 이지만, 임의의 epsilon > 0에 대해 f(n) / n = log n 은 Omega(n^epsilon)을 만족할 수 없습니다.',
+      '힌트 3: 재귀 트리의 깊이는 log_2 n이며, 각 깊이 i에서의 총 작업 비용은 n log(n / 2^i) 입니다.',
+    ],
+    modelAnswer: '다항식적 간격 부재로 마스터 정리가 적용 불가하며, 재귀 트리 각 깊이별 비용을 적분/합산하면 n log^2 n 이 도출된다.',
+    rubric: [
+      { id: 'rcp1', label: '1. 마스터 정리 한계 증명', maxScore: 5.0, weight: 0.35, description: '다항식적 우위 조건 결여 입증' },
+      { id: 'rcp2', label: '2. 재귀 트리 레벨별 식', maxScore: 5.0, weight: 0.35, description: '각 층 비용 2^i * (n/2^i) log(n/2^i) 식' },
+      { id: 'rcp3', label: '3. 로그 급수 합산 정확성', maxScore: 5.0, weight: 0.30, description: 'sum i = O(log^2 n) 계산' },
+    ],
+  },
+  {
+    id: 'prob-cs-04',
+    conceptIds: ['c-cs-01'],
+    subjectId: 'subj-cs201',
+    title: '음수 간선 다익스트라 오작동 반례 구성',
+    type: 'debug_counterexample',
+    categoryLabel: '4. 디버깅 및 반례 분석',
+    categoryNumber: 4,
+    promptText:
+      '음수 사이클이 없는 단순 방향 그래프임에도 불구하고 음수 가중치 간선이 포함될 때 다익스트라 알고리즘이 최단 경로 탐색에 실패하는 노드 수 3개(V=3)의 최소 반례 그래프를 정의하고, 탐욕적 선택 속성(Greedy Choice Property)과 노드 방문(Visited) 고정 논리가 붕괴되는 과정을 단계별로 디버깅하시오.',
+    codeSnippet: `Graph counterexample:
+Nodes: S, A, B
+Edges:
+  S -> A (weight: 1)
+  S -> B (weight: 5)
+  A -> B (weight: -10)`,
+    timeStandardMinutes: 15,
+    timeBreakdownDesc: '15분 (반례 그래프 정의 5분, 추적 디버깅 10분)',
+    coreEvaluationHighlight: '이미 방문 처리(Visited/Finalized)된 노드의 최단거리 갱신 불가 현상 적시',
+    itemCountDesc: '그래프 스펙 1문항, 알고리즘 추적 표 1문항',
+    sourceRefs: '알고리즘 기출 및 디버깅 핸드아웃 p.44',
+    hints: [
+      '힌트 1: 정점 S에서 시작할 때 우선순위 큐가 A를 먼저 꺼내며 확정합니다.',
+      '힌트 2: 만약 다른 경로를 통해 음수 간선으로 A나 B에 도달할 경우, 이미 Finalized된 노드의 거리가 줄어들어야 하지만 다익스트라는 이를 재처리하지 않습니다.',
+    ],
+    modelAnswer: '다익스트라는 꺼낸 노드의 거리가 절대 줄어들지 않는다는 전제(비음수 가중치)에 의존하므로, 음수 간선으로 인한 사후 거리 단축을 반영하지 못해 실패한다.',
+    rubric: [
+      { id: 'rd1', label: '1. 최소 반례 그래프 적합성', maxScore: 5.0, weight: 0.3, description: '3정점 유효 반례 구성' },
+      { id: 'rd2', label: '2. 우선순위 큐 상태 추적', maxScore: 5.0, weight: 0.4, description: '노드 확정 순서 및 오류 출력 명시' },
+      { id: 'rd3', label: '3. 알고리즘적 원인 분석', maxScore: 5.0, weight: 0.3, description: '탐욕적 불변식 훼손 증명' },
+    ],
+  },
+];

@@ -1,26 +1,83 @@
+@import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.min.css");
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Serif+KR:wght@500;600;700;900&display=swap");
+@import "katex/dist/katex.min.css";
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+  /* Typography Tokens: Noto Serif KR + Pretendard + JetBrains Mono */
+  --font-title: "Noto Serif KR", Georgia, serif;
+  --font-body: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, system-ui, Roboto, "Helvetica Neue", "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  --font-mono: "JetBrains Mono", "Pretendard Variable", ui-monospace, Menlo, Consolas, monospace;
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  /* Color & Paper Tokens */
+  --paper-bg: #fcfbfa;
+  --paper-card: #ffffff;
+  --paper-card-subtle: #fbf9f5;
+  --paper-border: #e2ded6;
+  --paper-border-strong: #c8c2b5;
+  --ink-primary: #191817;
+  --ink-secondary: #57544e;
+  --ink-muted: #827d73;
+  --crimson-accent: #c52828;
+  --crimson-light: #fef2f2;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: var(--paper-bg);
+  color: var(--ink-primary);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button, input, textarea, select {
+  font-family: var(--font-body);
+}
+
+h1, h2, h3, .subject-title, .font-academic-serif {
+  font-family: var(--font-title);
+}
+
+.metric, .date, code, .font-academic-mono {
+  font-family: var(--font-mono);
+}
+
+/* Long essay answer and reasoning text: Pretendard 16px, line-height 1.75 */
+.essay-answer {
+  font: 400 16px/1.75 var(--font-body);
+  letter-spacing: -0.01em;
+  word-break: keep-all;
+}
+
+.korean-prose {
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.75;
+  letter-spacing: -0.01em;
+  word-break: keep-all;
+}
+
+/* Custom scrollbars for academic dashboard */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #f1ede4;
+}
+::-webkit-scrollbar-thumb {
+  background: #c8c2b5;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a9a295;
+}
+
+/* Subtle focus indicators */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #c52828;
+  outline-offset: 1px;
 }
