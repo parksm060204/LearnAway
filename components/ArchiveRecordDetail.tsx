@@ -16,10 +16,30 @@ export function ArchiveRecordDetail({
   event,
   onOpenSourceModal,
 }: ArchiveRecordDetailProps) {
-  if (!event) {
+  if (!event || concept.status === 'unstudied') {
     return (
-      <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 text-xs font-academic-mono text-[#827d73] text-center">
-        선택된 이력 기록이 없습니다. 상단 차트에서 점을 선택하세요.
+      <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-5 text-xs text-[#57544e] space-y-2 shadow-2xs">
+        <div className="flex items-center gap-2 font-academic-mono text-xs font-bold text-[#191817] pb-2 border-b border-[#f1ede4]">
+          <span className="font-academic-mono text-xs font-bold text-[#827d73]">CONCEPT OVERVIEW</span>
+          <span className="text-[#c8c2b5]">|</span>
+          <span className="font-academic-serif">{concept.title}</span>
+          <span className="text-[10px] bg-slate-100 text-slate-700 px-1.5 py-0.2 rounded">
+            {concept.status === 'unstudied' ? '미학습 상태' : '이력 대기'}
+          </span>
+        </div>
+        {concept.description && (
+          <p className="text-xs leading-relaxed text-[#2e2c29]">{concept.description}</p>
+        )}
+        {concept.coreDefinitionFormulaOrAlgorithm && (
+          <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded font-academic-mono text-xs overflow-x-auto whitespace-pre-wrap">
+            {concept.coreDefinitionFormulaOrAlgorithm}
+          </div>
+        )}
+        <div className="text-[11px] font-academic-mono text-[#827d73] pt-1">
+          {concept.status === 'unstudied'
+            ? '사용자 자료에서 추출 승인된 개념입니다. 학습 완료 등록 전까지는 임의의 복습 점수가 생성되지 않습니다.'
+            : '선택된 이력 기록이 없습니다.'}
+        </div>
       </div>
     );
   }

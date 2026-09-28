@@ -49,14 +49,14 @@ export function calculateCurrentConceptScore(
   settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS,
   referenceDayOffset: number = 0
 ): number {
-  if (!events || events.length === 0) return 70.0;
+  if (!events || events.length === 0) return 0;
 
   // Filter events up to reference day and sort ascending
   const pastEvents = events
     .filter((e) => e.dayOffset <= referenceDayOffset)
     .sort((a, b) => a.dayOffset - b.dayOffset);
 
-  if (pastEvents.length === 0) return 70.0;
+  if (pastEvents.length === 0) return 0;
 
   const lastEvent = pastEvents[pastEvents.length - 1];
   const daysSinceLastEvent = referenceDayOffset - lastEvent.dayOffset;
@@ -111,6 +111,12 @@ export const CONCEPT_STATUS_METADATA: Record<
     textClass: 'text-blue-700',
     isUrgent: false,
   },
+  unstudied: {
+    label: '미학습 (대기)',
+    badgeClass: 'bg-slate-100 text-slate-700 border-slate-300 font-medium',
+    textClass: 'text-slate-600',
+    isUrgent: false,
+  },
 };
 
 export interface CurvePoint {
@@ -139,6 +145,18 @@ export function generateConceptTrajectory(
   settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS,
   examDayOffset: number = 14
 ): TrajectoryProjection {
+  if (!concept.events || concept.events.length === 0 || concept.status === 'unstudied') {
+    return {
+      historyCurve: [],
+      neglectedProjection: [],
+      reviewedProjection: [],
+      currentScore: 0,
+      examProjectedScoreNeglected: 0,
+      examProjectedScoreReviewed: 0,
+      criticalThreshold: settings.threshold,
+    };
+  }
+
   const events = [...concept.events].sort((a, b) => a.dayOffset - b.dayOffset);
   const historyCurve: CurvePoint[] = [];
 

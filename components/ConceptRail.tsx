@@ -37,8 +37,8 @@ export function ConceptRail({
     }
     if (sortMode === 'recent_study') {
       // More recent attempt/first learned first (higher dayOffset)
-      const dayA = a.lastAttemptDayOffset ?? a.firstLearnedDayOffset;
-      const dayB = b.lastAttemptDayOffset ?? b.firstLearnedDayOffset;
+      const dayA = a.lastAttemptDayOffset ?? a.firstLearnedDayOffset ?? -999;
+      const dayB = b.lastAttemptDayOffset ?? b.firstLearnedDayOffset ?? -999;
       return dayB - dayA;
     }
     // 'chapter_order'
@@ -165,15 +165,30 @@ export function ConceptRail({
 
                     <span
                       className={`font-bold text-xs ${
-                        concept.currentScore < 50
+                        concept.status === 'unstudied'
+                          ? 'text-[#827d73]'
+                          : concept.currentScore < 50
                           ? 'text-[#c52828]'
                           : concept.currentScore < 70
                           ? 'text-amber-700'
                           : 'text-[#191817]'
                       }`}
                     >
-                      SCORE {Math.round(concept.currentScore)}
+                      {concept.status === 'unstudied' ? 'SCORE --' : `SCORE ${Math.round(concept.currentScore)}`}
                     </span>
+                  </div>
+
+                  {/* Origin Badge */}
+                  <div className="mb-1">
+                    {concept.isDemo ? (
+                      <span className="text-[9.5px] font-academic-mono bg-[#f4f1ea] text-[#827d73] px-1 py-0.2 rounded border border-[#ded6c8]">
+                        데모 개념
+                      </span>
+                    ) : (
+                      <span className="text-[9.5px] font-academic-mono bg-indigo-50 text-indigo-700 px-1.5 py-0.2 rounded border border-indigo-200 font-semibold">
+                        자료 추출 승인
+                      </span>
+                    )}
                   </div>
 
                   {/* Title */}
@@ -185,8 +200,10 @@ export function ConceptRail({
                 {/* Metadata footer */}
                 <div className="mt-2.5 pt-2 border-t border-[#ede8de] space-y-0.5 text-[10px] sm:text-[11px] font-academic-mono text-[#57544e]">
                   <div className="flex justify-between">
-                    <span className="text-[#827d73]">최초 학:</span>
-                    <span className="text-[#191817]">{concept.firstLearnedDayOffset}일</span>
+                    <span className="text-[#827d73]">최초 학습:</span>
+                    <span className="text-[#191817]">
+                      {concept.status === 'unstudied' ? '미학습 대기' : `${concept.firstLearnedDayOffset ?? 0}일`}
+                    </span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-[#827d73]">최근 풀:</span>

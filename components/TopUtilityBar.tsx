@@ -14,6 +14,7 @@ import {
   X,
   Plus,
   FolderOpen,
+  Sparkles,
 } from 'lucide-react';
 
 interface TopUtilityBarProps {
@@ -23,6 +24,8 @@ interface TopUtilityBarProps {
   onOpenAddSubject: () => void;
   onOpenUpload: () => void;
   onOpenMaterialsList?: () => void;
+  onOpenConceptReview?: () => void;
+  draftCount?: number;
   onOpenProblemSession: () => void;
   onOpenMockExam: () => void;
   onOpenSettings: () => void;
@@ -37,6 +40,8 @@ export function TopUtilityBar({
   onOpenAddSubject,
   onOpenUpload,
   onOpenMaterialsList,
+  onOpenConceptReview,
+  draftCount = 0,
   onOpenProblemSession,
   onOpenMockExam,
   onOpenSettings,
@@ -169,6 +174,22 @@ export function TopUtilityBar({
             </button>
           )}
 
+          {onOpenConceptReview && (
+            <button
+              onClick={onOpenConceptReview}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
+              title="AI 개념 추출 및 검토"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+              <span>개념 검토</span>
+              {draftCount > 0 && (
+                <span className="text-[10px] font-academic-mono bg-amber-100 text-amber-800 border border-amber-300 px-1 rounded-full font-bold">
+                  {draftCount}
+                </span>
+              )}
+            </button>
+          )}
+
           <button
             onClick={onOpenProblemSession}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
@@ -248,6 +269,26 @@ export function TopUtilityBar({
             >
               <FolderOpen className="w-4 h-4 text-[#c52828]" />
               <span>과목 자료 보관함</span>
+            </button>
+          )}
+
+          {onOpenConceptReview && (
+            <button
+              onClick={() => {
+                onOpenConceptReview();
+                setIsMobileMenuOpen(false);
+              }}
+              className="w-full flex items-center justify-between py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+            >
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-amber-600" />
+                <span>개념 검토 및 승인</span>
+              </div>
+              {draftCount > 0 && (
+                <span className="text-[10px] font-academic-mono bg-amber-100 text-amber-800 border border-amber-300 px-1.5 py-0.5 rounded-full font-bold">
+                  {draftCount}
+                </span>
+              )}
             </button>
           )}
 

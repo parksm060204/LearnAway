@@ -21,6 +21,7 @@ import {
   Minimize2,
   BookmarkPlus,
   HelpCircle,
+  Sparkles,
 } from 'lucide-react';
 
 interface MaterialEditorModalProps {
@@ -28,6 +29,10 @@ interface MaterialEditorModalProps {
   onClose: () => void;
   material: Material | null;
   subject?: Subject | null;
+  draftCount?: number;
+  isAnalyzing?: boolean;
+  onTriggerAnalysis?: (material: Material) => void;
+  onOpenConceptReview?: (material: Material) => void;
   onSave: (
     updatedMaterial: Material,
     updatedContent: { markdown: string; pages?: MaterialPage[] }
@@ -39,6 +44,10 @@ export function MaterialEditorModal({
   onClose,
   material,
   subject,
+  draftCount = 0,
+  isAnalyzing = false,
+  onTriggerAnalysis,
+  onOpenConceptReview,
   onSave,
 }: MaterialEditorModalProps) {
   const [currentPage, setCurrentPage] = useState<number>(1);
@@ -217,6 +226,29 @@ export function MaterialEditorModal({
                 <CheckCircle2 className="w-3.5 h-3.5" />
                 {saveSuccessMsg}
               </span>
+            )}
+
+            {onTriggerAnalysis && (
+              <button
+                onClick={() => onTriggerAnalysis(material)}
+                disabled={isAnalyzing || !markdown.trim()}
+                className="px-3 py-1.5 bg-[#33302b] hover:bg-[#44403a] text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors disabled:opacity-40"
+                title="현재 저장된 Markdown으로 AI 개념 분석 실행"
+              >
+                <Sparkles className={`w-3.5 h-3.5 text-[#c52828] ${isAnalyzing ? 'animate-spin' : ''}`} />
+                <span>{isAnalyzing ? '분석 중...' : 'AI 개념 분석'}</span>
+              </button>
+            )}
+
+            {onOpenConceptReview && draftCount > 0 && (
+              <button
+                onClick={() => onOpenConceptReview(material)}
+                className="px-3 py-1.5 bg-indigo-900/80 hover:bg-indigo-900 text-indigo-200 border border-indigo-700/50 text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors"
+                title="추출된 개념 초안 검토 모달 열기"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                <span>개념 초안 ({draftCount}건)</span>
+              </button>
             )}
 
             <button

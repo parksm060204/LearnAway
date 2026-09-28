@@ -15,16 +15,22 @@ import {
   ExternalLink,
   FolderOpen,
   Filter,
+  Sparkles,
 } from 'lucide-react';
+import { ConceptDraft } from '../lib/types';
 
 interface MaterialsListModalProps {
   isOpen: boolean;
   onClose: () => void;
   activeSubject: Subject;
   materials: Material[];
+  drafts?: ConceptDraft[];
   onOpenUpload: () => void;
   onSelectMaterial: (material: Material) => void;
   onDeleteMaterial?: (materialId: string) => void;
+  onOpenConceptReview?: (material: Material) => void;
+  onTriggerAnalysis?: (material: Material) => void;
+  isAnalyzing?: boolean;
 }
 
 export function MaterialsListModal({
@@ -32,9 +38,13 @@ export function MaterialsListModal({
   onClose,
   activeSubject,
   materials,
+  drafts = [],
   onOpenUpload,
   onSelectMaterial,
   onDeleteMaterial,
+  onOpenConceptReview,
+  onTriggerAnalysis,
+  isAnalyzing = false,
 }: MaterialsListModalProps) {
   const [filterKind, setFilterKind] = useState<'all' | 'pdf' | 'transcript' | 'user' | 'demo'>('all');
 
@@ -171,118 +181,158 @@ export function MaterialsListModal({
             </div>
           ) : (
             <div className="space-y-3">
-              {filteredMaterials.map((mat) => (
-                <div
-                  key={mat.id}
-                  className="p-4 bg-[#faf8f4] hover:bg-white border border-[#ded6c8] hover:border-[#191817] rounded-xs transition-all shadow-2xs group flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-                >
-                  {/* Left Column: Icon & Meta */}
-                  <div className="flex items-start gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded bg-white border border-[#ded6c8] flex items-center justify-center shrink-0 mt-0.5">
-                      {mat.kind === 'pdf' ? (
-                        <FileText className="w-5 h-5 text-[#c52828]" />
-                      ) : mat.kind === 'transcript' ? (
-                        <Mic className="w-5 h-5 text-amber-600" />
+              {filteredMaterials.map((mat) => {
+                const matDrafts = drafts.filter((d) => d.materialId === mat.id);
+                const approvedDrafts = matDrafts.filter((d) => d.isApproved).length;
+
+                return (
+                  <div
+                    key={mat.id}
+                    className="p-4 bg-[#faf8f4] hover:bg-white border border-[#ded6c8] hover:border-[#191817] rounded-xs transition-all shadow-2xs group flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                  >
+                    {/* Left Column: Icon & Meta */}
+                    <div className="flex items-start gap-3 min-w-0">
+                      <div className="w-9 h-9 rounded bg-white border border-[#ded6c8] flex items-center justify-center shrink-0 mt-0.5">
+                        {mat.kind === 'pdf' ? (
+                          <FileText className="w-5 h-5 text-[#c52828]" />
+                        ) : mat.kind === 'transcript' ? (
+                          <Mic className="w-5 h-5 text-amber-600" />
+                        ) : (
+                          <FileSpreadsheet className="w-5 h-5 text-blue-600" />
+                        )}
+                      </div>
+
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap mb-1">
+                          <span className="font-academic-serif font-bold text-sm text-[#191817] group-hover:text-[#c52828] transition-colors truncate">
+                            {mat.title}
+                          </span>
+
+                          {/* Origin Badge */}
+                          {mat.isDemo ? (
+                            <span className="text-[10px] font-academic-mono bg-[#e8e4dc] text-[#57544e] px-1.5 py-0.5 rounded">
+                              데모
+                            </span>
+                          ) : (
+                            <span className="text-[10px] font-academic-mono bg-indigo-100 text-indigo-800 border border-indigo-200 px-1.5 py-0.5 rounded font-semibold">
+                              사용자 등록
+                            </span>
+                          )}
+
+                          {/* Status Badge */}
+                          {mat.status === 'ready' ? (
+                            <span className="text-[10px] font-academic-mono bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded flex items-center gap-1 font-semibold">
+                              <CheckCircle2 className="w-3 h-3" /> 변환 완료
+                            </span>
+                          ) : mat.status === 'needs_review' ? (
+                            <span className="text-[10px] font-academic-mono bg-amber-50 text-amber-800 border border-amber-300 px-1.5 py-0.5 rounded flex items-center gap-1 font-semibold">
+                              <AlertTriangle className="w-3 h-3 text-amber-600" /> 원본 확인 필요
+                            </span>
+                          ) : mat.status === 'failed' ? (
+                            <span className="text-[10px] font-academic-mono bg-red-50 text-red-700 border border-red-200 px-1.5 py-0.5 rounded flex items-center gap-1 font-semibold">
+                              <AlertTriangle className="w-3 h-3" /> 변환 실패
+                            </span>
+                          ) : (
+                            <span className="text-[10px] font-academic-mono bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded">
+                              변환 중...
+                            </span>
+                          )}
+
+                          {/* AI Extraction State Badge */}
+                          {matDrafts.length > 0 ? (
+                            <span className="text-[10px] font-academic-mono bg-indigo-50 text-indigo-800 border border-indigo-200 px-1.5 py-0.5 rounded font-semibold flex items-center gap-1">
+                              <Sparkles className="w-3 h-3 text-indigo-600" />
+                              <span>개념 {matDrafts.length}건 ({approvedDrafts}건 승인)</span>
+                            </span>
+                          ) : mat.hasAiConcepts ? (
+                            <span className="text-[10px] font-academic-mono text-[#57544e] bg-white border border-[#ded6c8] px-1.5 py-0.5 rounded">
+                              개념 연계됨
+                            </span>
+                          ) : (
+                            <span className="text-[10px] font-academic-mono text-amber-800 bg-amber-50/80 border border-amber-200 px-1.5 py-0.5 rounded">
+                              AI 개념 미추출
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-3 text-[11px] font-academic-mono text-[#827d73]">
+                          <span>출처: {mat.sourceRefs}</span>
+                          {mat.pageCount && <span>• {mat.pageCount}페이지</span>}
+                          {mat.durationMinutes && <span>• {mat.durationMinutes}분</span>}
+                          {mat.speakers && mat.speakers.length > 0 && (
+                            <span>• 화자: {mat.speakers.join(', ')}</span>
+                          )}
+                          <span>
+                            • 등록일:{' '}
+                            {new Date(mat.uploadedAt).toLocaleDateString('ko-KR', {
+                              year: 'numeric',
+                              month: '2-digit',
+                              day: '2-digit',
+                            })}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Right Column: Actions */}
+                    <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                      {/* Concept Review / AI Analysis Button */}
+                      {matDrafts.length > 0 ? (
+                        <button
+                          onClick={() => onOpenConceptReview && onOpenConceptReview(mat)}
+                          className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-800 text-xs font-bold rounded-xs flex items-center gap-1 transition-colors"
+                        >
+                          <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+                          <span>개념 초안 ({matDrafts.length}건)</span>
+                        </button>
+                      ) : mat.isConverted && mat.parsedMarkdown ? (
+                        <button
+                          onClick={() => onTriggerAnalysis && onTriggerAnalysis(mat)}
+                          disabled={isAnalyzing}
+                          className="px-3 py-1.5 bg-white hover:bg-[#faf8f4] border border-[#c8c2b5] text-[#191817] text-xs font-semibold rounded-xs flex items-center gap-1 transition-colors disabled:opacity-50"
+                          title="저장된 최신 Markdown으로 AI 개념 분석 실행"
+                        >
+                          <Sparkles className="w-3.5 h-3.5 text-[#c52828]" />
+                          <span>{isAnalyzing ? '분석 중...' : 'AI 개념 분석'}</span>
+                        </button>
                       ) : (
-                        <FileSpreadsheet className="w-5 h-5 text-blue-600" />
+                        <button
+                          disabled
+                          className="px-2.5 py-1.5 bg-[#f5f2eb] border border-[#ded6c8] text-[#a8a29e] text-xs rounded-xs flex items-center gap-1 cursor-not-allowed"
+                          title="먼저 Markdown을 검토하고 저장한 후에 분석할 수 있습니다."
+                        >
+                          <Sparkles className="w-3.5 h-3.5 text-[#a8a29e]" />
+                          <span>AI 분석 (저장 필요)</span>
+                        </button>
                       )}
-                    </div>
 
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap mb-1">
-                        <span className="font-academic-serif font-bold text-sm text-[#191817] group-hover:text-[#c52828] transition-colors truncate">
-                          {mat.title}
-                        </span>
-
-                        {/* Origin Badge */}
-                        {mat.isDemo ? (
-                          <span className="text-[10px] font-academic-mono bg-[#e8e4dc] text-[#57544e] px-1.5 py-0.5 rounded">
-                            데모
-                          </span>
-                        ) : (
-                          <span className="text-[10px] font-academic-mono bg-indigo-100 text-indigo-800 border border-indigo-200 px-1.5 py-0.5 rounded font-semibold">
-                            사용자 등록
-                          </span>
-                        )}
-
-                        {/* Status Badge */}
-                        {mat.status === 'ready' ? (
-                          <span className="text-[10px] font-academic-mono bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded flex items-center gap-1 font-semibold">
-                            <CheckCircle2 className="w-3 h-3" /> 변환 완료
-                          </span>
-                        ) : mat.status === 'needs_review' ? (
-                          <span className="text-[10px] font-academic-mono bg-amber-50 text-amber-800 border border-amber-300 px-1.5 py-0.5 rounded flex items-center gap-1 font-semibold">
-                            <AlertTriangle className="w-3 h-3 text-amber-600" /> 원본 확인 필요
-                          </span>
-                        ) : mat.status === 'failed' ? (
-                          <span className="text-[10px] font-academic-mono bg-red-50 text-red-700 border border-red-200 px-1.5 py-0.5 rounded flex items-center gap-1 font-semibold">
-                            <AlertTriangle className="w-3 h-3" /> 변환 실패
-                          </span>
-                        ) : (
-                          <span className="text-[10px] font-academic-mono bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded">
-                            변환 중...
-                          </span>
-                        )}
-
-                        {/* AI Extraction State Badge */}
-                        {mat.hasAiConcepts ? (
-                          <span className="text-[10px] font-academic-mono text-[#57544e] bg-white border border-[#ded6c8] px-1.5 py-0.5 rounded">
-                            개념 연계됨
-                          </span>
-                        ) : (
-                          <span className="text-[10px] font-academic-mono text-amber-800 bg-amber-50/80 border border-amber-200 px-1.5 py-0.5 rounded">
-                            AI 개념 미추출 (다음 단계)
-                          </span>
-                        )}
-                      </div>
-
-                      <div className="flex items-center gap-3 text-[11px] font-academic-mono text-[#827d73]">
-                        <span>출처: {mat.sourceRefs}</span>
-                        {mat.pageCount && <span>• {mat.pageCount}페이지</span>}
-                        {mat.durationMinutes && <span>• {mat.durationMinutes}분</span>}
-                        {mat.speakers && mat.speakers.length > 0 && (
-                          <span>• 화자: {mat.speakers.join(', ')}</span>
-                        )}
-                        <span>
-                          • 등록일:{' '}
-                          {new Date(mat.uploadedAt).toLocaleDateString('ko-KR', {
-                            year: 'numeric',
-                            month: '2-digit',
-                            day: '2-digit',
-                          })}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Right Column: Actions */}
-                  <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
-                    <button
-                      onClick={() => {
-                        onSelectMaterial(mat);
-                      }}
-                      className="px-3 py-1.5 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs flex items-center gap-1 transition-colors shadow-2xs"
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                      <span>원문 대조 및 편집</span>
-                    </button>
-
-                    {!mat.isDemo && onDeleteMaterial && (
                       <button
                         onClick={() => {
-                          if (confirm(`'${mat.title}' 자료를 삭제하시겠습니까?`)) {
-                            onDeleteMaterial(mat.id);
-                          }
+                          onSelectMaterial(mat);
                         }}
-                        className="p-1.5 text-[#827d73] hover:text-[#c52828] hover:bg-red-50 rounded transition-colors"
-                        title="자료 삭제"
+                        className="px-3 py-1.5 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs flex items-center gap-1 transition-colors shadow-2xs"
                       >
-                        <Trash2 className="w-4 h-4" />
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        <span>원문 대조 및 편집</span>
                       </button>
-                    )}
+
+                      {!mat.isDemo && onDeleteMaterial && (
+                        <button
+                          onClick={() => {
+                            if (confirm(`'${mat.title}' 자료를 삭제하시겠습니까?`)) {
+                              onDeleteMaterial(mat.id);
+                            }
+                          }}
+                          className="p-1.5 text-[#827d73] hover:text-[#c52828] hover:bg-red-50 rounded transition-colors"
+                          title="자료 삭제"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

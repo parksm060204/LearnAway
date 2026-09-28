@@ -5,6 +5,7 @@ import {
   Subject,
   Material,
   Concept,
+  ConceptDraft,
   Problem,
   Attempt,
   ProblemType,
@@ -19,6 +20,8 @@ import {
   saveStoredMaterials,
   loadStoredConcepts,
   saveStoredConcepts,
+  loadStoredConceptDrafts,
+  saveStoredConceptDrafts,
   loadStoredProblems,
   saveStoredProblems,
   loadStoredAttempts,
@@ -41,6 +44,7 @@ import { ScopeManageModal } from '../components/ScopeManageModal';
 import { MaterialUploadModal } from '../components/MaterialUploadModal';
 import { MaterialEditorModal } from '../components/MaterialEditorModal';
 import { MaterialsListModal } from '../components/MaterialsListModal';
+import { ConceptReviewModal } from '../components/ConceptReviewModal';
 import { PdfViewerModal } from '../components/PdfViewerModal';
 import { SettingsModal } from '../components/SettingsModal';
 import { MockExamModal } from '../components/MockExamModal';
@@ -84,6 +88,12 @@ export default function RedcallDashboardPage() {
   const [isMaterialEditorOpen, setIsMaterialEditorOpen] = useState(false);
   const [pdfViewerSourceRef, setPdfViewerSourceRef] = useState<string | null>(null);
 
+  // Stage 2: AI Concept Extraction & Review State
+  const [conceptDrafts, setConceptDrafts] = useState<ConceptDraft[]>([]);
+  const [isConceptReviewOpen, setIsConceptReviewOpen] = useState(false);
+  const [conceptReviewMaterial, setConceptReviewMaterial] = useState<Material | null>(null);
+  const [isAiAnalyzing, setIsAiAnalyzing] = useState(false);
+
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -100,6 +110,7 @@ export default function RedcallDashboardPage() {
     const loadedSubjectId = loadActiveSubjectId();
     const loadedMaterials = loadStoredMaterials();
     const loadedConcepts = loadStoredConcepts();
+    const loadedDrafts = loadStoredConceptDrafts();
     const loadedProblems = loadStoredProblems();
     const loadedAttempts = loadStoredAttempts();
     const loadedSettings = loadStoredSettings();
@@ -108,6 +119,7 @@ export default function RedcallDashboardPage() {
     setActiveSubjectId(loadedSubjectId);
     setMaterials(loadedMaterials);
     setAllConcepts(loadedConcepts);
+    setConceptDrafts(loadedDrafts);
     setAllProblems(loadedProblems);
     setAttempts(loadedAttempts);
     setSettings(loadedSettings);
@@ -140,6 +152,11 @@ export default function RedcallDashboardPage() {
     if (!activeSubject) return [];
     return allProblems.filter((p) => p.subjectId === activeSubject.id);
   }, [allProblems, activeSubject]);
+
+  const activeSubjectDrafts = useMemo(() => {
+    if (!activeSubject) return [];
+    return conceptDrafts.filter((d) => d.subjectId === activeSubject.id);
+  }, [conceptDrafts, activeSubject]);
 
   const selectedConcept = useMemo(() => {
     return (
@@ -253,6 +270,72 @@ export default function RedcallDashboardPage() {
     showToast(`자료 [${newMat.title}]가 등록되었습니다.`);
   };
 
+  // Stage 2: AI Concept Analysis Handler
+  const handleTriggerAiAnalysis = async (targetMaterial: Material) => {
+    if (!targetMaterial.parsedMarkdown || !targetMaterial.parsedMarkdown.trim()) {
+      showToast('검토 및 저장된 Markdown 내용이 없습니다. 먼저 자료를 저장해주세요.');
+      return;
+    }
+    if (targetMaterial.status !== 'ready') {
+      showToast('자료가 아직 변환 중이거나 오류 상태입니다. 저장 완료 후 분석할 수 있습니다.');
+      return;
+    }
+
+    setIsAiAnalyzing(true);
+    showToast(`[${targetMaterial.title}] AI 개념 분석 시작... (OpenAI/DeepSeek API 호출 중)`);
+
+    try {
+      const res = await fetch('/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          materialId: targetMaterial.id,
+          subjectId: targetMaterial.subjectId,
+          domain: activeSubject?.domain || 'mathematics',
+          markdown: targetMaterial.parsedMarkdown,
+          sourceRefs: targetMaterial.sourceRefs || [],
+          materialTitle: targetMaterial.title,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        const errMsg = data.error || 'AI 개념 분석에 실패했습니다.';
+        const details = data.details ? ` (${data.details})` : '';
+        showToast(`분석 실패: ${errMsg}${details}`);
+        return;
+      }
+
+      const newDrafts: ConceptDraft[] = data.drafts || [];
+      if (newDrafts.length === 0) {
+        showToast('추출된 새로운 개념이 없습니다.');
+        return;
+      }
+
+      // Replace or prepend drafts for this material, preserving drafts for other materials
+      const otherDrafts = conceptDrafts.filter((d) => d.materialId !== targetMaterial.id);
+      const updatedDrafts = [...newDrafts, ...otherDrafts];
+      setConceptDrafts(updatedDrafts);
+      saveStoredConceptDrafts(updatedDrafts);
+
+      // Update material hasAiConcepts flag
+      const updatedMaterials = materials.map((m) =>
+        m.id === targetMaterial.id ? { ...m, hasAiConcepts: true } : m
+      );
+      setMaterials(updatedMaterials);
+      saveStoredMaterials(updatedMaterials);
+
+      // Select and open review modal
+      setConceptReviewMaterial(targetMaterial);
+      setIsConceptReviewOpen(true);
+      showToast(`[${targetMaterial.title}] 분석 완료! ${newDrafts.length}개 개념 초안이 생성되었습니다.`);
+    } catch (err: any) {
+      showToast(`네트워크 또는 서버 오류: ${err?.message || '알 수 없는 오류'}`);
+    } finally {
+      setIsAiAnalyzing(false);
+    }
+  };
+
   // Attempt Submission Handler (Updates ReviewEvent & Retention Score)
   const handleSubmitAttempt = (attempt: Attempt) => {
     const { updatedConcepts, updatedAttempts } = recordAttemptAndUpdateConcept(attempt, settings);
@@ -314,6 +397,11 @@ export default function RedcallDashboardPage() {
         onOpenAddSubject={() => setIsAddSubjectModalOpen(true)}
         onOpenUpload={() => setIsUploadModalOpen(true)}
         onOpenMaterialsList={() => setIsMaterialsListOpen(true)}
+        onOpenConceptReview={() => {
+          setConceptReviewMaterial(null);
+          setIsConceptReviewOpen(true);
+        }}
+        draftCount={activeSubjectDrafts.length}
         onOpenProblemSession={() => setIsProblemSessionOpen(true)}
         onOpenMockExam={() => setIsMockExamModalOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -491,6 +579,7 @@ export default function RedcallDashboardPage() {
         onClose={() => setIsMaterialsListOpen(false)}
         activeSubject={activeSubject}
         materials={materials}
+        drafts={conceptDrafts}
         onOpenUpload={() => {
           setIsMaterialsListOpen(false);
           setIsUploadModalOpen(true);
@@ -505,6 +594,13 @@ export default function RedcallDashboardPage() {
           saveStoredMaterials(updated);
           showToast('자료가 삭제되었습니다.');
         }}
+        onOpenConceptReview={(mat) => {
+          setIsMaterialsListOpen(false);
+          setConceptReviewMaterial(mat || null);
+          setIsConceptReviewOpen(true);
+        }}
+        onTriggerAnalysis={handleTriggerAiAnalysis}
+        isAnalyzing={isAiAnalyzing}
       />
 
       {/* 4.2 Material Side-by-Side Comparison Editor Modal */}
@@ -516,6 +612,7 @@ export default function RedcallDashboardPage() {
         }}
         material={editingMaterial}
         subject={activeSubject}
+        draftCount={editingMaterial ? conceptDrafts.filter((d) => d.materialId === editingMaterial.id).length : 0}
         onSave={(updatedMat) => {
           const updated = materials.map((m) =>
             m.id === updatedMat.id ? updatedMat : m
@@ -525,6 +622,37 @@ export default function RedcallDashboardPage() {
           setEditingMaterial(updatedMat);
           showToast(`[${updatedMat.title}] 수정 내용이 저장되었습니다.`);
         }}
+        onOpenConceptReview={(mat) => {
+          setConceptReviewMaterial(mat || null);
+          setIsConceptReviewOpen(true);
+        }}
+        onTriggerAnalysis={handleTriggerAiAnalysis}
+        isAnalyzing={isAiAnalyzing}
+      />
+
+      {/* 4.3 AI Concept Extraction & Review Modal (Stage 2) */}
+      <ConceptReviewModal
+        isOpen={isConceptReviewOpen}
+        onClose={() => {
+          setIsConceptReviewOpen(false);
+          setConceptReviewMaterial(null);
+        }}
+        activeSubject={activeSubject}
+        material={conceptReviewMaterial}
+        drafts={conceptDrafts}
+        onUpdateDrafts={(updatedDrafts) => {
+          setConceptDrafts(updatedDrafts);
+        }}
+        onConceptsUpdated={(updatedConcepts) => {
+          setAllConcepts(updatedConcepts);
+        }}
+        onOpenMaterialEditor={(mat) => {
+          setIsConceptReviewOpen(false);
+          setEditingMaterial(mat);
+          setIsMaterialEditorOpen(true);
+        }}
+        onTriggerAnalysis={handleTriggerAiAnalysis}
+        isAnalyzing={isAiAnalyzing}
       />
 
       {/* 5. PDF Reference Excerpt Reader Modal */}

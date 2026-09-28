@@ -166,7 +166,134 @@ function runTests() {
     assert(econMats.every((m: any) => m.isDemo === true), 'Demo materials have isDemo=true');
     assert(econMats.every((m: any) => m.status === 'ready'), 'Initial materials are ready');
 
-    console.log(`\n=== TEST RESULTS: ${passed} PASSED, ${failed} FAILED ===`);
+    // 8. Stage 2: Markdown Hash & Version Change Detection
+    console.log('\n--- 8. Testing Markdown Hash & Version Change Detection ---');
+    const { computeMarkdownHash, chunkMarkdownForAnalysis, verifySourceCitation } = require('./markdownUtils');
+    const mdV1 = '# 중심극한정리\n표본평균의 분포는 정규분포에 수렴한다.';
+    const mdV2 = '# 중심극한정리\n표본평균의 분포는 정규분포에 수렴한다.\n\n수정된 내용 추가';
+    const hashV1 = computeMarkdownHash(mdV1);
+    const hashV2 = computeMarkdownHash(mdV2);
+    assert(hashV1.startsWith('h_'), 'Hash format uses h_ prefix');
+    assert(hashV1 === computeMarkdownHash(mdV1), 'Deterministic hashing returns same value for same content');
+    assert(hashV1 !== hashV2, 'Content change produces different hash (enabling outdated draft warning)');
+
+    // 9. Stage 2: Citation Verification & User Review Flagging
+    console.log('\n--- 9. Testing Source Citation Verification ---');
+    const fullSourceMd = `<!-- [PAGE 3] -->
+## 베이즈 정리 (Bayes' Theorem)
+조건부 확률 공식: $P(A|B) = \\frac{P(B|A)P(A)}{P(B)}$
+사전확률과 사후확률의 관계를 나타냅니다.`;
+
+    const validEvidence = {
+      type: 'page' as const,
+      pageNumber: 3,
+      quote: '조건부 확률 공식: $P(A|B) = \\frac{P(B|A)P(A)}{P(B)}$',
+      verified: false,
+    };
+    const checkValid = verifySourceCitation(fullSourceMd, validEvidence);
+    assert(checkValid.verified === true, 'Exact quote in source markdown is verified as valid');
+
+    const fakeEvidence = {
+      type: 'page' as const,
+      pageNumber: 5,
+      quote: '이 문장은 원문에 전혀 존재하지 않는 조작된 인용구입니다.',
+      verified: false,
+    };
+    const checkFake = verifySourceCitation(fullSourceMd, fakeEvidence);
+    assert(checkFake.verified === false, 'Fake or hallucinated quote fails verification');
+    assert(checkFake.verificationNote.length > 0, 'Provides user-review warning reason');
+
+    // 10. Stage 2: Chunking Preserving Page / Speech Markers
+    console.log('\n--- 10. Testing Chunking Preserving Page / Speech Markers ---');
+    const multiPageMd = `<!-- [PAGE 1] -->
+# 1페이지 서론
+기초 내용입니다.
+
+<!-- [PAGE 2] -->
+# 2페이지 심화
+심화 공식입니다.`;
+    const chunks = chunkMarkdownForAnalysis(multiPageMd, 50);
+    assert(chunks.length >= 2, 'Large multi-page document chunked into multiple pieces');
+    assert(chunks[0].text.includes('<!-- [PAGE 1] -->'), 'Chunk 0 preserves PAGE 1 marker');
+    assert(chunks[1].text.includes('<!-- [PAGE 2] -->'), 'Chunk 1 preserves PAGE 2 marker');
+
+    // 11. Stage 2: Draft Approval Without Artificial Mastery / Events (CRITICAL REQUIREMENT)
+    console.log('\n--- 11. Testing Draft Approval Without Fake Mastery or Review Events ---');
+    const {
+      saveStoredConceptDrafts,
+      approveConceptDraft,
+      mergeConceptDrafts,
+      markConceptAsLearned,
+      saveStoredConcepts,
+    } = require('./storage');
+
+    const dummyDraftId = 'test-draft-stage2-001';
+    const dummyDraft = {
+      id: dummyDraftId,
+      materialId: 'test-mat-001',
+      subjectId: 'subj-econ302',
+      title: '새로 추출된 가설검정',
+      domain: 'math_stats',
+      description: '귀무가설과 대립가설의 기각역을 검정합니다.',
+      coreDefinitionFormulaOrAlgorithm: 'p-value < alpha',
+      prerequisites: ['정규분포'],
+      relatedConcepts: ['유의수준'],
+      commonMisconceptions: ['p값이 대립가설이 참일 확률이라고 오해함'],
+      examples: ['t-검정 예제'],
+      sourceEvidence: validEvidence,
+      sourceMarkdownHash: hashV1,
+      isApproved: false,
+      createdAt: '2026-09-29T00:00:00+09:00',
+      updatedAt: '2026-09-29T00:00:00+09:00',
+    };
+
+    saveStoredConceptDrafts([dummyDraft]);
+    const { updatedDrafts, approvedConcept } = approveConceptDraft(dummyDraftId);
+    assert(approvedConcept !== null, 'Draft successfully approved and converted to Concept');
+    assert(approvedConcept?.status === 'unstudied', 'CRITICAL: Approved concept starts as "unstudied"');
+    assert(approvedConcept?.events.length === 0, 'CRITICAL: Approved concept has ZERO fake review events');
+    assert(approvedConcept?.baseScore === 0, 'CRITICAL: Approved concept has baseScore 0 (SCORE --)');
+    assert(approvedConcept?.currentScore === 0, 'CRITICAL: Approved concept has currentScore 0');
+    assert(approvedConcept?.isDemo === false, 'Concept is tagged isDemo=false (user-extracted concept)');
+    assert(approvedConcept?.isLearned === false, 'Concept is not yet marked as learned');
+
+    // 12. Stage 2: Transition from Unstudied to Learned
+    console.log('\n--- 12. Testing Marking Concept as Learned ---');
+    if (approvedConcept) {
+      saveStoredConcepts([approvedConcept]);
+      const { updatedConcepts, learnedConcept } = markConceptAsLearned(approvedConcept.id, 75);
+      assert(learnedConcept?.isLearned === true, 'Concept transitioned to isLearned=true');
+      assert(learnedConcept?.status === 'newly_learned', 'Concept status changed to newly_learned');
+      assert(learnedConcept?.events.length === 1, 'Legitimate initial review event recorded');
+      assert(learnedConcept?.currentScore === 75, 'Current score reflects initial evaluation score');
+    }
+
+    // 13. Stage 2: Draft Merging
+    console.log('\n--- 13. Testing Merging Duplicate Drafts ---');
+    const draftA = {
+      ...dummyDraft,
+      id: 'draft-merge-A',
+      title: '다익스트라 알고리즘',
+      prerequisites: ['우선순위 큐'],
+      relatedConcepts: ['벨만-포드'],
+    };
+    const draftB = {
+      ...dummyDraft,
+      id: 'draft-merge-B',
+      title: '다익스트라 최단경로법',
+      prerequisites: ['그래프 탐색'],
+      relatedConcepts: ['벨만-포드', 'A* 알고리즘'],
+      examples: ['네트워크 라우팅 예제'],
+    };
+    saveStoredConceptDrafts([draftA, draftB]);
+    const mergedList = mergeConceptDrafts('draft-merge-A', 'draft-merge-B');
+    const finalMerged = mergedList.find((d: any) => d.id === 'draft-merge-A');
+    assert(mergedList.some((d: any) => d.id === 'draft-merge-B') === false, 'Source draft B removed after merge');
+    assert(finalMerged?.prerequisites.includes('우선순위 큐') && finalMerged?.prerequisites.includes('그래프 탐색'), 'Prerequisites combined without loss');
+    assert(finalMerged?.relatedConcepts.filter((c: string) => c === '벨만-포드').length === 1, 'Related concepts deduplicated');
+    assert(finalMerged?.examples?.includes('네트워크 라우팅 예제'), 'Examples merged');
+
+    console.log(`\n=== ALL STAGE 1 & STAGE 2 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
     if (failed > 0) {
       process.exit(1);
     }

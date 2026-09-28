@@ -77,6 +77,18 @@ export function TodayReviewPanel({
         </h2>
       </div>
 
+      {concept.status === 'unstudied' && (
+        <div className="p-3 bg-slate-50 border border-slate-200 rounded text-xs text-slate-700 space-y-1">
+          <div className="font-bold flex items-center gap-1 text-[#191817]">
+            <AlertCircle className="w-3.5 h-3.5 text-slate-500" />
+            <span>미학습 상태 (학습 대기)</span>
+          </div>
+          <p className="text-[11px] leading-relaxed">
+            사용자 자료에서 추출 승인된 신규 개념입니다. 학습 완료 등록 전까지는 임의의 망각곡선이나 과거 점수를 생성하지 않습니다.
+          </p>
+        </div>
+      )}
+
       {/* Task Category Grid */}
       <div className="space-y-1.5">
         <div className="flex items-center justify-between text-[11px] font-academic-mono text-[#827d73]">

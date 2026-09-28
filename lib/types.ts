@@ -32,7 +32,8 @@ export type ConceptStatus =
   | 'recommend_d1'    // D+1 권장 (SCORE 50 ~ 65)
   | 'stable'          // 안정 구간 (SCORE 65 ~ 80)
   | 'maintained'      // 유지 상태 (SCORE 80 ~ 90)
-  | 'newly_learned';  // 신규 습득 (SCORE >= 90 or 최근 3일 이내)
+  | 'newly_learned'   // 신규 습득 (SCORE >= 90 or 최근 3일 이내)
+  | 'unstudied';      // 미학습 (사용자 자료에서 추출 승인되었으나 아직 학습을 시작하지 않음)
 
 export interface Subject {
   id: string;
@@ -120,14 +121,47 @@ export interface ReviewEvent {
   rubricScores?: RubricResult[];
 }
 
+export interface ConceptEvidence {
+  type: 'page' | 'transcript_block' | 'section';
+  pageNumber?: number;
+  blockIndex?: number;
+  timestamp?: string;
+  speaker?: string;
+  quote: string;
+  verified: boolean;
+  verificationNote?: string;
+}
+
+export interface ConceptDraft {
+  id: string;
+  subjectId: string;
+  materialId: string;
+  materialTitle?: string;
+  title: string;
+  domain: 'math_stats' | 'computer_science';
+  description: string;
+  coreDefinitionFormulaOrAlgorithm?: string;
+  prerequisites: string[];
+  relatedConcepts: string[];
+  commonMisconceptions: string[];
+  examples: string[];
+  sourceEvidence: ConceptEvidence;
+  status: 'draft' | 'approved' | 'rejected';
+  isApproved: boolean;
+  sourceMarkdownHash: string;
+  createdAt: string;
+  updatedAt: string;
+  editedByUser?: boolean;
+}
+
 export interface Concept {
   id: string;
   subjectId: string;
   materialIds: string[];
   title: string;
   chapterRef: string;
-  firstLearnedAt: string;
-  firstLearnedDayOffset: number;
+  firstLearnedAt?: string;
+  firstLearnedDayOffset?: number;
   lastAttemptAt?: string;
   lastAttemptDayOffset?: number;
   baseScore: number;
@@ -136,6 +170,16 @@ export interface Concept {
   order: number;
   events: ReviewEvent[];
   exerciseCount: number;
+  isDemo?: boolean;       // true: 데모 개념, false: 사용자 자료 추출 개념
+  isLearned?: boolean;    // 사용자가 '학습 완료'로 표시했는지 여부
+  description?: string;
+  coreDefinitionFormulaOrAlgorithm?: string;
+  prerequisites?: string[];
+  relatedConcepts?: string[];
+  commonMisconceptions?: string[];
+  examples?: string[];
+  sourceEvidence?: ConceptEvidence;
+  draftId?: string;
 }
 
 export interface Problem {

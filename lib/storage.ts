@@ -2,6 +2,8 @@ import {
   Subject,
   Material,
   Concept,
+  ConceptDraft,
+  ConceptStatus,
   Problem,
   Attempt,
   RetentionModelSettings,
@@ -24,17 +26,25 @@ const STORAGE_KEYS = {
   SUBJECTS: 'redcall_subjects_v1',
   MATERIALS: 'redcall_materials_v1',
   CONCEPTS: 'redcall_concepts_v1',
+  CONCEPT_DRAFTS: 'redcall_concept_drafts_v1',
   PROBLEMS: 'redcall_problems_v1',
   ATTEMPTS: 'redcall_attempts_v1',
   SETTINGS: 'redcall_retention_settings_v1',
 };
 
+const inMemoryStore: Record<string, string> = {};
+
 function safeGetItem<T>(key: string, fallback: T): T {
-  if (typeof window === 'undefined') return fallback;
   try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = localStorage.getItem(key);
+      if (!raw) return fallback;
+      return JSON.parse(raw) as T;
+    } else {
+      const raw = inMemoryStore[key];
+      if (!raw) return fallback;
+      return JSON.parse(raw) as T;
+    }
   } catch (e) {
     console.warn(`Failed to parse localStorage key ${key}`, e);
     return fallback;
@@ -42,9 +52,13 @@ function safeGetItem<T>(key: string, fallback: T): T {
 }
 
 function safeSetItem<T>(key: string, val: T): void {
-  if (typeof window === 'undefined') return;
   try {
-    localStorage.setItem(key, JSON.stringify(val));
+    const serialized = JSON.stringify(val);
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.setItem(key, serialized);
+    } else {
+      inMemoryStore[key] = serialized;
+    }
   } catch (e) {
     console.error(`Failed to write localStorage key ${key}`, e);
   }
@@ -87,11 +101,268 @@ export function saveStoredMaterials(materials: Material[]): void {
 }
 
 export function loadStoredConcepts(): Concept[] {
-  return safeGetItem<Concept[]>(STORAGE_KEYS.CONCEPTS, INITIAL_CONCEPTS);
+  const loaded = safeGetItem<Concept[]>(STORAGE_KEYS.CONCEPTS, INITIAL_CONCEPTS);
+  return loaded.map((c) => ({
+    ...c,
+    status: c.status || 'stable',
+    isDemo: c.isDemo ?? (c.id.startsWith('c-econ') || c.id.startsWith('c-cs')),
+    isLearned: c.isLearned ?? (c.id.startsWith('c-econ') || c.id.startsWith('c-cs')),
+  }));
 }
 
 export function saveStoredConcepts(concepts: Concept[]): void {
   safeSetItem(STORAGE_KEYS.CONCEPTS, concepts);
+}
+
+export function loadStoredConceptDrafts(): ConceptDraft[] {
+  return safeGetItem<ConceptDraft[]>(STORAGE_KEYS.CONCEPT_DRAFTS, []);
+}
+
+export function saveStoredConceptDrafts(drafts: ConceptDraft[]): void {
+  safeSetItem(STORAGE_KEYS.CONCEPT_DRAFTS, drafts);
+}
+
+export function approveConceptDraft(draftId: string): {
+  updatedDrafts: ConceptDraft[];
+  updatedConcepts: Concept[];
+  newConcept: Concept | null;
+  approvedConcept: Concept | null;
+} {
+  const drafts = loadStoredConceptDrafts();
+  const concepts = loadStoredConcepts();
+
+  const targetDraft = drafts.find((d) => d.id === draftId);
+  if (!targetDraft) {
+    return { updatedDrafts: drafts, updatedConcepts: concepts, newConcept: null, approvedConcept: null };
+  }
+
+  const updatedDrafts = drafts.map((d) =>
+    d.id === draftId
+      ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: new Date().toISOString() }
+      : d
+  );
+  saveStoredConceptDrafts(updatedDrafts);
+
+  // Check if concept already created from this draft
+  const existingIndex = concepts.findIndex((c) => c.draftId === draftId);
+  let newConcept: Concept;
+
+  const chapterRef =
+    targetDraft.sourceEvidence.type === 'page'
+      ? `제${targetDraft.sourceEvidence.pageNumber || 1}페이지`
+      : targetDraft.sourceEvidence.timestamp
+      ? `전사본 ${targetDraft.sourceEvidence.timestamp}`
+      : `전사본 발화 #${targetDraft.sourceEvidence.blockIndex || 1}`;
+
+  if (existingIndex >= 0) {
+    newConcept = {
+      ...concepts[existingIndex],
+      title: targetDraft.title,
+      description: targetDraft.description,
+      coreDefinitionFormulaOrAlgorithm: targetDraft.coreDefinitionFormulaOrAlgorithm,
+      prerequisites: targetDraft.prerequisites,
+      relatedConcepts: targetDraft.relatedConcepts,
+      commonMisconceptions: targetDraft.commonMisconceptions,
+      examples: targetDraft.examples,
+      sourceEvidence: targetDraft.sourceEvidence,
+    };
+    concepts[existingIndex] = newConcept;
+  } else {
+    newConcept = {
+      id: `c-ext-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+      subjectId: targetDraft.subjectId,
+      materialIds: [targetDraft.materialId],
+      title: targetDraft.title,
+      chapterRef,
+      baseScore: 0,
+      currentScore: 0,
+      status: 'unstudied', // DO NOT invent fake score or events!
+      order: concepts.length + 1,
+      events: [],
+      exerciseCount: 0,
+      isDemo: false,
+      isLearned: false,
+      description: targetDraft.description,
+      coreDefinitionFormulaOrAlgorithm: targetDraft.coreDefinitionFormulaOrAlgorithm,
+      prerequisites: targetDraft.prerequisites,
+      relatedConcepts: targetDraft.relatedConcepts,
+      commonMisconceptions: targetDraft.commonMisconceptions,
+      examples: targetDraft.examples,
+      sourceEvidence: targetDraft.sourceEvidence,
+      draftId: targetDraft.id,
+    };
+    concepts.push(newConcept);
+  }
+
+  saveStoredConcepts(concepts);
+
+  // Update material hasAiConcepts flag
+  const materials = loadStoredMaterials();
+  const matUpdated = materials.map((m) =>
+    m.id === targetDraft.materialId ? { ...m, hasAiConcepts: true } : m
+  );
+  saveStoredMaterials(matUpdated);
+
+  return { updatedDrafts, updatedConcepts: concepts, newConcept, approvedConcept: newConcept };
+}
+
+export function batchApproveConceptDrafts(draftIds: string[]): {
+  updatedDrafts: ConceptDraft[];
+  updatedConcepts: Concept[];
+} {
+  const drafts = loadStoredConceptDrafts();
+  let concepts = loadStoredConcepts();
+  const targetIdsSet = new Set(draftIds);
+
+  const updatedDrafts = drafts.map((d) =>
+    targetIdsSet.has(d.id)
+      ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: new Date().toISOString() }
+      : d
+  );
+  saveStoredConceptDrafts(updatedDrafts);
+
+  for (const draftId of draftIds) {
+    const draft = drafts.find((d) => d.id === draftId);
+    if (!draft) continue;
+
+    const existingIndex = concepts.findIndex((c) => c.draftId === draftId);
+    const chapterRef =
+      draft.sourceEvidence.type === 'page'
+        ? `제${draft.sourceEvidence.pageNumber || 1}페이지`
+        : draft.sourceEvidence.timestamp
+        ? `전사본 ${draft.sourceEvidence.timestamp}`
+        : `전사본 발화 #${draft.sourceEvidence.blockIndex || 1}`;
+
+    if (existingIndex >= 0) {
+      concepts[existingIndex] = {
+        ...concepts[existingIndex],
+        title: draft.title,
+        description: draft.description,
+        coreDefinitionFormulaOrAlgorithm: draft.coreDefinitionFormulaOrAlgorithm,
+        prerequisites: draft.prerequisites,
+        relatedConcepts: draft.relatedConcepts,
+        commonMisconceptions: draft.commonMisconceptions,
+        examples: draft.examples,
+        sourceEvidence: draft.sourceEvidence,
+      };
+    } else {
+      concepts.push({
+        id: `c-ext-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+        subjectId: draft.subjectId,
+        materialIds: [draft.materialId],
+        title: draft.title,
+        chapterRef,
+        baseScore: 0,
+        currentScore: 0,
+        status: 'unstudied',
+        order: concepts.length + 1,
+        events: [],
+        exerciseCount: 0,
+        isDemo: false,
+        isLearned: false,
+        description: draft.description,
+        coreDefinitionFormulaOrAlgorithm: draft.coreDefinitionFormulaOrAlgorithm,
+        prerequisites: draft.prerequisites,
+        relatedConcepts: draft.relatedConcepts,
+        commonMisconceptions: draft.commonMisconceptions,
+        examples: draft.examples,
+        sourceEvidence: draft.sourceEvidence,
+        draftId: draft.id,
+      });
+    }
+  }
+
+  saveStoredConcepts(concepts);
+  return { updatedDrafts, updatedConcepts: concepts };
+}
+
+export function deleteConceptDraft(draftId: string): ConceptDraft[] {
+  const drafts = loadStoredConceptDrafts();
+  const updated = drafts.filter((d) => d.id !== draftId);
+  saveStoredConceptDrafts(updated);
+  return updated;
+}
+
+export function mergeConceptDrafts(
+  targetDraftId: string,
+  sourceDraftId: string,
+  mergedData?: Partial<ConceptDraft>
+): ConceptDraft[] {
+  const drafts = loadStoredConceptDrafts();
+  const target = drafts.find((d) => d.id === targetDraftId);
+  const source = drafts.find((d) => d.id === sourceDraftId);
+
+  if (!target || !source) return drafts;
+
+  const mergedPrerequisites = Array.from(
+    new Set([...target.prerequisites, ...source.prerequisites])
+  );
+  const mergedRelated = Array.from(
+    new Set([...target.relatedConcepts, ...source.relatedConcepts])
+  );
+  const mergedMisconceptions = Array.from(
+    new Set([...target.commonMisconceptions, ...source.commonMisconceptions])
+  );
+  const mergedExamples = Array.from(new Set([...target.examples, ...source.examples]));
+
+  const updatedDraft: ConceptDraft = {
+    ...target,
+    ...mergedData,
+    prerequisites: mergedPrerequisites,
+    relatedConcepts: mergedRelated,
+    commonMisconceptions: mergedMisconceptions,
+    examples: mergedExamples,
+    updatedAt: new Date().toISOString(),
+    editedByUser: true,
+  };
+
+  const updated = drafts
+    .filter((d) => d.id !== sourceDraftId)
+    .map((d) => (d.id === targetDraftId ? updatedDraft : d));
+
+  saveStoredConceptDrafts(updated);
+  return updated;
+}
+
+export function markConceptAsLearned(
+  conceptId: string,
+  baseScore: number = 85
+): { updatedConcepts: Concept[]; learnedConcept?: Concept } {
+  const concepts = loadStoredConcepts();
+  const now = new Date().toISOString();
+
+  let targetLearned: Concept | undefined;
+
+  const updated = concepts.map((c) => {
+    if (c.id !== conceptId) return c;
+    const initialEvent: ReviewEvent = {
+      id: `ev-${Date.now()}`,
+      conceptId: c.id,
+      at: now,
+      dayOffset: 0,
+      kind: 'initial_study',
+      title: '학습 완료 등록',
+      resultScore: baseScore,
+      confidence: 4,
+      sourceRef: c.chapterRef,
+      evaluationSummary: '사용자 학습 완료 확인',
+    };
+    const learned: Concept = {
+      ...c,
+      isLearned: true,
+      status: 'newly_learned' as ConceptStatus,
+      firstLearnedAt: now,
+      firstLearnedDayOffset: 0,
+      baseScore,
+      currentScore: baseScore,
+      events: [initialEvent],
+    };
+    targetLearned = learned;
+    return learned;
+  });
+
+  saveStoredConcepts(updated);
+  return { updatedConcepts: updated, learnedConcept: targetLearned };
 }
 
 export function loadStoredProblems(): Problem[] {
@@ -127,6 +398,7 @@ export function resetToInitialDemoData(): void {
   localStorage.removeItem(STORAGE_KEYS.SUBJECTS);
   localStorage.removeItem(STORAGE_KEYS.MATERIALS);
   localStorage.removeItem(STORAGE_KEYS.CONCEPTS);
+  localStorage.removeItem(STORAGE_KEYS.CONCEPT_DRAFTS);
   localStorage.removeItem(STORAGE_KEYS.PROBLEMS);
   localStorage.removeItem(STORAGE_KEYS.ATTEMPTS);
   localStorage.removeItem(STORAGE_KEYS.SETTINGS);
