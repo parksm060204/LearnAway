@@ -582,6 +582,7 @@ export default function RedcallDashboardPage() {
               <ArchiveRecordDetail
                 concept={selectedConcept}
                 event={selectedEvent}
+                attempts={attempts}
                 onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
               />
             )}

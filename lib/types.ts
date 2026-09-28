@@ -102,6 +102,9 @@ export interface RubricResult {
   maxScore: number;
   isVulnerable?: boolean;
   feedback?: string;
+  evidenceQuote?: string;     // 답안에서 확인한 근거
+  deductionReason?: string;   // 감점 이유 (감점 없을 시 "만점 기준 충족")
+  improvementTip?: string;    // 개선 및 보완 방법
 }
 
 export interface ReviewEvent {
@@ -119,6 +122,10 @@ export interface ReviewEvent {
   sourceRef: string;
   evaluationSummary?: string;
   rubricScores?: RubricResult[];
+  attemptId?: string;
+  strengths?: string;
+  criticalImprovements?: string;
+  needsReview?: boolean;
 }
 
 export interface ConceptEvidence {
@@ -264,10 +271,23 @@ export interface Problem {
   createdAt?: string;
 }
 
+export interface EvaluationResult {
+  calculatedScore: number;
+  rubricResults: RubricResult[];
+  feedback: string;
+  strengths: string;
+  criticalImprovements: string;
+  recommendedErrorType: ErrorType;
+  staticAnalysisNotice: string;
+  needsReview: boolean;
+  isAiEvaluated: boolean;
+}
+
 export interface Attempt {
   id: string;
   problemId: string;
   conceptId: string;
+  conceptIds?: string[];           // 다중 개념 연결 목록
   subjectId: string;
   at: string;
   answer: string;
@@ -278,6 +298,14 @@ export interface Attempt {
   calculatedScore: number;
   rubricResults: RubricResult[];
   evaluatorFeedback: string;
+  strengths?: string;
+  criticalImprovements?: string;
+  staticAnalysisNotice?: string;
+  needsReview?: boolean;
+  isAiEvaluated?: boolean;         // 실제 AI 평가 여부
+  modelAnswerSnapshot?: string;    // 풀이 당시 모범 답안 스냅샷
+  problemTitleSnapshot?: string;   // 풀이 당시 문제 제목 스냅샷
+  problemPromptSnapshot?: string;  // 풀이 당시 문제 지문 스냅샷
 }
 
 export interface RetentionModelSettings {

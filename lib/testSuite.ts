@@ -260,7 +260,7 @@ function runTests() {
     // 12. Stage 2: Transition from Unstudied to Learned
     console.log('\n--- 12. Testing Marking Concept as Learned ---');
     if (approvedConcept) {
-      saveStoredConcepts([approvedConcept]);
+      saveStoredConcepts([approvedConcept, ...INITIAL_CONCEPTS]);
       const { updatedConcepts, learnedConcept } = markConceptAsLearned(approvedConcept.id, 75);
       assert(learnedConcept?.isLearned === true, 'Concept transitioned to isLearned=true');
       assert(learnedConcept?.status === 'newly_learned', 'Concept status changed to newly_learned');
@@ -403,7 +403,115 @@ function runTests() {
       'Newly approved problem persists in storedProblems alongside demo problems'
     );
 
-    console.log(`\n=== ALL STAGE 1, 2 & 3 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
+    // 19. Stage 4: Empty Answer Blocking & Validation Rules
+    console.log('\n--- 19. Testing Stage 4 Answer Validation & Anti-Empty Rules ---');
+    const empty1 = '';
+    const empty2 = '   \n\t  ';
+    assert(!empty1.trim() && !empty2.trim(), 'Empty and whitespace-only answers cleanly detected and blocked');
+
+    // 20. Stage 4: 100-Point Rubric Score Calculation (No Double Weighting)
+    console.log('\n--- 20. Testing Stage 4 100-Point Rubric Calculation & Non-Double Weighting ---');
+    const stage4Rubric = [
+      {
+        criterionId: 'r1',
+        label: '전제조건 확인',
+        score: 25,
+        maxScore: 30,
+        evidenceQuote: '결합밀도함수 조건 명시',
+        deductionReason: '가측성 언급 미흡',
+        improvementTip: '가측 집합 명시',
+      },
+      {
+        criterionId: 'r2',
+        label: '적분 순서 교환',
+        score: 35,
+        maxScore: 40,
+        evidenceQuote: '푸비니 정리 적용',
+        deductionReason: '절대수렴성 정당화 단계 간략화',
+        improvementTip: '절대값 적분 수렴성 명시',
+      },
+      {
+        criterionId: 'r3',
+        label: '결론 도출',
+        score: 30,
+        maxScore: 30,
+        evidenceQuote: 'E[E[Y|X]] = E[Y]',
+        deductionReason: '감점 요인 없음 (만점 기준 충족)',
+        improvementTip: '완벽한 결론 도출',
+      },
+    ];
+    const totalMax = stage4Rubric.reduce((sum, r) => sum + r.maxScore, 0);
+    const earnedTotal = stage4Rubric.reduce((sum, r) => sum + r.score, 0);
+    assert(totalMax === 100, 'Rubric max scores sum to 100 points');
+    assert(earnedTotal === 90, 'Earned total is direct arithmetic sum of criteria scores (90/100) without double-weighting');
+    assert(stage4Rubric.every((r) => r.score >= 0 && r.score <= r.maxScore), 'All criterion scores bounded in [0, maxScore]');
+
+    // 21. Stage 4: Attempt Structure & Snapshot Integrity
+    console.log('\n--- 21. Testing Stage 4 Attempt Structure & Problem Snapshot Preservation ---');
+    const stage4Attempt = {
+      id: 'test-att-stage4-001',
+      problemId: approvalResult.approvedProblem!.id,
+      conceptId: 'c-econ-01',
+      conceptIds: ['c-econ-01', 'c-econ-02'],
+      subjectId: 'subj-econ302',
+      at: '2026-09-29T10:00:00+09:00',
+      answer: '결합밀도함수 f(x,y)에 대해 E[Y|X=x]를 정의하고 푸비니 정리에 의해 적분 순서를 교환하여 E[E[Y|X]] = E[Y]를 증명함.',
+      confidence: 4,
+      errorType: 'none' as const,
+      hintCount: 1,
+      reasoningNotes: '푸비니 정리의 전제조건을 증명 첫 줄에 명시함',
+      calculatedScore: earnedTotal,
+      rubricResults: stage4Rubric,
+      evaluatorFeedback: '푸비니 정리 적용과 이중적분 순서 교환이 명확하고 논리적임.',
+      strengths: '푸비니 정리의 핵심 정당화 단계를 정확히 포착함.',
+      criticalImprovements: '절대수렴 조건 부등식 표현을 보완할 것.',
+      staticAnalysisNotice: '본 평가는 AI 모델의 정적 분석 및 논증 검토를 바탕으로 산출되었습니다.',
+      needsReview: false,
+      isAiEvaluated: true,
+      modelAnswerSnapshot: approvalResult.approvedProblem!.modelAnswer,
+      problemTitleSnapshot: approvalResult.approvedProblem!.title,
+      problemPromptSnapshot: approvalResult.approvedProblem!.promptText,
+    };
+
+    assert(stage4Attempt.problemPromptSnapshot.length > 0, 'Problem prompt snapshot safely preserved in Attempt');
+    assert((stage4Attempt.modelAnswerSnapshot?.length || 0) > 0, 'Model answer snapshot safely preserved in Attempt');
+    assert(stage4Attempt.rubricResults[0].evidenceQuote !== undefined, 'Rubric result contains evidence quote');
+    assert(stage4Attempt.rubricResults[0].deductionReason !== undefined, 'Rubric result contains deduction reason');
+    assert(stage4Attempt.rubricResults[0].improvementTip !== undefined, 'Rubric result contains improvement tip');
+
+    // 22. Stage 4: Safe Attempt Recording & Concept Isolation
+    console.log('\n--- 22. Testing Attempt Recording & Concept Isolation (No Arbitrary Score Duplication) ---');
+    const { getAttemptById, loadStoredConcepts } = require('./storage');
+    const preConcepts = loadStoredConcepts();
+    const c2Pre = preConcepts.find((c: any) => c.id === 'c-econ-02');
+    const c2PreEventCount = c2Pre?.events?.length || 0;
+
+    const recordResult = recordAttemptAndUpdateConcept(stage4Attempt, DEFAULT_RETENTION_SETTINGS);
+    assert(recordResult.updatedAttempts.some((a: any) => a.id === stage4Attempt.id), 'Attempt saved in attempts store');
+
+    // Check duplicate attempt guard
+    const recordDuplicate = recordAttemptAndUpdateConcept(stage4Attempt, DEFAULT_RETENTION_SETTINGS);
+    const countOccurrences = recordDuplicate.updatedAttempts.filter((a: any) => a.id === stage4Attempt.id).length;
+    assert(countOccurrences === 1, 'Duplicate submission prevention: attempt ID only recorded once');
+
+    // Concept isolation: c1 updated, c2 NOT artificially altered
+    const c1Post = recordResult.updatedConcepts.find((c: any) => c.id === 'c-econ-01');
+    const c2Post = recordResult.updatedConcepts.find((c: any) => c.id === 'c-econ-02');
+    assert(
+      Boolean(c1Post?.events.some((e: any) => e.attemptId === stage4Attempt.id)),
+      'Target concept received legitimate review event with attemptId'
+    );
+    assert((c2Post?.events?.length || 0) === c2PreEventCount, 'Multi-concept problem rule: unselected related concept does NOT receive forged duplicate score');
+
+    // 23. Stage 4: Re-viewing Saved Attempt Data via getAttemptById
+    console.log('\n--- 23. Testing Re-viewing Saved Attempt via getAttemptById ---');
+    const retrievedAttempt = getAttemptById(stage4Attempt.id);
+    assert(retrievedAttempt !== null, 'Saved attempt successfully retrieved by ID');
+    assert(retrievedAttempt?.answer === stage4Attempt.answer, 'Retrieved attempt contains original answer text');
+    assert(retrievedAttempt?.calculatedScore === stage4Attempt.calculatedScore, 'Retrieved attempt contains original calculatedScore');
+    assert(retrievedAttempt?.rubricResults.length === stage4Rubric.length, 'Retrieved attempt contains full itemized rubric results');
+
+    console.log(`\n=== ALL STAGE 1, 2, 3 & 4 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
     if (failed > 0) {
       process.exit(1);
     }

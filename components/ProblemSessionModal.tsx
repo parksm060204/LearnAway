@@ -1,7 +1,15 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Concept, Problem, Attempt, ErrorType, RubricResult, Subject } from '../lib/types';
+import {
+  Concept,
+  Problem,
+  Attempt,
+  ErrorType,
+  RubricResult,
+  Subject,
+  EvaluationResult,
+} from '../lib/types';
 import { MathFormula } from './MathFormula';
 import {
   X,
@@ -11,9 +19,16 @@ import {
   AlertTriangle,
   Send,
   Eye,
+  EyeOff,
   Edit,
   Sparkles,
   BookOpen,
+  RotateCcw,
+  CheckSquare,
+  Loader2,
+  HelpCircle,
+  ShieldCheck,
+  ShieldAlert,
 } from 'lucide-react';
 
 interface ProblemSessionModalProps {
@@ -41,11 +56,13 @@ export function ProblemSessionModal({
   const [confidence, setConfidence] = useState<number>(3);
   const [errorType, setErrorType] = useState<ErrorType>('none');
   const [reasoningNotes, setReasoningNotes] = useState('');
-  const [evaluationResult, setEvaluationResult] = useState<{
-    calculatedScore: number;
-    rubricResults: RubricResult[];
-    feedback: string;
-  } | null>(null);
+
+  // Stage 4: AI Evaluation State
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const [evaluationError, setEvaluationError] = useState<string | null>(null);
+  const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(false);
 
   if (!isOpen) return null;
 
@@ -59,103 +76,70 @@ export function ProblemSessionModal({
     setAnswerText((prev) => prev + snippet);
   };
 
-  // Demo Rubric Evaluator Adapter (Transparent & Honest Demo Grader)
-  const runDemoEvaluation = () => {
-    const text = answerText.trim();
-    if (!text) {
-      alert('답안을 작성한 후 제출해 주세요.');
+  // Stage 4: Real AI Answer Evaluation Request
+  const handleRequestEvaluation = async () => {
+    const trimmed = answerText.trim();
+    if (!trimmed) {
+      alert('답안을 작성한 후 평가를 요청해 주세요.');
       return;
     }
 
-    // Keyword & rubric-based mock evaluation adapter
-    let calculatedScore = 75;
-    const rubricResults: RubricResult[] = [];
+    setIsEvaluating(true);
+    setEvaluationError(null);
 
-    // Analyze text keywords based on domain
-    const isMath = subject.domain === 'math_stats';
-    const hasFubini = text.includes('푸비니') || text.includes('Fubini') || text.includes('절대수렴');
-    const hasIntegral = text.includes('적분') || text.includes('\\int') || text.includes('int');
-    const hasExpectation = text.includes('기댓값') || text.includes('E[') || text.includes('밀도');
+    try {
+      const res = await fetch('/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          problemId: problem.id,
+          conceptId: concept.id,
+          conceptIds: problem.conceptIds || [concept.id],
+          subjectId: subject.id,
+          domain: subject.domain || 'math_stats',
+          problemTitle: problem.title,
+          problemPrompt: problem.promptText,
+          appliedConditionNote: problem.appliedConditionNote,
+          mathFormula: problem.mathFormula,
+          codeSnippet: problem.codeSnippet,
+          modelAnswer: problem.modelAnswer,
+          rubric: problem.rubric,
+          userAnswer: trimmed,
+          revealedHintCount: revealedHints.length,
+          hints: problem.hints,
+        }),
+      });
 
-    const hasRbt = text.includes('불변식') || text.includes('회전') || text.includes('Rotate');
-    const hasCase = text.includes('Case') || text.includes('삼촌') || text.includes('부모');
-
-    problem.rubric.forEach((criterion, idx) => {
-      const isHundredScale = criterion.maxScore >= 10;
-      let scoreRatio = 0.85;
-      let isVulnerable = false;
-      let critFeedback = '논리적 서술 및 단계별 전개가 명확함.';
-
-      if (idx === 1) {
-        // Second criterion is usually rigorous condition check
-        if (isMath && !hasFubini) {
-          scoreRatio = 0.6;
-          isVulnerable = true;
-          critFeedback = '정리 적용의 절대수렴 요건(푸비니 정리 정당화) 명시가 미흡하여 감점됨.';
-        } else if (!isMath && !hasRbt) {
-          scoreRatio = 0.6;
-          isVulnerable = true;
-          critFeedback = '서브트리 포인터 재배치 및 블랙-하이트 보존 엄밀성 서술 부족.';
-        } else {
-          scoreRatio = 0.95;
-          critFeedback = '정리 및 조건의 전제조건을 엄밀하게 서술함.';
-        }
-      } else if (idx === 0) {
-        scoreRatio = text.length > 80 ? 0.9 : 0.65;
-        critFeedback =
-          text.length > 80
-            ? '수식 전개 및 도입부 논리성이 우수함.'
-            : '서술 분량이 다소 압축되어 추가 설명 필요.';
-      } else {
-        scoreRatio = 0.9;
-        critFeedback = '최종 결론의 수렴성 및 논리적 닫힘이 양호함.';
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setEvaluationError(data.error || 'AI 평가 요청에 실패했습니다.');
+        return;
       }
 
-      const critScore = isHundredScale
-        ? Math.round(criterion.maxScore * scoreRatio)
-        : Number((criterion.maxScore * scoreRatio).toFixed(1));
+      const evalData: EvaluationResult = data.evaluation;
+      setEvaluationResult(evalData);
 
-      rubricResults.push({
-        criterionId: criterion.id,
-        label: criterion.label,
-        score: critScore,
-        maxScore: criterion.maxScore,
-        isVulnerable,
-        feedback: critFeedback,
-      });
-    });
-
-    const isHundredTotal = problem.rubric.reduce((s, r) => s + r.maxScore, 0) >= 90;
-    if (isHundredTotal) {
-      calculatedScore = rubricResults.reduce((sum, r) => sum + r.score, 0);
-    } else {
-      const totalWeightedScore = rubricResults.reduce(
-        (sum, r) => sum + (r.score / r.maxScore) * 100 * (1 / rubricResults.length),
-        0
-      );
-      calculatedScore = Math.round(totalWeightedScore);
+      // Pre-fill error diagnosis with AI recommendation
+      if (evalData.recommendedErrorType) {
+        setErrorType(evalData.recommendedErrorType);
+      }
+    } catch (err: any) {
+      setEvaluationError(`네트워크 연결 오류: ${err?.message || '알 수 없는 오류'}`);
+    } finally {
+      setIsEvaluating(false);
     }
-
-    const feedback = isMath
-      ? hasFubini
-        ? '반복 기댓값의 법칙 증명에서 푸비니 정리의 전제 조건과 결합밀도함수의 이중적분 순서 교환을 적절하게 서술하였습니다.'
-        : '반복 기댓값의 법칙 증명 과정에서 이중적분 순서 교환 시 푸비니 정리(Fubini\'s Theorem)의 절대수렴성 정당화 단계가 일부 생략되었습니다.'
-      : '알고리즘 불변식 복구 단계와 케이스별 포인터 회전/색상 반전 메커니즘을 대체로 정확하게 도출하였습니다.';
-
-    setEvaluationResult({
-      calculatedScore,
-      rubricResults,
-      feedback,
-    });
   };
 
+  // Stage 4: Confirm and Commit Attempt
   const handleConfirmAndRecord = () => {
-    if (!evaluationResult) return;
+    if (!evaluationResult || isSubmitting) return;
+    setIsSubmitting(true);
 
     const newAttempt: Attempt = {
-      id: `att-${Date.now()}`,
+      id: `att-${Date.now()}-${Math.random().toString(36).substring(7)}`,
       problemId: problem.id,
       conceptId: concept.id,
+      conceptIds: problem.conceptIds || [concept.id],
       subjectId: subject.id,
       at: new Date().toISOString(),
       answer: answerText,
@@ -166,6 +150,14 @@ export function ProblemSessionModal({
       calculatedScore: evaluationResult.calculatedScore,
       rubricResults: evaluationResult.rubricResults,
       evaluatorFeedback: evaluationResult.feedback,
+      strengths: evaluationResult.strengths,
+      criticalImprovements: evaluationResult.criticalImprovements,
+      staticAnalysisNotice: evaluationResult.staticAnalysisNotice,
+      needsReview: evaluationResult.needsReview,
+      isAiEvaluated: evaluationResult.isAiEvaluated,
+      modelAnswerSnapshot: problem.modelAnswer,
+      problemTitleSnapshot: problem.title,
+      problemPromptSnapshot: problem.promptText,
     };
 
     onSubmitAttempt(newAttempt);
@@ -255,77 +247,134 @@ export function ProblemSessionModal({
             )}
 
             {problem.codeSnippet && (
-              <pre className="p-2.5 bg-[#252321] text-[#f4f1ea] font-academic-mono text-xs rounded-xs overflow-x-auto leading-relaxed">
+              <pre className="p-3 bg-[#191817] text-[#ded6c8] text-xs font-mono rounded-xs overflow-x-auto leading-relaxed whitespace-pre-wrap">
                 <code>{problem.codeSnippet}</code>
               </pre>
             )}
 
-            <div className="text-[11px] font-academic-mono text-[#827d73] pt-1 border-t border-[#ede8de]">
-              핵심 채점 포인트: <span className="font-semibold text-[#191817]">{problem.coreEvaluationHighlight}</span>
+            {/* Rubric Criteria Glance */}
+            <div className="pt-1 border-t border-[#ded6c8] flex flex-wrap items-center gap-1.5 text-[11px] font-academic-mono text-[#827d73]">
+              <span className="font-bold text-[#57544e]">채점 기준:</span>
+              {problem.rubric.map((r) => (
+                <span
+                  key={r.id}
+                  className="px-1.5 py-0.5 bg-white border border-[#ded6c8] rounded-2xs text-[#191817]"
+                >
+                  {r.label} ({r.maxScore}점)
+                </span>
+              ))}
+              <span className="text-[#c52828] font-bold">
+                [총 {problem.rubric.reduce((s, r) => s + r.maxScore, 0)}점 만점]
+              </span>
             </div>
           </div>
 
-          {/* Hints Section */}
-          <div className="border border-[#ded6c8] bg-white rounded-xs p-3.5 space-y-2">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 text-xs font-bold text-[#57544e] font-academic-mono">
-                <Lightbulb className="w-4 h-4 text-amber-600" />
-                <span>단계별 힌트 (사용한 힌트 수는 복습 성취도 계산에 반영됩니다)</span>
+          {/* Progressive Hints Section */}
+          {problem.hints && problem.hints.length > 0 && (
+            <div className="border border-[#ded6c8] rounded-xs p-3.5 bg-white space-y-2">
+              <div className="flex items-center justify-between text-xs font-academic-mono">
+                <div className="flex items-center gap-1.5 text-[#57544e] font-bold">
+                  <Lightbulb className="w-4 h-4 text-amber-500" />
+                  <span>단계별 서술 힌트 (열람 시 평가 기록에 반영됨)</span>
+                </div>
+                <span className="text-[11px] text-[#827d73]">
+                  {revealedHints.length} / {problem.hints.length} 열람됨
+                </span>
               </div>
-              <span className="text-xs font-academic-mono text-[#827d73]">
-                사용한 힌트: {revealedHints.length} / {problem.hints.length}
-              </span>
-            </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              {problem.hints.map((hint, idx) => {
-                const isRevealed = revealedHints.includes(idx);
-                return (
-                  <div
-                    key={idx}
-                    className={`p-3 rounded-xs border text-xs ${
-                      isRevealed
-                        ? 'border-amber-300 bg-amber-50/70 text-[#191817]'
-                        : 'border-[#ded6c8] bg-[#faf8f4] text-[#827d73]'
-                    }`}
-                  >
-                    {isRevealed ? (
-                      <p className="text-[14px] sm:text-[15px] leading-relaxed korean-prose">{hint}</p>
-                    ) : (
-                      <button
-                        onClick={() => handleRevealHint(idx)}
-                        className="w-full text-left font-academic-mono font-medium hover:text-[#191817] flex items-center justify-between"
-                      >
-                        <span>[힌트 {idx + 1} 열기]</span>
-                        <span className="text-[10px] text-amber-700">클릭하여 확인</span>
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
+              <div className="space-y-1.5 pt-1">
+                {problem.hints.map((hint, idx) => {
+                  const isRevealed = revealedHints.includes(idx);
+                  return (
+                    <div
+                      key={idx}
+                      className={`p-2.5 rounded-xs text-xs border transition-colors ${
+                        isRevealed
+                          ? 'bg-[#faf8f4] border-[#ded6c8] text-[#191817]'
+                          : 'bg-[#f6f3eb] border-[#e2ded6] text-[#827d73]'
+                      }`}
+                    >
+                      {isRevealed ? (
+                        <div className="flex items-start gap-2">
+                          <span className="font-academic-mono font-bold text-[#c52828] shrink-0">
+                            [힌트 {idx + 1}]
+                          </span>
+                          <span className="korean-prose">{hint}</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center justify-between">
+                          <span className="font-academic-mono text-[11px]">
+                            힌트 {idx + 1}단계 (사고 확장 및 풀이 방향성)
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleRevealHint(idx)}
+                            className="px-2 py-0.5 bg-white border border-[#ded6c8] hover:border-[#191817] text-[#191817] text-[11px] rounded-xs font-academic-mono transition-colors"
+                          >
+                            열람하기
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
+          )}
+
+          {/* Model Answer (Spoiler Prevention: Hidden by default before submission) */}
+          <div className="border border-[#ded6c8] rounded-xs bg-[#fcfbf9] overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setIsModelAnswerVisible(!isModelAnswerVisible)}
+              className="w-full px-4 py-2 bg-[#f6f3eb] hover:bg-[#ede8dc] flex items-center justify-between text-xs transition-colors"
+            >
+              <div className="flex items-center gap-1.5 font-bold text-[#57544e]">
+                {isModelAnswerVisible ? (
+                  <EyeOff className="w-3.5 h-3.5 text-[#827d73]" />
+                ) : (
+                  <Eye className="w-3.5 h-3.5 text-[#827d73]" />
+                )}
+                <span>출제자 모범 답안 (스포일러 방지)</span>
+              </div>
+              <span className="text-[11px] font-academic-mono text-[#827d73]">
+                {isModelAnswerVisible ? '답안 접기' : '풀이 전 스포일러 주의 (클릭하여 확인)'}
+              </span>
+            </button>
+
+            {isModelAnswerVisible && (
+              <div className="p-4 border-t border-[#ded6c8] bg-white space-y-2 text-xs leading-relaxed text-[#191817] korean-prose whitespace-pre-wrap">
+                <div className="font-academic-mono text-[11px] text-[#827d73] font-semibold mb-1">
+                  모범 답안 및 핵심 논증 단계:
+                </div>
+                {problem.modelAnswer}
+              </div>
+            )}
           </div>
 
           {/* Answer Workspace Area */}
           <div className="space-y-2">
-            <div className="flex items-center justify-between border-b border-[#ded6c8] pb-1.5">
-              <div className="flex items-center gap-1">
+            <div className="flex items-center justify-between">
+              {/* Tab Selector */}
+              <div className="flex items-center gap-1 bg-[#faf8f4] p-1 border border-[#ded6c8] rounded-xs">
                 <button
+                  type="button"
                   onClick={() => setActiveTab('editor')}
-                  className={`px-3 py-1 text-xs font-medium rounded-xs transition-colors ${
+                  className={`px-3 py-1 text-xs font-academic-mono rounded-xs transition-colors ${
                     activeTab === 'editor'
-                      ? 'bg-[#191817] text-white font-semibold'
-                      : 'text-[#57544e] hover:bg-[#faf8f4]'
+                      ? 'bg-white font-bold text-[#191817] shadow-2xs'
+                      : 'text-[#827d73] hover:text-[#191817]'
                   }`}
                 >
-                  답안 작성 에디터
+                  답안 작성 (Editor)
                 </button>
                 <button
+                  type="button"
                   onClick={() => setActiveTab('preview')}
-                  className={`px-3 py-1 text-xs font-medium rounded-xs transition-colors ${
+                  className={`px-3 py-1 text-xs font-academic-mono rounded-xs transition-colors ${
                     activeTab === 'preview'
-                      ? 'bg-[#191817] text-white font-semibold'
-                      : 'text-[#57544e] hover:bg-[#faf8f4]'
+                      ? 'bg-white font-bold text-[#191817] shadow-2xs'
+                      : 'text-[#827d73] hover:text-[#191817]'
                   }`}
                 >
                   수식 & 서술 미리보기
@@ -334,7 +383,7 @@ export function ProblemSessionModal({
 
               {/* Math / Quick Snippets */}
               <div className="hidden sm:flex items-center gap-1 text-[11px] font-academic-mono text-[#827d73]">
-                <span>빠른 수식 입력:</span>
+                <span>빠른 기호 입력:</span>
                 {['\\int', 'E[Y|X]', '\\iint', '\\le', '\\infty', 'f(x,y)'].map((snip) => (
                   <button
                     key={snip}
@@ -367,7 +416,7 @@ export function ProblemSessionModal({
             )}
           </div>
 
-          {/* Self-Reflection & Diagnostic Area */}
+          {/* Self-Reflection & Diagnostic Area (Always visible, pre-filled after evaluation) */}
           <div className="bg-[#faf8f4] border border-[#ded6c8] p-3.5 rounded-xs space-y-3">
             <span className="text-xs font-academic-mono font-bold text-[#827d73] uppercase tracking-wider">
               풀이 자가 진단 및 메타인지 평가
@@ -400,7 +449,7 @@ export function ProblemSessionModal({
               {/* Error Diagnostic Tag */}
               <div>
                 <label className="block text-[11px] font-academic-mono text-[#57544e] mb-1">
-                  자가 오답/취약 원인 판별:
+                  오답/취약 원인 판별 (AI 추천 반영):
                 </label>
                 <select
                   value={errorType}
@@ -430,86 +479,217 @@ export function ProblemSessionModal({
             </div>
           </div>
 
-          {/* Evaluation Trigger or Evaluation Result Display */}
-          {!evaluationResult ? (
+          {/* Evaluation Trigger Button or Loading / Error / Results */}
+          {!evaluationResult && !isEvaluating && !evaluationError && (
             <div className="pt-2">
               <button
                 type="button"
-                onClick={runDemoEvaluation}
-                className="w-full flex items-center justify-center gap-2 py-3 px-4 bg-[#c52828] hover:bg-[#a82020] text-white text-xs sm:text-sm font-bold rounded-xs shadow-xs transition-all"
+                onClick={handleRequestEvaluation}
+                disabled={!answerText.trim()}
+                className={`w-full flex items-center justify-center gap-2 py-3 px-4 text-xs sm:text-sm font-bold rounded-xs shadow-xs transition-all ${
+                  answerText.trim()
+                    ? 'bg-[#c52828] hover:bg-[#a82020] text-white cursor-pointer'
+                    : 'bg-[#ded6c8] text-[#827d73] cursor-not-allowed'
+                }`}
               >
                 <Send className="w-4 h-4" />
-                <span>제출 및 정밀 첨삭 평가 (EVALUATE SUBMISSION)</span>
+                <span>답안 제출 및 AI 정밀 평가 요청 (EVALUATE SUBMISSION)</span>
               </button>
             </div>
-          ) : (
-            <div className="border border-[#c52828] bg-[#fef2f2]/40 p-4 rounded-xs space-y-3 animate-fade-in">
-              {/* Honest Grader Notice Banner */}
-              <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-xs text-[11px] text-amber-900 flex items-start gap-2">
-                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                <div>
-                  <strong className="block font-bold">키워드 기반 간이 채점 데모 안내</strong>
-                  <span>
-                    현재 점수 및 첨삭은 패턴 매칭 기반 간이 어댑터 결과입니다. LLM 기반 정밀 AI 심층 채점 및 루브릭 자동 평가는 다음 단계(4단계)에서 연동됩니다.
-                  </span>
+          )}
+
+          {/* Evaluating Loader State */}
+          {isEvaluating && (
+            <div className="p-6 border border-[#ded6c8] bg-[#faf8f4] rounded-xs text-center space-y-3">
+              <Loader2 className="w-7 h-7 text-[#c52828] animate-spin mx-auto" />
+              <div className="space-y-1">
+                <h4 className="font-bold text-sm text-[#191817] font-academic-serif">
+                  AI 정밀 루브릭 평가 진행 중...
+                </h4>
+                <p className="text-xs text-[#57544e] korean-prose max-w-lg mx-auto">
+                  수학적 동치성 검증, 전제조건 충족 여부, 부분 점수 판별 및 100점 배점표 기반 채점을 수행하고 있습니다. 잠시만 기다려 주십시오.
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* Evaluation Error State (Transparent Failure, No Fake Records) */}
+          {evaluationError && (
+            <div className="p-4 border border-red-300 bg-red-50/80 rounded-xs space-y-3">
+              <div className="flex items-start gap-2 text-red-900 text-xs">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <strong className="block font-bold">AI 평가 호출 실패</strong>
+                  <p className="text-[11.5px] leading-relaxed text-red-800">{evaluationError}</p>
+                  <p className="text-[10.5px] font-academic-mono text-red-700">
+                    * 오류로 인해 가짜 점수나 임의의 풀이 이력은 생성되지 않았습니다.
+                  </p>
                 </div>
               </div>
 
-              <div className="flex items-center justify-between border-b border-[#fecaca] pb-2">
+              <button
+                type="button"
+                onClick={handleRequestEvaluation}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-[#c52828] hover:bg-[#a82020] text-white text-xs font-bold rounded-xs transition-colors"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>평가 다시 시도하기</span>
+              </button>
+            </div>
+          )}
+
+          {/* Full Stage 4 AI Evaluation Result Display */}
+          {evaluationResult && (
+            <div className="border border-[#c52828] bg-[#fef2f2]/30 p-4 sm:p-5 rounded-xs space-y-4 animate-fade-in">
+              {/* Header with Score and Verification Badge */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#fecaca] pb-3">
                 <div className="flex items-center gap-2">
                   <Sparkles className="w-4 h-4 text-[#c52828]" />
-                  <span className="font-bold text-xs sm:text-sm text-[#191817] font-academic-serif">
-                    정밀 루브릭 평가 결과: SCORE {evaluationResult.calculatedScore}점
+                  <span className="font-bold text-base text-[#191817] font-academic-serif">
+                    AI 채점 결과: SCORE {evaluationResult.calculatedScore} / 100점
                   </span>
+                  {evaluationResult.needsReview ? (
+                    <span className="flex items-center gap-1 text-[11px] font-academic-mono bg-amber-100 text-amber-900 border border-amber-300 px-2 py-0.5 rounded-xs font-semibold">
+                      <ShieldAlert className="w-3 h-3 text-amber-700" />
+                      검토 필요 (Needs Review)
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-[11px] font-academic-mono bg-emerald-100 text-emerald-900 border border-emerald-300 px-2 py-0.5 rounded-xs font-semibold">
+                      <ShieldCheck className="w-3 h-3 text-emerald-700" />
+                      평가 완료
+                    </span>
+                  )}
                 </div>
+
                 <span className="text-[11px] font-academic-mono text-[#827d73]">
-                  데모 루브릭 어댑터 산출
+                  ENGINE: AI-RUBRIC EVALUATOR V4
                 </span>
               </div>
 
-              {/* Rubric Breakdown */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
-                {evaluationResult.rubricResults.map((rubric) => (
-                  <div
-                    key={rubric.criterionId}
-                    className={`p-2.5 rounded-xs border bg-white ${
-                      rubric.isVulnerable ? 'border-[#c52828]' : 'border-[#ded6c8]'
-                    }`}
-                  >
-                    <div className="flex justify-between font-bold mb-1">
-                      <span className={rubric.isVulnerable ? 'text-[#c52828]' : 'text-[#191817]'}>
-                        {rubric.label}
-                      </span>
-                      <span className={rubric.isVulnerable ? 'text-[#c52828]' : 'text-[#191817]'}>
-                        {rubric.score.toFixed(1)} / {rubric.maxScore.toFixed(1)}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-[#57544e]">{rubric.feedback}</p>
+              {/* Static Analysis Notice Banner (Requirement) */}
+              {evaluationResult.staticAnalysisNotice && (
+                <div className="p-2.5 bg-amber-50/90 border border-amber-200 rounded-xs text-[11px] text-amber-950 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <div>
+                    <strong className="block font-bold">정적 분석 안내</strong>
+                    <span>{evaluationResult.staticAnalysisNotice}</span>
                   </div>
-                ))}
+                </div>
+              )}
+
+              {/* Strengths & Critical Improvements */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div className="p-3 bg-emerald-50/70 border border-emerald-200 rounded-xs space-y-1">
+                  <strong className="block font-bold text-emerald-950 font-academic-mono text-[11px]">
+                    ✓ 잘한 점 (STRENGTHS):
+                  </strong>
+                  <p className="text-[11.5px] text-emerald-900 leading-relaxed">
+                    {evaluationResult.strengths}
+                  </p>
+                </div>
+
+                <div className="p-3 bg-amber-50/70 border border-amber-200 rounded-xs space-y-1">
+                  <strong className="block font-bold text-amber-950 font-academic-mono text-[11px]">
+                    ▲ 가장 중요한 보완점 (IMPROVEMENTS):
+                  </strong>
+                  <p className="text-[11.5px] text-amber-900 leading-relaxed">
+                    {evaluationResult.criticalImprovements}
+                  </p>
+                </div>
               </div>
 
-              <div className="p-3 bg-white border border-[#ded6c8] rounded-xs text-sm sm:text-base korean-prose text-[#191817] leading-relaxed">
-                <strong className="text-[#827d73] block mb-1 font-academic-mono text-xs font-semibold">정밀 첨삭 총평:</strong>
-                {evaluationResult.feedback}
+              {/* Detailed Rubric Breakdown with Evidence, Deduction, Improvement */}
+              <div className="space-y-2">
+                <span className="text-[11px] font-academic-mono font-bold text-[#57544e] uppercase tracking-wider block">
+                  루브릭 세부 채점 내역 (항목별 획득 점수 / 확인 근거 / 감점 사유):
+                </span>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+                  {evaluationResult.rubricResults.map((rubric) => (
+                    <div
+                      key={rubric.criterionId}
+                      className={`p-3 rounded-xs border bg-white space-y-2 ${
+                        rubric.isVulnerable ? 'border-[#c52828]' : 'border-[#ded6c8]'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-1 border-b border-[#f1ede4] pb-1.5">
+                        <span
+                          className={`font-bold leading-tight ${
+                            rubric.isVulnerable ? 'text-[#c52828]' : 'text-[#191817]'
+                          }`}
+                        >
+                          {rubric.label}
+                        </span>
+                        <span
+                          className={`font-academic-mono font-bold shrink-0 ${
+                            rubric.isVulnerable ? 'text-[#c52828]' : 'text-[#191817]'
+                          }`}
+                        >
+                          {rubric.score} / {rubric.maxScore}점
+                        </span>
+                      </div>
+
+                      {/* Evidence quote from user answer */}
+                      {rubric.evidenceQuote && (
+                        <div className="text-[11px] text-[#57544e]">
+                          <strong className="text-[#827d73] font-academic-mono">확인 근거: </strong>
+                          <span className="italic">
+                            &ldquo;{rubric.evidenceQuote}&rdquo;
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Deduction reason */}
+                      {rubric.deductionReason && (
+                        <div className="text-[11px] text-[#57544e]">
+                          <strong className="text-[#827d73] font-academic-mono">감점 요인: </strong>
+                          <span className={rubric.isVulnerable ? 'text-[#c52828]' : ''}>
+                            {rubric.deductionReason}
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Improvement tip */}
+                      {rubric.improvementTip && (
+                        <div className="text-[11px] text-[#191817] bg-[#faf8f4] p-1.5 rounded-2xs border border-[#f1ede4]">
+                          <strong className="text-[#827d73] font-academic-mono">개선 방법: </strong>
+                          {rubric.improvementTip}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
 
-              <div className="flex items-center justify-between gap-2 pt-1">
+              {/* Comprehensive Feedback Prose */}
+              <div className="p-3.5 bg-white border border-[#ded6c8] rounded-xs text-xs sm:text-sm korean-prose text-[#191817] leading-relaxed space-y-1">
+                <strong className="text-[#827d73] block font-academic-mono text-[11px] font-semibold">
+                  종합 학술 첨삭 총평:
+                </strong>
+                <p>{evaluationResult.feedback}</p>
+              </div>
+
+              {/* Action Buttons: Revise vs Confirm & Commit */}
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-2 pt-2 border-t border-[#fecaca]">
                 <button
                   type="button"
                   onClick={() => setEvaluationResult(null)}
-                  className="px-3 py-2 text-xs border border-[#ded6c8] text-[#57544e] hover:bg-white rounded-xs"
+                  className="w-full sm:w-auto px-4 py-2 text-xs border border-[#ded6c8] text-[#57544e] hover:bg-white rounded-xs transition-colors flex items-center justify-center gap-1.5"
                 >
-                  다시 수정하기
+                  <Edit className="w-3.5 h-3.5" />
+                  <span>답안 수정 및 재평가</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={handleConfirmAndRecord}
-                  className="flex-1 flex items-center justify-center gap-1.5 py-2.5 px-4 bg-[#191817] hover:bg-[#33302b] text-white text-xs sm:text-sm font-bold rounded-xs shadow-xs transition-all"
+                  disabled={isSubmitting}
+                  className="w-full sm:w-auto flex-1 flex items-center justify-center gap-2 py-2.5 px-5 bg-[#191817] hover:bg-[#33302b] text-white text-xs sm:text-sm font-bold rounded-xs shadow-xs transition-all disabled:opacity-50"
                 >
                   <CheckCircle className="w-4 h-4 text-emerald-400" />
-                  <span>이력 저장 및 망각곡선 즉시 반영하기</span>
+                  <span>
+                    {isSubmitting ? '기록 저장 중...' : '결과 확인 및 복습 이력에 기록 확정하기'}
+                  </span>
                 </button>
               </div>
             </div>

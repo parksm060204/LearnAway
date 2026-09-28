@@ -605,7 +605,7 @@ export function resetToInitialDemoData(): void {
 
 /**
  * Adds an attempt and automatically creates a new ReviewEvent on the concept,
- * recalculating its retention score and status dynamically.
+ * recalculating its retention score and status dynamically without artificial duplicates.
  */
 export function recordAttemptAndUpdateConcept(
   attempt: Attempt,
@@ -614,19 +614,24 @@ export function recordAttemptAndUpdateConcept(
   const currentConcepts = loadStoredConcepts();
   const currentAttempts = loadStoredAttempts();
 
-  const newAttempts = [attempt, ...currentAttempts];
-  saveStoredAttempts(newAttempts);
+  // Guard against duplicate submission (e.g. double click or retry)
+  const alreadyExists = currentAttempts.some((a) => a.id === attempt.id);
+  const newAttempts = alreadyExists ? currentAttempts : [attempt, ...currentAttempts];
+  if (!alreadyExists) {
+    saveStoredAttempts(newAttempts);
+  }
 
   const updatedConcepts = currentConcepts.map((c) => {
+    // Only update the primary concept connected to this attempt
     if (c.id !== attempt.conceptId) return c;
 
     const newEvent: ReviewEvent = {
-      id: `ev-${Date.now()}`,
+      id: `ev-${Date.now()}-${Math.random().toString(36).substring(7)}`,
       conceptId: c.id,
       at: attempt.at,
       dayOffset: 0, // Recorded today
       kind: 'attempt',
-      title: `복습 제출 (${attempt.calculatedScore}점)`,
+      title: `풀이 제출 (${attempt.calculatedScore}점)`,
       resultScore: attempt.calculatedScore,
       confidence: attempt.confidence,
       errorType: attempt.errorType,
@@ -635,6 +640,10 @@ export function recordAttemptAndUpdateConcept(
       sourceRef: c.chapterRef,
       evaluationSummary: attempt.evaluatorFeedback,
       rubricScores: attempt.rubricResults,
+      attemptId: attempt.id,
+      strengths: attempt.strengths,
+      criticalImprovements: attempt.criticalImprovements,
+      needsReview: attempt.needsReview,
     };
 
     const updatedEvents = [...c.events, newEvent];
@@ -646,6 +655,10 @@ export function recordAttemptAndUpdateConcept(
       events: updatedEvents,
       lastAttemptAt: attempt.at,
       lastAttemptDayOffset: 0,
+      firstLearnedAt: c.firstLearnedAt || attempt.at,
+      firstLearnedDayOffset: c.firstLearnedDayOffset ?? 0,
+      isLearned: true,
+      baseScore: c.baseScore > 0 ? c.baseScore : attempt.calculatedScore,
       currentScore: newCurrentScore,
       status: newStatus,
       exerciseCount: c.exerciseCount + 1,
@@ -654,4 +667,9 @@ export function recordAttemptAndUpdateConcept(
 
   saveStoredConcepts(updatedConcepts);
   return { updatedConcepts, updatedAttempts: newAttempts };
+}
+
+export function getAttemptById(attemptId: string): Attempt | null {
+  const attempts = loadStoredAttempts();
+  return attempts.find((a) => a.id === attemptId) || null;
 }

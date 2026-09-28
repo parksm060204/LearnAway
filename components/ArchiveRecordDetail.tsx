@@ -1,21 +1,40 @@
 'use client';
 
-import React from 'react';
-import { Concept, ReviewEvent, ERROR_TYPE_LABELS } from '../lib/types';
+import React, { useState } from 'react';
+import { Concept, ReviewEvent, Attempt, ERROR_TYPE_LABELS } from '../lib/types';
 import { MathFormula } from './MathFormula';
-import { FileText, ExternalLink, AlertTriangle, CheckCircle2, HelpCircle } from 'lucide-react';
+import {
+  FileText,
+  ExternalLink,
+  AlertTriangle,
+  CheckCircle2,
+  HelpCircle,
+  Eye,
+  EyeOff,
+  ChevronDown,
+  ChevronUp,
+  Sparkles,
+  BookOpen,
+  ShieldCheck,
+  ShieldAlert,
+} from 'lucide-react';
 
 interface ArchiveRecordDetailProps {
   concept: Concept;
   event: ReviewEvent | null;
+  attempts?: Attempt[];
   onOpenSourceModal: (sourceRef: string) => void;
 }
 
 export function ArchiveRecordDetail({
   concept,
   event,
+  attempts = [],
   onOpenSourceModal,
 }: ArchiveRecordDetailProps) {
+  const [isAttemptExpanded, setIsAttemptExpanded] = useState(false);
+  const [isModelAnswerExpanded, setIsModelAnswerExpanded] = useState(false);
+
   if (!event || concept.status === 'unstudied') {
     return (
       <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-5 text-xs text-[#57544e] space-y-2 shadow-2xs">
@@ -46,6 +65,13 @@ export function ArchiveRecordDetail({
 
   const isAttempt = event.kind === 'attempt' || event.kind === 'review';
 
+  // Find linked attempt if available
+  const matchingAttempt = attempts.find(
+    (a) =>
+      (event.attemptId && a.id === event.attemptId) ||
+      (a.conceptId === concept.id && a.at === event.at)
+  );
+
   return (
     <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 sm:p-5 shadow-2xs space-y-3.5">
       {/* Archive Header */}
@@ -56,6 +82,11 @@ export function ArchiveRecordDetail({
           <h3 className="text-xs sm:text-sm font-bold text-[#191817] font-academic-serif">
             [Day {event.dayOffset >= 0 ? `+${event.dayOffset}` : event.dayOffset}] {event.title} 정밀 첨삭 기록
           </h3>
+          {event.needsReview && (
+            <span className="text-[10px] font-academic-mono bg-amber-100 text-amber-900 border border-amber-300 px-1.5 py-0.5 rounded-2xs font-semibold">
+              검토 필요
+            </span>
+          )}
         </div>
 
         {/* Source link */}
@@ -70,7 +101,7 @@ export function ArchiveRecordDetail({
       </div>
 
       {/* Evaluation Summary */}
-      <div className="bg-[#faf8f4] border border-[#ded6c8] p-3.5 rounded-xs space-y-1.5">
+      <div className="bg-[#faf8f4] border border-[#ded6c8] p-3.5 rounded-xs space-y-2">
         <div className="flex items-center justify-between">
           <span className="font-academic-mono text-[11px] font-bold text-[#827d73] uppercase tracking-wider">
             EVALUATION SUMMARY:
@@ -89,7 +120,7 @@ export function ArchiveRecordDetail({
 
         {/* Confidence and Hint metrics if available */}
         {isAttempt && (
-          <div className="pt-1.5 flex flex-wrap items-center gap-3 text-[11px] font-academic-mono text-[#827d73]">
+          <div className="pt-1.5 flex flex-wrap items-center gap-3 text-[11px] font-academic-mono text-[#827d73] border-t border-[#f1ede4]">
             {event.confidence !== undefined && (
               <span>
                 자가 확신도:{' '}
@@ -103,6 +134,34 @@ export function ArchiveRecordDetail({
                 열람 힌트 수: <strong className="text-[#191817]">{event.hintCount}개</strong>
               </span>
             )}
+            {event.resultScore !== undefined && (
+              <span>
+                획득 점수:{' '}
+                <strong className="text-[#c52828] font-bold">{event.resultScore}점</strong>
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Strengths & Critical Improvements callout */}
+        {(event.strengths || event.criticalImprovements) && (
+          <div className="pt-2 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs border-t border-[#f1ede4]">
+            {event.strengths && (
+              <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded-2xs">
+                <span className="font-bold text-emerald-950 text-[10.5px] block font-academic-mono">
+                  ✓ 잘한 점:
+                </span>
+                <span className="text-[11px] text-emerald-900">{event.strengths}</span>
+              </div>
+            )}
+            {event.criticalImprovements && (
+              <div className="p-2 bg-amber-50/60 border border-amber-200 rounded-2xs">
+                <span className="font-bold text-amber-950 text-[10.5px] block font-academic-mono">
+                  ▲ 보완할 점:
+                </span>
+                <span className="text-[11px] text-amber-900">{event.criticalImprovements}</span>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -111,20 +170,20 @@ export function ArchiveRecordDetail({
       {event.rubricScores && event.rubricScores.length > 0 && (
         <div className="space-y-1.5">
           <div className="text-[11px] font-academic-mono text-[#827d73] font-semibold">
-            채점 루브릭 기준별 배점 및 취약 영역 분석:
+            채점 루브릭 기준별 배점 및 세부 분석:
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
             {event.rubricScores.map((rubric) => (
               <div
                 key={rubric.criterionId}
-                className={`p-3 rounded-xs border flex flex-col justify-between ${
+                className={`p-3 rounded-xs border flex flex-col justify-between space-y-1.5 ${
                   rubric.isVulnerable
                     ? 'border-[#c52828] bg-[#fef2f2]/60'
                     : 'border-[#ded6c8] bg-[#fcfbf9]'
                 }`}
               >
-                <div className="flex items-start justify-between gap-1 mb-1.5">
+                <div className="flex items-start justify-between gap-1 mb-0.5">
                   <span
                     className={`text-xs font-bold leading-tight ${
                       rubric.isVulnerable ? 'text-[#c52828]' : 'text-[#191817]'
@@ -137,18 +196,111 @@ export function ArchiveRecordDetail({
                       rubric.isVulnerable ? 'text-[#c52828]' : 'text-[#191817]'
                     }`}
                   >
-                    {rubric.score.toFixed(1)} / {rubric.maxScore.toFixed(1)}
+                    {rubric.score.toFixed(1)} / {rubric.maxScore.toFixed(1)}점
                   </span>
                 </div>
 
                 {rubric.feedback && (
-                  <p className="text-[11px] text-[#57544e] leading-snug line-clamp-2">
+                  <p className="text-[11px] text-[#57544e] leading-snug">
                     {rubric.feedback}
                   </p>
+                )}
+
+                {rubric.evidenceQuote && (
+                  <div className="text-[10px] text-[#827d73] border-t border-[#f1ede4] pt-1">
+                    <span className="font-mono">근거: </span>
+                    <span className="italic line-clamp-2">&ldquo;{rubric.evidenceQuote}&rdquo;</span>
+                  </div>
                 )}
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Stage 4: Re-view Full Saved Attempt Section */}
+      {matchingAttempt && (
+        <div className="border border-[#ded6c8] rounded-xs bg-[#faf8f4] overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setIsAttemptExpanded(!isAttemptExpanded)}
+            className="w-full px-4 py-2 bg-[#f6f3eb] hover:bg-[#ece6da] flex items-center justify-between text-xs transition-colors"
+          >
+            <div className="flex items-center gap-2 font-bold text-[#191817]">
+              <Eye className="w-3.5 h-3.5 text-[#c52828]" />
+              <span>당시 제출 답안 전문 및 평가 상세 기록 열람</span>
+            </div>
+            <div className="flex items-center gap-1.5 text-[11px] font-academic-mono text-[#827d73]">
+              <span>{isAttemptExpanded ? '접기' : '풀이 전문 확인'}</span>
+              {isAttemptExpanded ? (
+                <ChevronUp className="w-3.5 h-3.5" />
+              ) : (
+                <ChevronDown className="w-3.5 h-3.5" />
+              )}
+            </div>
+          </button>
+
+          {isAttemptExpanded && (
+            <div className="p-4 space-y-3.5 border-t border-[#ded6c8] bg-white text-xs">
+              {/* Problem Statement Snapshot if available */}
+              {(matchingAttempt.problemTitleSnapshot || matchingAttempt.problemPromptSnapshot) && (
+                <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1">
+                  <div className="font-academic-mono text-[11px] font-bold text-[#827d73] uppercase">
+                    풀이 당시 문제 지문:
+                  </div>
+                  {matchingAttempt.problemTitleSnapshot && (
+                    <h4 className="font-bold text-sm text-[#191817] font-academic-serif">
+                      {matchingAttempt.problemTitleSnapshot}
+                    </h4>
+                  )}
+                  {matchingAttempt.problemPromptSnapshot && (
+                    <p className="text-xs text-[#2e2c29] leading-relaxed korean-prose whitespace-pre-wrap">
+                      {matchingAttempt.problemPromptSnapshot}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* User Answer Text */}
+              <div className="space-y-1">
+                <span className="font-academic-mono text-[11px] font-bold text-[#57544e] block">
+                  학생이 제출한 답안 전문:
+                </span>
+                <div className="p-3.5 bg-[#fcfbf9] border border-[#ded6c8] rounded-xs font-serif text-xs leading-relaxed text-[#191817] whitespace-pre-wrap selection:bg-amber-100">
+                  {matchingAttempt.answer}
+                </div>
+              </div>
+
+              {/* Model Answer Toggle if snapshot available */}
+              {matchingAttempt.modelAnswerSnapshot && (
+                <div className="border border-[#ded6c8] rounded-xs overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => setIsModelAnswerExpanded(!isModelAnswerExpanded)}
+                    className="w-full px-3 py-1.5 bg-[#f6f3eb] hover:bg-[#ede8dc] flex items-center justify-between text-[11px] font-academic-mono transition-colors"
+                  >
+                    <span className="font-bold text-[#57544e]">출제자 모범 답안 스냅샷 비교</span>
+                    <span className="text-[#827d73]">
+                      {isModelAnswerExpanded ? '답안 접기' : '모범 답안 보기'}
+                    </span>
+                  </button>
+                  {isModelAnswerExpanded && (
+                    <div className="p-3 bg-white text-xs leading-relaxed text-[#191817] whitespace-pre-wrap border-t border-[#ded6c8]">
+                      {matchingAttempt.modelAnswerSnapshot}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Static Analysis Notice if available */}
+              {matchingAttempt.staticAnalysisNotice && (
+                <div className="p-2 bg-amber-50 border border-amber-200 rounded-2xs text-[10.5px] text-amber-950 flex items-start gap-1.5">
+                  <AlertTriangle className="w-3 h-3 text-amber-600 shrink-0 mt-0.5" />
+                  <span>{matchingAttempt.staticAnalysisNotice}</span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
