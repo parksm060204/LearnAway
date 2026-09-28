@@ -15,6 +15,7 @@ import {
   Plus,
   FolderOpen,
   Sparkles,
+  FileQuestion,
 } from 'lucide-react';
 
 interface TopUtilityBarProps {
@@ -26,6 +27,9 @@ interface TopUtilityBarProps {
   onOpenMaterialsList?: () => void;
   onOpenConceptReview?: () => void;
   draftCount?: number;
+  onOpenProblemGenerator?: () => void;
+  onOpenProblemReview?: () => void;
+  problemDraftCount?: number;
   onOpenProblemSession: () => void;
   onOpenMockExam: () => void;
   onOpenSettings: () => void;
@@ -42,6 +46,9 @@ export function TopUtilityBar({
   onOpenMaterialsList,
   onOpenConceptReview,
   draftCount = 0,
+  onOpenProblemGenerator,
+  onOpenProblemReview,
+  problemDraftCount = 0,
   onOpenProblemSession,
   onOpenMockExam,
   onOpenSettings,
@@ -190,6 +197,33 @@ export function TopUtilityBar({
             </button>
           )}
 
+          {onOpenProblemReview && (
+            <button
+              onClick={onOpenProblemReview}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
+              title="AI 시험 문제 검토 및 승인"
+            >
+              <FileQuestion className="w-3.5 h-3.5 text-blue-600" />
+              <span>문제 검토</span>
+              {problemDraftCount > 0 && (
+                <span className="text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 px-1.5 py-0.2 rounded-full font-bold">
+                  {problemDraftCount}
+                </span>
+              )}
+            </button>
+          )}
+
+          {onOpenProblemGenerator && (
+            <button
+              onClick={onOpenProblemGenerator}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xs text-[#191817] hover:bg-[#faf8f4] border border-[#ded6c8] font-semibold transition-colors mr-1"
+              title="AI 고난도 문제 출제"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+              <span>문제 출제</span>
+            </button>
+          )}
+
           <button
             onClick={onOpenProblemSession}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
@@ -289,6 +323,39 @@ export function TopUtilityBar({
                   {draftCount}
                 </span>
               )}
+            </button>
+          )}
+
+          {onOpenProblemReview && (
+            <button
+              onClick={() => {
+                onOpenProblemReview();
+                setIsMobileMenuOpen(false);
+              }}
+              className="w-full flex items-center justify-between py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+            >
+              <div className="flex items-center gap-2">
+                <FileQuestion className="w-4 h-4 text-blue-600" />
+                <span>문제 검토 및 승인</span>
+              </div>
+              {problemDraftCount > 0 && (
+                <span className="text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 px-1.5 py-0.5 rounded-full font-bold">
+                  {problemDraftCount}
+                </span>
+              )}
+            </button>
+          )}
+
+          {onOpenProblemGenerator && (
+            <button
+              onClick={() => {
+                onOpenProblemGenerator();
+                setIsMobileMenuOpen(false);
+              }}
+              className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+            >
+              <Sparkles className="w-4 h-4 text-amber-600" />
+              <span>AI 고난도 시험 문제 출제</span>
             </button>
           )}
 

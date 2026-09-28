@@ -5,6 +5,7 @@ import {
   ConceptDraft,
   ConceptStatus,
   Problem,
+  ProblemDraft,
   Attempt,
   RetentionModelSettings,
   ReviewEvent,
@@ -28,6 +29,7 @@ const STORAGE_KEYS = {
   CONCEPTS: 'redcall_concepts_v1',
   CONCEPT_DRAFTS: 'redcall_concept_drafts_v1',
   PROBLEMS: 'redcall_problems_v1',
+  PROBLEM_DRAFTS: 'redcall_problem_drafts_v1',
   ATTEMPTS: 'redcall_attempts_v1',
   SETTINGS: 'redcall_retention_settings_v1',
 };
@@ -366,11 +368,207 @@ export function markConceptAsLearned(
 }
 
 export function loadStoredProblems(): Problem[] {
-  return safeGetItem<Problem[]>(STORAGE_KEYS.PROBLEMS, INITIAL_PROBLEMS);
+  const raw = safeGetItem<Problem[]>(STORAGE_KEYS.PROBLEMS, INITIAL_PROBLEMS);
+  return raw.map((p) => ({
+    ...p,
+    isDemo: p.isDemo ?? true,
+    isApproved: p.isApproved ?? true,
+  }));
 }
 
 export function saveStoredProblems(problems: Problem[]): void {
   safeSetItem(STORAGE_KEYS.PROBLEMS, problems);
+}
+
+export function loadStoredProblemDrafts(): ProblemDraft[] {
+  return safeGetItem<ProblemDraft[]>(STORAGE_KEYS.PROBLEM_DRAFTS, []);
+}
+
+export function saveStoredProblemDrafts(drafts: ProblemDraft[]): void {
+  safeSetItem(STORAGE_KEYS.PROBLEM_DRAFTS, drafts);
+}
+
+export function updateProblemDraft(draft: ProblemDraft): ProblemDraft[] {
+  const drafts = loadStoredProblemDrafts();
+  const updated = drafts.map((d) =>
+    d.id === draft.id ? { ...draft, editedByUser: true, updatedAt: new Date().toISOString() } : d
+  );
+  saveStoredProblemDrafts(updated);
+  return updated;
+}
+
+export function deleteProblemDraft(draftId: string): ProblemDraft[] {
+  const drafts = loadStoredProblemDrafts();
+  const updated = drafts.filter((d) => d.id !== draftId);
+  saveStoredProblemDrafts(updated);
+  return updated;
+}
+
+export function approveProblemDraft(draftId: string): {
+  updatedDrafts: ProblemDraft[];
+  updatedProblems: Problem[];
+  approvedProblem: Problem | null;
+} {
+  const drafts = loadStoredProblemDrafts();
+  const problems = loadStoredProblems();
+
+  const targetDraft = drafts.find((d) => d.id === draftId);
+  if (!targetDraft) {
+    return { updatedDrafts: drafts, updatedProblems: problems, approvedProblem: null };
+  }
+
+  const now = new Date().toISOString();
+  const updatedDrafts = drafts.map((d) =>
+    d.id === draftId
+      ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now }
+      : d
+  );
+  saveStoredProblemDrafts(updatedDrafts);
+
+  const existingIndex = problems.findIndex((p) => p.draftId === draftId);
+  let approvedProblem: Problem;
+
+  if (existingIndex >= 0) {
+    approvedProblem = {
+      ...problems[existingIndex],
+      title: targetDraft.title,
+      type: targetDraft.type,
+      difficulty: targetDraft.difficulty,
+      promptText: targetDraft.promptText,
+      mathFormula: targetDraft.mathFormula,
+      codeSnippet: targetDraft.codeSnippet,
+      designIntent: targetDraft.designIntent,
+      appliedConditionNote: targetDraft.appliedConditionNote,
+      timeStandardMinutes: targetDraft.timeStandardMinutes,
+      timeBreakdownDesc: targetDraft.timeBreakdownDesc,
+      coreEvaluationHighlight: targetDraft.coreEvaluationHighlight,
+      itemCountDesc: targetDraft.itemCountDesc,
+      hints: targetDraft.hints,
+      modelAnswer: targetDraft.modelAnswer,
+      rubric: targetDraft.rubric,
+      sourceRefs: targetDraft.sourceRefs,
+      sourceMarkdownHash: targetDraft.sourceMarkdownHash,
+      isApproved: true,
+      isDemo: false,
+    };
+    problems[existingIndex] = approvedProblem;
+  } else {
+    approvedProblem = {
+      id: `prob-ai-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+      conceptIds: targetDraft.conceptIds,
+      subjectId: targetDraft.subjectId,
+      title: targetDraft.title,
+      type: targetDraft.type,
+      categoryLabel: targetDraft.categoryLabel,
+      categoryNumber: targetDraft.categoryNumber,
+      promptText: targetDraft.promptText,
+      mathFormula: targetDraft.mathFormula,
+      codeSnippet: targetDraft.codeSnippet,
+      timeStandardMinutes: targetDraft.timeStandardMinutes,
+      timeBreakdownDesc: targetDraft.timeBreakdownDesc,
+      coreEvaluationHighlight: targetDraft.coreEvaluationHighlight,
+      itemCountDesc: targetDraft.itemCountDesc,
+      sourceRefs: targetDraft.sourceRefs,
+      hints: targetDraft.hints,
+      modelAnswer: targetDraft.modelAnswer,
+      rubric: targetDraft.rubric,
+      isDemo: false,
+      isApproved: true,
+      draftId: targetDraft.id,
+      difficulty: targetDraft.difficulty,
+      designIntent: targetDraft.designIntent,
+      appliedConditionNote: targetDraft.appliedConditionNote,
+      sourceMarkdownHash: targetDraft.sourceMarkdownHash,
+      createdAt: now,
+    };
+    problems.push(approvedProblem);
+  }
+
+  saveStoredProblems(problems);
+  return { updatedDrafts, updatedProblems: problems, approvedProblem };
+}
+
+export function batchApproveProblemDrafts(draftIds: string[]): {
+  updatedDrafts: ProblemDraft[];
+  updatedProblems: Problem[];
+  approvedCount: number;
+} {
+  const drafts = loadStoredProblemDrafts();
+  let problems = loadStoredProblems();
+  const targetIdsSet = new Set(draftIds);
+  const now = new Date().toISOString();
+
+  const updatedDrafts = drafts.map((d) =>
+    targetIdsSet.has(d.id)
+      ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now }
+      : d
+  );
+  saveStoredProblemDrafts(updatedDrafts);
+
+  let approvedCount = 0;
+  for (const draftId of draftIds) {
+    const draft = drafts.find((d) => d.id === draftId);
+    if (!draft) continue;
+
+    const existingIndex = problems.findIndex((p) => p.draftId === draftId);
+    if (existingIndex >= 0) {
+      problems[existingIndex] = {
+        ...problems[existingIndex],
+        title: draft.title,
+        type: draft.type,
+        difficulty: draft.difficulty,
+        promptText: draft.promptText,
+        mathFormula: draft.mathFormula,
+        codeSnippet: draft.codeSnippet,
+        designIntent: draft.designIntent,
+        appliedConditionNote: draft.appliedConditionNote,
+        timeStandardMinutes: draft.timeStandardMinutes,
+        timeBreakdownDesc: draft.timeBreakdownDesc,
+        coreEvaluationHighlight: draft.coreEvaluationHighlight,
+        itemCountDesc: draft.itemCountDesc,
+        hints: draft.hints,
+        modelAnswer: draft.modelAnswer,
+        rubric: draft.rubric,
+        sourceRefs: draft.sourceRefs,
+        sourceMarkdownHash: draft.sourceMarkdownHash,
+        isApproved: true,
+        isDemo: false,
+      };
+    } else {
+      problems.push({
+        id: `prob-ai-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+        conceptIds: draft.conceptIds,
+        subjectId: draft.subjectId,
+        title: draft.title,
+        type: draft.type,
+        categoryLabel: draft.categoryLabel,
+        categoryNumber: draft.categoryNumber,
+        promptText: draft.promptText,
+        mathFormula: draft.mathFormula,
+        codeSnippet: draft.codeSnippet,
+        timeStandardMinutes: draft.timeStandardMinutes,
+        timeBreakdownDesc: draft.timeBreakdownDesc,
+        coreEvaluationHighlight: draft.coreEvaluationHighlight,
+        itemCountDesc: draft.itemCountDesc,
+        sourceRefs: draft.sourceRefs,
+        hints: draft.hints,
+        modelAnswer: draft.modelAnswer,
+        rubric: draft.rubric,
+        isDemo: false,
+        isApproved: true,
+        draftId: draft.id,
+        difficulty: draft.difficulty,
+        designIntent: draft.designIntent,
+        appliedConditionNote: draft.appliedConditionNote,
+        sourceMarkdownHash: draft.sourceMarkdownHash,
+        createdAt: now,
+      });
+    }
+    approvedCount++;
+  }
+
+  saveStoredProblems(problems);
+  return { updatedDrafts, updatedProblems: problems, approvedCount };
 }
 
 export function loadStoredAttempts(): Attempt[] {
@@ -400,6 +598,7 @@ export function resetToInitialDemoData(): void {
   localStorage.removeItem(STORAGE_KEYS.CONCEPTS);
   localStorage.removeItem(STORAGE_KEYS.CONCEPT_DRAFTS);
   localStorage.removeItem(STORAGE_KEYS.PROBLEMS);
+  localStorage.removeItem(STORAGE_KEYS.PROBLEM_DRAFTS);
   localStorage.removeItem(STORAGE_KEYS.ATTEMPTS);
   localStorage.removeItem(STORAGE_KEYS.SETTINGS);
 }

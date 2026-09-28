@@ -7,6 +7,7 @@ import {
   Concept,
   ConceptDraft,
   Problem,
+  ProblemDraft,
   Attempt,
   ProblemType,
   RetentionModelSettings,
@@ -24,6 +25,12 @@ import {
   saveStoredConceptDrafts,
   loadStoredProblems,
   saveStoredProblems,
+  loadStoredProblemDrafts,
+  saveStoredProblemDrafts,
+  approveProblemDraft,
+  batchApproveProblemDrafts,
+  deleteProblemDraft,
+  updateProblemDraft,
   loadStoredAttempts,
   loadStoredSettings,
   saveStoredSettings,
@@ -31,6 +38,7 @@ import {
   resetToInitialDemoData,
 } from '../lib/storage';
 import { DEFAULT_RETENTION_SETTINGS } from '../lib/retentionModel';
+import { computeMarkdownHash } from '../lib/markdownUtils';
 import { TopUtilityBar } from '../components/TopUtilityBar';
 import { ExamRecordCard } from '../components/ExamRecordCard';
 import { StatusStrip } from '../components/StatusStrip';
@@ -45,6 +53,8 @@ import { MaterialUploadModal } from '../components/MaterialUploadModal';
 import { MaterialEditorModal } from '../components/MaterialEditorModal';
 import { MaterialsListModal } from '../components/MaterialsListModal';
 import { ConceptReviewModal } from '../components/ConceptReviewModal';
+import { ProblemGeneratorModal } from '../components/ProblemGeneratorModal';
+import { ProblemReviewModal } from '../components/ProblemReviewModal';
 import { PdfViewerModal } from '../components/PdfViewerModal';
 import { SettingsModal } from '../components/SettingsModal';
 import { MockExamModal } from '../components/MockExamModal';
@@ -94,6 +104,12 @@ export default function RedcallDashboardPage() {
   const [conceptReviewMaterial, setConceptReviewMaterial] = useState<Material | null>(null);
   const [isAiAnalyzing, setIsAiAnalyzing] = useState(false);
 
+  // Stage 3: AI Problem Generation & Review State
+  const [problemDrafts, setProblemDrafts] = useState<ProblemDraft[]>([]);
+  const [isProblemGeneratorOpen, setIsProblemGeneratorOpen] = useState(false);
+  const [isProblemReviewOpen, setIsProblemReviewOpen] = useState(false);
+  const [activeProblemIdForSession, setActiveProblemIdForSession] = useState<string | null>(null);
+
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -112,6 +128,7 @@ export default function RedcallDashboardPage() {
     const loadedConcepts = loadStoredConcepts();
     const loadedDrafts = loadStoredConceptDrafts();
     const loadedProblems = loadStoredProblems();
+    const loadedProblemDrafts = loadStoredProblemDrafts();
     const loadedAttempts = loadStoredAttempts();
     const loadedSettings = loadStoredSettings();
 
@@ -121,6 +138,7 @@ export default function RedcallDashboardPage() {
     setAllConcepts(loadedConcepts);
     setConceptDrafts(loadedDrafts);
     setAllProblems(loadedProblems);
+    setProblemDrafts(loadedProblemDrafts);
     setAttempts(loadedAttempts);
     setSettings(loadedSettings);
 
@@ -157,6 +175,22 @@ export default function RedcallDashboardPage() {
     if (!activeSubject) return [];
     return conceptDrafts.filter((d) => d.subjectId === activeSubject.id);
   }, [conceptDrafts, activeSubject]);
+
+  const activeSubjectProblemDrafts = useMemo(() => {
+    if (!activeSubject) return [];
+    return problemDrafts.filter((d) => d.subjectId === activeSubject.id);
+  }, [problemDrafts, activeSubject]);
+
+  const activeSessionProblem = useMemo(() => {
+    if (activeProblemIdForSession) {
+      const found = subjectProblems.find((p) => p.id === activeProblemIdForSession);
+      if (found) return found;
+    }
+    return (
+      subjectProblems.find((p) => p.type === selectedProblemType) ||
+      subjectProblems[0]
+    );
+  }, [subjectProblems, activeProblemIdForSession, selectedProblemType]);
 
   const selectedConcept = useMemo(() => {
     return (
@@ -336,6 +370,82 @@ export default function RedcallDashboardPage() {
     }
   };
 
+  // Stage 3: AI Problem Generation & Review Handlers
+  const handleProblemGenerateSuccess = (newDrafts: ProblemDraft[]) => {
+    const otherDrafts = problemDrafts.filter((d) => !newDrafts.some((nd) => nd.id === d.id));
+    const updated = [...newDrafts, ...otherDrafts];
+    setProblemDrafts(updated);
+    saveStoredProblemDrafts(updated);
+
+    // Update material hasAiProblems flag if material exists
+    const targetMaterial = materials.find((m) => m.subjectId === activeSubject?.id);
+    if (targetMaterial && !targetMaterial.hasAiProblems) {
+      const updatedMaterials = materials.map((m) =>
+        m.id === targetMaterial.id ? { ...m, hasAiProblems: true } : m
+      );
+      setMaterials(updatedMaterials);
+      saveStoredMaterials(updatedMaterials);
+    }
+
+    setIsProblemReviewOpen(true);
+    showToast(`AI 고난도 문제 ${newDrafts.length}건이 성공적으로 생성되었습니다. 검토를 진행해 주세요.`);
+  };
+
+  const handleApproveProblemDraft = (draftId: string) => {
+    const { approvedProblem, updatedDrafts, updatedProblems } = approveProblemDraft(draftId);
+    if (approvedProblem) {
+      setProblemDrafts(updatedDrafts);
+      setAllProblems(updatedProblems);
+      showToast(`문제 [${approvedProblem.title}]이(가) 승인되어 풀이 목록에 등록되었습니다.`);
+    }
+  };
+
+  const handleBatchApproveProblemDrafts = (draftIds: string[]) => {
+    const { approvedCount, updatedDrafts, updatedProblems } = batchApproveProblemDrafts(draftIds);
+    setProblemDrafts(updatedDrafts);
+    setAllProblems(updatedProblems);
+    showToast(`선택한 문제 ${approvedCount}건이 승인 완료되어 풀이에 등록되었습니다.`);
+  };
+
+  const handleUpdateProblemDraft = (updatedDraft: ProblemDraft) => {
+    const updated = updateProblemDraft(updatedDraft);
+    setProblemDrafts(updated);
+    showToast('문제 초안 수정 내용이 저장되었습니다.');
+  };
+
+  const handleDeleteProblemDraft = (draftId: string) => {
+    const updated = deleteProblemDraft(draftId);
+    setProblemDrafts(updated);
+    showToast('문제 초안이 삭제되었습니다.');
+  };
+
+  const handleStartPracticeFromDraft = (draft: ProblemDraft) => {
+    let problemToPracticeId = '';
+    if (!draft.isApproved) {
+      const { approvedProblem, updatedDrafts, updatedProblems } = approveProblemDraft(draft.id);
+      if (approvedProblem) {
+        problemToPracticeId = approvedProblem.id;
+        setProblemDrafts(updatedDrafts);
+        setAllProblems(updatedProblems);
+      }
+    } else {
+      const existing = allProblems.find((p) => p.draftId === draft.id);
+      if (existing) {
+        problemToPracticeId = existing.id;
+      }
+    }
+
+    if (draft.conceptIds && draft.conceptIds.length > 0) {
+      setSelectedConceptId(draft.conceptIds[0]);
+    }
+    setSelectedProblemType(draft.type);
+    if (problemToPracticeId) {
+      setActiveProblemIdForSession(problemToPracticeId);
+    }
+    setIsProblemReviewOpen(false);
+    setIsProblemSessionOpen(true);
+  };
+
   // Attempt Submission Handler (Updates ReviewEvent & Retention Score)
   const handleSubmitAttempt = (attempt: Attempt) => {
     const { updatedConcepts, updatedAttempts } = recordAttemptAndUpdateConcept(attempt, settings);
@@ -402,6 +512,9 @@ export default function RedcallDashboardPage() {
           setIsConceptReviewOpen(true);
         }}
         draftCount={activeSubjectDrafts.length}
+        onOpenProblemGenerator={() => setIsProblemGeneratorOpen(true)}
+        onOpenProblemReview={() => setIsProblemReviewOpen(true)}
+        problemDraftCount={activeSubjectProblemDrafts.length}
         onOpenProblemSession={() => setIsProblemSessionOpen(true)}
         onOpenMockExam={() => setIsMockExamModalOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -486,6 +599,9 @@ export default function RedcallDashboardPage() {
                 onStartSession={() => setIsProblemSessionOpen(true)}
                 onPostponeDay={handlePostponeDay}
                 onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
+                onOpenProblemGenerator={() => setIsProblemGeneratorOpen(true)}
+                onOpenProblemReview={() => setIsProblemReviewOpen(true)}
+                problemDraftCount={activeSubjectProblemDrafts.length}
               />
             )}
           </div>
@@ -532,13 +648,13 @@ export default function RedcallDashboardPage() {
       {selectedConcept && (
         <ProblemSessionModal
           isOpen={isProblemSessionOpen}
-          onClose={() => setIsProblemSessionOpen(false)}
+          onClose={() => {
+            setIsProblemSessionOpen(false);
+            setActiveProblemIdForSession(null);
+          }}
           subject={activeSubject}
           concept={selectedConcept}
-          problem={
-            subjectProblems.find((p) => p.type === selectedProblemType) ||
-            subjectProblems[0]
-          }
+          problem={activeSessionProblem}
           onSubmitAttempt={handleSubmitAttempt}
           onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
         />
@@ -620,6 +736,18 @@ export default function RedcallDashboardPage() {
           setMaterials(updated);
           saveStoredMaterials(updated);
           setEditingMaterial(updatedMat);
+
+          // Mark problems created from prior version of markdown as outdated
+          const newHash = computeMarkdownHash(updatedMat.parsedMarkdown || '');
+          const newProblems = allProblems.map((p) => {
+            if (p.subjectId === updatedMat.subjectId && p.sourceMarkdownHash && p.sourceMarkdownHash !== newHash) {
+              return { ...p, isOutdated: true };
+            }
+            return p;
+          });
+          setAllProblems(newProblems);
+          saveStoredProblems(newProblems);
+
           showToast(`[${updatedMat.title}] 수정 내용이 저장되었습니다.`);
         }}
         onOpenConceptReview={(mat) => {
@@ -707,6 +835,38 @@ export default function RedcallDashboardPage() {
         isOpen={isAddSubjectModalOpen}
         onClose={() => setIsAddSubjectModalOpen(false)}
         onAddSubject={handleAddSubject}
+      />
+
+      {/* 9. AI Problem Generator Modal (Stage 3) */}
+      <ProblemGeneratorModal
+        isOpen={isProblemGeneratorOpen}
+        onClose={() => setIsProblemGeneratorOpen(false)}
+        activeSubject={activeSubject}
+        concepts={subjectConcepts}
+        selectedConceptId={selectedConceptId}
+        onGenerateSuccess={handleProblemGenerateSuccess}
+        sourceMarkdown={
+          materials.find((m) => m.subjectId === activeSubject.id && m.parsedMarkdown)?.parsedMarkdown
+        }
+      />
+
+      {/* 10. AI Problem Review & Approval Modal (Stage 3) */}
+      <ProblemReviewModal
+        isOpen={isProblemReviewOpen}
+        onClose={() => setIsProblemReviewOpen(false)}
+        activeSubject={activeSubject}
+        drafts={problemDrafts}
+        concepts={subjectConcepts}
+        materials={materials}
+        onUpdateDraft={handleUpdateProblemDraft}
+        onApproveDraft={handleApproveProblemDraft}
+        onBatchApproveDrafts={handleBatchApproveProblemDrafts}
+        onDeleteDraft={handleDeleteProblemDraft}
+        onStartPracticeSession={handleStartPracticeFromDraft}
+        onOpenGenerator={() => {
+          setIsProblemReviewOpen(false);
+          setIsProblemGeneratorOpen(true);
+        }}
       />
     </div>
   );

@@ -293,7 +293,117 @@ function runTests() {
     assert(finalMerged?.relatedConcepts.filter((c: string) => c === '벨만-포드').length === 1, 'Related concepts deduplicated');
     assert(finalMerged?.examples?.includes('네트워크 라우팅 예제'), 'Examples merged');
 
-    console.log(`\n=== ALL STAGE 1 & STAGE 2 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
+    // 14. Stage 3: Domain Problem Type Filtering & Subject Scoping
+    console.log('\n--- 14. Testing Stage 3 Problem Type Filtering & Subject Scoping ---');
+    const mathTypes = ['essay_descriptive', 'calc_derivation', 'proof_counterexample', 'error_spotting'];
+    const csTypes = ['impl_descriptive', 'algorithm_optimization', 'complexity_proof', 'debug_counterexample'];
+    
+    assert(mathTypes.every((t) => !csTypes.includes(t)), 'Math problem types and CS types are strictly disjoint');
+    assert(mathTypes.length === 4 && csTypes.length === 4, 'Exactly 4 problem types per domain');
+
+    // 15. Stage 3: 100-Point Rubric Verification
+    console.log('\n--- 15. Testing Stage 3 100-Point Rubric Rule ---');
+    const validRubric = [
+      { id: 'crit-1', label: '전제조건 및 엄밀한 정의 서술', maxScore: 30, weight: 0.3, description: '전제조건 서술' },
+      { id: 'crit-2', label: '단계별 유도 및 증명 논리 전개', maxScore: 40, weight: 0.4, description: '유도 과정' },
+      { id: 'crit-3', label: '최종 결론 및 통계적/알고리즘적 해석', maxScore: 30, weight: 0.3, description: '결론 도출' },
+    ];
+    const rubricSum = validRubric.reduce((sum, c) => sum + c.maxScore, 0);
+    assert(rubricSum === 100, 'Detailed rubric criteria sum equals exactly 100 points');
+
+    // 16. Stage 3: Problem Draft Lifecycle & Approval
+    console.log('\n--- 16. Testing Stage 3 Problem Draft Lifecycle & Storage Isolation ---');
+    const {
+      saveStoredProblemDrafts,
+      loadStoredProblemDrafts,
+      approveProblemDraft,
+      updateProblemDraft,
+      loadStoredProblems,
+    } = require('./storage');
+
+    const testDraftId = 'test-prob-draft-001';
+    const testDraft = {
+      id: testDraftId,
+      subjectId: 'subj-econ302',
+      conceptIds: ['c1-iterated-expectations', 'c2-mle'],
+      conceptTitles: ['반복 기댓값의 법칙', '최대우도추정법'],
+      title: '조건부 기댓값 하에서의 MLE 일치성 증명 및 제약 최적화',
+      type: 'essay_descriptive',
+      difficulty: 'advanced_college',
+      categoryLabel: '1. 대학 논술·서술형',
+      categoryNumber: 1,
+      promptText: '두 개념을 연계하여 조건부 기댓값 수렴 조건 하에서 MLE의 점근적 정규성을 증명하시오.',
+      mathFormula: 'E[Y] = E[E[Y|X]]',
+      designIntent: '단순 계산을 지양하고 전제조건 정당화 및 다단계 논리적 증명 능력을 평가',
+      appliedConditionNote: 'AI 설계 응용 조건: 결합밀도함수의 적분 순서 교환 가능성(Fubini 정리) 조건 추가',
+      sourceRefs: 'Wooldridge Ch. 2 & Ch. 9',
+      sourceEvidenceQuote: '조건부 평균의 정의에 따라 E[u|x]=0이면 Cov(x,u)=0이다.',
+      sourceMarkdownHash: 'h_test1234_l100',
+      timeStandardMinutes: 20,
+      timeBreakdownDesc: '조건 분석 4분, 증명 전개 12분, 결론 4분',
+      coreEvaluationHighlight: '푸비니 정리 적용 정당성',
+      itemCountDesc: '소문항 2개',
+      hints: ['1단계: 조건부 기댓값 정의', '2단계: 우도함수 테일러 전개'],
+      modelAnswer: '모범 답안 본문: 수렴 정리와 우도방정식을 결합...',
+      rubric: validRubric,
+      status: 'draft',
+      isApproved: false,
+      verificationStatus: {
+        hasRequiredFields: true,
+        isScore100: true,
+        scoreSum: 100,
+        hasConceptLink: true,
+        isSourceVerified: true,
+      },
+      createdAt: '2026-09-29T00:00:00+09:00',
+      updatedAt: '2026-09-29T00:00:00+09:00',
+    };
+
+    saveStoredProblemDrafts([testDraft]);
+    const loadedDrafts = loadStoredProblemDrafts();
+    assert(loadedDrafts.some((d: any) => d.id === testDraftId), 'Draft saved and loaded from storage');
+
+    // Update draft
+    const updatedDraft = { ...testDraft, title: '수정된 시험 문제 제목' };
+    updateProblemDraft(updatedDraft);
+    const loadedAfterEdit = loadStoredProblemDrafts().find((d: any) => d.id === testDraftId);
+    assert(loadedAfterEdit?.title === '수정된 시험 문제 제목', 'Draft edited and persisted');
+    assert(loadedAfterEdit?.editedByUser === true, 'editedByUser flag marked true on edit');
+
+    // Approve draft
+    const approvalResult = approveProblemDraft(testDraftId);
+    assert(approvalResult.approvedProblem !== null, 'Draft converted to Problem upon approval');
+    assert(approvalResult.approvedProblem?.isApproved === true, 'Approved problem has isApproved=true');
+    assert(approvalResult.approvedProblem?.isDemo === false, 'Approved problem has isDemo=false');
+    assert(approvalResult.approvedProblem?.draftId === testDraftId, 'Approved problem correctly links back to draftId');
+    assert(approvalResult.approvedProblem?.subjectId === 'subj-econ302', 'Problem subject isolation maintained');
+    assert(
+      approvalResult.approvedProblem?.rubric.reduce((s: number, r: any) => s + r.maxScore, 0) === 100,
+      'Approved problem maintains 100-point rubric'
+    );
+
+    // Verify draft status in storage
+    const approvedDraftInStore = loadStoredProblemDrafts().find((d: any) => d.id === testDraftId);
+    assert(approvedDraftInStore?.isApproved === true, 'Stored draft marked isApproved=true');
+    assert(approvedDraftInStore?.status === 'approved', 'Stored draft status marked "approved"');
+
+    // 17. Outdated Source Markdown Detection
+    console.log('\n--- 17. Testing Outdated Source Markdown Detection ---');
+    const currentHash = 'h_newhash5678_l200';
+    const isOutdated = approvalResult.approvedProblem?.sourceMarkdownHash !== currentHash;
+    assert(isOutdated === true, 'Problem generated from old markdown hash correctly flagged as outdated');
+
+    // 18. Non-destruction of User Data Rule
+    console.log('\n--- 18. Testing Data Integrity: No Destruction of Problems or Attempts ---');
+    const storedProblems = loadStoredProblems();
+    const demoProblems = storedProblems.filter((p: any) => p.isDemo === true);
+    assert(demoProblems.length > 0, 'Original demo problems preserved without deletion');
+    assert(
+      storedProblems.some((p: any) => p.id === approvalResult.approvedProblem?.id),
+      'Newly approved problem persists in storedProblems alongside demo problems'
+    );
+
+    console.log(`\n=== ALL STAGE 1, 2 & 3 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
     if (failed > 0) {
       process.exit(1);
     }

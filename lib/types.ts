@@ -182,6 +182,57 @@ export interface Concept {
   draftId?: string;
 }
 
+export type ProblemDifficulty = 'advanced_college' | 'intermediate' | 'graduate_challenging';
+
+export const PROBLEM_DIFFICULTY_LABELS: Record<ProblemDifficulty, string> = {
+  advanced_college: '고난도·대학 학부 시험 수준 (기본)',
+  intermediate: '중간고사 표준형 (응용 및 개념 통합)',
+  graduate_challenging: '대학원·심화 도전형 (일반화 및 엄밀 증명)',
+};
+
+export interface ProblemDraftVerification {
+  hasRequiredFields: boolean;
+  isScore100: boolean;
+  scoreSum: number;
+  hasConceptLink: boolean;
+  isSourceVerified: boolean;
+  note?: string;
+}
+
+export interface ProblemDraft {
+  id: string;
+  subjectId: string;
+  conceptIds: string[];
+  conceptTitles: string[];
+  title: string;
+  type: ProblemType;
+  difficulty: ProblemDifficulty;
+  categoryLabel: string;
+  categoryNumber: number;
+  promptText: string;
+  mathFormula?: string;
+  codeSnippet?: string;
+  designIntent: string;           // 출제 의도 및 배경
+  appliedConditionNote?: string;   // 원문에 없는 새 상황은 AI가 설계한 응용 조건임을 명시
+  sourceRefs: string;              // 학습 자료 출처
+  sourceEvidenceQuote?: string;    // 원문 인용 근거
+  sourceMarkdownHash?: string;     // 분석/생성에 참조된 자료 버전 해시
+  timeStandardMinutes: number;
+  timeBreakdownDesc: string;
+  coreEvaluationHighlight: string;
+  itemCountDesc: string;
+  hints: string[];
+  modelAnswer: string;
+  rubric: RubricCriterion[];       // 합계 100점
+  status: 'draft' | 'needs_review' | 'approved' | 'rejected';
+  isApproved: boolean;
+  isDemo?: boolean;
+  verificationStatus: ProblemDraftVerification;
+  createdAt: string;
+  updatedAt: string;
+  editedByUser?: boolean;
+}
+
 export interface Problem {
   id: string;
   conceptIds: string[];
@@ -201,6 +252,16 @@ export interface Problem {
   hints: string[];
   modelAnswer: string;
   rubric: RubricCriterion[];
+  // Stage 3 fields:
+  isDemo?: boolean;              // true: 0단계 데모 문제, false: AI 생성 승인 문제
+  isApproved?: boolean;          // 승인 완료 플래그
+  draftId?: string;              // 연계 초안 ID
+  difficulty?: ProblemDifficulty;
+  designIntent?: string;         // 출제 의도
+  appliedConditionNote?: string; // AI 설계 응용 조건
+  sourceMarkdownHash?: string;   // 생성 당시 원문 해시
+  isOutdated?: boolean;          // 원문 Markdown 사후 수정 시 구버전 플래그
+  createdAt?: string;
 }
 
 export interface Attempt {

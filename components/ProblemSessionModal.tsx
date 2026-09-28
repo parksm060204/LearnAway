@@ -81,31 +81,39 @@ export function ProblemSessionModal({
     const hasCase = text.includes('Case') || text.includes('삼촌') || text.includes('부모');
 
     problem.rubric.forEach((criterion, idx) => {
-      let critScore = 4.0;
+      const isHundredScale = criterion.maxScore >= 10;
+      let scoreRatio = 0.85;
       let isVulnerable = false;
       let critFeedback = '논리적 서술 및 단계별 전개가 명확함.';
 
       if (idx === 1) {
         // Second criterion is usually rigorous condition check
         if (isMath && !hasFubini) {
-          critScore = 2.5;
+          scoreRatio = 0.6;
           isVulnerable = true;
           critFeedback = '정리 적용의 절대수렴 요건(푸비니 정리 정당화) 명시가 미흡하여 감점됨.';
         } else if (!isMath && !hasRbt) {
-          critScore = 2.5;
+          scoreRatio = 0.6;
           isVulnerable = true;
           critFeedback = '서브트리 포인터 재배치 및 블랙-하이트 보존 엄밀성 서술 부족.';
         } else {
-          critScore = 4.5;
+          scoreRatio = 0.95;
           critFeedback = '정리 및 조건의 전제조건을 엄밀하게 서술함.';
         }
       } else if (idx === 0) {
-        critScore = text.length > 80 ? 4.5 : 3.0;
-        critFeedback = text.length > 80 ? '수식 전개 및 도입부 논리성이 우수함.' : '서술 분량이 다소 압축되어 추가 설명 필요.';
+        scoreRatio = text.length > 80 ? 0.9 : 0.65;
+        critFeedback =
+          text.length > 80
+            ? '수식 전개 및 도입부 논리성이 우수함.'
+            : '서술 분량이 다소 압축되어 추가 설명 필요.';
       } else {
-        critScore = 4.5;
+        scoreRatio = 0.9;
         critFeedback = '최종 결론의 수렴성 및 논리적 닫힘이 양호함.';
       }
+
+      const critScore = isHundredScale
+        ? Math.round(criterion.maxScore * scoreRatio)
+        : Number((criterion.maxScore * scoreRatio).toFixed(1));
 
       rubricResults.push({
         criterionId: criterion.id,
@@ -117,12 +125,16 @@ export function ProblemSessionModal({
       });
     });
 
-    const totalWeightedScore = rubricResults.reduce(
-      (sum, r) => sum + (r.score / r.maxScore) * 100 * (1 / rubricResults.length),
-      0
-    );
-
-    calculatedScore = Math.round(totalWeightedScore);
+    const isHundredTotal = problem.rubric.reduce((s, r) => s + r.maxScore, 0) >= 90;
+    if (isHundredTotal) {
+      calculatedScore = rubricResults.reduce((sum, r) => sum + r.score, 0);
+    } else {
+      const totalWeightedScore = rubricResults.reduce(
+        (sum, r) => sum + (r.score / r.maxScore) * 100 * (1 / rubricResults.length),
+        0
+      );
+      calculatedScore = Math.round(totalWeightedScore);
+    }
 
     const feedback = isMath
       ? hasFubini
@@ -188,9 +200,20 @@ export function ProblemSessionModal({
           {/* Problem Statement Card */}
           <div className="bg-[#faf8f4] border border-[#ded6c8] p-4 rounded-xs space-y-2.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="font-academic-mono text-xs font-bold text-[#c52828]">
-                {problem.categoryLabel} · 표준 소요: {problem.timeStandardMinutes}분
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="font-academic-mono text-xs font-bold text-[#c52828]">
+                  {problem.categoryLabel} · 표준 소요: {problem.timeStandardMinutes}분
+                </span>
+                {problem.isDemo ? (
+                  <span className="text-[10px] font-academic-mono bg-[#f4f1ea] border border-[#ded6c8] text-[#827d73] px-1.5 py-0.5 rounded-2xs">
+                    0단계 데모 문제
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-academic-mono bg-emerald-50 border border-emerald-300 text-emerald-800 px-1.5 py-0.5 rounded-2xs font-semibold">
+                    AI 출제 승인 문제
+                  </span>
+                )}
+              </div>
 
               <button
                 onClick={() => onOpenSourceModal(problem.sourceRefs)}
@@ -200,6 +223,26 @@ export function ProblemSessionModal({
                 <span>출처: {problem.sourceRefs}</span>
               </button>
             </div>
+
+            {problem.appliedConditionNote && (
+              <div className="p-2.5 bg-amber-50/80 border border-amber-200 rounded-xs text-[11.5px] text-amber-900 flex items-start gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <strong className="font-bold">AI 설계 응용 조건: </strong>
+                  <span>{problem.appliedConditionNote}</span>
+                </div>
+              </div>
+            )}
+
+            {problem.isOutdated && (
+              <div className="p-2.5 bg-amber-100/90 border border-amber-300 rounded-xs text-[11.5px] text-amber-950 flex items-start gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-700 shrink-0 mt-0.5" />
+                <div>
+                  <strong className="font-bold">이전 자료 기반 출제: </strong>
+                  <span>원문 학습 자료 또는 Markdown이 수정되어 출제 당시의 원문 버전과 차이가 있을 수 있습니다.</span>
+                </div>
+              </div>
+            )}
 
             <h3 className="text-base sm:text-[17px] font-bold text-[#191817] font-academic-serif leading-[1.75] korean-prose">
               {problem.promptText}
@@ -401,6 +444,17 @@ export function ProblemSessionModal({
             </div>
           ) : (
             <div className="border border-[#c52828] bg-[#fef2f2]/40 p-4 rounded-xs space-y-3 animate-fade-in">
+              {/* Honest Grader Notice Banner */}
+              <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-xs text-[11px] text-amber-900 flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <strong className="block font-bold">키워드 기반 간이 채점 데모 안내</strong>
+                  <span>
+                    현재 점수 및 첨삭은 패턴 매칭 기반 간이 어댑터 결과입니다. LLM 기반 정밀 AI 심층 채점 및 루브릭 자동 평가는 다음 단계(4단계)에서 연동됩니다.
+                  </span>
+                </div>
+              </div>
+
               <div className="flex items-center justify-between border-b border-[#fecaca] pb-2">
                 <div className="flex items-center gap-2">
                   <Sparkles className="w-4 h-4 text-[#c52828]" />

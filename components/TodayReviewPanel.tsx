@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { Concept, Problem, ProblemType, Subject } from '../lib/types';
-import { Target, Clock, Play, Calendar, BookOpen, AlertCircle } from 'lucide-react';
+import { Target, Clock, Play, Calendar, BookOpen, AlertCircle, Sparkles, CheckSquare } from 'lucide-react';
 
 interface TodayReviewPanelProps {
   subject: Subject;
@@ -13,6 +13,9 @@ interface TodayReviewPanelProps {
   onStartSession: () => void;
   onPostponeDay: () => void;
   onOpenSourceModal: (ref: string) => void;
+  onOpenProblemGenerator?: () => void;
+  onOpenProblemReview?: () => void;
+  problemDraftCount?: number;
 }
 
 export function TodayReviewPanel({
@@ -24,6 +27,9 @@ export function TodayReviewPanel({
   onStartSession,
   onPostponeDay,
   onOpenSourceModal,
+  onOpenProblemGenerator,
+  onOpenProblemReview,
+  problemDraftCount = 0,
 }: TodayReviewPanelProps) {
   // Find problem matching selected category
   const activeProblem =
@@ -149,6 +155,33 @@ export function TodayReviewPanel({
           </p>
         </div>
       )}
+
+      {/* AI Problem Generation & Review Strip (Stage 3) */}
+      <div className="grid grid-cols-2 gap-2 pt-0.5">
+        {onOpenProblemGenerator && (
+          <button
+            type="button"
+            onClick={onOpenProblemGenerator}
+            className="flex items-center justify-center gap-1.5 py-2 px-2.5 text-xs text-[#191817] font-semibold bg-[#faf8f4] hover:bg-white border border-[#ded6c8] hover:border-[#c52828] rounded-xs transition-colors shadow-2xs"
+            title="선택된 개념으로 대학 고난도 시험 문제를 출제합니다"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+            <span>AI 문제 출제</span>
+          </button>
+        )}
+
+        {onOpenProblemReview && (
+          <button
+            type="button"
+            onClick={onOpenProblemReview}
+            className="flex items-center justify-center gap-1.5 py-2 px-2.5 text-xs text-[#57544e] hover:text-[#191817] bg-[#faf8f4] hover:bg-white border border-[#ded6c8] rounded-xs transition-colors"
+            title="출제된 문제 초안을 검토하고 승인합니다"
+          >
+            <CheckSquare className="w-3.5 h-3.5 text-emerald-600" />
+            <span>문제 검토 ({problemDraftCount}건)</span>
+          </button>
+        )}
+      </div>
 
       {/* CTA Button */}
       <button
