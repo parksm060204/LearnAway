@@ -107,10 +107,70 @@ function runTests() {
   assert(csProblems.some((p) => p.type === 'complexity_proof'), 'CS201 has complexity_proof');
   assert(csProblems.some((p) => p.type === 'debug_counterexample'), 'CS201 has debug_counterexample');
 
-  console.log(`\n=== TEST RESULTS: ${passed} PASSED, ${failed} FAILED ===`);
-  if (failed > 0) {
-    process.exit(1);
-  }
+  // 5. Stage 1: Transcript Parsing Tests
+  console.log('\n--- 5. Testing Transcript Parser & Timestamp Preservation ---');
+  const { parseTranscript } = require('./transcriptParser');
+
+  // Case A: Transcript with explicit timestamps and speakers
+  const transcriptWithTs = `[00:15:30] 교수: 오늘 강의는 중심극한정리를 다룹니다.
+[00:16:10] 학생: 표본 크기 n은 몇 이상이어야 하나요?
+[00:16:25] 교수: 보통 30 이상을 충분히 큰 표본으로 봅니다.`;
+  const parsedA = parseTranscript(transcriptWithTs, '통계 강의');
+  assert(parsedA.hasTimestamps === true, 'Detected timestamps in transcript with timestamps');
+  assert(parsedA.speakers.length === 2, 'Detected 2 speakers (교수, 학생)');
+  assert(parsedA.speakers.includes('교수') && parsedA.speakers.includes('학생'), 'Speaker names matched');
+  assert(parsedA.markdown.includes('00:15:30'), 'Markdown retains exact timestamp 00:15:30');
+  assert(parsedA.markdown.includes('중심극한정리'), 'Markdown retains raw text');
+
+  // Case B: Transcript WITHOUT timestamps (CRITICAL REQUIREMENT: NEVER INVENT TIMESTAMPS)
+  const transcriptNoTs = `교수: 이번 알고리즘은 다익스트라 최단경로입니다.
+학생: 음의 가중치가 있는 그래프에서도 동작하나요?
+교수: 아닙니다. 음의 간선이 있으면 벨만-포드를 사용해야 합니다.`;
+  const parsedB = parseTranscript(transcriptNoTs, '알고리즘 강의');
+  assert(parsedB.hasTimestamps === false, 'hasTimestamps is false when raw text has no time');
+  assert(!parsedB.markdown.includes('00:00') && !parsedB.markdown.includes('00:01'), 'Never invents artificial timestamps');
+  assert(parsedB.speakers.length === 2, 'Identified speakers without timestamps');
+  assert(parsedB.markdown.includes('벨만-포드'), 'Original academic content is preserved');
+
+  // 6. Stage 1: Decoupled Material Content Storage Tests
+  console.log('\n--- 6. Testing Decoupled Material Content Storage ---');
+  const { saveMaterialContent, loadMaterialContent } = require('./materialStorage');
+  const testMatId = 'test-mat-stage1-001';
+  const testMarkdown = '# 테스트 교재\n\n$$E[X] = \\mu$$\n\n본문 내용입니다.';
+  const testPages = [
+    { pageNumber: 1, markdown: '# 1페이지', hasText: true },
+    { pageNumber: 2, markdown: '', hasText: false },
+  ];
+
+  // Async test in sync suite runner
+  saveMaterialContent(testMatId, {
+    markdown: testMarkdown,
+    rawText: '테스트 원문',
+    pages: testPages,
+  }).then(async () => {
+    const loaded = await loadMaterialContent(testMatId);
+    assert(loaded !== null, 'Loaded decoupled material content');
+    assert(loaded?.markdown === testMarkdown, 'Loaded markdown matches saved markdown');
+    assert(loaded?.pages?.length === 2, 'Pages array preserved with page numbers');
+    assert(loaded?.pages?.[1].hasText === false, 'Image-only page hasText=false preserved');
+
+    // 7. Stage 1: Subject Isolation for Materials
+    console.log('\n--- 7. Testing Subject Isolation for Materials ---');
+    const econMats = INITIAL_MATERIALS.filter((m: any) => m.subjectId === 'subj-econ302');
+    const csMats = INITIAL_MATERIALS.filter((m: any) => m.subjectId === 'subj-cs201');
+    assert(econMats.length === 4, 'ECON302 has 4 materials');
+    assert(csMats.length === 3, 'CS201 has 3 materials');
+    assert(!econMats.some((m: any) => m.subjectId === 'subj-cs201'), 'No cross-contamination of subject materials');
+
+    // Verify demo badges and AI statuses
+    assert(econMats.every((m: any) => m.isDemo === true), 'Demo materials have isDemo=true');
+    assert(econMats.every((m: any) => m.status === 'ready'), 'Initial materials are ready');
+
+    console.log(`\n=== TEST RESULTS: ${passed} PASSED, ${failed} FAILED ===`);
+    if (failed > 0) {
+      process.exit(1);
+    }
+  });
 }
 
 runTests();

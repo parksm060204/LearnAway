@@ -39,6 +39,8 @@ import { ProblemSessionModal } from '../components/ProblemSessionModal';
 import { ExamScheduleModal } from '../components/ExamScheduleModal';
 import { ScopeManageModal } from '../components/ScopeManageModal';
 import { MaterialUploadModal } from '../components/MaterialUploadModal';
+import { MaterialEditorModal } from '../components/MaterialEditorModal';
+import { MaterialsListModal } from '../components/MaterialsListModal';
 import { PdfViewerModal } from '../components/PdfViewerModal';
 import { SettingsModal } from '../components/SettingsModal';
 import { MockExamModal } from '../components/MockExamModal';
@@ -77,6 +79,9 @@ export default function RedcallDashboardPage() {
   const [isProblemSessionOpen, setIsProblemSessionOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [isMockExamModalOpen, setIsMockExamModalOpen] = useState(false);
+  const [isMaterialsListOpen, setIsMaterialsListOpen] = useState(false);
+  const [editingMaterial, setEditingMaterial] = useState<Material | null>(null);
+  const [isMaterialEditorOpen, setIsMaterialEditorOpen] = useState(false);
   const [pdfViewerSourceRef, setPdfViewerSourceRef] = useState<string | null>(null);
 
   // Toast Notification
@@ -308,6 +313,7 @@ export default function RedcallDashboardPage() {
         onSelectSubject={handleSelectSubject}
         onOpenAddSubject={() => setIsAddSubjectModalOpen(true)}
         onOpenUpload={() => setIsUploadModalOpen(true)}
+        onOpenMaterialsList={() => setIsMaterialsListOpen(true)}
         onOpenProblemSession={() => setIsProblemSessionOpen(true)}
         onOpenMockExam={() => setIsMockExamModalOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -320,9 +326,11 @@ export default function RedcallDashboardPage() {
         {/* Section 1: Subject Exam Record & D-Day */}
         <ExamRecordCard
           subject={activeSubject}
+          materialCount={materials.filter((m) => m.subjectId === activeSubject.id).length}
           onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
           onOpenScopeModal={() => setIsScopeModalOpen(true)}
           onOpenUploadModal={() => setIsUploadModalOpen(true)}
+          onOpenMaterialsListModal={() => setIsMaterialsListOpen(true)}
         />
 
         {/* Section 2: Status Strip */}
@@ -471,6 +479,52 @@ export default function RedcallDashboardPage() {
         subjects={subjects}
         activeSubject={activeSubject}
         onAddMaterial={handleAddMaterial}
+        onOpenEditor={(newMat) => {
+          setEditingMaterial(newMat);
+          setIsMaterialEditorOpen(true);
+        }}
+      />
+
+      {/* 4.1 Materials Repository List Modal */}
+      <MaterialsListModal
+        isOpen={isMaterialsListOpen}
+        onClose={() => setIsMaterialsListOpen(false)}
+        activeSubject={activeSubject}
+        materials={materials}
+        onOpenUpload={() => {
+          setIsMaterialsListOpen(false);
+          setIsUploadModalOpen(true);
+        }}
+        onSelectMaterial={(mat) => {
+          setEditingMaterial(mat);
+          setIsMaterialEditorOpen(true);
+        }}
+        onDeleteMaterial={(materialId) => {
+          const updated = materials.filter((m) => m.id !== materialId);
+          setMaterials(updated);
+          saveStoredMaterials(updated);
+          showToast('자료가 삭제되었습니다.');
+        }}
+      />
+
+      {/* 4.2 Material Side-by-Side Comparison Editor Modal */}
+      <MaterialEditorModal
+        isOpen={isMaterialEditorOpen && !!editingMaterial}
+        onClose={() => {
+          setIsMaterialEditorOpen(false);
+          setEditingMaterial(null);
+        }}
+        material={editingMaterial}
+        subject={activeSubject}
+        onSave={(updatedMat) => {
+          const updated = materials.map((m) =>
+            m.id === updatedMat.id ? updatedMat : m
+          );
+          setMaterials(updated);
+          saveStoredMaterials(updated);
+          setEditingMaterial(updatedMat);
+          showToast(`[${updatedMat.title}] 수정 내용이 저장되었습니다.`);
+        }}
       />
 
       {/* 5. PDF Reference Excerpt Reader Modal */}
@@ -479,6 +533,21 @@ export default function RedcallDashboardPage() {
         onClose={() => setPdfViewerSourceRef(null)}
         sourceRef={pdfViewerSourceRef || ''}
         conceptTitle={selectedConcept?.title}
+        material={
+          materials.find(
+            (m) =>
+              m.subjectId === activeSubject.id &&
+              (m.sourceRefs.includes(pdfViewerSourceRef || '') ||
+                m.title.includes(pdfViewerSourceRef || ''))
+          ) ||
+          materials.find((m) => m.subjectId === activeSubject.id) ||
+          null
+        }
+        onOpenEditor={(mat) => {
+          setPdfViewerSourceRef(null);
+          setEditingMaterial(mat);
+          setIsMaterialEditorOpen(true);
+        }}
       />
 
       {/* 6. Settings Modal */}

@@ -67,11 +67,23 @@ export function saveActiveSubjectId(id: string): void {
 }
 
 export function loadStoredMaterials(): Material[] {
-  return safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, INITIAL_MATERIALS);
+  const loaded = safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, INITIAL_MATERIALS);
+  return loaded.map((m) => ({
+    ...m,
+    status: m.status || (m.isConverted ? 'ready' : 'converting'),
+    isDemo: m.isDemo ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
+    hasAiConcepts: m.hasAiConcepts ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
+    hasAiProblems: m.hasAiProblems ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
+  }));
 }
 
 export function saveStoredMaterials(materials: Material[]): void {
-  safeSetItem(STORAGE_KEYS.MATERIALS, materials);
+  // Decouple storage: strip heavy rawText and pages from localStorage
+  const lightMaterials = materials.map((m) => {
+    const { pages, rawText, ...rest } = m;
+    return rest;
+  });
+  safeSetItem(STORAGE_KEYS.MATERIALS, lightMaterials);
 }
 
 export function loadStoredConcepts(): Concept[] {

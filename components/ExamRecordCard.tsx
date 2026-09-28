@@ -3,20 +3,24 @@
 import React from 'react';
 import { Subject } from '../lib/types';
 import { calculateDDay, formatExamDate } from '../lib/dateUtils';
-import { Edit3, Sliders, Plus, Calendar, MapPin, Layers } from 'lucide-react';
+import { Edit3, Sliders, Plus, Calendar, MapPin, Layers, FolderOpen } from 'lucide-react';
 
 interface ExamRecordCardProps {
   subject: Subject;
+  materialCount?: number;
   onOpenScheduleModal: () => void;
   onOpenScopeModal: () => void;
   onOpenUploadModal: () => void;
+  onOpenMaterialsListModal?: () => void;
 }
 
 export function ExamRecordCard({
   subject,
+  materialCount = 0,
   onOpenScheduleModal,
   onOpenScopeModal,
   onOpenUploadModal,
+  onOpenMaterialsListModal,
 }: ExamRecordCardProps) {
   const dday = calculateDDay(subject.examAt);
 
@@ -126,6 +130,19 @@ export function ExamRecordCard({
               <Sliders className="w-3.5 h-3.5 text-[#827d73]" />
               <span>출제범위 관리</span>
             </button>
+
+            {onOpenMaterialsListModal && (
+              <button
+                onClick={onOpenMaterialsListModal}
+                className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-[#191817] bg-white hover:bg-[#faf8f4] border border-[#c8c2b5] rounded-xs shadow-2xs hover:border-[#191817] transition-all"
+              >
+                <FolderOpen className="w-3.5 h-3.5 text-[#c52828]" />
+                <span>자료 보관함</span>
+                <span className="text-[10px] font-academic-mono bg-[#f4f1ea] px-1.5 py-0.2 rounded text-[#57544e]">
+                  {materialCount}
+                </span>
+              </button>
+            )}
 
             <button
               onClick={onOpenUploadModal}

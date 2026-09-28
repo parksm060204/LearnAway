@@ -57,7 +57,11 @@ export const INITIAL_MATERIALS: Material[] = [
     title: '통계학원론_3장_조건부분포.pdf',
     sourceRefs: '제3장 p.40 ~ p.58',
     pageCount: 19,
+    status: 'ready',
     isConverted: true,
+    isDemo: true,
+    hasAiConcepts: true,
+    hasAiProblems: true,
     uploadedAt: '2026-09-18T14:20:00+09:00',
     parsedMarkdown: `# 제3장 조건부분포 및 조건부 기댓값
 
@@ -77,8 +81,21 @@ $$\\int_{-\\infty}^{\\infty} \\int_{-\\infty}^{\\infty} |y| f_{X,Y}(x,y) \\, dx 
     title: '통계학원론_4장_극한정리.pdf',
     sourceRefs: '제4장 p.80 ~ p.102',
     pageCount: 23,
+    status: 'ready',
     isConverted: true,
+    isDemo: true,
+    hasAiConcepts: true,
+    hasAiProblems: true,
     uploadedAt: '2026-09-12T11:00:00+09:00',
+    parsedMarkdown: `# 제4장 대수의 법칙 및 중심극한정리
+
+## 4.1 약대수의 법칙 (Weak Law of Large Numbers)
+표본평균 $\\bar{X}_n$은 표본 크기 $n \\to \\infty$일 때 모평균 $\\mu$로 확률수렴한다:
+$$\\lim_{n \\to \\infty} P(|\\bar{X}_n - \\mu| \\ge \\epsilon) = 0$$
+
+## 4.2 린데베르그-레비 중심극한정리 (Lindeberg-Lévy CLT)
+유한한 분산 $\\sigma^2 < \\infty$을 갖는 i.i.d. 확률변수열에 대하여:
+$$\\sqrt{n}\\left(\\frac{\\bar{X}_n - \\mu}{\\sigma}\\right) \\xrightarrow{d} N(0, 1)$$`,
   },
   {
     id: 'mat-econ-3',
@@ -87,8 +104,28 @@ $$\\int_{-\\infty}^{\\infty} \\int_{-\\infty}^{\\infty} |y| f_{X,Y}(x,y) \\, dx 
     title: '강의녹취_4차시_결합확률분포.txt',
     sourceRefs: '강의녹취 4차시 22:15',
     durationMinutes: 75,
+    status: 'ready',
     isConverted: true,
+    isDemo: true,
+    hasAiConcepts: true,
+    hasAiProblems: true,
+    speakerCount: 2,
+    speakers: ['교수', '학생'],
     uploadedAt: '2026-09-22T09:30:00+09:00',
+    parsedMarkdown: `# 강의녹취 4차시: 결합확률분포와 주변확률분포
+
+> ⏱️ **00:00:15** | **교수**
+여러분 안녕하세요. 지난 시간에 이어 결합확률밀도함수(joint PDF)의 정의와 주변확률분포(marginal distribution)의 도출 과정을 살펴보겠습니다.
+
+> ⏱️ **00:12:40** | **교수**
+두 연속확률변수 $X, Y$의 결합밀도가 $f_{X,Y}(x,y)$일 때, $X$의 주변밀도함수는 $Y$의 전체 지지집합에 대해 적분하여 구합니다:
+$$f_X(x) = \\int_{-\\infty}^{\\infty} f_{X,Y}(x,y) \\, dy$$
+
+> ⏱️ **00:22:15** | **학생**
+교수님, 만약 $X$와 $Y$가 상호 독립이라면 결합밀도가 각 주변밀도의 곱으로 분해되는 건가요?
+
+> ⏱️ **00:23:00** | **교수**
+아주 정확한 지적입니다. $f_{X,Y}(x,y) = f_X(x) f_Y(y)$가 모든 $(x,y)$에 대해 성립할 때 두 변수는 독립이라고 정의합니다.`,
   },
   {
     id: 'mat-econ-4',
@@ -97,8 +134,19 @@ $$\\int_{-\\infty}^{\\infty} \\int_{-\\infty}^{\\infty} |y| f_{X,Y}(x,y) \\, dx 
     title: '필기노트_Handout_02_MLE.pdf',
     sourceRefs: 'Handout #02 p.1 ~ p.8',
     pageCount: 8,
+    status: 'ready',
     isConverted: true,
+    isDemo: true,
+    hasAiConcepts: true,
+    hasAiProblems: true,
     uploadedAt: '2026-09-25T16:45:00+09:00',
+    parsedMarkdown: `# Handout #02: 최대우도추정법 (MLE)
+
+## 1. 우도함수의 정의
+모수 $\\theta$에 대한 우도함수 $L(\\theta; x)$ 및 로그우도함수 $\\ell(\\theta) = \\ln L(\\theta; x)$.
+
+## 2. 1계 조건 (First-Order Condition)
+$$\\frac{\\partial \\ell(\\theta)}{\\partial \\theta} = 0$$`,
   },
   // CS201 Materials
   {
@@ -108,8 +156,26 @@ $$\\int_{-\\infty}^{\\infty} \\int_{-\\infty}^{\\infty} |y| f_{X,Y}(x,y) \\, dx 
     title: 'Introduction_to_Algorithms_Ch13_RBT.pdf',
     sourceRefs: 'Ch 13 Red-Black Trees p.308 ~ p.338',
     pageCount: 31,
+    status: 'ready',
     isConverted: true,
+    isDemo: true,
+    hasAiConcepts: true,
+    hasAiProblems: true,
     uploadedAt: '2026-09-15T10:15:00+09:00',
+    parsedMarkdown: `# Chapter 13: Red-Black Trees (레드-블랙 트리)
+
+## 13.1 Properties of Red-Black Trees
+레드-블랙 트리는 각 노드가 색상 비트(Red 또는 Black)를 가지는 균형 이진 탐색 트리이다.
+
+### 5가지 불변식 (Invariants):
+1. **Node Color**: 모든 노드는 Red이거나 Black이다.
+2. **Root Property**: 루트 노드는 항상 Black이다.
+3. **Leaf Property**: 모든 잎 노드(NIL)는 Black이다.
+4. **Red Property**: 노드가 Red이면 그 자식들은 모두 Black이어야 한다 (연속된 Red 불가).
+5. **Black-Height Property**: 임의의 노드에서 그 자손 잎 노드까지의 모든 단순 경로에는 동일한 개수의 Black 노드가 포함된다.
+
+## 13.2 Rotations
+트리의 균형을 복구하기 위해 좌회전(Left-Rotate)과 우회전(Right-Rotate)을 $O(1)$ 시간에 수행한다.`,
   },
   {
     id: 'mat-cs-2',
@@ -118,8 +184,19 @@ $$\\int_{-\\infty}^{\\infty} \\int_{-\\infty}^{\\infty} |y| f_{X,Y}(x,y) \\, dx 
     title: 'CS201_05강_Dijkstra_Proof.pdf',
     sourceRefs: '강의 교안 05강 p.1 ~ p.34',
     pageCount: 34,
+    status: 'ready',
     isConverted: true,
+    isDemo: true,
+    hasAiConcepts: true,
+    hasAiProblems: true,
     uploadedAt: '2026-09-19T13:40:00+09:00',
+    parsedMarkdown: `# CS201 05강: 다익스트라 최단 경로 알고리즘과 정당성 증명
+
+## 알고리즘 개요
+음의 가중치가 없는 그래프 $G=(V, E, w)$에서 단일 출발점 최단 경로를 탐욕적(Greedy) 방식으로 구한다.
+
+## 정당성 증명 (수학적 귀납법)
+방문 집합 $S$에 새로운 정점 $u$가 추가될 때, $d[u]$는 $s$에서 $u$까지의 실제 최단 거리 $\\delta(s, u)$와 일치함을 불변식으로 증명한다.`,
   },
   {
     id: 'mat-cs-3',
@@ -128,8 +205,29 @@ $$\\int_{-\\infty}^{\\infty} \\int_{-\\infty}^{\\infty} |y| f_{X,Y}(x,y) \\, dx 
     title: 'CS201_전사본_8차시_NP_Reductions.txt',
     sourceRefs: '전사본 8차시 41:10',
     durationMinutes: 90,
+    status: 'ready',
     isConverted: true,
+    isDemo: true,
+    hasAiConcepts: true,
+    hasAiProblems: true,
+    speakerCount: 2,
+    speakers: ['교수', '학생'],
     uploadedAt: '2026-09-23T18:00:00+09:00',
+    parsedMarkdown: `# CS201 강의 전사본 8차시: NP-완전성 및 다항 시간 리덕션
+
+> ⏱️ **00:05:00** | **교수**
+이번 주차는 계산 복잡도 이론의 핵심인 P 대 NP 문제와 Cook-Levin 정리를 다룹니다.
+
+> ⏱️ **00:25:30** | **교수**
+어떤 문제 $B$가 NP-완전(NP-Complete)임을 증명하려면 다음 두 가지를 보여야 합니다:
+1. $B \\in NP$ (다항 시간 검증자 존재)
+2. 임의의 알려진 NP-완전 문제 $A$에 대하여 $A \\le_p B$ (다항 시간 환원)
+
+> ⏱️ **00:41:10** | **학생**
+환원의 방향이 헷갈립니다. $A \\le_p B$라면 $B$를 풀 수 있는 알고리즘으로 $A$를 푼다는 뜻인가요?
+
+> ⏱️ **00:41:40** | **교수**
+맞습니다! $B$가 풀리면 $A$도 풀리므로, $B$는 적어도 $A$만큼 어렵다는 뜻입니다.`,
   },
 ];
 

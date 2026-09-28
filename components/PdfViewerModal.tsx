@@ -1,14 +1,18 @@
 'use client';
 
-import React from 'react';
-import { MathFormula } from './MathFormula';
-import { X, BookOpen, ExternalLink, Printer } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Material } from '../lib/types';
+import { loadMaterialContent } from '../lib/materialStorage';
+import { MarkdownRenderer } from './MarkdownRenderer';
+import { X, BookOpen, ExternalLink, FileText, Mic, AlertTriangle } from 'lucide-react';
 
 interface PdfViewerModalProps {
   isOpen: boolean;
   onClose: () => void;
   sourceRef: string;
   conceptTitle?: string;
+  material?: Material | null;
+  onOpenEditor?: (material: Material) => void;
 }
 
 export function PdfViewerModal({
@@ -16,18 +20,44 @@ export function PdfViewerModal({
   onClose,
   sourceRef,
   conceptTitle,
+  material,
+  onOpenEditor,
 }: PdfViewerModalProps) {
+  const [contentMarkdown, setContentMarkdown] = useState<string>('');
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    if (material) {
+      setIsLoading(true);
+      loadMaterialContent(material.id)
+        .then((saved) => {
+          setContentMarkdown(saved?.markdown || material.parsedMarkdown || '');
+        })
+        .finally(() => {
+          setIsLoading(false);
+        });
+    } else {
+      setContentMarkdown('');
+    }
+  }, [isOpen, material]);
+
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto">
-      <div className="w-full max-w-3xl bg-white border border-[#c8c2b5] rounded-xs shadow-xl my-auto overflow-hidden flex flex-col max-h-[90vh]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/60 backdrop-blur-xs overflow-y-auto">
+      <div className="w-full max-w-3xl bg-white border border-[#c8c2b5] rounded-xs shadow-2xl my-auto overflow-hidden flex flex-col max-h-[90vh]">
         {/* Header */}
-        <div className="bg-[#191817] text-white px-5 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <BookOpen className="w-4 h-4 text-[#c52828]" />
+        <div className="bg-[#191817] text-white px-5 py-3 flex items-center justify-between border-b border-[#33302b]">
+          <div className="flex items-center gap-2 overflow-hidden">
+            {material?.kind === 'transcript' ? (
+              <Mic className="w-4 h-4 text-amber-500 shrink-0" />
+            ) : (
+              <BookOpen className="w-4 h-4 text-[#c52828] shrink-0" />
+            )}
             <h3 className="font-academic-serif text-sm font-bold truncate max-w-[450px]">
-              원문 교재 및 강의자료 열람: {sourceRef}
+              {material ? material.title : `자료 열람: ${sourceRef}`}
             </h3>
           </div>
           <button onClick={onClose} className="text-[#ded6c8] hover:text-white" aria-label="닫기">
@@ -35,54 +65,60 @@ export function PdfViewerModal({
           </button>
         </div>
 
+        {/* Top Reference Meta */}
+        <div className="border-b border-[#ded6c8] bg-[#faf8f4] px-5 py-2 flex items-center justify-between text-xs text-[#57544e] font-academic-mono">
+          <span>참조 위치: § {material ? material.sourceRefs : sourceRef}</span>
+          <span>연결 개념: {conceptTitle || (material?.isDemo ? '데모 학습 자료' : '사용자 등록 자료')}</span>
+        </div>
+
         {/* Reader Document Body */}
-        <div className="p-6 overflow-y-auto space-y-4 font-sans text-xs sm:text-sm text-[#191817] leading-relaxed bg-[#fdfcfb]">
-          <div className="border-b border-[#ded6c8] pb-3 flex items-center justify-between text-xs text-[#827d73] font-academic-mono">
-            <span>참조 위치: § {sourceRef}</span>
-            <span>연결 개념: {conceptTitle || '대학 논술 학습 자료'}</span>
-          </div>
-
-          <div className="space-y-4 font-academic-serif">
-            <h2 className="text-base sm:text-lg font-bold text-[#191817] border-l-2 border-[#c52828] pl-3">
-              제3장 조건부분포 및 조건부 기댓값 (Law of Iterated Expectations)
-            </h2>
-
-            <p className="text-justify font-sans text-xs sm:text-sm text-[#33302b]">
-              확률변수 X와 Y가 연속형 결합확률밀도함수 f(x,y)를 가질 때, 주어진 X=x 조건 하에서 Y의 조건부 기댓값 E[Y|X=x]는 다음과 같이 적분 형태로 정의된다.
-            </p>
-
-            <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs text-center overflow-x-auto my-2">
-              <MathFormula
-                math="E[Y|X=x] = \int_{-\infty}^{\infty} y f_{Y|X}(y|x) \, dy = \int_{-\infty}^{\infty} y \frac{f_{X,Y}(x,y)}{f_X(x)} \, dy"
-                displayMode
-              />
+        <div className="p-6 overflow-y-auto space-y-4 font-sans text-xs sm:text-sm text-[#191817] leading-relaxed bg-[#fdfcfb] min-h-[300px]">
+          {isLoading ? (
+            <div className="py-20 flex flex-col items-center justify-center gap-2 text-xs text-[#57544e]">
+              <div className="w-6 h-6 border-2 border-[#c52828] border-t-transparent rounded-full animate-spin" />
+              <span>자료를 불러오는 중입니다...</span>
             </div>
-
-            <h4 className="font-bold text-sm text-[#191817] pt-2">정리 3.4 (반복 기댓값의 법칙, Tower Property)</h4>
-            <p className="font-sans text-xs sm:text-sm text-[#33302b]">
-              만약 <MathFormula math="E[|Y|] < \infty" /> 이 성립하면, 다음이 성립한다:
-            </p>
-
-            <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs text-center overflow-x-auto my-2">
-              <MathFormula math="E\big[E[Y|X]\big] = E[Y]" displayMode />
-            </div>
-
-            <div className="p-3.5 bg-amber-50/70 border border-amber-200 rounded-xs text-xs space-y-1 font-sans">
-              <div className="font-bold text-amber-900 font-academic-mono">
-                [교재 각주 및 시험 출제 주의사항]
-              </div>
-              <p className="text-amber-800 leading-relaxed">
-                적분 순서를 교환하기 위해서는 <strong>푸비니 정리(Fubini&apos;s Theorem)</strong>의 절대수렴 조건인 <MathFormula math="\iint |y| f_{X,Y}(x,y) \, dx \, dy < \infty" /> 가 전제되어야 합니다. 대학 기말/중간 논술형 시험에서는 이 절대수렴 조건의 명시 여부가 핵심 감점 포인트로 작용합니다.
+          ) : contentMarkdown ? (
+            <MarkdownRenderer content={contentMarkdown} />
+          ) : (
+            <div className="py-16 text-center text-[#827d73] space-y-2">
+              <AlertTriangle className="w-8 h-8 text-amber-500 mx-auto" />
+              <div className="font-bold text-sm text-[#191817]">저장된 Markdown 본문이 없습니다.</div>
+              <p className="text-xs max-w-sm mx-auto leading-relaxed">
+                원본 PDF에서 아직 텍스트를 추출하지 못했거나 작성 중인 자료입니다. 원문 대조 편집기에서 내용을 입력하고 확인해 보세요.
               </p>
+              {material && onOpenEditor && (
+                <button
+                  onClick={() => {
+                    onClose();
+                    onOpenEditor(material);
+                  }}
+                  className="mt-3 px-3.5 py-1.5 bg-[#191817] text-white rounded text-xs font-bold inline-flex items-center gap-1.5"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>원문 대조 편집기 열기</span>
+                </button>
+              )}
             </div>
-          </div>
+          )}
         </div>
 
         {/* Footer */}
         <div className="bg-[#faf8f4] border-t border-[#ded6c8] px-5 py-3 flex items-center justify-between text-xs">
-          <span className="font-academic-mono text-[#827d73]">
-            VIEWER MODE: ACADEMIC_PAGE_PREVIEW
-          </span>
+          <div className="flex items-center gap-2">
+            {material && onOpenEditor && (
+              <button
+                onClick={() => {
+                  onClose();
+                  onOpenEditor(material);
+                }}
+                className="px-3 py-1.5 bg-white hover:bg-[#e8e4dc] border border-[#ded6c8] text-[#191817] rounded-xs font-medium flex items-center gap-1.5 transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5 text-[#c52828]" />
+                <span>원문 대조 편집기에서 열기</span>
+              </button>
+            )}
+          </div>
           <button
             onClick={onClose}
             className="px-4 py-1.5 bg-[#191817] text-white hover:bg-[#33302b] rounded-xs font-medium"

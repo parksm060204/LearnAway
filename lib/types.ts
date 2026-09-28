@@ -54,17 +54,36 @@ export interface Subject {
 
 export type MaterialKind = 'pdf' | 'transcript' | 'handout';
 
+export type MaterialConversionStatus = 'ready' | 'converting' | 'failed' | 'needs_review';
+
+export interface MaterialPage {
+  pageNumber: number;
+  markdown: string;
+  hasText: boolean;
+  rawText?: string;
+}
+
 export interface Material {
   id: string;
   subjectId: string;
   kind: MaterialKind;
   title: string;
-  sourceRefs: string;     // e.g. "제3장 조건부분포 p.40 ~ p.58"
+  sourceRefs: string;     // e.g. "제3장 조건부분포 p.40 ~ p.58" or "전사본 1~24발화"
   pageCount?: number;
   durationMinutes?: number;
   parsedMarkdown?: string;
+  rawText?: string;
+  pages?: MaterialPage[];
+  status: MaterialConversionStatus;
+  statusMessage?: string;
   isConverted: boolean;
+  isDemo?: boolean;        // true: 초기 데모 자료, false: 사용자 업로드 자료
   uploadedAt: string;
+  lastEditedAt?: string;
+  speakerCount?: number;
+  speakers?: string[];
+  hasAiConcepts?: boolean; // AI 개념 추출 완료 여부 (false면 'AI 개념 미추출')
+  hasAiProblems?: boolean; // AI 문제 생성 완료 여부 (false면 'AI 문제 미생성')
 }
 
 export interface RubricCriterion {

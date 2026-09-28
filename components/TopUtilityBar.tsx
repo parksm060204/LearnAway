@@ -13,6 +13,7 @@ import {
   Menu,
   X,
   Plus,
+  FolderOpen,
 } from 'lucide-react';
 
 interface TopUtilityBarProps {
@@ -21,6 +22,7 @@ interface TopUtilityBarProps {
   onSelectSubject: (subjectId: string) => void;
   onOpenAddSubject: () => void;
   onOpenUpload: () => void;
+  onOpenMaterialsList?: () => void;
   onOpenProblemSession: () => void;
   onOpenMockExam: () => void;
   onOpenSettings: () => void;
@@ -34,6 +36,7 @@ export function TopUtilityBar({
   onSelectSubject,
   onOpenAddSubject,
   onOpenUpload,
+  onOpenMaterialsList,
   onOpenProblemSession,
   onOpenMockExam,
   onOpenSettings,
@@ -156,6 +159,16 @@ export function TopUtilityBar({
             <span>자료 등록</span>
           </button>
 
+          {onOpenMaterialsList && (
+            <button
+              onClick={onOpenMaterialsList}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
+            >
+              <FolderOpen className="w-3.5 h-3.5 text-[#c52828]" />
+              <span>자료 보관함</span>
+            </button>
+          )}
+
           <button
             onClick={onOpenProblemSession}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
@@ -222,8 +235,21 @@ export function TopUtilityBar({
             className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
           >
             <Upload className="w-4 h-4 text-[#827d73]" />
-            <span>자료 업로드 (PDF / 전사본)</span>
+            <span>자료 등록 (PDF / 전사본)</span>
           </button>
+
+          {onOpenMaterialsList && (
+            <button
+              onClick={() => {
+                onOpenMaterialsList();
+                setIsMobileMenuOpen(false);
+              }}
+              className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+            >
+              <FolderOpen className="w-4 h-4 text-[#c52828]" />
+              <span>과목 자료 보관함</span>
+            </button>
+          )}
 
           <button
             onClick={() => {
