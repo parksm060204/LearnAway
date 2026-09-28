@@ -21,6 +21,7 @@ import {
   calculateCurrentConceptScore,
   getConceptStatusFromScore,
 } from './retentionModel';
+import { addDaysToDate } from './dateUtils';
 
 const STORAGE_KEYS = {
   CURRENT_SUBJECT_ID: 'redcall_active_subject_id',
@@ -102,14 +103,41 @@ export function saveStoredMaterials(materials: Material[]): void {
   safeSetItem(STORAGE_KEYS.MATERIALS, lightMaterials);
 }
 
-export function loadStoredConcepts(): Concept[] {
+export function loadStoredConcepts(referenceDate: Date = new Date()): Concept[] {
   const loaded = safeGetItem<Concept[]>(STORAGE_KEYS.CONCEPTS, INITIAL_CONCEPTS);
-  return loaded.map((c) => ({
-    ...c,
-    status: c.status || 'stable',
-    isDemo: c.isDemo ?? (c.id.startsWith('c-econ') || c.id.startsWith('c-cs')),
-    isLearned: c.isLearned ?? (c.id.startsWith('c-econ') || c.id.startsWith('c-cs')),
-  }));
+  const settings = safeGetItem<RetentionModelSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_RETENTION_SETTINGS);
+
+  return loaded.map((c) => {
+    const isDemo = c.isDemo ?? (c.id.startsWith('c-econ') || c.id.startsWith('c-cs'));
+    const isLearned = c.isLearned ?? isDemo;
+    const isUnstudied = c.status === 'unstudied' || (!isLearned && (!c.events || c.events.length === 0));
+
+    if (isUnstudied) {
+      return {
+        ...c,
+        status: 'unstudied' as ConceptStatus,
+        baseScore: 0,
+        currentScore: 0,
+        events: c.events || [],
+        isDemo,
+        isLearned: false,
+        postponeDays: c.postponeDays ?? 0,
+      };
+    }
+
+    // Dynamic model score recalculation using actual timestamps and elapsed time
+    const dynamicScore = calculateCurrentConceptScore(c.events, settings, referenceDate);
+    const dynamicStatus = getConceptStatusFromScore(dynamicScore);
+
+    return {
+      ...c,
+      status: dynamicStatus,
+      currentScore: dynamicScore,
+      isDemo,
+      isLearned: true,
+      postponeDays: c.postponeDays ?? 0,
+    };
+  });
 }
 
 export function saveStoredConcepts(concepts: Concept[]): void {
@@ -647,7 +675,7 @@ export function recordAttemptAndUpdateConcept(
     };
 
     const updatedEvents = [...c.events, newEvent];
-    const newCurrentScore = calculateCurrentConceptScore(updatedEvents, settings, 0);
+    const newCurrentScore = calculateCurrentConceptScore(updatedEvents, settings, new Date(attempt.at));
     const newStatus = getConceptStatusFromScore(newCurrentScore);
 
     return {
@@ -662,11 +690,51 @@ export function recordAttemptAndUpdateConcept(
       currentScore: newCurrentScore,
       status: newStatus,
       exerciseCount: c.exerciseCount + 1,
+      postponeDays: 0, // Reset postponement upon active confirmed review
+      postponedUntil: undefined,
     };
   });
 
   saveStoredConcepts(updatedConcepts);
   return { updatedConcepts, updatedAttempts: newAttempts };
+}
+
+/**
+ * Postpones a concept's review schedule by specified calendar days (default +1 day).
+ * CRITICAL INVARIANT: This modifies ONLY the schedule offset (postponeDays & postponedUntil).
+ * It NEVER inflates retention score, NEVER modifies baseScore, and NEVER appends fake ReviewEvents.
+ */
+export function postponeConceptReview(
+  conceptId: string,
+  daysToAdd: number = 1,
+  referenceDate: Date = new Date()
+): { updatedConcepts: Concept[]; postponedConcept: Concept | null } {
+  const currentConcepts = loadStoredConcepts(referenceDate);
+  let postponedConcept: Concept | null = null;
+
+  const updatedConcepts = currentConcepts.map((c) => {
+    if (c.id !== conceptId) return c;
+
+    const currentPostpone = c.postponeDays || 0;
+    const nextPostpone = currentPostpone + daysToAdd;
+    const postponedUntil = addDaysToDate(referenceDate, nextPostpone);
+
+    const updated: Concept = {
+      ...c,
+      postponeDays: nextPostpone,
+      postponedUntil,
+      // ABSOLUTE INTEGRITY: Retention score and review events remain unchanged
+      events: [...c.events],
+      baseScore: c.baseScore,
+      currentScore: c.currentScore,
+      status: c.status,
+    };
+    postponedConcept = updated;
+    return updated;
+  });
+
+  saveStoredConcepts(updatedConcepts);
+  return { updatedConcepts, postponedConcept };
 }
 
 export function getAttemptById(attemptId: string): Attempt | null {

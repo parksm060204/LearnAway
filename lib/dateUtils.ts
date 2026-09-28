@@ -6,10 +6,10 @@
 export const REFERENCE_NOW_ISO = '2026-09-28T22:47:12+09:00';
 
 /**
- * Returns current timestamp or reference timestamp
+ * Returns current timestamp in real runtime (no frozen static timestamp for live scheduling)
  */
 export function getCurrentDate(): Date {
-  return new Date(REFERENCE_NOW_ISO);
+  return new Date();
 }
 
 /**
@@ -26,6 +26,82 @@ export function toSeoulDateString(dateInput: string | Date): string {
     day: '2-digit',
   });
   return formatter.format(date); // returns YYYY-MM-DD
+}
+
+/**
+ * Calculates calendar day difference between two dates in Asia/Seoul:
+ * returns (toDate - fromDate) in whole calendar days.
+ * Handles midnight boundary transitions in KST cleanly.
+ */
+export function getSeoulCalendarDiff(fromDateInput: Date | string, toDateInput: Date | string): number {
+  const fromStr = toSeoulDateString(fromDateInput);
+  const toStr = toSeoulDateString(toDateInput);
+  if (!fromStr || !toStr) return 0;
+
+  const [y1, m1, d1] = fromStr.split('-').map(Number);
+  const [y2, m2, d2] = toStr.split('-').map(Number);
+
+  const utc1 = Date.UTC(y1, m1 - 1, d1);
+  const utc2 = Date.UTC(y2, m2 - 1, d2);
+
+  const msPerDay = 1000 * 60 * 60 * 24;
+  return Math.round((utc2 - utc1) / msPerDay);
+}
+
+/**
+ * Calculates real elapsed fractional days from an ISO timestamp to reference date.
+ */
+export function getElapsedDays(fromIso: string, referenceDate: Date = new Date()): number {
+  const from = new Date(fromIso);
+  if (isNaN(from.getTime())) return 0;
+  const diffMs = referenceDate.getTime() - from.getTime();
+  return Math.max(0, diffMs / (1000 * 60 * 60 * 24));
+}
+
+/**
+ * Formats a date in Asia/Seoul into compact label (e.g. "09.28", "2026.09.28 (월)")
+ */
+export function formatSeoulDate(
+  dateInput: string | Date,
+  options?: { includeYear?: boolean; includeDayName?: boolean }
+): string {
+  const date = typeof dateInput === 'string' ? new Date(dateInput) : dateInput;
+  if (isNaN(date.getTime())) return '';
+
+  const koreanDayNames = ['일', '월', '화', '수', '목', '금', '토'];
+
+  const formatter = new Intl.DateTimeFormat('ko-KR', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+
+  const parts = formatter.formatToParts(date);
+  const getPart = (type: string) => parts.find((p) => p.type === type)?.value || '';
+
+  const year = getPart('year');
+  const month = getPart('month');
+  const day = getPart('day');
+
+  const seoulDayIndex = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Seoul' })).getDay();
+  const dayName = koreanDayNames[seoulDayIndex];
+
+  let result = options?.includeYear ? `${year}.${month}.${day}` : `${month}.${day}`;
+  if (options?.includeDayName) {
+    result += ` (${dayName})`;
+  }
+  return result;
+}
+
+/**
+ * Adds whole calendar days to an Asia/Seoul date and returns ISO string
+ */
+export function addDaysToDate(baseDateInput: string | Date, daysToAdd: number): string {
+  const base = typeof baseDateInput === 'string' ? new Date(baseDateInput) : new Date(baseDateInput);
+  if (isNaN(base.getTime())) return new Date().toISOString();
+  const next = new Date(base.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
+  return next.toISOString();
 }
 
 /**

@@ -187,6 +187,32 @@ export interface Concept {
   examples?: string[];
   sourceEvidence?: ConceptEvidence;
   draftId?: string;
+  // Stage 5 fields: Spaced repetition recommendation & postpone tracking
+  postponeDays?: number;         // 미루기 누적 일수 (기본 0)
+  postponedUntil?: string;       // 미루기 적용 목표 일자 (ISO 또는 YYYY-MM-DD)
+  recommendedReviewAt?: string;  // 계산된 다음 권장 복습 시각 (ISO)
+  lastCalculatedAt?: string;     // 최근 스케줄 계산 시각
+}
+
+export interface ReviewRecommendation {
+  conceptId: string;
+  recommendedAt: string;          // ISO string e.g. "2026-09-30T10:00:00+09:00"
+  recommendedDateStr: string;     // YYYY-MM-DD in Asia/Seoul
+  daysUntilReview: number;        // negative = overdue, 0 = today, positive = future days
+  urgencyScore: number;           // Higher score = higher priority
+  priorityRank: number;           // Deterministic rank 1, 2, 3...
+  priorityReason: string;         // Human-readable rationale
+  isDueTodayOrOverdue: boolean;   // true if daysUntilReview <= 0
+  factors: {
+    lastScore: number;
+    elapsedDays: number;
+    effectiveTau: number;
+    confidenceFactor: number;
+    hintPenalty: number;
+    vulnerableCriterionCount: number;
+    examProximityWeight: number;
+    postponeDays: number;
+  };
 }
 
 export type ProblemDifficulty = 'advanced_college' | 'intermediate' | 'graduate_challenging';

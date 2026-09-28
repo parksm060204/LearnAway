@@ -3,7 +3,7 @@
 import React from 'react';
 import { Concept, ConceptStatus } from '../lib/types';
 import { CONCEPT_STATUS_METADATA } from '../lib/retentionModel';
-import { formatRelativeDay } from '../lib/dateUtils';
+import { formatRelativeDay, formatSeoulDate, getSeoulCalendarDiff } from '../lib/dateUtils';
 import { ArrowUpDown, CheckSquare, Square } from 'lucide-react';
 
 export type SortMode = 'vulnerability' | 'recent_study' | 'chapter_order';
@@ -199,22 +199,36 @@ export function ConceptRail({
 
                 {/* Metadata footer */}
                 <div className="mt-2.5 pt-2 border-t border-[#ede8de] space-y-0.5 text-[10px] sm:text-[11px] font-academic-mono text-[#57544e]">
-                  <div className="flex justify-between">
+                  <div className="flex justify-between items-center">
                     <span className="text-[#827d73]">최초 학습:</span>
                     <span className="text-[#191817]">
-                      {concept.status === 'unstudied' ? '미학습 대기' : `${concept.firstLearnedDayOffset ?? 0}일`}
+                      {concept.status === 'unstudied'
+                        ? '미학습 대기'
+                        : concept.firstLearnedAt
+                        ? formatSeoulDate(concept.firstLearnedAt)
+                        : `${concept.firstLearnedDayOffset ?? 0}일`}
                     </span>
                   </div>
-                  <div className="flex justify-between">
-                    <span className="text-[#827d73]">최근 풀:</span>
+                  <div className="flex justify-between items-center">
+                    <span className="text-[#827d73]">최근 풀이:</span>
                     <span className="text-[#191817]">
-                      {concept.lastAttemptDayOffset !== undefined
+                      {concept.lastAttemptAt
+                        ? getSeoulCalendarDiff(concept.lastAttemptAt, new Date()) === 0
+                          ? '오늘'
+                          : `${getSeoulCalendarDiff(concept.lastAttemptAt, new Date())}일 전`
+                        : concept.lastAttemptDayOffset !== undefined
                         ? concept.lastAttemptDayOffset === 0
                           ? '오늘'
                           : `${concept.lastAttemptDayOffset}일 전`
                         : '미실시'}
                     </span>
                   </div>
+                  {concept.postponeDays && concept.postponeDays > 0 ? (
+                    <div className="flex justify-between items-center text-blue-700">
+                      <span>일정 연기:</span>
+                      <span className="font-semibold">+{concept.postponeDays}일 미룸</span>
+                    </div>
+                  ) : null}
                   <div className="truncate text-[#827d73] pt-0.5" title={concept.chapterRef}>
                     <span className="text-[#827d73]">REF:</span> {concept.chapterRef}
                   </div>

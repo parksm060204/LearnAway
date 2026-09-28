@@ -36,8 +36,12 @@ import {
   saveStoredSettings,
   recordAttemptAndUpdateConcept,
   resetToInitialDemoData,
+  postponeConceptReview,
 } from '../lib/storage';
-import { DEFAULT_RETENTION_SETTINGS } from '../lib/retentionModel';
+import {
+  DEFAULT_RETENTION_SETTINGS,
+  rankConceptsForReview,
+} from '../lib/retentionModel';
 import { computeMarkdownHash } from '../lib/markdownUtils';
 import { TopUtilityBar } from '../components/TopUtilityBar';
 import { ExamRecordCard } from '../components/ExamRecordCard';
@@ -59,7 +63,7 @@ import { PdfViewerModal } from '../components/PdfViewerModal';
 import { SettingsModal } from '../components/SettingsModal';
 import { MockExamModal } from '../components/MockExamModal';
 import { AddSubjectModal } from '../components/AddSubjectModal';
-import { calculateDDay } from '../lib/dateUtils';
+import { calculateDDay, toSeoulDateString } from '../lib/dateUtils';
 import { CheckCircle2, Info } from 'lucide-react';
 
 export default function RedcallDashboardPage() {
@@ -142,9 +146,20 @@ export default function RedcallDashboardPage() {
     setAttempts(loadedAttempts);
     setSettings(loadedSettings);
 
-    // Initial concept selection
+    // Initial concept selection prioritizing top urgent review recommendation
     const subjectConcepts = loadedConcepts.filter((c) => c.subjectId === loadedSubjectId);
-    if (subjectConcepts.length > 0) {
+    const activeSub = loadedSubjects.find((s) => s.id === loadedSubjectId);
+    const initialRanking = rankConceptsForReview(subjectConcepts, loadedSettings, activeSub?.examAt, new Date());
+
+    if (initialRanking.rankedRecommendations.length > 0) {
+      const topId = initialRanking.rankedRecommendations[0].conceptId;
+      setSelectedConceptId(topId);
+      const topConcept = subjectConcepts.find((c) => c.id === topId);
+      const lastEvent = topConcept?.events[topConcept.events.length - 1];
+      if (lastEvent) {
+        setSelectedEventId(lastEvent.id);
+      }
+    } else if (subjectConcepts.length > 0) {
       const firstConcept = subjectConcepts[0];
       setSelectedConceptId(firstConcept.id);
       const lastEvent = firstConcept.events[firstConcept.events.length - 1];
@@ -222,14 +237,43 @@ export default function RedcallDashboardPage() {
     return calc.calendarDiff > 0 ? calc.calendarDiff : 14;
   }, [activeSubject]);
 
-  // Subject Switch Handler
+  // Stage 5: Deterministic Spaced Repetition Review Recommendations & Urgency Ranking
+  const reviewRanking = useMemo(() => {
+    if (!activeSubject) {
+      return { rankedRecommendations: [], dueTodayCount: 0, unstudiedConcepts: [] };
+    }
+    return rankConceptsForReview(
+      subjectConcepts,
+      settings,
+      activeSubject.examAt,
+      new Date()
+    );
+  }, [subjectConcepts, settings, activeSubject]);
+
+  const selectedConceptRecommendation = useMemo(() => {
+    if (!selectedConcept) return null;
+    return (
+      reviewRanking.rankedRecommendations.find((r) => r.conceptId === selectedConcept.id) || null
+    );
+  }, [reviewRanking, selectedConcept]);
+
+  // Subject Switch Handler (Clean Isolation between subjects)
   const handleSelectSubject = (newSubjectId: string) => {
     setActiveSubjectId(newSubjectId);
     saveActiveSubjectId(newSubjectId);
 
-    // Select first concept in new subject
+    // Select top recommended concept or first concept in new subject
     const newConcepts = allConcepts.filter((c) => c.subjectId === newSubjectId);
-    if (newConcepts.length > 0) {
+    const newSubject = subjects.find((s) => s.id === newSubjectId);
+    const ranking = rankConceptsForReview(newConcepts, settings, newSubject?.examAt, new Date());
+
+    if (ranking.rankedRecommendations.length > 0) {
+      const topConceptId = ranking.rankedRecommendations[0].conceptId;
+      setSelectedConceptId(topConceptId);
+      const topConcept = newConcepts.find((c) => c.id === topConceptId);
+      const lastEvent = topConcept?.events[topConcept.events.length - 1];
+      setSelectedEventId(lastEvent ? lastEvent.id : null);
+    } else if (newConcepts.length > 0) {
       setSelectedConceptId(newConcepts[0].id);
       const lastEvent = newConcepts[0].events[newConcepts[0].events.length - 1];
       setSelectedEventId(lastEvent ? lastEvent.id : null);
@@ -462,9 +506,20 @@ export default function RedcallDashboardPage() {
     showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
   };
 
-  // Postpone 1 day
-  const handlePostponeDay = () => {
-    showToast(`[${selectedConcept?.title || '개념'}]의 권장 복습일정이 +1일 연기되었습니다.`);
+  // Postpone 1 day (Schedule shift only: does not boost score or create events)
+  const handlePostponeDay = (conceptId?: string) => {
+    const targetId = conceptId || selectedConcept?.id;
+    if (!targetId) return;
+
+    const { updatedConcepts, postponedConcept } = postponeConceptReview(targetId, 1);
+    setAllConcepts(updatedConcepts);
+
+    const targetDate = postponedConcept?.postponedUntil
+      ? toSeoulDateString(postponedConcept.postponedUntil)
+      : '익일';
+    showToast(
+      `[${postponedConcept?.title || '개념'}] 권장 복습일정이 +1일 연기되었습니다. (누적 +${postponedConcept?.postponeDays || 1}일, 다음 권장일: ${targetDate})`
+    );
   };
 
   // Scroll to Today Review panel
@@ -574,6 +629,7 @@ export default function RedcallDashboardPage() {
                 onSelectEvent={(evId) => setSelectedEventId(evId)}
                 settings={settings}
                 examDayOffset={examDDay}
+                hasExamDate={Boolean(activeSubject.examAt && !isNaN(new Date(activeSubject.examAt).getTime()))}
               />
             )}
 
@@ -597,12 +653,24 @@ export default function RedcallDashboardPage() {
                 problems={subjectProblems}
                 selectedProblemType={selectedProblemType}
                 onSelectProblemType={setSelectedProblemType}
-                onStartSession={() => setIsProblemSessionOpen(true)}
+                onStartSession={(problemId) => {
+                  if (problemId) {
+                    setActiveProblemIdForSession(problemId);
+                  }
+                  setIsProblemSessionOpen(true);
+                }}
                 onPostponeDay={handlePostponeDay}
                 onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
-                onOpenProblemGenerator={() => setIsProblemGeneratorOpen(true)}
+                onOpenProblemGenerator={(conceptId) => {
+                  if (conceptId) {
+                    setSelectedConceptId(conceptId);
+                  }
+                  setIsProblemGeneratorOpen(true);
+                }}
                 onOpenProblemReview={() => setIsProblemReviewOpen(true)}
                 problemDraftCount={activeSubjectProblemDrafts.length}
+                recommendation={selectedConceptRecommendation}
+                totalConceptsCount={subjectConcepts.length}
               />
             )}
           </div>

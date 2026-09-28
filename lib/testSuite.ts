@@ -1,9 +1,22 @@
-import { calculateDDay, formatExamDate, toSeoulDateString } from './dateUtils';
+import {
+  calculateDDay,
+  formatExamDate,
+  toSeoulDateString,
+  getSeoulCalendarDiff,
+  getElapsedDays,
+  formatSeoulDate,
+  addDaysToDate,
+} from './dateUtils';
 import {
   calculatePowerLawRetention,
   getEffectiveTau,
+  calculateComprehensiveTau,
   calculateCurrentConceptScore,
+  calculatePowerLawOptimalInterval,
+  calculateNextReviewRecommendation,
+  rankConceptsForReview,
   generateConceptTrajectory,
+  getConfirmedEvents,
   DEFAULT_RETENTION_SETTINGS,
 } from './retentionModel';
 import {
@@ -12,7 +25,11 @@ import {
   INITIAL_PROBLEMS,
   INITIAL_MATERIALS,
 } from './initialData';
-import { recordAttemptAndUpdateConcept } from './storage';
+import {
+  recordAttemptAndUpdateConcept,
+  postponeConceptReview,
+  loadStoredConcepts,
+} from './storage';
 import { Attempt } from './types';
 
 function runTests() {
@@ -511,7 +528,181 @@ function runTests() {
     assert(retrievedAttempt?.calculatedScore === stage4Attempt.calculatedScore, 'Retrieved attempt contains original calculatedScore');
     assert(retrievedAttempt?.rubricResults.length === stage4Rubric.length, 'Retrieved attempt contains full itemized rubric results');
 
-    console.log(`\n=== ALL STAGE 1, 2, 3 & 4 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
+    // 24. Stage 5: Timestamp-based Asia/Seoul Calendar & Elapsed Time Calculation
+    console.log('\n--- 24. Testing Real Timestamp-Based Asia/Seoul Calendar & Elapsed Day Calculations ---');
+    const refSeoulTime = new Date('2026-09-29T10:00:00+09:00');
+    const eventTime1 = '2026-09-26T16:00:00+09:00'; // 3 calendar days ago
+    const eventTime2 = '2026-09-29T02:00:00+09:00'; // same calendar day (midnight crossed)
+    const futureTime = '2026-10-12T10:00:00+09:00'; // +13 calendar days
+
+    const diff1 = getSeoulCalendarDiff(eventTime1, refSeoulTime);
+    assert(diff1 === 3, `Calendar day diff in Asia/Seoul is exactly 3 days (got ${diff1})`);
+
+    const diffMidnight = getSeoulCalendarDiff(eventTime2, refSeoulTime);
+    assert(diffMidnight === 0, `Same calendar day across midnight yields 0 days (got ${diffMidnight})`);
+
+    const diffFuture = getSeoulCalendarDiff(refSeoulTime, futureTime);
+    assert(diffFuture === 13, `Future date calendar diff is exactly +13 days (got ${diffFuture})`);
+
+    const fractionalElapsed = getElapsedDays(eventTime1, refSeoulTime);
+    assert(
+      fractionalElapsed > 2.7 && fractionalElapsed < 2.8,
+      `Exact fractional elapsed days calculated accurately (~2.75 days, got ${fractionalElapsed.toFixed(2)})`
+    );
+
+    // 25. Stage 5: Spaced Repetition Optimal Interval & Factor Sensitivity
+    console.log('\n--- 25. Testing Optimal Review Interval & Factor Sensitivity ---');
+    // High confidence (5) vs Low confidence (1)
+    const tauHighConf = calculateComprehensiveTau(2.5, 1, 5, 0, 0);
+    const tauLowConf = calculateComprehensiveTau(2.5, 1, 1, 0, 0);
+    assert(
+      tauHighConf > tauLowConf,
+      `Higher confidence yields greater stability: tauHigh(${tauHighConf}) > tauLow(${tauLowConf})`
+    );
+
+    // Hint usage penalty
+    const tauNoHints = calculateComprehensiveTau(2.5, 1, 3, 0, 0);
+    const tauWithHints = calculateComprehensiveTau(2.5, 1, 3, 3, 0);
+    assert(
+      tauNoHints > tauWithHints,
+      `Using hints reduces stability: tauNoHints(${tauNoHints}) > tauWithHints(${tauWithHints})`
+    );
+
+    // Vulnerable rubric items penalty
+    const tauCleanRubric = calculateComprehensiveTau(2.5, 1, 3, 0, 0);
+    const tauVulnerableRubric = calculateComprehensiveTau(2.5, 1, 3, 0, 2);
+    assert(
+      tauCleanRubric > tauVulnerableRubric,
+      `Vulnerable rubric items accelerate decay: clean(${tauCleanRubric}) > vulnerable(${tauVulnerableRubric})`
+    );
+
+    // Power-law inversion formula: interval where R(t*) = threshold
+    const interval88 = calculatePowerLawOptimalInterval(88, 2.5, 0.55, 50.0);
+    assert(
+      interval88 > 2.0 && interval88 < 8.0,
+      `Power-law inversion yields reasonable optimal review interval (~4-6 days, got ${interval88.toFixed(2)})`
+    );
+
+    const intervalBelowThreshold = calculatePowerLawOptimalInterval(45, 2.5, 0.55, 50.0);
+    assert(
+      intervalBelowThreshold === 0,
+      'Score already at or below critical threshold triggers immediate review (interval = 0)'
+    );
+
+    // 26. Stage 5: Postpone (+1 Day) Invariant (No Fake Score Boost or Events)
+    console.log('\n--- 26. Testing Postpone (+1 Day) Invariant (No Fake Score Boost or Events) ---');
+    const conceptsBeforePostpone: any[] = loadStoredConcepts(refSeoulTime);
+    const targetC = conceptsBeforePostpone.find((c: any) => c.id === 'c-econ-01')!;
+    const scoreBefore = targetC.currentScore;
+    const baseScoreBefore = targetC.baseScore;
+    const eventCountBefore = targetC.events.length;
+    const initialPostpone = targetC.postponeDays || 0;
+
+    const postponeResult1 = postponeConceptReview(targetC.id, 1, refSeoulTime);
+    const postponedC1 = postponeResult1.postponedConcept!;
+
+    assert(
+      postponedC1.postponeDays === initialPostpone + 1,
+      `Postpone increments postponeDays by 1 (was ${initialPostpone}, now ${postponedC1.postponeDays})`
+    );
+    assert(
+      postponedC1.currentScore === scoreBefore,
+      `CRITICAL INVARIANT: Postpone does NOT inflate currentScore (${postponedC1.currentScore} === ${scoreBefore})`
+    );
+    assert(
+      postponedC1.baseScore === baseScoreBefore,
+      `CRITICAL INVARIANT: Postpone does NOT modify baseScore (${postponedC1.baseScore} === ${baseScoreBefore})`
+    );
+    assert(
+      postponedC1.events.length === eventCountBefore,
+      `CRITICAL INVARIANT: Postpone does NOT append fake ReviewEvents (${postponedC1.events.length} === ${eventCountBefore})`
+    );
+    assert(
+      Boolean(postponedC1.postponedUntil),
+      `Postponed target date safely stored in postponedUntil (${postponedC1.postponedUntil})`
+    );
+
+    // Second consecutive postpone adds another day
+    const postponeResult2 = postponeConceptReview(targetC.id, 1, refSeoulTime);
+    assert(
+      postponeResult2.postponedConcept!.postponeDays === initialPostpone + 2,
+      'Consecutive postpone shifts schedule additively (+2 days)'
+    );
+
+    // 27. Stage 5: Deterministic Review Urgency Ranking
+    console.log('\n--- 27. Testing Deterministic Review Urgency Ranking ---');
+    const rankingEcon = rankConceptsForReview(
+      conceptsBeforePostpone.filter((c: any) => c.subjectId === 'subj-econ302'),
+      DEFAULT_RETENTION_SETTINGS,
+      '2026-10-12T10:00:00+09:00',
+      refSeoulTime
+    );
+
+    assert(rankingEcon.rankedRecommendations.length > 0, 'Generated ranked recommendations for ECON302');
+    assert(
+      rankingEcon.rankedRecommendations[0].priorityRank === 1,
+      'Top recommendation assigned priorityRank = 1'
+    );
+    assert(
+      rankingEcon.rankedRecommendations[0].urgencyScore >= rankingEcon.rankedRecommendations[1].urgencyScore,
+      `Deterministic ordering: Rank 1 urgency (${rankingEcon.rankedRecommendations[0].urgencyScore}) >= Rank 2 (${rankingEcon.rankedRecommendations[1].urgencyScore})`
+    );
+
+    // Concept with low score (c-econ-01: ~48 score) is due today or overdue
+    const recC1 = rankingEcon.rankedRecommendations.find((r) => r.conceptId === 'c-econ-01');
+    assert(recC1 !== undefined, 'Concept 1 included in recommendations');
+    assert(
+      recC1!.priorityReason.includes('모델 점수') || recC1!.priorityReason.includes('임계치'),
+      `Priority rationale clearly explains factors: "${recC1!.priorityReason}"`
+    );
+
+    // 28. Stage 5: Dynamic Trajectory Projection to Exam Date vs Unset Exam & Unstudied Concepts
+    console.log('\n--- 28. Testing Dynamic Trajectory to Exam Date vs Unset Exam & Unstudied Concepts ---');
+    // Concept with exam date
+    const trajWithExam = generateConceptTrajectory(targetC, DEFAULT_RETENTION_SETTINGS, 13, refSeoulTime);
+    assert(trajWithExam.hasExamDate === true, 'trajWithExam recognizes set exam date');
+    assert(trajWithExam.historyCurve.length > 0, 'Contains observed historical points');
+    assert(
+      trajWithExam.historyCurve.some((pt) => pt.isEventPoint && pt.dateStr),
+      'Event dots annotated with real calendar dates'
+    );
+    assert(trajWithExam.dateTicks.some((t) => t.isToday), 'Chart X-axis includes dynamic Today tick');
+    assert(trajWithExam.dateTicks.some((t) => t.isExam), 'Chart X-axis includes dynamic Exam Day tick');
+
+    // Unset exam fallback
+    const trajUnsetExam = generateConceptTrajectory(targetC, DEFAULT_RETENTION_SETTINGS, 0, refSeoulTime);
+    assert(trajUnsetExam.hasExamDate === false, 'trajUnsetExam cleanly flags hasExamDate = false');
+
+    // Unstudied concept invariant
+    const unstudiedConcept = {
+      ...targetC,
+      id: 'c-test-unstudied',
+      status: 'unstudied' as const,
+      events: [],
+      currentScore: 0,
+      baseScore: 0,
+    };
+    const trajUnstudied = generateConceptTrajectory(unstudiedConcept, DEFAULT_RETENTION_SETTINGS, 13, refSeoulTime);
+    assert(trajUnstudied.isUnstudied === true, 'Unstudied concept isUnstudied flag is true');
+    assert(trajUnstudied.historyCurve.length === 0, 'Unstudied concept has ZERO fake history coordinates');
+    assert(trajUnstudied.neglectedProjection.length === 0, 'Unstudied concept has ZERO fake projection coordinates');
+    assert(trajUnstudied.currentScore === 0, 'Unstudied concept score is strictly 0 (SCORE --)');
+
+    // 29. Stage 5: Subject Data Isolation & Non-Contamination
+    console.log('\n--- 29. Testing Subject Data Isolation & Recommendation Scoping ---');
+    const csConcepts = conceptsBeforePostpone.filter((c: any) => c.subjectId === 'subj-cs201');
+    const rankingCs = rankConceptsForReview(csConcepts, DEFAULT_RETENTION_SETTINGS, undefined, refSeoulTime);
+
+    assert(
+      !rankingCs.rankedRecommendations.some((r) => r.conceptId.startsWith('c-econ')),
+      'CS201 recommendations contain NO ECON302 concepts'
+    );
+    assert(
+      !rankingEcon.rankedRecommendations.some((r) => r.conceptId.startsWith('c-cs')),
+      'ECON302 recommendations contain NO CS201 concepts'
+    );
+
+    console.log(`\n=== ALL STAGE 1, 2, 3, 4 & 5 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
     if (failed > 0) {
       process.exit(1);
     }
@@ -519,3 +710,4 @@ function runTests() {
 }
 
 runTests();
+
