@@ -36,18 +36,20 @@ export type ConceptStatus =
 
 export interface Subject {
   id: string;
+  ownerId?: string;        // 사용자 계정 연결 확장용 소유자 ID (로그인 미구현)
   name: string;
   code: string;
-  semester: string;
-  examAt: string;          // ISO string e.g. "2026-10-12T10:00:00+09:00"
+  semester?: string;
+  examAt?: string;          // ISO string e.g. "2026-10-12T10:00:00+09:00", optional
   examEndTime?: string;    // e.g. "12:00"
-  location: string;
+  location?: string;
   timezone: Timezone;
-  scope: string;
-  chapters: string[];
-  lastEvaluatedAt: string; // ISO string
-  engineName: string;
-  domain: 'math_stats' | 'computer_science';
+  scope?: string;
+  chapters?: string[];
+  lastEvaluatedAt?: string; // ISO string
+  engineName?: string;
+  domain?: 'math_stats' | 'computer_science';
+  isDemo?: boolean;        // 초기 예시 과목 데모 데이터 표기
 }
 
 export type MaterialKind = 'pdf' | 'transcript' | 'handout';

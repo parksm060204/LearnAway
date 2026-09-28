@@ -47,6 +47,10 @@ function runTests() {
   const ddayPast = calculateDDay('2026-09-20T10:00:00+09:00', new Date('2026-09-28T10:00:00+09:00'));
   assert(ddayPast.displayBadge === '시험 종료', 'Past date yields 시험 종료', ddayPast);
 
+  const ddayUnset = calculateDDay(undefined);
+  assert(ddayUnset.displayBadge === '시험일 설정', 'Unset exam date yields 시험일 설정', ddayUnset);
+  assert(ddayUnset.isNotSet === true, 'ddayUnset.isNotSet is true');
+
   // 2. Pure Power-Law Retention Model tests
   console.log('\n--- 2. Testing Power-Law Retention Decay Model ---');
   const r0 = calculatePowerLawRetention(0, 88);

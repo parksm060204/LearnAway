@@ -134,8 +134,11 @@ export function ForgettingCurveChart({
               망각곡선 감쇠 궤적 분석: {concept.title}
             </h2>
           </div>
-          <div className="text-[11px] font-academic-mono text-[#827d73] mt-0.5">
-            MATHEMATICAL MODEL: R(t) = S0 · (1 + t/τ)^(-α) [Power-Law Retention Model · 데모 시연용 지수]
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-academic-mono text-[#827d73] mt-0.5">
+            <span>MATHEMATICAL MODEL: R(t) = S0 · (1 + t/τ)^(-α)</span>
+            <span className="text-[10px] bg-[#f4f1ea] border border-[#ded6c8] text-[#827d73] px-1.5 py-0.5 rounded-2xs">
+              0단계 시각적 배치 데모 · 다음 단계 동적 감쇠 계산 연동 예정
+            </span>
           </div>
         </div>
 

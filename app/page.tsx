@@ -42,6 +42,7 @@ import { MaterialUploadModal } from '../components/MaterialUploadModal';
 import { PdfViewerModal } from '../components/PdfViewerModal';
 import { SettingsModal } from '../components/SettingsModal';
 import { MockExamModal } from '../components/MockExamModal';
+import { AddSubjectModal } from '../components/AddSubjectModal';
 import { calculateDDay } from '../lib/dateUtils';
 import { CheckCircle2, Info } from 'lucide-react';
 
@@ -69,6 +70,7 @@ export default function RedcallDashboardPage() {
   const [comparedConceptIds, setComparedConceptIds] = useState<string[]>([]);
 
   // Modals Visibility
+  const [isAddSubjectModalOpen, setIsAddSubjectModalOpen] = useState(false);
   const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
   const [isScopeModalOpen, setIsScopeModalOpen] = useState(false);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
@@ -195,6 +197,15 @@ export default function RedcallDashboardPage() {
     showToast(`과목이 [${targetSubject?.name || '새 과목'}]으로 전환되었습니다.`);
   };
 
+  // Add Subject Handler (Stage 0)
+  const handleAddSubject = (newSubject: Subject) => {
+    const updated = [...subjects, newSubject];
+    setSubjects(updated);
+    saveStoredSubjects(updated);
+    handleSelectSubject(newSubject.id);
+    showToast(`새 과목 폴더 [${newSubject.name}]이 생성되었습니다.`);
+  };
+
   // Concept Selection Handler
   const handleSelectConcept = (conceptId: string) => {
     setSelectedConceptId(conceptId);
@@ -295,6 +306,7 @@ export default function RedcallDashboardPage() {
         subjects={subjects}
         activeSubject={activeSubject}
         onSelectSubject={handleSelectSubject}
+        onOpenAddSubject={() => setIsAddSubjectModalOpen(true)}
         onOpenUpload={() => setIsUploadModalOpen(true)}
         onOpenProblemSession={() => setIsProblemSessionOpen(true)}
         onOpenMockExam={() => setIsMockExamModalOpen(true)}
@@ -491,6 +503,13 @@ export default function RedcallDashboardPage() {
         onStartExamReview={() => {
           setIsProblemSessionOpen(true);
         }}
+      />
+
+      {/* 8. Add Subject Modal (Stage 0) */}
+      <AddSubjectModal
+        isOpen={isAddSubjectModalOpen}
+        onClose={() => setIsAddSubjectModalOpen(false)}
+        onAddSubject={handleAddSubject}
       />
     </div>
   );

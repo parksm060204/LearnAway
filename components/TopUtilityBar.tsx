@@ -12,12 +12,14 @@ import {
   ChevronDown,
   Menu,
   X,
+  Plus,
 } from 'lucide-react';
 
 interface TopUtilityBarProps {
   subjects: Subject[];
   activeSubject: Subject;
   onSelectSubject: (subjectId: string) => void;
+  onOpenAddSubject: () => void;
   onOpenUpload: () => void;
   onOpenProblemSession: () => void;
   onOpenMockExam: () => void;
@@ -30,6 +32,7 @@ export function TopUtilityBar({
   subjects,
   activeSubject,
   onSelectSubject,
+  onOpenAddSubject,
   onOpenUpload,
   onOpenProblemSession,
   onOpenMockExam,
@@ -68,38 +71,68 @@ export function TopUtilityBar({
             >
               <span className="text-[#827d73] font-academic-mono text-xs">REF:{activeSubject.code.replace('§', '')}</span>
               <span className="truncate max-w-[140px] sm:max-w-[220px]">{activeSubject.name}</span>
+              {activeSubject.isDemo && (
+                <span className="text-[10px] font-academic-mono bg-[#f4f1ea] text-[#827d73] px-1.5 py-0.5 rounded-xs border border-[#ded6c8]">
+                  데모
+                </span>
+              )}
               <ChevronDown className="w-3.5 h-3.5 text-[#827d73]" />
             </button>
 
             {isDropdownOpen && (
-              <div className="absolute left-0 mt-1 w-72 bg-white border border-[#c8c2b5] shadow-lg rounded-xs z-50 py-1 font-sans">
-                <div className="px-3 py-1.5 text-[11px] font-academic-mono text-[#827d73] border-b border-[#f1ede4] bg-[#faf8f4]">
-                  과목 전환 (과목별 데이터 격리)
+              <div className="absolute left-0 mt-1 w-80 bg-white border border-[#c8c2b5] shadow-lg rounded-xs z-50 py-1 font-sans">
+                <div className="px-3 py-1.5 text-[11px] font-academic-mono text-[#827d73] border-b border-[#f1ede4] bg-[#faf8f4] flex justify-between items-center">
+                  <span>과목 폴더 선택</span>
+                  <span>{subjects.length}개 보관</span>
                 </div>
-                {subjects.map((sub) => (
-                  <button
-                    key={sub.id}
-                    onClick={() => {
-                      onSelectSubject(sub.id);
-                      setIsDropdownOpen(false);
-                    }}
-                    className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between hover:bg-[#faf8f4] transition-colors ${
-                      sub.id === activeSubject.id
-                        ? 'font-bold text-[#c52828] bg-[#fef2f2]'
-                        : 'text-[#191817]'
-                    }`}
-                  >
-                    <div>
-                      <div className="font-medium">{sub.name}</div>
-                      <div className="text-[11px] text-[#827d73] font-academic-mono">
-                        {sub.code} · {sub.domain === 'math_stats' ? '수리통계/대학수학' : '컴퓨터공학/알고리즘'}
+                <div className="max-h-60 overflow-y-auto">
+                  {subjects.map((sub) => (
+                    <button
+                      key={sub.id}
+                      onClick={() => {
+                        onSelectSubject(sub.id);
+                        setIsDropdownOpen(false);
+                      }}
+                      className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between hover:bg-[#faf8f4] transition-colors ${
+                        sub.id === activeSubject.id
+                          ? 'font-bold text-[#c52828] bg-[#fef2f2]'
+                          : 'text-[#191817]'
+                      }`}
+                    >
+                      <div>
+                        <div className="font-medium flex items-center gap-1.5">
+                          <span>{sub.name}</span>
+                          {sub.isDemo && (
+                            <span className="text-[9.5px] font-academic-mono text-[#827d73] border border-[#ded6c8] px-1 rounded-2xs">
+                              데모
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-[#827d73] font-academic-mono">
+                          {sub.code} · {sub.domain === 'math_stats' ? '수학/수리통계' : '컴퓨터공학/코딩'}
+                        </div>
                       </div>
-                    </div>
-                    {sub.id === activeSubject.id && (
-                      <span className="w-1.5 h-1.5 rounded-full bg-[#c52828]" />
-                    )}
+                      {sub.id === activeSubject.id && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-[#c52828]" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Create New Subject Button */}
+                <div className="p-1.5 border-t border-[#f1ede4] bg-[#faf8f4]">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsDropdownOpen(false);
+                      onOpenAddSubject();
+                    }}
+                    className="w-full py-1.5 px-2.5 text-xs font-bold text-[#191817] hover:text-[#c52828] hover:bg-white border border-[#ded6c8] rounded-xs flex items-center justify-center gap-1.5 transition-all shadow-2xs"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-[#c52828]" />
+                    <span>+ 새 과목 폴더 추가</span>
                   </button>
-                ))}
+                </div>
               </div>
             )}
           </div>
@@ -108,11 +141,19 @@ export function TopUtilityBar({
         {/* Right Desktop Nav */}
         <nav className="hidden lg:flex items-center gap-1 text-xs">
           <button
+            onClick={onOpenAddSubject}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-xs text-[#c52828] hover:bg-[#fef2f2] border border-[#fecaca] font-semibold transition-colors mr-1"
+          >
+            <Plus className="w-3.5 h-3.5 text-[#c52828]" />
+            <span>과목 추가</span>
+          </button>
+
+          <button
             onClick={onOpenUpload}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
           >
             <Upload className="w-3.5 h-3.5 text-[#827d73]" />
-            <span>자료 업로드</span>
+            <span>자료 등록</span>
           </button>
 
           <button
@@ -125,10 +166,13 @@ export function TopUtilityBar({
 
           <button
             onClick={onOpenMockExam}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#827d73] hover:text-[#57544e] hover:bg-[#faf8f4] border border-transparent transition-colors"
           >
             <Award className="w-3.5 h-3.5 text-[#827d73]" />
             <span>모의시험</span>
+            <span className="text-[10px] font-academic-mono bg-[#f4f1ea] px-1 rounded-2xs text-[#827d73]">
+              준비 중
+            </span>
           </button>
 
           <button

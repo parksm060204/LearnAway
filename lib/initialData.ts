@@ -3,6 +3,7 @@ import { Subject, Material, Concept, Problem, Attempt } from './types';
 export const INITIAL_SUBJECTS: Subject[] = [
   {
     id: 'subj-econ302',
+    ownerId: 'demo-user',
     name: '경제통계기초 (2026-2)',
     code: '§2026-STAT-02',
     semester: '2026-2',
@@ -20,9 +21,11 @@ export const INITIAL_SUBJECTS: Subject[] = [
     lastEvaluatedAt: '2026-09-28T10:00:00+09:00',
     engineName: 'REDCALL-EBBINGHAUS-DECAY-v4',
     domain: 'math_stats',
+    isDemo: true,
   },
   {
     id: 'subj-cs201',
+    ownerId: 'demo-user',
     name: '알고리즘 및 자료구조 (2026-2)',
     code: '§2026-CS-04',
     semester: '2026-2',
@@ -41,6 +44,7 @@ export const INITIAL_SUBJECTS: Subject[] = [
     lastEvaluatedAt: '2026-09-28T10:00:00+09:00',
     engineName: 'REDCALL-EBBINGHAUS-DECAY-v4',
     domain: 'computer_science',
+    isDemo: true,
   },
 ];
 

@@ -19,7 +19,7 @@ export function ExamScheduleModal({
   onUpdateSubject,
 }: ExamScheduleModalProps) {
   // Extract initial date and time
-  const currentSeoulDate = subject.examAt ? toSeoulDateString(subject.examAt) : '2026-10-12';
+  const currentSeoulDate = subject.examAt ? toSeoulDateString(subject.examAt) : '';
   const initialTime = subject.examAt ? new Date(subject.examAt).toTimeString().slice(0, 5) : '10:00';
 
   const [dateStr, setDateStr] = useState(currentSeoulDate);
@@ -30,7 +30,7 @@ export function ExamScheduleModal({
   if (!isOpen) return null;
 
   // Real-time preview calculation
-  const previewIso = `${dateStr}T${startTime}:00+09:00`;
+  const previewIso = dateStr ? `${dateStr}T${startTime || '10:00'}:00+09:00` : undefined;
   const previewDDay = calculateDDay(previewIso);
 
   const handleSave = (e: React.FormEvent) => {
@@ -38,7 +38,7 @@ export function ExamScheduleModal({
     const updatedSubject: Subject = {
       ...subject,
       examAt: previewIso,
-      examEndTime: endTime,
+      examEndTime: dateStr ? endTime : undefined,
       location,
     };
     onUpdateSubject(updatedSubject);
@@ -84,14 +84,24 @@ export function ExamScheduleModal({
           </div>
 
           <div>
-            <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-              시험 날짜 (Asia/Seoul):
-            </label>
+            <div className="flex justify-between items-center mb-1">
+              <label className="block font-academic-mono text-[11px] text-[#57544e]">
+                시험 날짜 (Asia/Seoul, 선택):
+              </label>
+              {dateStr && (
+                <button
+                  type="button"
+                  onClick={() => setDateStr('')}
+                  className="text-[10px] text-[#c52828] hover:underline font-academic-mono"
+                >
+                  시험일 미설정으로 초기화
+                </button>
+              )}
+            </div>
             <input
               type="date"
               value={dateStr}
               onChange={(e) => setDateStr(e.target.value)}
-              required
               className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817]"
             />
           </div>

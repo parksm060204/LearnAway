@@ -32,11 +32,16 @@ export function ExamRecordCard({
             </span>
             <span className="text-[#c8c2b5]">|</span>
             <h1 className="text-base sm:text-lg font-bold text-[#191817] font-academic-serif tracking-tight">
-              {subject.name} 중간고사 평가
+              {subject.name}
             </h1>
             <span className="text-[11px] font-academic-mono bg-[#f4f1ea] border border-[#ded6c8] text-[#57544e] px-2 py-0.5 rounded-xs">
               코드 {subject.code}
             </span>
+            {subject.isDemo && (
+              <span className="text-[10px] font-academic-mono bg-[#fef3c7] border border-[#fde68a] text-[#92400e] px-1.5 py-0.5 rounded-xs font-semibold">
+                데모 데이터
+              </span>
+            )}
           </div>
 
           {/* Details Row: Date, Location */}
@@ -45,7 +50,7 @@ export function ExamRecordCard({
               <Calendar className="w-3.5 h-3.5 text-[#827d73] shrink-0" />
               <span className="font-academic-mono font-medium text-[#827d73]">DATE</span>
               <span className="font-medium text-[#191817]">
-                {formatExamDate(subject.examAt, subject.examEndTime)}
+                {formatExamDate(subject.examAt || '', subject.examEndTime)}
               </span>
             </div>
 
@@ -63,7 +68,7 @@ export function ExamRecordCard({
             <Layers className="w-3.5 h-3.5 text-[#827d73] shrink-0 mt-0.5" />
             <span className="font-academic-mono font-medium text-[#827d73] shrink-0">SCOPE</span>
             <span className="font-medium text-[#191817] leading-relaxed">
-              {subject.scope || '범위 미설정'}
+              {subject.scope || '출제 범위 미설정'}
             </span>
           </div>
         </div>
@@ -71,29 +76,38 @@ export function ExamRecordCard({
         {/* Right Column: D-Day Badge + Action Buttons */}
         <div className="flex flex-wrap sm:flex-nowrap items-center gap-3 shrink-0 pt-2 lg:pt-0 border-t lg:border-t-0 border-[#f1ede4]">
           {/* D-Day Box */}
-          <div
-            className={`border rounded-xs px-3.5 py-1.5 min-w-[130px] flex flex-col items-center justify-center text-center ${
-              dday.isOverdue
+          <button
+            type="button"
+            onClick={onOpenScheduleModal}
+            className={`border rounded-xs px-3.5 py-1.5 min-w-[130px] flex flex-col items-center justify-center text-center transition-all hover:ring-1 hover:ring-[#c52828] cursor-pointer ${
+              dday.isNotSet
+                ? 'border-[#c8c2b5] bg-[#faf8f4]'
+                : dday.isOverdue
                 ? 'border-[#827d73] bg-[#faf8f4]'
                 : dday.isToday
                 ? 'border-[#c52828] bg-[#fef2f2]'
                 : 'border-[#c52828] bg-[#fefefe]'
             }`}
+            title="클릭하여 시험일정 편집"
           >
             <span className="text-[10px] font-academic-mono tracking-widest text-[#827d73] uppercase font-semibold">
-              REMAINING
+              {dday.isNotSet ? 'STATUS' : 'REMAINING'}
             </span>
             <div className="flex items-baseline gap-1.5">
-              <span className="text-xl sm:text-2xl font-bold font-academic-serif text-[#c52828] tracking-tight">
+              <span
+                className={`text-xl sm:text-2xl font-bold font-academic-serif tracking-tight ${
+                  dday.isNotSet ? 'text-[#57544e]' : 'text-[#c52828]'
+                }`}
+              >
                 {dday.displayBadge}
               </span>
-              {dday.hoursDisplay && !dday.isOverdue && (
+              {dday.hoursDisplay && !dday.isOverdue && !dday.isNotSet && (
                 <span className="text-xs font-academic-mono text-[#827d73]">
                   ({dday.hoursDisplay})
                 </span>
               )}
             </div>
-          </div>
+          </button>
 
           {/* Action Buttons */}
           <div className="flex items-center gap-2">

@@ -56,6 +56,9 @@ export function TodayReviewPanel({
         <div className="flex items-center gap-1.5 text-xs font-academic-mono font-bold text-[#c52828]">
           <Target className="w-4 h-4 text-[#c52828]" />
           <span>TODAY PROTOCOL 1/3</span>
+          <span className="text-[9.5px] font-normal font-academic-mono bg-[#f4f1ea] border border-[#ded6c8] text-[#827d73] px-1 py-0.5 rounded-2xs">
+            0단계 레이아웃 프리뷰
+          </span>
         </div>
 
         <div className="flex items-center gap-1 text-xs font-academic-mono text-[#57544e]">
