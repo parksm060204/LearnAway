@@ -249,13 +249,11 @@ export function TopUtilityBar({
 
           <button
             onClick={onOpenMockExam}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#827d73] hover:text-[#57544e] hover:bg-[#faf8f4] border border-transparent transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
+            title="혼합형 모의시험 응시 및 AI 평가"
           >
-            <Award className="w-3.5 h-3.5 text-[#827d73]" />
+            <Award className="w-3.5 h-3.5 text-purple-600" />
             <span>모의시험</span>
-            <span className="text-[10px] font-academic-mono bg-[#f4f1ea] px-1 rounded-2xs text-[#827d73]">
-              준비 중
-            </span>
           </button>
 
           <button
@@ -400,8 +398,8 @@ export function TopUtilityBar({
             }}
             className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
           >
-            <Award className="w-4 h-4 text-[#827d73]" />
-            <span>모의시험 안내</span>
+            <Award className="w-4 h-4 text-purple-600" />
+            <span>혼합형 모의시험 응시</span>
           </button>
 
           <button
