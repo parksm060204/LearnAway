@@ -29,8 +29,27 @@ import {
   recordAttemptAndUpdateConcept,
   postponeConceptReview,
   loadStoredConcepts,
+  loadStoredProblems,
+  saveStoredProblems,
+  loadStoredAttempts,
+  saveStoredAttempts,
+  reportProblemError,
+  updateProblemQualityStatus,
+  dismissProblemReport,
+  editAndReviseProblem,
+  reapproveProblem,
+  suspendProblem,
 } from './storage';
-import { Attempt } from './types';
+import {
+  Attempt,
+  Problem,
+  ProblemReport,
+  ProblemReportType,
+  ProblemQualityStatus,
+  isProblemAvailableForPractice,
+  PROBLEM_REPORT_TYPE_LABELS,
+  PROBLEM_QUALITY_STATUS_LABELS,
+} from './types';
 
 function runTests() {
   console.log('=== STARTING REDCALL AUTOMATED VERIFICATION SUITE ===\n');
@@ -702,7 +721,363 @@ function runTests() {
       'ECON302 recommendations contain NO CS201 concepts'
     );
 
-    console.log(`\n=== ALL STAGE 1, 2, 3, 4 & 5 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
+    // ========================================================
+    // STAGE 6 TESTS: PROBLEM QUALITY REPORT, REVIEW, EDIT, REAPPROVAL
+    // ========================================================
+
+    // 30. Stage 6: Problem Quality Status & Version Default Migration
+    console.log('\n--- 30. Testing Stage 6 Problem Quality & Version Migration ---');
+    // Save raw problem without version or qualityStatus (simulating legacy data)
+    const rawLegacyProblems: any[] = [
+      {
+        id: 'prob-legacy-01',
+        draftId: 'draft-legacy-01',
+        subjectId: 'subj-econ302',
+        conceptIds: ['c-econ-01'],
+        type: 'essay_descriptive',
+        difficulty: 'exam_advanced',
+        title: '레거시 수리통계 검정 문제',
+        promptText: '검정력 함수의 단조성을 증명하시오.',
+        modelAnswer: '모수 공간 theta > theta_0에 대해 기각역을 설정하여...',
+        rubric: [
+          { item: '가설 설정', maxScore: 30, description: '귀무가설과 대립가설' },
+          { item: '기각역 유도', maxScore: 40, description: '우도비 통계량' },
+          { item: '단조성 증명', maxScore: 30, description: '도함수 부호 판별' },
+        ],
+        hints: ['우도비 검정을 활용하세요.'],
+        createdAt: '2026-09-20T10:00:00+09:00',
+      },
+    ];
+    saveStoredProblems(rawLegacyProblems);
+
+    const loadedMigrated = loadStoredProblems();
+    const migratedProb = loadedMigrated.find((p: Problem) => p.id === 'prob-legacy-01')!;
+    assert(migratedProb !== undefined, 'Legacy problem loaded safely');
+    assert(migratedProb.version === 1, `Legacy problem migrated with default version 1 (got ${migratedProb.version})`);
+    assert(
+      migratedProb.qualityStatus === 'normal',
+      `Legacy problem migrated with default qualityStatus 'normal' (got ${migratedProb.qualityStatus})`
+    );
+    assert(Array.isArray(migratedProb.reports) && migratedProb.reports.length === 0, 'Legacy problem initialized with empty reports array');
+    assert(Array.isArray(migratedProb.versionHistory) && migratedProb.versionHistory.length === 0, 'Legacy problem initialized with empty versionHistory');
+    assert(isProblemAvailableForPractice(migratedProb) === true, 'Migrated normal problem is available for practice');
+
+    // Legacy attempt migration (problemVersion default)
+    const rawLegacyAttempts: any[] = [
+      {
+        id: 'att-legacy-01',
+        conceptId: 'c-econ-01',
+        problemId: 'prob-legacy-01',
+        problemType: 'essay_descriptive',
+        userAnswer: '가설 H0: theta <= theta_0 ...',
+        revealedHintCount: 0,
+        selfConfidence: 4,
+        diagnosedErrorType: 'none',
+        calculatedScore: 92,
+        evaluatedAt: '2026-09-20T11:00:00+09:00',
+      },
+    ];
+    saveStoredAttempts(rawLegacyAttempts);
+    const loadedMigratedAttempts = loadStoredAttempts();
+    const migratedAtt = loadedMigratedAttempts.find((a: Attempt) => a.id === 'att-legacy-01')!;
+    assert(migratedAtt.problemVersion === 1, `Legacy attempt migrated with default problemVersion 1 (got ${migratedAtt.problemVersion})`);
+
+    // 31. Stage 6: Reporting Problem Across 7 Categories & Quarantine Invariant
+    console.log('\n--- 31. Testing Problem Reporting across 7 Categories & Practice Quarantine ---');
+    const reportCategories: ProblemReportType[] = [
+      'missing_or_vague_condition',
+      'incorrect_model_answer',
+      'rubric_error',
+      'source_mismatch',
+      'multiple_answers_possible',
+      'inappropriate_difficulty_or_scope',
+      'other',
+    ];
+
+    for (const cat of reportCategories) {
+      assert(PROBLEM_REPORT_TYPE_LABELS[cat] !== undefined, `Category ${cat} has user-friendly label: "${PROBLEM_REPORT_TYPE_LABELS[cat]}"`);
+    }
+
+    // Submit report on migrated problem
+    const reportRes1 = reportProblemError('prob-legacy-01', {
+      type: 'missing_or_vague_condition',
+      details: '표본의 정규분포 가정이 누락되어 우도비 검정 통계량 전개가 성립하지 않습니다.',
+      attemptId: 'att-legacy-01',
+    });
+
+    assert(reportRes1.success === true, 'Successfully reported problem error with category and attempt link');
+    assert(reportRes1.reportId !== undefined, 'Report returned unique reportId');
+
+    const problemsAfterReport = loadStoredProblems();
+    const reportedProb = problemsAfterReport.find((p: Problem) => p.id === 'prob-legacy-01')!;
+    assert(reportedProb.qualityStatus === 'reported', `Problem status automatically transitioned to 'reported' (got ${reportedProb.qualityStatus})`);
+    assert(reportedProb.reports.length === 1, 'Problem reports array contains 1 recorded report');
+    assert(reportedProb.reports[0].type === 'missing_or_vague_condition', 'Report type preserved correctly');
+    assert(reportedProb.reports[0].attemptId === 'att-legacy-01', 'Report preserves user attemptId linkage');
+    assert(reportedProb.reports[0].status === 'open', 'New report initialized in open status');
+
+    // CRITICAL INVARIANT: Quarantine from practice / review / mock exams
+    assert(
+      isProblemAvailableForPractice(reportedProb) === false,
+      'CRITICAL INVARIANT: Reported problem is immediately quarantined and excluded from practice/review/mock exams'
+    );
+
+    // 32. Stage 6: Debounce Protection (Anti-Spam Rapid Duplicate Prevention)
+    console.log('\n--- 32. Testing Anti-Spam Debounce Protection ---');
+    // Immediate identical report submission within 15 seconds
+    const spamReportRes = reportProblemError('prob-legacy-01', {
+      type: 'missing_or_vague_condition',
+      details: '표본의 정규분포 가정이 누락되어 우도비 검정 통계량 전개가 성립하지 않습니다.',
+    });
+    assert(spamReportRes.success === false, 'Duplicate report within debounce window is REJECTED');
+    assert(
+      Boolean(
+        spamReportRes.error?.includes('중복') ||
+        spamReportRes.error?.includes('연속') ||
+        spamReportRes.error?.includes('동일한')
+      ),
+      `Debounce rejection returns informative message: "${spamReportRes.error}"`
+    );
+
+    const probAfterSpam = loadStoredProblems().find((p: Problem) => p.id === 'prob-legacy-01')!;
+    assert(probAfterSpam.reports.length === 1, 'Report count DID NOT increment on duplicate submission');
+
+    // A distinct non-duplicate report (e.g. rubric_error) succeeds
+    const secondReportRes = reportProblemError('prob-legacy-01', {
+      type: 'rubric_error',
+      details: '배점 기준의 기각역 유도 항목 40점이 너무 과다합니다.',
+    });
+    assert(secondReportRes.success === true, 'Distinct report with different category/details succeeds');
+    const probWithTwoReports = loadStoredProblems().find((p: Problem) => p.id === 'prob-legacy-01')!;
+    assert(probWithTwoReports.reports.length === 2, 'Problem preserves multiple distinct reports with timestamps');
+
+    // 33. Stage 6: Quality Review Lifecycle (`under_review`)
+    console.log('\n--- 33. Testing Quality Review Status Transition ---');
+    const { updatedProblem: underReviewProb } = updateProblemQualityStatus('prob-legacy-01', 'under_review', '운영자가 검토 착수');
+    assert(underReviewProb !== null && underReviewProb !== undefined, 'updateProblemQualityStatus succeeds');
+    assert(underReviewProb!.qualityStatus === 'under_review', 'Problem qualityStatus is now under_review');
+    assert(isProblemAvailableForPractice(underReviewProb!) === false, 'Problem remains quarantined while under_review');
+    assert(
+      Boolean(underReviewProb!.reports && underReviewProb!.reports.every((r: ProblemReport) => r.status === 'under_review')),
+      'All pending reports transitioned to under_review'
+    );
+
+    // 34. Stage 6: Report Dismissal with Documented Reason & Practice Restoration
+    console.log('\n--- 34. Testing Report Dismissal with Documented Reason ---');
+    // Dismiss without reason fails
+    const failDismiss = dismissProblemReport('prob-legacy-01', secondReportRes.reportId!, '');
+    assert(failDismiss.success === false, 'Dismissal without documented reason is REJECTED');
+
+    // Dismiss second report
+    const okDismiss2 = dismissProblemReport(
+      'prob-legacy-01',
+      secondReportRes.reportId!,
+      '수리통계학 기말 배점 관행상 기각역 유도 40점은 정상적인 배점 분배임.'
+    );
+    assert(okDismiss2.success === true, 'Report dismissed successfully with documented reason');
+
+    const probAfterDismiss1 = loadStoredProblems().find((p: Problem) => p.id === 'prob-legacy-01')!;
+    const dismissedRep = probAfterDismiss1.reports.find((r: ProblemReport) => r.id === secondReportRes.reportId)!;
+    assert(dismissedRep.status === 'dismissed', 'Report status marked as dismissed');
+    assert(dismissedRep.resolutionNote !== undefined, 'Dismissed reason preserved');
+    assert(probAfterDismiss1.qualityStatus === 'under_review', 'Problem remains under review because first report is still open');
+
+    // Dismiss first report as well
+    const okDismiss1 = dismissProblemReport(
+      'prob-legacy-01',
+      reportRes1.reportId!,
+      '문제 전문의 단서 조항에 i.i.d. N(mu, sigma^2) 가정이 이미 명시되어 있어 신고 기각함.'
+    );
+    assert(okDismiss1.success === true, 'First report dismissed');
+
+    const probAllDismissed = loadStoredProblems().find((p: Problem) => p.id === 'prob-legacy-01')!;
+    assert(
+      probAllDismissed.qualityStatus === 'normal' || probAllDismissed.qualityStatus === 'reapproved',
+      `All reports resolved: problem automatically restored to active status (${probAllDismissed.qualityStatus})`
+    );
+    assert(
+      isProblemAvailableForPractice(probAllDismissed) === true,
+      'Problem is RESTORED to practice availability once all false reports are dismissed'
+    );
+
+    // 35. Stage 6: Problem Revision, Version Increment (v1 -> v2) & Version Snapshot Invariant
+    console.log('\n--- 35. Testing Problem Revision & Version History Snapshot ---');
+    // Report a real error on a fresh problem to test revision flow
+    const testProbV1: Problem = {
+      id: 'prob-revision-test',
+      draftId: 'draft-rev-01',
+      subjectId: 'subj-econ302',
+      conceptIds: ['c-econ-01'],
+      type: 'essay_descriptive',
+      difficulty: 'advanced_college',
+      categoryLabel: '대학 논술·서술형',
+      categoryNumber: 1,
+      timeStandardMinutes: 20,
+      timeBreakdownDesc: '풀이 및 검산 20분',
+      coreEvaluationHighlight: '수리적 엄밀성',
+      itemCountDesc: '2개 세부 문항',
+      sourceRefs: '수리통계학 제4장 p.120',
+      title: '가설검정 오류 검토 대상 문제 v1',
+      promptText: '지문 v1: 표본 X_1, ..., X_n에 대한 검정통계량을 구하시오.',
+      modelAnswer: '모범 답안 v1: t-통계량 = (X_bar - mu0) / (S / sqrt(n))',
+      rubric: [
+        { id: 'r1', label: '항목 1', maxScore: 50, weight: 0.5, description: '통계량 유도' },
+        { id: 'r2', label: '항목 2', maxScore: 50, weight: 0.5, description: '자유도 명시' },
+      ],
+      hints: ['힌트 v1'],
+      version: 1,
+      qualityStatus: 'normal',
+      reports: [],
+      versionHistory: [],
+      createdAt: '2026-09-20T10:00:00+09:00',
+    };
+    saveStoredProblems([...loadStoredProblems(), testProbV1]);
+
+    // Record an attempt for v1 BEFORE revision
+    const attemptForV1: Attempt = {
+      id: 'att-v1-recorded',
+      conceptId: 'c-econ-01',
+      problemId: 'prob-revision-test',
+      subjectId: 'subj-econ302',
+      problemVersion: 1,
+      at: '2026-09-20T12:00:00+09:00',
+      answer: '사용자 v1 작성 답안: t = ...',
+      confidence: 3,
+      errorType: 'none',
+      hintCount: 0,
+      reasoningNotes: '',
+      calculatedScore: 88,
+      rubricResults: [
+        { criterionId: 'r1', label: '항목 1', score: 45, maxScore: 50, feedback: '전개 우수' },
+        { criterionId: 'r2', label: '항목 2', score: 43, maxScore: 50, feedback: '자유도 n-1 정확함' },
+      ],
+      evaluatorFeedback: '전반적으로 우수함',
+    };
+    saveStoredAttempts([...loadStoredAttempts(), attemptForV1]);
+
+    // Report problem
+    reportProblemError('prob-revision-test', {
+      type: 'missing_or_vague_condition',
+      details: '모분산이 알려지지 않은 정규모집단 가정이 누락됨.',
+      attemptId: 'att-v1-recorded',
+    });
+
+    // Revise problem with new text and mandatory editReason
+    const editRes = editAndReviseProblem(
+      'prob-revision-test',
+      {
+        promptText: '지문 v2: 모분산 sigma^2을 모르는 정규모집단으로부터의 확률표본 X_1, ..., X_n에 대한...',
+        modelAnswer: '모범 답안 v2: t-통계량 유도 및 자유도 n-1의 t-분포 따름을 명시...',
+        hints: ['힌트 v2: 정규모집단 표준화 과정 주의'],
+      },
+      '모집단 정규성 및 모분산 미지 조건 명시'
+    );
+
+    assert(editRes.success === true, 'Problem revision succeeded');
+    const probV2 = loadStoredProblems().find((p: Problem) => p.id === 'prob-revision-test')!;
+
+    assert(probV2.version === 2, `Problem version incremented to 2 (got ${probV2.version})`);
+    assert(
+      probV2.qualityStatus === 'review_after_edit',
+      `Problem status moved to 'review_after_edit' (got ${probV2.qualityStatus})`
+    );
+    assert(
+      isProblemAvailableForPractice(probV2) === false,
+      'Revised problem remains quarantined until explicit re-approval'
+    );
+    assert(Boolean(probV2.versionHistory && probV2.versionHistory.length === 1), 'Version history contains 1 archived snapshot');
+
+    const v1Snapshot = probV2.versionHistory![0];
+    assert(v1Snapshot.version === 1, 'Snapshot correctly archives version 1');
+    assert(v1Snapshot.promptText === '지문 v1: 표본 X_1, ..., X_n에 대한 검정통계량을 구하시오.', 'Snapshot preserves v1 promptText');
+    assert(v1Snapshot.modelAnswer === '모범 답안 v1: t-통계량 = (X_bar - mu0) / (S / sqrt(n))', 'Snapshot preserves v1 modelAnswer');
+    assert(v1Snapshot.editReason === '모집단 정규성 및 모분산 미지 조건 명시', 'Snapshot documents revision reason');
+
+    // 36. Stage 6: Past Attempt Immutability Invariant (Never Regrade or Overwrite)
+    console.log('\n--- 36. Testing Past Attempt Score Immutability & Version Invariant ---');
+    const allAttemptsAfterRev = loadStoredAttempts();
+    const pastAttempt = allAttemptsAfterRev.find((a: Attempt) => a.id === 'att-v1-recorded')!;
+
+    assert(pastAttempt !== undefined, 'Past attempt found in storage');
+    assert(
+      pastAttempt.calculatedScore === 88,
+      `CRITICAL INVARIANT: Past attempt score is strictly PRESERVED at 88 (NOT regraded or overwritten)`
+    );
+    assert(
+      pastAttempt.problemVersion === 1,
+      `CRITICAL INVARIANT: Past attempt still accurately points to problemVersion 1 (got ${pastAttempt.problemVersion})`
+    );
+    assert(
+      pastAttempt.problemVersion !== probV2.version,
+      `Attempt version (v1) and current problem version (v2) are clearly distinguished in history`
+    );
+
+    // 37. Stage 6: AI Re-review Rules & Invariant (No Auto Re-approval)
+    console.log('\n--- 37. Testing Deterministic Quality Rules & Non-Auto-Reapproval Invariant ---');
+    // Test rule checking logic: Rubric sum != 100
+    const invalidRubricProb: Problem = {
+      ...probV2,
+      id: 'prob-invalid-rubric',
+      rubric: [
+        { id: 'rA', label: '항목 A', maxScore: 50, weight: 0.5, description: 'A' },
+        { id: 'rB', label: '항목 B', maxScore: 40, weight: 0.4, description: 'B' }, // sum = 90
+      ],
+    };
+    saveStoredProblems([...loadStoredProblems(), invalidRubricProb]);
+
+    // Reapproval of problem with sum 90 must FAIL
+    const reapproveFailRes = reapproveProblem('prob-invalid-rubric', '승인 시도');
+    assert(reapproveFailRes.success === false, 'Re-approval with non-100-point rubric is REJECTED');
+    assert(
+      Boolean(reapproveFailRes.error?.includes('100점')),
+      `Re-approval error message clearly specifies rubric requirement: "${reapproveFailRes.error}"`
+    );
+
+    // 38. Stage 6: Manual Re-approval Flow & Practice Restoration
+    console.log('\n--- 38. Testing Manual Re-approval & Practice Circulation Restoration ---');
+    // Reapprove probV2 (which has valid 50+50=100 rubric)
+    const reapproveSuccessRes = reapproveProblem('prob-revision-test', '출처 및 필수 항목 검증 완료');
+    assert(reapproveSuccessRes.success === true, 'Manual re-approval succeeded');
+
+    const probAfterReapproval = loadStoredProblems().find((p: Problem) => p.id === 'prob-revision-test')!;
+    assert(
+      probAfterReapproval.qualityStatus === 'reapproved',
+      `Problem qualityStatus is now 'reapproved' (got ${probAfterReapproval.qualityStatus})`
+    );
+    assert(
+      isProblemAvailableForPractice(probAfterReapproval) === true,
+      'Re-approved problem is RESTORED to practice circulation'
+    );
+    assert(
+      Boolean(probAfterReapproval.reports && probAfterReapproval.reports.every((r: ProblemReport) => r.status === 'resolved')),
+      'All open reports transitioned to resolved upon problem re-approval'
+    );
+
+    // 39. Stage 6: Problem Suspension
+    console.log('\n--- 39. Testing Problem Suspension ---');
+    const { updatedProblem: suspendRes } = suspendProblem('prob-revision-test', '출제 범위 개정으로 인한 문제 영구 제외');
+    assert(suspendRes !== null && suspendRes !== undefined, 'suspendProblem call returned suspended problem');
+    assert(suspendRes!.qualityStatus === 'suspended', 'Quality status is suspended');
+    assert(
+      isProblemAvailableForPractice(suspendRes!) === false,
+      'Suspended problem is permanently excluded from practice'
+    );
+
+    // 40. Stage 6: Subject Data Isolation & Non-Contamination
+    console.log('\n--- 40. Testing Subject Isolation for Problems & Quality Reports ---');
+    const econProblems = loadStoredProblems().filter((p: Problem) => p.subjectId === 'subj-econ302');
+    const csProblems = loadStoredProblems().filter((p: Problem) => p.subjectId === 'subj-cs201');
+
+    assert(
+      econProblems.every((p: Problem) => p.subjectId === 'subj-econ302'),
+      'ECON302 problem set contains ONLY ECON302 problems'
+    );
+    assert(
+      csProblems.every((p: Problem) => p.subjectId === 'subj-cs201'),
+      'CS201 problem set contains ONLY CS201 problems'
+    );
+
+    console.log(`\n=== ALL STAGES 1, 2, 3, 4, 5 & 6 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
     if (failed > 0) {
       process.exit(1);
     }

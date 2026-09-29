@@ -36,12 +36,15 @@ import {
   Layers,
   Plus,
 } from 'lucide-react';
+import { ProblemQualityReviewTab } from './ProblemQualityReviewTab';
+import { ProblemQualityStatus } from '../lib/types';
 
 interface ProblemReviewModalProps {
   isOpen: boolean;
   onClose: () => void;
   activeSubject: Subject;
   drafts: ProblemDraft[];
+  problems?: Problem[];
   concepts: Concept[];
   materials?: Material[];
   onUpdateDraft: (draft: ProblemDraft) => void;
@@ -50,6 +53,14 @@ interface ProblemReviewModalProps {
   onDeleteDraft: (draftId: string) => void;
   onStartPracticeSession?: (draft: ProblemDraft) => void;
   onOpenGenerator?: () => void;
+  // Stage 6 Problem Quality:
+  onUpdateProblemQualityStatus?: (problemId: string, newStatus: ProblemQualityStatus, note?: string) => void;
+  onDismissReport?: (problemId: string, reportId: string, dismissReason: string) => { success: boolean; error?: string };
+  onReviseProblem?: (problemId: string, updates: Partial<Problem>, editReason: string) => { success: boolean; error?: string };
+  onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
+  onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
+  onOpenSourceModal?: (sourceRef: string) => void;
+  initialMode?: 'drafts' | 'quality_reports';
 }
 
 export function ProblemReviewModal({
@@ -57,6 +68,7 @@ export function ProblemReviewModal({
   onClose,
   activeSubject,
   drafts,
+  problems = [],
   concepts,
   materials,
   onUpdateDraft,
@@ -65,11 +77,32 @@ export function ProblemReviewModal({
   onDeleteDraft,
   onStartPracticeSession,
   onOpenGenerator,
+  onUpdateProblemQualityStatus,
+  onDismissReport,
+  onReviseProblem,
+  onReapproveProblem,
+  onSuspendProblem,
+  onOpenSourceModal,
+  initialMode,
 }: ProblemReviewModalProps) {
+  // Mode switcher: 'drafts' vs 'quality_reports'
+  const [mainMode, setMainMode] = useState<'drafts' | 'quality_reports'>(initialMode || 'drafts');
+
   // Filter drafts belonging to the active subject
   const subjectDrafts = useMemo(() => {
     return drafts.filter((d) => d.subjectId === activeSubject.id);
   }, [drafts, activeSubject.id]);
+
+  // Count problems with quality issues for badge
+  const subjectQualityCount = useMemo(() => {
+    return problems.filter(
+      (p) =>
+        p.subjectId === activeSubject.id &&
+        (p.qualityStatus === 'reported' ||
+          p.qualityStatus === 'under_review' ||
+          p.qualityStatus === 'review_after_edit')
+    ).length;
+  }, [problems, activeSubject.id]);
 
   const [filterTab, setFilterTab] = useState<'all' | 'pending' | 'needs_review' | 'approved'>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -258,21 +291,62 @@ export function ProblemReviewModal({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/60 backdrop-blur-xs overflow-y-auto">
       <div className="w-full max-w-6xl bg-white border border-[#c8c2b5] rounded-xs shadow-2xl my-auto overflow-hidden flex flex-col h-[94vh] animate-fade-in font-sans">
         {/* Top Header */}
-        <div className="bg-[#191817] text-white px-5 py-3 flex items-center justify-between border-b border-[#33302b] shrink-0">
-          <div className="flex items-center gap-2.5">
+        <div className="bg-[#191817] text-white px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-[#33302b] shrink-0">
+          <div className="flex flex-wrap items-center gap-2.5">
             <span className="w-2.5 h-2.5 bg-[#c52828] inline-block shrink-0" />
-            <span className="font-academic-mono text-xs text-[#ded6c8]">EXAM PROBLEM REVIEW</span>
+            <span className="font-academic-mono text-xs text-[#ded6c8]">EXAM PROBLEM REVIEW & QA</span>
             <span className="text-[#827d73]">|</span>
-            <span className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5">
-              <span>{activeSubject.name} 문제 검토 및 승인</span>
-              <span className="text-[11px] font-academic-mono text-amber-400 bg-amber-950/60 border border-amber-800/80 px-1.5 py-0.5 rounded-2xs">
-                초안 {subjectDrafts.length}건
-              </span>
+            <span className="text-xs sm:text-sm font-bold text-white">
+              {activeSubject.name}
             </span>
+
+            {/* Mode Switcher Tabs */}
+            <div className="flex items-center gap-1 bg-[#2b2723] p-0.5 rounded-xs border border-[#443e37] text-xs font-academic-mono ml-2">
+              <button
+                type="button"
+                onClick={() => setMainMode('drafts')}
+                className={`px-3 py-1 rounded-2xs transition-colors flex items-center gap-1.5 ${
+                  mainMode === 'drafts'
+                    ? 'bg-[#c52828] text-white font-bold shadow-2xs'
+                    : 'text-[#ded6c8] hover:text-white'
+                }`}
+              >
+                <span>AI 문제 초안 검토</span>
+                <span className="px-1.5 py-0.2 bg-black/30 rounded-2xs text-[10px]">
+                  {subjectDrafts.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setMainMode('quality_reports')}
+                className={`px-3 py-1 rounded-2xs transition-colors flex items-center gap-1.5 ${
+                  mainMode === 'quality_reports'
+                    ? 'bg-[#c52828] text-white font-bold shadow-2xs'
+                    : subjectQualityCount > 0
+                    ? 'text-amber-300 font-bold hover:text-amber-200'
+                    : 'text-[#ded6c8] hover:text-white'
+                }`}
+              >
+                {subjectQualityCount > 0 && (
+                  <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                )}
+                <span>문제 품질 & 신고 관리</span>
+                {subjectQualityCount > 0 ? (
+                  <span className="px-1.5 py-0.2 bg-red-600 text-white rounded-2xs text-[10px] font-bold">
+                    {subjectQualityCount}건
+                  </span>
+                ) : (
+                  <span className="px-1.5 py-0.2 bg-black/30 rounded-2xs text-[10px]">
+                    {(problems || []).filter((p) => p.subjectId === activeSubject.id).length}
+                  </span>
+                )}
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            {onOpenGenerator && (
+          <div className="flex items-center gap-2 self-end sm:self-auto">
+            {mainMode === 'drafts' && onOpenGenerator && (
               <button
                 type="button"
                 onClick={() => {
@@ -296,21 +370,35 @@ export function ProblemReviewModal({
           </div>
         </div>
 
-        {/* Action & Filter Strip */}
-        <div className="bg-[#faf8f4] border-b border-[#ded6c8] px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0">
-          {/* Tabs */}
-          <div className="flex items-center gap-1 text-xs">
-            <button
-              type="button"
-              onClick={() => setFilterTab('all')}
-              className={`px-2.5 py-1 rounded-xs font-academic-mono transition-colors ${
-                filterTab === 'all'
-                  ? 'bg-[#191817] text-white font-bold'
-                  : 'bg-white text-[#57544e] border border-[#ded6c8] hover:bg-[#f1ede4]'
-              }`}
-            >
-              전체 ({subjectDrafts.length})
-            </button>
+        {mainMode === 'quality_reports' ? (
+          <ProblemQualityReviewTab
+            activeSubject={activeSubject}
+            problems={problems}
+            materials={materials}
+            onUpdateQualityStatus={onUpdateProblemQualityStatus}
+            onDismissReport={onDismissReport}
+            onReviseProblem={onReviseProblem}
+            onReapproveProblem={onReapproveProblem}
+            onSuspendProblem={onSuspendProblem}
+            onOpenSourceModal={onOpenSourceModal}
+          />
+        ) : (
+          <>
+            {/* Action & Filter Strip */}
+            <div className="bg-[#faf8f4] border-b border-[#ded6c8] px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0">
+              {/* Tabs */}
+              <div className="flex items-center gap-1 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setFilterTab('all')}
+                  className={`px-2.5 py-1 rounded-xs font-academic-mono transition-colors ${
+                    filterTab === 'all'
+                      ? 'bg-[#191817] text-white font-bold'
+                      : 'bg-white text-[#57544e] border border-[#ded6c8] hover:bg-[#f1ede4]'
+                  }`}
+                >
+                  전체 ({subjectDrafts.length})
+                </button>
 
             <button
               type="button"
@@ -920,6 +1008,8 @@ export function ProblemReviewModal({
             )}
           </div>
         </div>
+      </>
+    )}
       </div>
     </div>
   );

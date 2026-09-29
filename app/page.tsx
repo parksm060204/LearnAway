@@ -11,6 +11,9 @@ import {
   Attempt,
   ProblemType,
   RetentionModelSettings,
+  ProblemQualityStatus,
+  ProblemReportType,
+  isProblemAvailableForPractice,
 } from '../lib/types';
 import {
   loadStoredSubjects,
@@ -37,6 +40,12 @@ import {
   recordAttemptAndUpdateConcept,
   resetToInitialDemoData,
   postponeConceptReview,
+  reportProblemError,
+  updateProblemQualityStatus,
+  dismissProblemReport,
+  editAndReviseProblem,
+  reapproveProblem,
+  suspendProblem,
 } from '../lib/storage';
 import {
   DEFAULT_RETENTION_SETTINGS,
@@ -196,16 +205,32 @@ export default function RedcallDashboardPage() {
     return problemDrafts.filter((d) => d.subjectId === activeSubject.id);
   }, [problemDrafts, activeSubject]);
 
+  const activeSubjectReportedCount = useMemo(() => {
+    return subjectProblems.filter(
+      (p) =>
+        p.qualityStatus === 'reported' ||
+        p.qualityStatus === 'under_review' ||
+        p.qualityStatus === 'review_after_edit'
+    ).length;
+  }, [subjectProblems]);
+
+  const availableSubjectProblems = useMemo(() => {
+    return subjectProblems.filter(isProblemAvailableForPractice);
+  }, [subjectProblems]);
+
   const activeSessionProblem = useMemo(() => {
     if (activeProblemIdForSession) {
       const found = subjectProblems.find((p) => p.id === activeProblemIdForSession);
+      if (found && isProblemAvailableForPractice(found)) return found;
       if (found) return found;
     }
     return (
+      availableSubjectProblems.find((p) => p.type === selectedProblemType) ||
+      availableSubjectProblems[0] ||
       subjectProblems.find((p) => p.type === selectedProblemType) ||
       subjectProblems[0]
     );
-  }, [subjectProblems, activeProblemIdForSession, selectedProblemType]);
+  }, [subjectProblems, availableSubjectProblems, activeProblemIdForSession, selectedProblemType]);
 
   const selectedConcept = useMemo(() => {
     return (
@@ -490,6 +515,88 @@ export default function RedcallDashboardPage() {
     setIsProblemSessionOpen(true);
   };
 
+  // Stage 6: Problem Quality, Reporting, Review, Revision & Re-approval Handlers
+  const handleReportProblem = (
+    problemId: string,
+    reportData: { type: ProblemReportType; details: string; attemptId?: string }
+  ) => {
+    const res = reportProblemError(problemId, reportData);
+    if (res.success) {
+      const reloadedProblems = loadStoredProblems();
+      setAllProblems(reloadedProblems);
+      showToast('문제 오류가 신고되었습니다. 품질 검토 및 수정 완료 시까지 출제에서 제외됩니다.');
+    } else {
+      showToast(`신고 접수 실패: ${res.error}`);
+    }
+    return res;
+  };
+
+  const handleUpdateProblemQualityStatus = (
+    problemId: string,
+    newStatus: ProblemQualityStatus,
+    note?: string
+  ) => {
+    const updated = updateProblemQualityStatus(problemId, newStatus, note);
+    if (updated) {
+      const reloadedProblems = loadStoredProblems();
+      setAllProblems(reloadedProblems);
+      showToast(`문제 상태가 [${newStatus}]으로 변경되었습니다.`);
+    }
+  };
+
+  const handleDismissProblemReport = (
+    problemId: string,
+    reportId: string,
+    dismissReason: string
+  ) => {
+    const res = dismissProblemReport(problemId, reportId, dismissReason);
+    if (res.success) {
+      const reloadedProblems = loadStoredProblems();
+      setAllProblems(reloadedProblems);
+      showToast('신고가 기각 사유와 함께 종결 처리되었습니다.');
+    } else {
+      showToast(`신고 기각 실패: ${res.error}`);
+    }
+    return res;
+  };
+
+  const handleReviseProblem = (
+    problemId: string,
+    updates: Partial<Problem>,
+    editReason: string
+  ) => {
+    const res = editAndReviseProblem(problemId, updates, editReason);
+    if (res.success) {
+      const reloadedProblems = loadStoredProblems();
+      setAllProblems(reloadedProblems);
+      showToast('문제가 수정되어 새 버전으로 기록되었습니다. (수정 후 재검토 상태)');
+    } else {
+      showToast(`문제 수정 실패: ${res.error}`);
+    }
+    return res;
+  };
+
+  const handleReapproveProblem = (problemId: string, reapprovalNote?: string) => {
+    const res = reapproveProblem(problemId, reapprovalNote);
+    if (res.success) {
+      const reloadedProblems = loadStoredProblems();
+      setAllProblems(reloadedProblems);
+      showToast('문제 품질 검토 및 재승인이 완료되어 다시 출제에 포함됩니다.');
+    } else {
+      showToast(`재승인 실패: ${res.error}`);
+    }
+    return res;
+  };
+
+  const handleSuspendProblem = (problemId: string, suspensionReason?: string) => {
+    const suspended = suspendProblem(problemId, suspensionReason);
+    if (suspended) {
+      const reloadedProblems = loadStoredProblems();
+      setAllProblems(reloadedProblems);
+      showToast('문제가 사용 중지 처리되었습니다.');
+    }
+  };
+
   // Attempt Submission Handler (Updates ReviewEvent & Retention Score)
   const handleSubmitAttempt = (attempt: Attempt) => {
     const { updatedConcepts, updatedAttempts } = recordAttemptAndUpdateConcept(attempt, settings);
@@ -570,6 +677,7 @@ export default function RedcallDashboardPage() {
         onOpenProblemGenerator={() => setIsProblemGeneratorOpen(true)}
         onOpenProblemReview={() => setIsProblemReviewOpen(true)}
         problemDraftCount={activeSubjectProblemDrafts.length}
+        problemReportedCount={activeSubjectReportedCount}
         onOpenProblemSession={() => setIsProblemSessionOpen(true)}
         onOpenMockExam={() => setIsMockExamModalOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -639,7 +747,9 @@ export default function RedcallDashboardPage() {
                 concept={selectedConcept}
                 event={selectedEvent}
                 attempts={attempts}
+                problems={allProblems}
                 onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
+                onReportProblem={handleReportProblem}
               />
             )}
           </div>
@@ -726,6 +836,7 @@ export default function RedcallDashboardPage() {
           problem={activeSessionProblem}
           onSubmitAttempt={handleSubmitAttempt}
           onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
+          onReportProblem={handleReportProblem}
         />
       )}
 
@@ -919,12 +1030,13 @@ export default function RedcallDashboardPage() {
         }
       />
 
-      {/* 10. AI Problem Review & Approval Modal (Stage 3) */}
+      {/* 10. AI Problem Review & Approval Modal (Stage 3 & 6) */}
       <ProblemReviewModal
         isOpen={isProblemReviewOpen}
         onClose={() => setIsProblemReviewOpen(false)}
         activeSubject={activeSubject}
         drafts={problemDrafts}
+        problems={allProblems}
         concepts={subjectConcepts}
         materials={materials}
         onUpdateDraft={handleUpdateProblemDraft}
@@ -936,6 +1048,12 @@ export default function RedcallDashboardPage() {
           setIsProblemReviewOpen(false);
           setIsProblemGeneratorOpen(true);
         }}
+        onUpdateProblemQualityStatus={handleUpdateProblemQualityStatus}
+        onDismissReport={handleDismissProblemReport}
+        onReviseProblem={handleReviseProblem}
+        onReapproveProblem={handleReapproveProblem}
+        onSuspendProblem={handleSuspendProblem}
+        onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
       />
     </div>
   );

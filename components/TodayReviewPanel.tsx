@@ -1,7 +1,14 @@
 'use client';
 
 import React from 'react';
-import { Concept, Problem, ProblemType, Subject, ReviewRecommendation } from '../lib/types';
+import {
+  Concept,
+  Problem,
+  ProblemType,
+  Subject,
+  ReviewRecommendation,
+  isProblemAvailableForPractice,
+} from '../lib/types';
 import {
   Target,
   Clock,
@@ -11,8 +18,7 @@ import {
   AlertCircle,
   Sparkles,
   CheckSquare,
-  HelpCircle,
-  ArrowRight,
+  ShieldAlert,
 } from 'lucide-react';
 
 interface TodayReviewPanelProps {
@@ -46,18 +52,22 @@ export function TodayReviewPanel({
   recommendation,
   totalConceptsCount = 1,
 }: TodayReviewPanelProps) {
-  // Find problems linked to this concept
-  const conceptProblems = problems.filter(
+  // Find problems linked to this concept that are available for practice (normal or reapproved)
+  const allConceptProblems = problems.filter(
     (p) => p.conceptIds?.includes(concept.id) || (p as any).conceptId === concept.id
   );
+  const conceptProblems = allConceptProblems.filter((p) => isProblemAvailableForPractice(p));
+  const quarantinedCount = allConceptProblems.length - conceptProblems.length;
   const hasApprovedProblems = conceptProblems.length > 0;
 
-  // Find problem matching selected category or fallback
+  // Find problem matching selected category or fallback from available problems
+  const availableAll = problems.filter((p) => isProblemAvailableForPractice(p));
   const activeProblem =
     (hasApprovedProblems ? conceptProblems.find((p) => p.type === selectedProblemType) : null) ||
     conceptProblems[0] ||
-    problems.find((p) => p.type === selectedProblemType) ||
-    problems[0];
+    availableAll.find((p) => p.type === selectedProblemType) ||
+    availableAll[0] ||
+    null;
 
   const isMath = subject.domain === 'math_stats';
 
@@ -217,6 +227,28 @@ export function TodayReviewPanel({
               );
             })}
           </div>
+        </div>
+      ) : quarantinedCount > 0 ? (
+        /* Quarantined problems fallback */
+        <div className="p-3.5 bg-red-50/80 border border-red-200 rounded-xs text-xs space-y-2">
+          <div className="flex items-center gap-1.5 font-bold text-red-900">
+            <ShieldAlert className="w-4 h-4 text-red-600" />
+            <span>품질 신고 검토 진행 중 ({quarantinedCount}건 출제 일시 제외)</span>
+          </div>
+          <p className="text-[11.5px] text-red-800 leading-relaxed">
+            이 개념에 연계된 문제가 품질 오류 신고 접수 또는 수정 후 재검토 상태입니다.
+            문제 무결성을 위해 재승인이 완료될 때까지 풀이 대상에서 자동 제외됩니다.
+          </p>
+          {onOpenProblemReview && (
+            <button
+              type="button"
+              onClick={onOpenProblemReview}
+              className="w-full flex items-center justify-center gap-1.5 py-2 px-3 bg-[#191817] hover:bg-[#33302b] text-white font-bold text-xs rounded-xs shadow-2xs transition-colors"
+            >
+              <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
+              <span>신고된 문제 검토 및 재승인 화면으로 이동 →</span>
+            </button>
+          )}
         </div>
       ) : (
         /* No approved problems for this concept fallback */

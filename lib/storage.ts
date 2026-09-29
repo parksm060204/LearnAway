@@ -9,6 +9,10 @@ import {
   Attempt,
   RetentionModelSettings,
   ReviewEvent,
+  ProblemReport,
+  ProblemReportType,
+  ProblemQualityStatus,
+  ProblemVersionSnapshot,
 } from './types';
 import {
   INITIAL_SUBJECTS,
@@ -401,6 +405,10 @@ export function loadStoredProblems(): Problem[] {
     ...p,
     isDemo: p.isDemo ?? true,
     isApproved: p.isApproved ?? true,
+    qualityStatus: p.qualityStatus ?? 'normal',
+    version: p.version ?? 1,
+    reports: p.reports ?? [],
+    versionHistory: p.versionHistory ?? [],
   }));
 }
 
@@ -478,6 +486,10 @@ export function approveProblemDraft(draftId: string): {
       sourceMarkdownHash: targetDraft.sourceMarkdownHash,
       isApproved: true,
       isDemo: false,
+      qualityStatus: problems[existingIndex].qualityStatus || 'normal',
+      version: problems[existingIndex].version || 1,
+      reports: problems[existingIndex].reports || [],
+      versionHistory: problems[existingIndex].versionHistory || [],
     };
     problems[existingIndex] = approvedProblem;
   } else {
@@ -508,6 +520,10 @@ export function approveProblemDraft(draftId: string): {
       appliedConditionNote: targetDraft.appliedConditionNote,
       sourceMarkdownHash: targetDraft.sourceMarkdownHash,
       createdAt: now,
+      version: 1,
+      qualityStatus: 'normal',
+      reports: [],
+      versionHistory: [],
     };
     problems.push(approvedProblem);
   }
@@ -522,7 +538,7 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
   approvedCount: number;
 } {
   const drafts = loadStoredProblemDrafts();
-  let problems = loadStoredProblems();
+  const problems = loadStoredProblems();
   const targetIdsSet = new Set(draftIds);
   const now = new Date().toISOString();
 
@@ -561,6 +577,10 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
         sourceMarkdownHash: draft.sourceMarkdownHash,
         isApproved: true,
         isDemo: false,
+        qualityStatus: problems[existingIndex].qualityStatus || 'normal',
+        version: problems[existingIndex].version || 1,
+        reports: problems[existingIndex].reports || [],
+        versionHistory: problems[existingIndex].versionHistory || [],
       };
     } else {
       problems.push({
@@ -590,6 +610,10 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
         appliedConditionNote: draft.appliedConditionNote,
         sourceMarkdownHash: draft.sourceMarkdownHash,
         createdAt: now,
+        version: 1,
+        qualityStatus: 'normal',
+        reports: [],
+        versionHistory: [],
       });
     }
     approvedCount++;
@@ -599,8 +623,327 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
   return { updatedDrafts, updatedProblems: problems, approvedCount };
 }
 
+// Stage 6: Problem Quality, Reporting, Versioning & Review Operations
+
+/**
+ * Submits an error report for a problem.
+ * Quarantines problem by transitioning qualityStatus to 'reported',
+ * excluding it from future practice/mock exams until re-approved.
+ * Guards against rapid duplicate submissions by the same user.
+ */
+export function reportProblemError(
+  problemId: string,
+  reportData: {
+    attemptId?: string;
+    type: ProblemReportType;
+    details: string;
+  }
+): {
+  success: boolean;
+  reportId?: string;
+  updatedProblems: Problem[];
+  newReport: ProblemReport | null;
+  error?: string;
+} {
+  const problems = loadStoredProblems();
+  const targetProblem = problems.find((p) => p.id === problemId);
+
+  if (!targetProblem) {
+    return { success: false, updatedProblems: problems, newReport: null, error: '신고 대상 문제를 찾을 수 없습니다.' };
+  }
+
+  const trimmedDetails = reportData.details.trim();
+  if (!trimmedDetails) {
+    return { success: false, updatedProblems: problems, newReport: null, error: '신고 사유 및 상세 내용을 입력해 주세요.' };
+  }
+
+  const now = new Date();
+  const existingReports = targetProblem.reports || [];
+
+  // Debounce & duplicate prevention: identical report within 15 seconds
+  const recentDuplicate = existingReports.find((r) => {
+    if (r.type !== reportData.type) return false;
+    if (r.status === 'dismissed' || r.status === 'resolved') return false;
+    const timeDiffMs = Math.abs(now.getTime() - new Date(r.createdAt).getTime());
+    return timeDiffMs < 15000 && r.details.trim() === trimmedDetails;
+  });
+
+  if (recentDuplicate) {
+    return {
+      success: false,
+      updatedProblems: problems,
+      newReport: null,
+      error: '동일한 내용의 신고가 방금 접수되었습니다. 잠시 후 다시 확인해 주세요.',
+    };
+  }
+
+  const newReport: ProblemReport = {
+    id: `rep-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+    problemId,
+    attemptId: reportData.attemptId,
+    type: reportData.type,
+    details: trimmedDetails,
+    createdAt: now.toISOString(),
+    status: 'open',
+  };
+
+  const updatedReports = [newReport, ...existingReports];
+
+  // Exclude from new practice: transition to 'reported' unless already 'under_review'
+  const nextStatus: ProblemQualityStatus =
+    targetProblem.qualityStatus === 'under_review' ? 'under_review' : 'reported';
+
+  const updatedProblem: Problem = {
+    ...targetProblem,
+    reports: updatedReports,
+    qualityStatus: nextStatus,
+    lastReviewedAt: now.toISOString(),
+  };
+
+  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  saveStoredProblems(updatedProblems);
+
+  return { success: true, reportId: newReport.id, updatedProblems, newReport };
+}
+
+/**
+ * Updates the problem's quality review status ('normal' | 'reported' | 'under_review' | 'review_after_edit' | 'reapproved' | 'suspended')
+ */
+export function updateProblemQualityStatus(
+  problemId: string,
+  newStatus: ProblemQualityStatus,
+  note?: string
+): { success: boolean; updatedProblems: Problem[]; updatedProblem: Problem | null; error?: string } {
+  const problems = loadStoredProblems();
+  const target = problems.find((p) => p.id === problemId);
+  if (!target) return { success: false, updatedProblems: problems, updatedProblem: null, error: '문제를 찾을 수 없습니다.' };
+
+  const now = new Date().toISOString();
+  const updatedReports = (target.reports || []).map((r) => {
+    if (newStatus === 'under_review' && r.status === 'open') {
+      return { ...r, status: 'under_review' as const };
+    }
+    return r;
+  });
+
+  const updatedProblem: Problem = {
+    ...target,
+    qualityStatus: newStatus,
+    reports: updatedReports,
+    lastReviewedAt: now,
+    reviewNotes: note !== undefined ? note : target.reviewNotes,
+  };
+
+  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  saveStoredProblems(updatedProblems);
+  return { success: true, updatedProblems, updatedProblem };
+}
+
+/**
+ * Dismisses a report with a documented reason.
+ * If all reports are resolved/dismissed, problem is restored to practice circulation ('normal' or 'reapproved').
+ */
+export function dismissProblemReport(
+  problemId: string,
+  reportId: string,
+  dismissReason: string
+): { success: boolean; updatedProblems: Problem[]; updatedProblem: Problem | null; error?: string } {
+  const problems = loadStoredProblems();
+  const target = problems.find((p) => p.id === problemId);
+  if (!target) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '문제를 찾을 수 없습니다.' };
+  }
+
+  const trimmedReason = dismissReason.trim();
+  if (!trimmedReason) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '신고 기각 사유를 반드시 작성해야 합니다.' };
+  }
+
+  const now = new Date().toISOString();
+  let foundReport = false;
+  const updatedReports = (target.reports || []).map((r) => {
+    if (r.id === reportId) {
+      foundReport = true;
+      return {
+        ...r,
+        status: 'dismissed' as const,
+        resolutionNote: trimmedReason,
+        resolvedAt: now,
+      };
+    }
+    return r;
+  });
+
+  if (!foundReport) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '해당 신고 내역을 찾을 수 없습니다.' };
+  }
+
+  // Check if any open or under_review reports remain
+  const hasRemainingOpenReports = updatedReports.some(
+    (r) => r.status === 'open' || r.status === 'under_review'
+  );
+
+  const restoredStatus: ProblemQualityStatus = hasRemainingOpenReports
+    ? target.qualityStatus || 'reported'
+    : (target.version && target.version > 1 ? 'reapproved' : 'normal');
+
+  const updatedProblem: Problem = {
+    ...target,
+    reports: updatedReports,
+    qualityStatus: restoredStatus,
+    lastReviewedAt: now,
+    reviewNotes: `신고 #${reportId} 기각 처리: ${trimmedReason}`,
+  };
+
+  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  saveStoredProblems(updatedProblems);
+  return { success: true, updatedProblems, updatedProblem };
+}
+
+/**
+ * Edits problem content, archiving current version into versionHistory and incrementing version number.
+ * Sets qualityStatus to 'review_after_edit' pending re-approval.
+ */
+export function editAndReviseProblem(
+  problemId: string,
+  updates: Partial<Problem>,
+  editReason: string
+): { success: boolean; updatedProblems: Problem[]; updatedProblem: Problem | null; error?: string } {
+  const problems = loadStoredProblems();
+  const target = problems.find((p) => p.id === problemId);
+  if (!target) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '문제를 찾을 수 없습니다.' };
+  }
+
+  const trimmedReason = editReason.trim();
+  if (!trimmedReason) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '수정 사유 및 변경 내용을 입력해 주세요.' };
+  }
+
+  const currentVersion = target.version || 1;
+  const snapshot: ProblemVersionSnapshot = {
+    version: currentVersion,
+    title: target.title,
+    promptText: target.promptText,
+    mathFormula: target.mathFormula,
+    codeSnippet: target.codeSnippet,
+    timeStandardMinutes: target.timeStandardMinutes,
+    hints: [...target.hints],
+    modelAnswer: target.modelAnswer,
+    rubric: [...target.rubric],
+    editedAt: new Date().toISOString(),
+    editReason: trimmedReason,
+  };
+
+  const nextVersion = currentVersion + 1;
+  const now = new Date().toISOString();
+
+  const updatedProblem: Problem = {
+    ...target,
+    ...updates,
+    version: nextVersion,
+    versionHistory: [snapshot, ...(target.versionHistory || [])],
+    qualityStatus: 'review_after_edit',
+    lastReviewedAt: now,
+    reviewNotes: `v${nextVersion} 수정 완료: ${trimmedReason}`,
+  };
+
+  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  saveStoredProblems(updatedProblems);
+  return { success: true, updatedProblems, updatedProblem };
+}
+
+/**
+ * Re-approves a problem after quality review and/or edits, verifying mandatory 100-point rubric and required fields.
+ * Restores problem to practice availability with status 'reapproved'.
+ */
+export function reapproveProblem(
+  problemId: string,
+  reapprovalNote?: string
+): { success: boolean; updatedProblems: Problem[]; updatedProblem: Problem | null; error?: string } {
+  const problems = loadStoredProblems();
+  const target = problems.find((p) => p.id === problemId);
+  if (!target) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '문제를 찾을 수 없습니다.' };
+  }
+
+  // Strict verification rules before re-approval
+  if (!target.promptText || !target.promptText.trim()) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '문제 지문이 비어 있어 재승인할 수 없습니다.' };
+  }
+  if (!target.modelAnswer || !target.modelAnswer.trim()) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '모범 답안이 누락되어 재승인할 수 없습니다.' };
+  }
+  if (!target.rubric || target.rubric.length === 0) {
+    return { success: false, updatedProblems: problems, updatedProblem: null, error: '채점 기준(루브릭)이 비어 있어 재승인할 수 없습니다.' };
+  }
+  const rubricSum = target.rubric.reduce((sum, r) => sum + (Number(r.maxScore) || 0), 0);
+  if (Math.abs(rubricSum - 100) > 0.001) {
+    return {
+      success: false,
+      updatedProblems: problems,
+      updatedProblem: null,
+      error: `루브릭 배점 합계가 100점이 아닙니다. (현재 합계: ${rubricSum}점)`,
+    };
+  }
+
+  const now = new Date().toISOString();
+  // Mark all unresolved reports as resolved
+  const updatedReports = (target.reports || []).map((r) => {
+    if (r.status === 'open' || r.status === 'under_review') {
+      return {
+        ...r,
+        status: 'resolved' as const,
+        resolutionNote: reapprovalNote || '문제 검토 및 수정/보완 완료 후 사용자 재승인',
+        resolvedAt: now,
+      };
+    }
+    return r;
+  });
+
+  const updatedProblem: Problem = {
+    ...target,
+    reports: updatedReports,
+    qualityStatus: 'reapproved',
+    lastReviewedAt: now,
+    reviewNotes: reapprovalNote || '품질 검증 통과 및 재승인 완료 (출제 가능 복귀)',
+  };
+
+  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  saveStoredProblems(updatedProblems);
+  return { success: true, updatedProblems, updatedProblem };
+}
+
+/**
+ * Suspends problem from circulation if it cannot be salvaged or has fatal academic flaws.
+ */
+export function suspendProblem(
+  problemId: string,
+  suspensionReason?: string
+): { success: boolean; updatedProblems: Problem[]; updatedProblem: Problem | null; error?: string } {
+  const problems = loadStoredProblems();
+  const target = problems.find((p) => p.id === problemId);
+  if (!target) return { success: false, updatedProblems: problems, updatedProblem: null, error: '문제를 찾을 수 없습니다.' };
+
+  const now = new Date().toISOString();
+  const updatedProblem: Problem = {
+    ...target,
+    qualityStatus: 'suspended',
+    lastReviewedAt: now,
+    reviewNotes: suspensionReason || '품질 기준 미달로 사용 중지',
+  };
+
+  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  saveStoredProblems(updatedProblems);
+  return { success: true, updatedProblems, updatedProblem };
+}
+
 export function loadStoredAttempts(): Attempt[] {
-  return safeGetItem<Attempt[]>(STORAGE_KEYS.ATTEMPTS, []);
+  const raw = safeGetItem<Attempt[]>(STORAGE_KEYS.ATTEMPTS, []);
+  return raw.map((a) => ({
+    ...a,
+    problemVersion: a.problemVersion ?? 1,
+  }));
 }
 
 export function saveStoredAttempts(attempts: Attempt[]): void {

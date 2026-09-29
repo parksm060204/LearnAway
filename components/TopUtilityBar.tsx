@@ -16,6 +16,7 @@ import {
   FolderOpen,
   Sparkles,
   FileQuestion,
+  ShieldAlert,
 } from 'lucide-react';
 
 interface TopUtilityBarProps {
@@ -30,6 +31,7 @@ interface TopUtilityBarProps {
   onOpenProblemGenerator?: () => void;
   onOpenProblemReview?: () => void;
   problemDraftCount?: number;
+  problemReportedCount?: number;
   onOpenProblemSession: () => void;
   onOpenMockExam: () => void;
   onOpenSettings: () => void;
@@ -49,6 +51,7 @@ export function TopUtilityBar({
   onOpenProblemGenerator,
   onOpenProblemReview,
   problemDraftCount = 0,
+  problemReportedCount = 0,
   onOpenProblemSession,
   onOpenMockExam,
   onOpenSettings,
@@ -201,13 +204,25 @@ export function TopUtilityBar({
             <button
               onClick={onOpenProblemReview}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
-              title="AI 시험 문제 검토 및 승인"
+              title="AI 시험 문제 검토, 승인 및 신고 관리"
             >
               <FileQuestion className="w-3.5 h-3.5 text-blue-600" />
               <span>문제 검토</span>
               {problemDraftCount > 0 && (
-                <span className="text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 px-1.5 py-0.2 rounded-full font-bold">
+                <span
+                  className="text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 px-1.5 py-0.2 rounded-full font-bold"
+                  title={`초안 ${problemDraftCount}건`}
+                >
                   {problemDraftCount}
+                </span>
+              )}
+              {problemReportedCount > 0 && (
+                <span
+                  className="text-[10px] font-academic-mono bg-red-100 text-red-800 border border-red-300 px-1.5 py-0.2 rounded-full font-bold flex items-center gap-0.5"
+                  title={`신고/검토 필요 문제 ${problemReportedCount}건`}
+                >
+                  <ShieldAlert className="w-2.5 h-2.5 text-red-600" />
+                  {problemReportedCount}
                 </span>
               )}
             </button>
@@ -338,11 +353,19 @@ export function TopUtilityBar({
                 <FileQuestion className="w-4 h-4 text-blue-600" />
                 <span>문제 검토 및 승인</span>
               </div>
-              {problemDraftCount > 0 && (
-                <span className="text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 px-1.5 py-0.5 rounded-full font-bold">
-                  {problemDraftCount}
-                </span>
-              )}
+              <div className="flex items-center gap-1.5">
+                {problemDraftCount > 0 && (
+                  <span className="text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 px-1.5 py-0.5 rounded-full font-bold">
+                    초안 {problemDraftCount}
+                  </span>
+                )}
+                {problemReportedCount > 0 && (
+                  <span className="text-[10px] font-academic-mono bg-red-100 text-red-800 border border-red-300 px-1.5 py-0.5 rounded-full font-bold flex items-center gap-0.5">
+                    <ShieldAlert className="w-2.5 h-2.5 text-red-600" />
+                    신고 {problemReportedCount}
+                  </span>
+                )}
+              </div>
             </button>
           )}
 

@@ -297,6 +297,132 @@ export interface Problem {
   createdAt?: string;
 }
 
+// Stage 6: Problem Quality, Reporting, Versioning & Review Types
+export type ProblemReportType =
+  | 'missing_or_vague_condition'       // 조건 누락·모호함
+  | 'incorrect_model_answer'          // 모범 답안 오류
+  | 'rubric_error'                    // 채점 기준 오류
+  | 'source_mismatch'                 // 출처 불일치
+  | 'multiple_answers_possible'       // 복수 정답 가능성
+  | 'inappropriate_difficulty_or_scope' // 난도·범위 부적합
+  | 'other';                          // 기타
+
+export const PROBLEM_REPORT_TYPE_LABELS: Record<ProblemReportType, string> = {
+  missing_or_vague_condition: '조건 누락·모호함',
+  incorrect_model_answer: '모범 답안 오류',
+  rubric_error: '채점 기준 오류',
+  source_mismatch: '출처 불일치',
+  multiple_answers_possible: '복수 정답 가능성',
+  inappropriate_difficulty_or_scope: '난도·범위 부적합',
+  other: '기타',
+};
+
+export type ProblemQualityStatus =
+  | 'normal'              // 정상
+  | 'reported'            // 신고 접수
+  | 'under_review'        // 검토 중
+  | 'review_after_edit'   // 수정 후 재검토
+  | 'reapproved'          // 재승인
+  | 'suspended';          // 사용 중지
+
+export const PROBLEM_QUALITY_STATUS_LABELS: Record<ProblemQualityStatus, string> = {
+  normal: '정상',
+  reported: '신고 접수',
+  under_review: '검토 중',
+  review_after_edit: '수정 후 재검토',
+  reapproved: '재승인',
+  suspended: '사용 중지',
+};
+
+export type ProblemReportStatus = 'open' | 'under_review' | 'resolved' | 'dismissed';
+
+export interface ProblemReport {
+  id: string;
+  problemId: string;
+  attemptId?: string;
+  type: ProblemReportType;
+  details: string;
+  createdAt: string;
+  status: ProblemReportStatus;
+  resolutionNote?: string;
+  resolvedAt?: string;
+}
+
+export interface ProblemVersionSnapshot {
+  version: number;
+  title: string;
+  promptText: string;
+  mathFormula?: string;
+  codeSnippet?: string;
+  timeStandardMinutes?: number;
+  hints: string[];
+  modelAnswer: string;
+  rubric: RubricCriterion[];
+  editedAt: string;
+  editReason?: string;
+}
+
+export function isProblemAvailableForPractice(problem: Problem): boolean {
+  const status = problem.qualityStatus || 'normal';
+  return status === 'normal' || status === 'reapproved';
+}
+
+export interface ProblemQualityRuleCheck {
+  hasRequiredFields: boolean;
+  isRubric100: boolean;
+  rubricSum: number;
+  isSourceVerified: boolean;
+  details: string;
+}
+
+export interface ProblemQualityReviewResult {
+  isReportJustified: boolean;
+  severity: 'critical' | 'moderate' | 'minor' | 'none';
+  recommendation: 'edit_required' | 'suspend' | 'dismiss_report';
+  analysisSummary: string;
+  suggestedFixes?: string;
+  ruleChecks: ProblemQualityRuleCheck;
+  canAutoReapprove: false; // Explicit invariant: AI cannot auto-reapprove
+}
+
+export interface Problem {
+  id: string;
+  conceptIds: string[];
+  subjectId: string;
+  title: string;
+  type: ProblemType;
+  categoryLabel: string;
+  categoryNumber: number;
+  promptText: string;
+  mathFormula?: string;
+  codeSnippet?: string;
+  timeStandardMinutes: number;
+  timeBreakdownDesc: string;
+  coreEvaluationHighlight: string;
+  itemCountDesc: string;
+  sourceRefs: string;
+  hints: string[];
+  modelAnswer: string;
+  rubric: RubricCriterion[];
+  // Stage 3 fields:
+  isDemo?: boolean;              // true: 0단계 데모 문제, false: AI 생성 승인 문제
+  isApproved?: boolean;          // 승인 완료 플래그
+  draftId?: string;              // 연계 초안 ID
+  difficulty?: ProblemDifficulty;
+  designIntent?: string;         // 출제 의도
+  appliedConditionNote?: string; // AI 설계 응용 조건
+  sourceMarkdownHash?: string;   // 생성 당시 원문 해시
+  isOutdated?: boolean;          // 원문 Markdown 사후 수정 시 구버전 플래그
+  createdAt?: string;
+  // Stage 6 fields:
+  version?: number;                      // 문제 버전 (기본 1)
+  qualityStatus?: ProblemQualityStatus;  // 품질 검토 상태 (정상, 신고 접수, 검토 중, 수정 후 재검토, 재승인, 사용 중지)
+  reports?: ProblemReport[];             // 누적 신고 기록
+  versionHistory?: ProblemVersionSnapshot[]; // 이전 버전 스냅샷 이력
+  lastReviewedAt?: string;               // 최근 검토 시각
+  reviewNotes?: string;                  // 검토/처리 메모
+}
+
 export interface EvaluationResult {
   calculatedScore: number;
   rubricResults: RubricResult[];
@@ -332,6 +458,9 @@ export interface Attempt {
   modelAnswerSnapshot?: string;    // 풀이 당시 모범 답안 스냅샷
   problemTitleSnapshot?: string;   // 풀이 당시 문제 제목 스냅샷
   problemPromptSnapshot?: string;  // 풀이 당시 문제 지문 스냅샷
+  // Stage 6 fields:
+  problemVersion?: number;         // 풀이 당시 문제 버전 (기본 1)
+  rubricSnapshot?: RubricCriterion[]; // 풀이 당시 루브릭 기준 스냅샷
 }
 
 export interface RetentionModelSettings {

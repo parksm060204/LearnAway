@@ -9,8 +9,10 @@ import {
   RubricResult,
   Subject,
   EvaluationResult,
+  ProblemReportType,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
+import { ProblemReportModal } from './ProblemReportModal';
 import {
   X,
   Clock,
@@ -39,6 +41,10 @@ interface ProblemSessionModalProps {
   problem: Problem;
   onSubmitAttempt: (attempt: Attempt) => void;
   onOpenSourceModal: (sourceRef: string) => void;
+  onReportProblem?: (
+    problemId: string,
+    reportData: { type: ProblemReportType; details: string; attemptId?: string }
+  ) => { success: boolean; error?: string };
 }
 
 export function ProblemSessionModal({
@@ -49,6 +55,7 @@ export function ProblemSessionModal({
   problem,
   onSubmitAttempt,
   onOpenSourceModal,
+  onReportProblem,
 }: ProblemSessionModalProps) {
   const [answerText, setAnswerText] = useState('');
   const [activeTab, setActiveTab] = useState<'editor' | 'preview'>('editor');
@@ -63,6 +70,10 @@ export function ProblemSessionModal({
   const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(false);
+
+  // Stage 6: Report State
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
+  const [currentAttemptId, setCurrentAttemptId] = useState<string | undefined>();
 
   if (!isOpen) return null;
 
@@ -118,6 +129,7 @@ export function ProblemSessionModal({
 
       const evalData: EvaluationResult = data.evaluation;
       setEvaluationResult(evalData);
+      setCurrentAttemptId(`att-${Date.now()}-${Math.random().toString(36).substring(7)}`);
 
       // Pre-fill error diagnosis with AI recommendation
       if (evalData.recommendedErrorType) {
@@ -135,8 +147,10 @@ export function ProblemSessionModal({
     if (!evaluationResult || isSubmitting) return;
     setIsSubmitting(true);
 
+    const attemptIdToUse = currentAttemptId || `att-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
     const newAttempt: Attempt = {
-      id: `att-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+      id: attemptIdToUse,
       problemId: problem.id,
       conceptId: concept.id,
       conceptIds: problem.conceptIds || [concept.id],
@@ -158,6 +172,8 @@ export function ProblemSessionModal({
       modelAnswerSnapshot: problem.modelAnswer,
       problemTitleSnapshot: problem.title,
       problemPromptSnapshot: problem.promptText,
+      problemVersion: problem.version || 1,
+      rubricSnapshot: problem.rubric,
     };
 
     onSubmitAttempt(newAttempt);
@@ -173,18 +189,33 @@ export function ProblemSessionModal({
             <span className="w-2.5 h-2.5 bg-[#c52828] inline-block" />
             <span className="font-academic-mono text-xs text-[#ded6c8]">EXAMINATION PRACTICE</span>
             <span className="text-[#827d73]">|</span>
-            <span className="text-xs sm:text-sm font-bold truncate max-w-[300px] sm:max-w-[450px]">
+            <span className="text-xs sm:text-sm font-bold truncate max-w-[240px] sm:max-w-[400px]">
               {concept.title} [{problem.categoryLabel}]
+            </span>
+            <span className="text-[10px] font-academic-mono bg-[#33302b] text-[#ded6c8] px-1.5 py-0.5 rounded-2xs">
+              v{problem.version || 1}
             </span>
           </div>
 
-          <button
-            onClick={onClose}
-            className="text-[#ded6c8] hover:text-white p-1 rounded-xs"
-            aria-label="닫기"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setIsReportModalOpen(true)}
+              className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-academic-mono bg-[#2b2723] hover:bg-[#3a3530] text-amber-300 border border-amber-500/40 rounded-xs transition-colors"
+              title="문제 오류 신고"
+            >
+              <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline">문제 오류 신고</span>
+            </button>
+
+            <button
+              onClick={onClose}
+              className="text-[#ded6c8] hover:text-white p-1 rounded-xs"
+              aria-label="닫기"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Modal Body */}
@@ -205,15 +236,29 @@ export function ProblemSessionModal({
                     AI 출제 승인 문제
                   </span>
                 )}
+                <span className="text-[10px] font-academic-mono bg-[#ded6c8]/60 text-[#57544e] px-1.5 py-0.5 rounded-2xs font-semibold">
+                  v{problem.version || 1}
+                </span>
               </div>
 
-              <button
-                onClick={() => onOpenSourceModal(problem.sourceRefs)}
-                className="flex items-center gap-1 text-[11px] font-academic-mono text-[#57544e] hover:text-[#c52828] underline"
-              >
-                <BookOpen className="w-3.5 h-3.5" />
-                <span>출처: {problem.sourceRefs}</span>
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsReportModalOpen(true)}
+                  className="flex items-center gap-1 text-[11px] font-academic-mono text-amber-700 hover:text-amber-900 underline"
+                >
+                  <ShieldAlert className="w-3 h-3 text-amber-600" />
+                  <span>문제 오류 신고</span>
+                </button>
+
+                <button
+                  onClick={() => onOpenSourceModal(problem.sourceRefs)}
+                  className="flex items-center gap-1 text-[11px] font-academic-mono text-[#57544e] hover:text-[#c52828] underline"
+                >
+                  <BookOpen className="w-3.5 h-3.5" />
+                  <span>출처: {problem.sourceRefs}</span>
+                </button>
+              </div>
             </div>
 
             {problem.appliedConditionNote && (
@@ -669,16 +714,27 @@ export function ProblemSessionModal({
                 <p>{evaluationResult.feedback}</p>
               </div>
 
-              {/* Action Buttons: Revise vs Confirm & Commit */}
+              {/* Action Buttons: Revise vs Confirm & Commit vs Report Error */}
               <div className="flex flex-col sm:flex-row items-center justify-between gap-2 pt-2 border-t border-[#fecaca]">
-                <button
-                  type="button"
-                  onClick={() => setEvaluationResult(null)}
-                  className="w-full sm:w-auto px-4 py-2 text-xs border border-[#ded6c8] text-[#57544e] hover:bg-white rounded-xs transition-colors flex items-center justify-center gap-1.5"
-                >
-                  <Edit className="w-3.5 h-3.5" />
-                  <span>답안 수정 및 재평가</span>
-                </button>
+                <div className="flex items-center gap-2 w-full sm:w-auto">
+                  <button
+                    type="button"
+                    onClick={() => setEvaluationResult(null)}
+                    className="flex-1 sm:flex-initial px-3.5 py-2 text-xs border border-[#ded6c8] text-[#57544e] hover:bg-white rounded-xs transition-colors flex items-center justify-center gap-1.5"
+                  >
+                    <Edit className="w-3.5 h-3.5" />
+                    <span>답안 수정</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsReportModalOpen(true)}
+                    className="flex-1 sm:flex-initial px-3 py-2 text-xs border border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100 rounded-xs transition-colors flex items-center justify-center gap-1"
+                  >
+                    <ShieldAlert className="w-3.5 h-3.5 text-amber-600" />
+                    <span>문제/해설 오류 신고</span>
+                  </button>
+                </div>
 
                 <button
                   type="button"
@@ -696,6 +752,22 @@ export function ProblemSessionModal({
           )}
         </div>
       </div>
+
+      {/* Problem Report Modal */}
+      {isReportModalOpen && (
+        <ProblemReportModal
+          isOpen={isReportModalOpen}
+          onClose={() => setIsReportModalOpen(false)}
+          problem={problem}
+          attemptId={currentAttemptId}
+          onSubmitReport={(probId, reportData) => {
+            if (onReportProblem) {
+              return onReportProblem(probId, reportData);
+            }
+            return { success: false, error: '신고 핸들러가 연결되지 않았습니다.' };
+          }}
+        />
+      )}
     </div>
   );
 }
