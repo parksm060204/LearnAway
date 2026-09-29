@@ -971,6 +971,7 @@ export function resetToInitialDemoData(): void {
   localStorage.removeItem(STORAGE_KEYS.PROBLEMS);
   localStorage.removeItem(STORAGE_KEYS.PROBLEM_DRAFTS);
   localStorage.removeItem(STORAGE_KEYS.ATTEMPTS);
+  localStorage.removeItem('redcall_mock_exam_sessions_v1');
   localStorage.removeItem(STORAGE_KEYS.SETTINGS);
 }
 

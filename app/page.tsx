@@ -1000,15 +1000,19 @@ export default function RedcallDashboardPage() {
       />
 
       {/* 7. Mock Exam Modal */}
-      <MockExamModal
+      {isMockExamModalOpen && <MockExamModal
+        key={activeSubject.id}
         isOpen={isMockExamModalOpen}
         onClose={() => setIsMockExamModalOpen(false)}
         subject={activeSubject}
         concepts={subjectConcepts}
-        onStartExamReview={() => {
-          setIsProblemSessionOpen(true);
+        problems={availableSubjectProblems}
+        onExamRecorded={() => {
+          setAllConcepts(loadStoredConcepts());
+          setAttempts(loadStoredAttempts());
+          showToast('모의시험 답안과 평가가 학습 이력에 저장되었습니다.');
         }}
-      />
+      />}
 
       {/* 8. Add Subject Modal (Stage 0) */}
       <AddSubjectModal

@@ -461,6 +461,23 @@ export interface Attempt {
   // Stage 6 fields:
   problemVersion?: number;         // 풀이 당시 문제 버전 (기본 1)
   rubricSnapshot?: RubricCriterion[]; // 풀이 당시 루브릭 기준 스냅샷
+  mockExamSessionId?: string;
+}
+
+export interface MockExamSession {
+  id: string;
+  subjectId: string;
+  createdAt: string;
+  endsAt: string;
+  submittedAt?: string;
+  durationMinutes: number;
+  status: 'in_progress' | 'submitted' | 'graded' | 'recorded';
+  selectedConceptIds: string[];
+  selectedTypes: ProblemType[];
+  problems: Problem[]; // 시험 시작 당시 고정된 문제·정답·채점 기준
+  answers: Record<string, string>;
+  evaluations: Record<string, EvaluationResult>;
+  recordedAttemptIds?: string[];
 }
 
 export interface RetentionModelSettings {
