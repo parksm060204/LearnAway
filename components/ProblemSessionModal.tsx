@@ -33,6 +33,16 @@ import {
   Compass,
 } from 'lucide-react';
 
+// Snapshot of every input that the AI evaluation depends on. Recording is only
+// allowed while the current inputs still match this snapshot.
+interface EvaluationInputSnapshot {
+  answer: string;
+  solvingReason: string;
+  isReasonNotApplicable: boolean;
+  reasonNotApplicableJustification: string;
+  hintCount: number;
+}
+
 interface ProblemSessionModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -73,8 +83,7 @@ export function ProblemSessionModal({
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [evaluationError, setEvaluationError] = useState<string | null>(null);
   const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
-  const [evaluatedAnswer, setEvaluatedAnswer] = useState<string | null>(null);
-  const [evaluatedHintCount, setEvaluatedHintCount] = useState(0);
+  const [evaluatedSnapshot, setEvaluatedSnapshot] = useState<EvaluationInputSnapshot | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(false);
 
@@ -84,20 +93,55 @@ export function ProblemSessionModal({
 
   if (!isOpen) return null;
 
+  const buildEvaluationSnapshot = (): EvaluationInputSnapshot => ({
+    answer: answerText.trim(),
+    solvingReason: isReasonNotApplicable ? '' : solvingReason.trim(),
+    isReasonNotApplicable,
+    reasonNotApplicableJustification: isReasonNotApplicable
+      ? reasonNotApplicableJustification.trim()
+      : '',
+    hintCount: revealedHints.length,
+  });
+
+  // Any change to an evaluation input invalidates the previous diagnosis so a
+  // stale diagnosis can never be attached to changed content.
+  const invalidateEvaluation = () => {
+    setEvaluationResult(null);
+    setEvaluatedSnapshot(null);
+    setEvaluationError(null);
+    setCurrentAttemptId(undefined);
+  };
+
   const handleRevealHint = (index: number) => {
     if (isEvaluating) return;
     if (!revealedHints.includes(index)) {
       setRevealedHints([...revealedHints, index]);
+      invalidateEvaluation();
     }
   };
 
   const changeAnswer = (value: string) => {
     if (isEvaluating) return;
     setAnswerText(value);
-    setEvaluationResult(null);
-    setEvaluatedAnswer(null);
-    setEvaluationError(null);
-    setCurrentAttemptId(undefined);
+    invalidateEvaluation();
+  };
+
+  const changeSolvingReason = (value: string) => {
+    if (isEvaluating) return;
+    setSolvingReason(value);
+    invalidateEvaluation();
+  };
+
+  const changeReasonNotApplicable = (value: boolean) => {
+    if (isEvaluating) return;
+    setIsReasonNotApplicable(value);
+    invalidateEvaluation();
+  };
+
+  const changeJustification = (value: string) => {
+    if (isEvaluating) return;
+    setReasonNotApplicableJustification(value);
+    invalidateEvaluation();
   };
 
   const insertMathSnippet = (snippet: string) => {
@@ -158,8 +202,15 @@ export function ProblemSessionModal({
 
       const evalData: EvaluationResult = data.evaluation;
       setEvaluationResult(evalData);
-      setEvaluatedAnswer(trimmed);
-      setEvaluatedHintCount(revealedHints.length);
+      setEvaluatedSnapshot({
+        answer: trimmed,
+        solvingReason: isReasonNotApplicable ? '' : solvingReason.trim(),
+        isReasonNotApplicable,
+        reasonNotApplicableJustification: isReasonNotApplicable
+          ? reasonNotApplicableJustification.trim()
+          : '',
+        hintCount: revealedHints.length,
+      });
       setCurrentAttemptId(`att-${Date.now()}-${Math.random().toString(36).substring(7)}`);
 
       // Pre-fill error diagnosis with AI recommendation
@@ -175,9 +226,19 @@ export function ProblemSessionModal({
 
   // Stage 4 & 8: Confirm and Commit Attempt
   const handleConfirmAndRecord = () => {
-    if (!evaluationResult || isSubmitting || evaluatedAnswer !== answerText.trim()) return;
+    const current = buildEvaluationSnapshot();
+    const matchesSnapshot =
+      evaluatedSnapshot !== null &&
+      evaluatedSnapshot.answer === current.answer &&
+      evaluatedSnapshot.solvingReason === current.solvingReason &&
+      evaluatedSnapshot.isReasonNotApplicable === current.isReasonNotApplicable &&
+      evaluatedSnapshot.reasonNotApplicableJustification === current.reasonNotApplicableJustification &&
+      evaluatedSnapshot.hintCount === current.hintCount;
+
+    if (!evaluationResult || isSubmitting || !matchesSnapshot) return;
     setIsSubmitting(true);
 
+    const snapshot = evaluatedSnapshot;
     const attemptIdToUse = currentAttemptId || `att-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 
     const newAttempt: Attempt = {
@@ -187,10 +248,10 @@ export function ProblemSessionModal({
       conceptIds: problem.conceptIds || [concept.id],
       subjectId: subject.id,
       at: new Date().toISOString(),
-      answer: evaluatedAnswer,
+      answer: snapshot.answer,
       confidence,
       errorType,
-      hintCount: evaluatedHintCount,
+      hintCount: snapshot.hintCount,
       reasoningNotes,
       calculatedScore: evaluationResult.calculatedScore,
       rubricResults: evaluationResult.rubricResults,
@@ -205,11 +266,11 @@ export function ProblemSessionModal({
       problemPromptSnapshot: problem.promptText,
       problemVersion: problem.version || 1,
       rubricSnapshot: problem.rubric,
-      // Stage 8 fields
-      solvingReason: isReasonNotApplicable ? undefined : solvingReason,
-      isReasonNotApplicable,
-      reasonNotApplicableJustification: isReasonNotApplicable
-        ? reasonNotApplicableJustification
+      // Stage 8 fields — record the exact inputs that were evaluated
+      solvingReason: snapshot.isReasonNotApplicable ? undefined : snapshot.solvingReason,
+      isReasonNotApplicable: snapshot.isReasonNotApplicable,
+      reasonNotApplicableJustification: snapshot.isReasonNotApplicable
+        ? snapshot.reasonNotApplicableJustification
         : undefined,
       methodSelectionDiagnosis: evaluationResult.methodSelectionDiagnosis,
     };
@@ -538,7 +599,7 @@ export function ProblemSessionModal({
                   <input
                     type="checkbox"
                     checked={isReasonNotApplicable}
-                    onChange={(e) => setIsReasonNotApplicable(e.target.checked)}
+                    onChange={(e) => changeReasonNotApplicable(e.target.checked)}
                     className="rounded-2xs border-[#ded6c8] text-indigo-600 focus:ring-indigo-500"
                   />
                   <span className="font-academic-mono text-[11.5px]">방법 선택 &apos;해당 없음&apos; (선택할 방법 자체가 없는 문항)</span>
@@ -554,7 +615,7 @@ export function ProblemSessionModal({
                   <input
                     type="text"
                     value={reasonNotApplicableJustification}
-                    onChange={(e) => setReasonNotApplicableJustification(e.target.value)}
+                    onChange={(e) => changeJustification(e.target.value)}
                     placeholder="예: 단순 정의 확인 및 단일 사칙연산 문항으로 별도의 공식·정리·알고리즘 선택 과정이 필요하지 않음"
                     className="w-full p-2 text-xs border border-amber-300 rounded-xs bg-white text-[#191817] focus:ring-1 focus:ring-amber-500"
                   />
@@ -575,7 +636,7 @@ export function ProblemSessionModal({
 
                   <textarea
                     value={solvingReason}
-                    onChange={(e) => setSolvingReason(e.target.value)}
+                    onChange={(e) => changeSolvingReason(e.target.value)}
                     placeholder={
                       subject.domain === 'computer_science'
                         ? '예: N<=10^5 제약으로 O(N^2) 완전탐색 대신 O(N log N) 우선순위 큐 다익스트라를 선택함. 음수 가중치가 없으므로 다익스트라 전제조건을 만족함.'

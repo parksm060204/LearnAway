@@ -679,7 +679,7 @@ export default function RedcallDashboardPage() {
   };
 
   const handleReapproveProblem = (problemId: string, reapprovalNote?: string) => {
-    const res = reapproveProblem(problemId, reapprovalNote);
+    const res = reapproveProblem(problemId, reapprovalNote, materials);
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
@@ -718,6 +718,13 @@ export default function RedcallDashboardPage() {
 
   // Stage 9: Study Plan Handlers
   const handleStartPlanItem = (item: StudyPlanItem) => {
+    // Switch to the item's own subject first so subject-scoped modals (problem
+    // session, generator, mock exam, source viewer) open with the right subject.
+    if (item.subjectId !== activeSubjectId) {
+      setActiveSubjectId(item.subjectId);
+      saveActiveSubjectId(item.subjectId);
+    }
+
     if (item.needsProblemGeneration) {
       if (item.conceptId) {
         setSelectedConceptId(item.conceptId);

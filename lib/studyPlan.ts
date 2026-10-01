@@ -94,20 +94,20 @@ export function getEligibleProblemsForPlan(
   const outdatedProblems = available.filter((p) => p.isOutdated === true);
   const currentProblems = available.filter((p) => !p.isOutdated);
 
-  // Sort by preferred types if specified
-  const pool = currentProblems.length > 0 ? currentProblems : outdatedProblems;
-  if (preferredTypes && preferredTypes.length > 0) {
-    const typeSet = new Set(preferredTypes);
-    pool.sort((a, b) => {
-      const aPref = typeSet.has(a.type) ? 1 : 0;
-      const bPref = typeSet.has(b.type) ? 1 : 0;
-      return bPref - aPref || a.id.localeCompare(b.id);
-    });
-  }
+  // The selected problem types are a real filter, not just a sort preference.
+  // If none of the approved problems match the selected types, the concept needs
+  // a new problem rather than silently using an unselected type.
+  const typeSet =
+    preferredTypes && preferredTypes.length > 0 ? new Set(preferredTypes) : null;
+  const matchesType = (p: Problem) => !typeSet || typeSet.has(p.type);
+
+  const typedCurrent = currentProblems.filter(matchesType).sort((a, b) => a.id.localeCompare(b.id));
+  const typedOutdated = outdatedProblems.filter(matchesType).sort((a, b) => a.id.localeCompare(b.id));
+  const pool = typedCurrent.length > 0 ? typedCurrent : typedOutdated;
 
   return {
     eligibleProblems: pool,
-    outdatedProblems,
+    outdatedProblems: typedOutdated,
     quarantinedCount,
   };
 }
@@ -148,14 +148,6 @@ export function generateStudyPlan({
       if (item.kind === 'mixed_mock_exam') {
         completedByMockExam.set(`${item.subjectId}-${item.assignedDate}`, item);
       }
-    }
-  }
-
-  // 2. Auto-match attempts saved in storage to mark matching uncompleted plan items as completed
-  const recentAttemptsByProblem = new Map<string, Attempt>();
-  for (const att of attempts) {
-    if (!recentAttemptsByProblem.has(att.problemId)) {
-      recentAttemptsByProblem.set(att.problemId, att);
     }
   }
 
@@ -242,6 +234,7 @@ export function generateStudyPlan({
         conceptId: c.id,
         conceptName: c.title,
         kind: 'initial_study',
+        earliestDate: todaySeoulStr,
         assignedDate: existing?.assignedDate || todaySeoulStr,
         estimatedMinutes: 20, // Explicit estimated time for reading & understanding
         isEstimatedTime: true,
@@ -285,6 +278,15 @@ export function generateStudyPlan({
 
       const isVulnerabilityTarget =
         hasMethodError || hasCalcError || hasNeedsImprovementDiagnosis || hasVulnerableRubric;
+
+      // Review rounds: the pending item targets the NEXT review (reviewCount + 1).
+      // Completion is only linked to the attempt that actually belongs to a round.
+      const reviewEvents = (c.events || [])
+        .filter((e) => e.kind === 'attempt' || e.kind === 'review')
+        .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+      const reviewCount = reviewEvents.length;
+      const nextRound = reviewCount + 1;
+      const attemptById = new Map(attempts.map((a) => [a.id, a]));
 
       // Find available problem for practice
       const { eligibleProblems } = getEligibleProblemsForPlan(
@@ -346,20 +348,18 @@ export function generateStudyPlan({
       const reason = reasonParts.join(' · ') || '기억 감쇠 방지 권장 복습';
 
       const probIdSuffix = targetProblem ? targetProblem.id : 'no-prob';
-      const itemId = `spi-${kind}-${subject.id}-${c.id}-${probIdSuffix}`;
+      const itemId = `spi-${kind}-${subject.id}-${c.id}-${probIdSuffix}-r${nextRound}`;
       const existing = existingItemMap.get(itemId);
 
-      // Check if attempt already completed today
-      let isCompleted = existing?.status === 'completed';
-      let completedAttId = existing?.completedAttemptId;
-      let completedAt = existing?.completedAt;
+      // Only a persisted completed item for THIS round counts. A past attempt for the
+      // same problem must never complete the next round's item.
+      const isCompleted = existing?.status === 'completed';
+      const completedAttId = existing?.completedAttemptId;
+      const completedAt = existing?.completedAt;
 
-      if (!isCompleted && targetProblem && recentAttemptsByProblem.has(targetProblem.id)) {
-        const matchingAtt = recentAttemptsByProblem.get(targetProblem.id)!;
-        isCompleted = true;
-        completedAttId = matchingAtt.id;
-        completedAt = matchingAtt.at;
-      }
+      // The next review cannot be assigned before the model's recommended date.
+      const recommendedDateStr = rec?.recommendedDateStr || todaySeoulStr;
+      const earliestDate = recommendedDateStr > todaySeoulStr ? recommendedDateStr : todaySeoulStr;
 
       const item: StudyPlanItem = {
         id: itemId,
@@ -371,6 +371,8 @@ export function generateStudyPlan({
         problemTitle: targetProblem?.title,
         problemType: targetProblem?.type,
         kind,
+        round: nextRound,
+        earliestDate,
         assignedDate: existing?.assignedDate || todaySeoulStr,
         estimatedMinutes: problemMinutes,
         isEstimatedTime: false,
@@ -379,7 +381,7 @@ export function generateStudyPlan({
         status: isCompleted ? 'completed' : existing?.status || 'pending',
         snapshotTitle: targetProblem ? `[${kind === 'vulnerability_fix' ? '취약점 보완' : '권장 복습'}] ${targetProblem.title}` : `[문제 생성 필요] ${c.title}`,
         snapshotDetail: targetProblem
-          ? `개념: ${c.title} · ${targetProblem.categoryLabel} · 권장 ${problemMinutes}분`
+          ? `개념: ${c.title} · ${targetProblem.categoryLabel} · 권장 ${problemMinutes}분 · ${nextRound}회차`
           : `승인된 문제가 없습니다. 문제 출제 및 검토 화면에서 새 문제를 생성해 주세요.`,
         completedAt,
         completedAttemptId: completedAttId,
@@ -393,6 +395,52 @@ export function generateStudyPlan({
         urgencyPriority: priorityScore,
         subjectOrder: subIdx,
       });
+
+      // Preserve completed review history within the horizon, each linked to the
+      // actual attempt of its own round.
+      for (let k = 1; k <= reviewCount; k++) {
+        const ev = reviewEvents[k - 1];
+        const completedDateStr = toSeoulDateString(ev.at);
+        if (completedDateStr < todaySeoulStr) continue;
+
+        const matchedAttempt = ev.attemptId ? attemptById.get(ev.attemptId) : undefined;
+        const histProblemId = matchedAttempt?.problemId || targetProblem?.id;
+        const matchedProblem = histProblemId ? problems.find((p) => p.id === histProblemId) : undefined;
+        const histMinutes = matchedProblem?.timeStandardMinutes || problemMinutes;
+        const histId = `spi-${kind}-${subject.id}-${c.id}-${histProblemId || 'no-prob'}-r${k}`;
+        const existingHist = existingItemMap.get(histId);
+
+        const historyItem: StudyPlanItem = {
+          id: histId,
+          subjectId: subject.id,
+          subjectName: subject.name,
+          conceptId: c.id,
+          conceptName: c.title,
+          problemId: histProblemId,
+          problemTitle:
+            matchedAttempt?.problemTitleSnapshot || matchedProblem?.title || targetProblem?.title,
+          problemType: matchedProblem?.type || targetProblem?.type,
+          kind,
+          round: k,
+          assignedDate: existingHist?.assignedDate || completedDateStr,
+          estimatedMinutes: histMinutes,
+          isEstimatedTime: false,
+          priorityScore: 0,
+          priorityReason: `복습 ${k}회차 완료 (해당 회차 실제 기록 연결)`,
+          status: 'completed',
+          snapshotTitle: `[복습 ${k}회차 완료] ${c.title}`,
+          snapshotDetail: `완료일 ${completedDateStr} · 회차 ${k}`,
+          completedAt: ev.at,
+          completedAttemptId: ev.attemptId || ev.id,
+        };
+
+        candidateItems.push({
+          item: historyItem,
+          examDDayDiff: examDiff,
+          urgencyPriority: -1,
+          subjectOrder: subIdx,
+        });
+      }
     });
 
     // 3.3 Generate 'mixed_mock_exam' if enabled and subject has studied concepts
@@ -412,6 +460,7 @@ export function generateStudyPlan({
         subjectName: subject.name,
         conceptIds: studied.map((c) => c.id),
         kind: 'mixed_mock_exam',
+        earliestDate: todaySeoulStr,
         assignedDate: existing?.assignedDate || todaySeoulStr,
         estimatedMinutes: mockMinutes,
         isEstimatedTime: false,
@@ -455,6 +504,8 @@ export function generateStudyPlan({
 
   // Separate already completed items from pending candidate pool
   const pendingPool = candidateItems.map((c) => c.item);
+  // Completed review history is placed on its actual completion date, not re-scheduled.
+  const completedCandidates = pendingPool.filter((i) => i.status === 'completed');
 
   // 5. Daily budget allocation across the planning horizon
   const days: DailyStudyPlan[] = [];
@@ -519,10 +570,37 @@ export function generateStudyPlan({
       }
     }
 
+    // Place generated completed history on its real completion date
+    for (const item of completedCandidates) {
+      if (scheduledItemIds.has(item.id)) continue;
+      const completedDateStr = item.completedAt
+        ? toSeoulDateString(item.completedAt)
+        : item.assignedDate;
+      if (completedDateStr === dayDateStr) {
+        dayItems.push({ ...item, assignedDate: dayDateStr });
+        scheduledItemIds.add(item.id);
+        if (item.problemId) usedProblemsToday.add(item.problemId);
+        assignedMinutes += item.estimatedMinutes;
+      }
+    }
+
     // Next, allocate pending items if budget remains and not rest day
     if (!isRestDay && dayAvailableMinutes > 0) {
       for (const item of pendingPool) {
         if (scheduledItemIds.has(item.id)) continue;
+        // Completed history is placed above; never auto-schedule it forward.
+        if (item.status === 'completed') continue;
+
+        // Start constraint: never assign before the recommended/earliest date.
+        if (item.earliestDate && dayDateStr < item.earliestDate) continue;
+
+        // Deadline constraint: for an upcoming exam, never assign that subject's
+        // work after the exam date. (A past exam keeps a general post-exam mode.)
+        const itemSubject = subjects.find((s) => s.id === item.subjectId);
+        if (itemSubject?.examAt) {
+          const subExamStr = toSeoulDateString(itemSubject.examAt);
+          if (subExamStr >= todaySeoulStr && dayDateStr > subExamStr) continue;
+        }
 
         // Check if item was postponed or skipped
         const override = postponedOrSkipped.get(item.id);
@@ -551,15 +629,6 @@ export function generateStudyPlan({
             assignedDate: dayDateStr,
           };
 
-          // Postponement warning check against exam date
-          const sub = subjects.find((s) => s.id === item.subjectId);
-          if (sub?.examAt) {
-            const subExamStr = toSeoulDateString(sub.examAt);
-            if (dayDateStr > subExamStr) {
-              scheduledItem.warningNote = '배정 날짜가 시험일 이후입니다. 일정 조정이 필요합니다.';
-            }
-          }
-
           dayItems.push(scheduledItem);
           scheduledItemIds.add(item.id);
           if (item.problemId) usedProblemsToday.add(item.problemId);
@@ -583,10 +652,19 @@ export function generateStudyPlan({
   // 6. Any pending items not scheduled in the horizon are gathered into unassigned items
   const allUnassignedItems: StudyPlanItem[] = [];
   for (const item of pendingPool) {
+    if (item.status === 'completed') continue;
     if (!scheduledItemIds.has(item.id)) {
+      const sub = subjects.find((s) => s.id === item.subjectId);
+      const pastExam = Boolean(
+        sub?.examAt && toSeoulDateString(referenceDate) > toSeoulDateString(sub.examAt)
+      );
       allUnassignedItems.push({
         ...item,
         assignedDate: '',
+        warningNote:
+          sub?.examAt && !pastExam
+            ? '시험일 이전 일정에 배정하지 못했습니다. 학습 시간을 늘리거나 범위를 조정해 주세요.'
+            : item.warningNote,
       });
     }
   }

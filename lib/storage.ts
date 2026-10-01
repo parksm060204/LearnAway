@@ -32,6 +32,7 @@ import {
   getConceptStatusFromScore,
 } from './retentionModel';
 import { addDaysToDate } from './dateUtils';
+import { computeMarkdownHash } from './markdownUtils';
 
 const STORAGE_KEYS = {
   CURRENT_SUBJECT_ID: 'redcall_active_subject_id',
@@ -875,7 +876,8 @@ export function editAndReviseProblem(
  */
 export function reapproveProblem(
   problemId: string,
-  reapprovalNote?: string
+  reapprovalNote?: string,
+  currentMaterials?: Material[]
 ): { success: boolean; updatedProblems: Problem[]; updatedProblem: Problem | null; error?: string } {
   const problems = loadStoredProblems();
   const target = problems.find((p) => p.id === problemId);
@@ -917,10 +919,25 @@ export function reapproveProblem(
     return r;
   });
 
+  // Record the source versions the user confirmed, so re-saving the SAME source
+  // content does not immediately re-flag the problem as outdated.
+  const refreshedSourceMaterials = currentMaterials
+    ? target.sourceMaterials?.map((ref) => {
+        const material = currentMaterials.find((m) => m.id === ref.materialId);
+        if (!material) return ref;
+        return {
+          ...ref,
+          title: material.title,
+          markdownHash: computeMarkdownHash(material.parsedMarkdown || ''),
+        };
+      })
+    : target.sourceMaterials;
+
   const updatedProblem: Problem = {
     ...target,
     reports: updatedReports,
     qualityStatus: 'reapproved',
+    sourceMaterials: refreshedSourceMaterials,
     // Explicit user re-approval clears the outdated/review flags so the problem
     // is not permanently excluded from circulation.
     isOutdated: false,
@@ -1105,15 +1122,21 @@ export function recordAttemptAndUpdateConcept(
   const currentConcepts = loadStoredConcepts();
   const currentAttempts = loadStoredAttempts();
 
+  const alreadyAttemptStored = currentAttempts.some((a) => a.id === attempt.id);
+  // Recovery must use the STORED record, not a possibly different retry payload,
+  // so a recovered event can never disagree with the saved Attempt's score.
+  const effectiveAttempt = alreadyAttemptStored
+    ? currentAttempts.find((a) => a.id === attempt.id) ?? attempt
+    : attempt;
+
   const targetConcept = currentConcepts.find(
-    (c) => c.id === attempt.conceptId && c.subjectId === attempt.subjectId
+    (c) => c.id === effectiveAttempt.conceptId && c.subjectId === effectiveAttempt.subjectId
   );
   if (!targetConcept) {
     throw new Error('풀이 기록의 개념과 과목이 일치하지 않습니다.');
   }
 
-  const alreadyAttemptStored = currentAttempts.some((a) => a.id === attempt.id);
-  const alreadyEventStored = targetConcept.events.some((e) => e.attemptId === attempt.id);
+  const alreadyEventStored = targetConcept.events.some((e) => e.attemptId === effectiveAttempt.id);
 
   // Fully recorded already: do not add a second Attempt, event, or exercise count.
   if (alreadyAttemptStored && alreadyEventStored) {
@@ -1121,7 +1144,7 @@ export function recordAttemptAndUpdateConcept(
   }
 
   // Persist the Attempt if it is missing (idempotent).
-  const newAttempts = alreadyAttemptStored ? currentAttempts : [attempt, ...currentAttempts];
+  const newAttempts = alreadyAttemptStored ? currentAttempts : [effectiveAttempt, ...currentAttempts];
   if (!alreadyAttemptStored) {
     saveStoredAttempts(newAttempts);
   }
@@ -1129,10 +1152,15 @@ export function recordAttemptAndUpdateConcept(
   // If the Attempt exists but its review event is missing (a previous partial
   // failure), recover by appending only the missing event.
 
-  // Stage 9: Auto-complete any uncompleted StudyPlanItem matching this problem
+  // Stage 9: Auto-complete the StudyPlanItem for THIS review round only.
+  const completedRound =
+    targetConcept.events.filter((e) => e.kind === 'attempt' || e.kind === 'review').length + 1;
   const currentPlanItems = loadStoredStudyPlanItems();
   const matchingPlanItem = currentPlanItems.find(
-    (i) => i.problemId === attempt.problemId && i.status !== 'completed'
+    (i) =>
+      i.problemId === effectiveAttempt.problemId &&
+      i.status !== 'completed' &&
+      (i.round === undefined || i.round === completedRound)
   );
   if (matchingPlanItem) {
     const updatedPlanItems = currentPlanItems.map((i) =>
@@ -1140,8 +1168,8 @@ export function recordAttemptAndUpdateConcept(
         ? {
             ...i,
             status: 'completed' as const,
-            completedAt: attempt.at,
-            completedAttemptId: attempt.id,
+            completedAt: effectiveAttempt.at,
+            completedAttemptId: effectiveAttempt.id,
           }
         : i
     );
@@ -1150,44 +1178,44 @@ export function recordAttemptAndUpdateConcept(
 
   const updatedConcepts = currentConcepts.map((c) => {
     // Only update the primary concept connected to this attempt
-    if (c.id !== attempt.conceptId || c.subjectId !== attempt.subjectId) return c;
+    if (c.id !== effectiveAttempt.conceptId || c.subjectId !== effectiveAttempt.subjectId) return c;
     // Never append a duplicate event for the same Attempt.
     if (alreadyEventStored) return c;
 
     const newEvent: ReviewEvent = {
       id: `ev-${Date.now()}-${Math.random().toString(36).substring(7)}`,
       conceptId: c.id,
-      at: attempt.at,
+      at: effectiveAttempt.at,
       dayOffset: 0, // Recorded today
       kind: 'attempt',
-      title: `풀이 제출 (${attempt.calculatedScore}점)`,
-      resultScore: attempt.calculatedScore,
-      confidence: attempt.confidence,
-      errorType: attempt.errorType,
-      hintCount: attempt.hintCount,
-      notes: attempt.reasoningNotes,
+      title: `풀이 제출 (${effectiveAttempt.calculatedScore}점)`,
+      resultScore: effectiveAttempt.calculatedScore,
+      confidence: effectiveAttempt.confidence,
+      errorType: effectiveAttempt.errorType,
+      hintCount: effectiveAttempt.hintCount,
+      notes: effectiveAttempt.reasoningNotes,
       sourceRef: c.chapterRef,
-      evaluationSummary: attempt.evaluatorFeedback,
-      rubricScores: attempt.rubricResults,
-      attemptId: attempt.id,
-      strengths: attempt.strengths,
-      criticalImprovements: attempt.criticalImprovements,
-      needsReview: attempt.needsReview,
+      evaluationSummary: effectiveAttempt.evaluatorFeedback,
+      rubricScores: effectiveAttempt.rubricResults,
+      attemptId: effectiveAttempt.id,
+      strengths: effectiveAttempt.strengths,
+      criticalImprovements: effectiveAttempt.criticalImprovements,
+      needsReview: effectiveAttempt.needsReview,
     };
 
     const updatedEvents = [...c.events, newEvent];
-    const newCurrentScore = calculateCurrentConceptScore(updatedEvents, settings, new Date(attempt.at));
+    const newCurrentScore = calculateCurrentConceptScore(updatedEvents, settings, new Date(effectiveAttempt.at));
     const newStatus = getConceptStatusFromScore(newCurrentScore);
 
     return {
       ...c,
       events: updatedEvents,
-      lastAttemptAt: attempt.at,
+      lastAttemptAt: effectiveAttempt.at,
       lastAttemptDayOffset: 0,
-      firstLearnedAt: c.firstLearnedAt || attempt.at,
+      firstLearnedAt: c.firstLearnedAt || effectiveAttempt.at,
       firstLearnedDayOffset: c.firstLearnedDayOffset ?? 0,
       isLearned: true,
-      baseScore: c.baseScore > 0 ? c.baseScore : attempt.calculatedScore,
+      baseScore: c.baseScore > 0 ? c.baseScore : effectiveAttempt.calculatedScore,
       currentScore: newCurrentScore,
       status: newStatus,
       exerciseCount: c.exerciseCount + 1,

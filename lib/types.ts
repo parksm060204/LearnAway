@@ -612,6 +612,8 @@ export interface StudyPlanItem {
   priorityScore: number; // 우선순위 계산값 (내림차순 정렬)
   priorityReason: string; // 실제 데이터에 근거한 추천 이유
   status: StudyPlanItemStatus;
+  round?: number;        // 복습 회차 (1부터). 같은 회차의 실제 기록만 완료로 연결한다.
+  earliestDate?: string; // 배정 가능 시작일 (YYYY-MM-DD, 권장일/시험 제약 반영)
 
   // Snapshots for persistence & history:
   snapshotTitle: string;

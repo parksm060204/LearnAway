@@ -12,7 +12,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
-  'lib/problemSources.ts', 'lib/problemFreshness.ts', 'app/api/evaluate-answer/route.ts',
+  'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
+  'app/api/evaluate-answer/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -31,6 +32,7 @@ async function run() {
   const matStorage = load(path.join(output, 'lib/materialStorage.js'));
   const problemSources = load(path.join(output, 'lib/problemSources.js'));
   const problemFreshness = load(path.join(output, 'lib/problemFreshness.js'));
+  const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
   const markdownUtils = load(path.join(output, 'lib/markdownUtils.js'));
   const types = load(path.join(output, 'lib/types.js'));
   const { INITIAL_SUBJECTS, INITIAL_CONCEPTS, INITIAL_PROBLEMS } = load(path.join(output, 'lib/initialData.js'));
@@ -260,6 +262,126 @@ async function run() {
     assert.equal(afterRetry.events.filter((e) => e.attemptId === 'recovery-attempt').length, 1);
     assert.equal(storage.loadStoredAttempts().length, 1);
     assert.equal(afterRetry.exerciseCount, exerciseCount);
+  });
+
+  // ---- Stage 12: review rounds, scheduling constraints, type filter ----
+  const planSubject = {
+    ...structuredClone(INITIAL_SUBJECTS[0]), id: 'plan-subj', isDemo: false,
+    examAt: '2026-10-20T10:00:00+09:00',
+  };
+  const planRef = new Date('2026-10-01T09:00:00+09:00');
+  const planSettings = structuredClone(types.DEFAULT_STUDY_PLAN_SETTINGS);
+  planSettings.subjectConfigs = {
+    'plan-subj': {
+      subjectId: 'plan-subj', selectedConceptIds: ['plan-c1'],
+      selectedProblemTypes: ['essay_descriptive'], includeMockExam: false, mockExamTargetMinutes: 45,
+    },
+  };
+  const mkPlanProblem = (id, type, conceptId = 'plan-c1') => ({
+    ...structuredClone(INITIAL_PROBLEMS[0]), id, subjectId: 'plan-subj', conceptIds: [conceptId],
+    isDemo: false, isApproved: true, qualityStatus: 'normal', isOutdated: false, version: 1, type,
+    rubric: [{ id: 'r', label: 'r', maxScore: 100, weight: 1, description: 'r' }],
+  });
+  const oldAttemptConcept = {
+    ...structuredClone(INITIAL_CONCEPTS[0]), id: 'plan-c1', subjectId: 'plan-subj', isDemo: false,
+    isLearned: true, status: 'stable', exerciseCount: 1,
+    events: [{ id: 'ev-old', conceptId: 'plan-c1', at: '2026-09-01T10:00:00+09:00', dayOffset: 0,
+      kind: 'attempt', title: 'old', resultScore: 80, confidence: 3, hintCount: 0, sourceRef: '', rubricScores: [] }],
+  };
+  const recentHighConcept = {
+    ...structuredClone(INITIAL_CONCEPTS[0]), id: 'plan-c2', subjectId: 'plan-subj', isDemo: false,
+    isLearned: true, status: 'stable', exerciseCount: 1,
+    events: [{ id: 'ev-new', conceptId: 'plan-c2', at: '2026-10-01T08:00:00+09:00', dayOffset: 0,
+      kind: 'attempt', title: 'recent', resultScore: 95, confidence: 4, hintCount: 0, sourceRef: '', rubricScores: [] }],
+  };
+  const recentHighProblem = mkPlanProblem('plan-prob2', 'essay_descriptive', 'plan-c2');
+  const recentHighSettings = {
+    ...planSettings,
+    subjectConfigs: {
+      'plan-subj': { ...planSettings.subjectConfigs['plan-subj'], selectedConceptIds: ['plan-c2'] },
+    },
+  };
+
+  check('a past attempt does not complete a new review round', () => {
+    const plan = studyPlan.generateStudyPlan({
+      subjects: [planSubject], concepts: [oldAttemptConcept],
+      problems: [mkPlanProblem('plan-prob', 'essay_descriptive')], attempts: [],
+      settings: planSettings, referenceDate: planRef, daysCount: 7,
+    });
+    const all = plan.days.flatMap((d) => d.items).concat(plan.days[0].unassignedItems);
+    const pending = all.find((i) => i.conceptId === 'plan-c1' && i.round === 2);
+    assert.ok(pending, 'a new review round item exists');
+    assert.equal(pending.status, 'pending');
+    assert.ok(!all.some((i) => i.status === 'completed' && i.completedAttemptId === 'ev-old'),
+      'the old attempt does not complete any round');
+  });
+
+  check('a far-future recommendation is not assigned today', () => {
+    const plan = studyPlan.generateStudyPlan({
+      subjects: [planSubject], concepts: [recentHighConcept], problems: [recentHighProblem],
+      attempts: [], settings: recentHighSettings, referenceDate: planRef, daysCount: 7,
+    });
+    const all = plan.days.flatMap((d) => d.items).concat(plan.days[0].unassignedItems);
+    const pending = all.find((i) => i.conceptId === 'plan-c2' && i.round === 2);
+    assert.ok(pending.earliestDate > '2026-10-01', 'earliest date is in the future');
+    for (const item of plan.days.flatMap((d) => d.items)) {
+      if (item.earliestDate) assert.ok(item.assignedDate >= item.earliestDate, 'assigned on/after earliest');
+    }
+  });
+
+  check('work that cannot fit before the exam is counted as shortage', () => {
+    const urgentSubject = { ...planSubject, examAt: '2026-10-02T10:00:00+09:00' };
+    const plan = studyPlan.generateStudyPlan({
+      subjects: [urgentSubject], concepts: [recentHighConcept], problems: [recentHighProblem],
+      attempts: [], settings: recentHighSettings, referenceDate: planRef, daysCount: 7,
+    });
+    assert.ok(plan.totalShortageMinutes > 0, 'shortage is reported');
+    const afterExam = plan.days.filter((d) => d.date > '2026-10-02').flatMap((d) => d.items);
+    assert.equal(afterExam.length, 0, 'nothing is assigned after the exam');
+  });
+
+  check('unselected problem types are filtered, not just sorted', () => {
+    const proofOnly = mkPlanProblem('plan-proof', 'proof_counterexample');
+    const { eligibleProblems } = studyPlan.getEligibleProblemsForPlan(
+      planSubject, oldAttemptConcept, [proofOnly], ['plan-c1'], ['essay_descriptive']
+    );
+    assert.equal(eligibleProblems.length, 0);
+    const plan = studyPlan.generateStudyPlan({
+      subjects: [planSubject], concepts: [oldAttemptConcept], problems: [proofOnly],
+      attempts: [], settings: planSettings, referenceDate: planRef, daysCount: 7,
+    });
+    const item = plan.days.flatMap((d) => d.items).concat(plan.days[0].unassignedItems)
+      .find((i) => i.conceptId === 'plan-c1');
+    assert.equal(item.needsProblemGeneration, true);
+  });
+
+  await checkAsync('recovery uses the stored Attempt score, not the retry payload', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    const base = {
+      id: 'stored-att', problemId: 'p', conceptId: c.id, subjectId: c.subjectId,
+      at: '2026-10-01T08:00:00+09:00', answer: 'a', confidence: 3, errorType: 'none',
+      hintCount: 0, reasoningNotes: '', rubricResults: [], evaluatorFeedback: '',
+    };
+    storage.saveStoredAttempts([{ ...base, calculatedScore: 80 }]);
+    // Retry with a different score must not corrupt the recovered event.
+    storage.recordAttemptAndUpdateConcept({ ...base, calculatedScore: 10 });
+    const ev = storage.loadStoredConcepts()[0].events.find((e) => e.attemptId === 'stored-att');
+    assert.equal(ev.resultScore, 80);
+  });
+
+  await checkAsync('re-approval records the confirmed source hash', async () => {
+    const material = { id: 'm-confirm', subjectId: subject.id, title: '자료', sourceRefs: 'p.1', parsedMarkdown: '# A v2' };
+    const problem = {
+      ...freshnessBase, id: 'prob-confirm',
+      sourceMaterials: [{ materialId: 'm-confirm', title: '자료', markdownHash: 'stale-hash' }],
+    };
+    storage.saveStoredProblems([problem]);
+    const r = storage.reapproveProblem('prob-confirm', '확인 후 재승인', [material]);
+    assert.equal(r.success, true);
+    assert.equal(r.updatedProblem.sourceMaterials[0].markdownHash, markdownUtils.computeMarkdownHash('# A v2'));
+    const applied = problemFreshness.applyMaterialEditToProblems([r.updatedProblem], material, []);
+    assert.deepEqual(applied.outdatedIds, [], 're-saving the same source does not re-flag outdated');
   });
 
   console.log(`${passed} regression checks passed`);

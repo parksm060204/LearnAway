@@ -2216,7 +2216,7 @@ function runTests() {
     };
     const l10RecProblem2 = buildL10Problem('prob-l10-rec2', ['c-l10-rec2']);
     const l10CompletedItem: StudyPlanItem = {
-      id: 'spi-recommended_review-subj-l10-c-l10-rec-prob-l10-rec',
+      id: 'spi-recommended_review-subj-l10-c-l10-rec-prob-l10-rec-r2',
       subjectId: 'subj-l10',
       subjectName: l10Subject.name,
       conceptId: 'c-l10-rec',
