@@ -46,22 +46,26 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
   const eligible = useMemo(() => problems.filter((p) => p.subjectId === subject.id && p.isApproved !== false && isProblemAvailableForPractice(p)), [problems, subject.id]);
   const availableTypes = useMemo(() => Array.from(new Set(eligible.map((p) => p.type))), [eligible]);
 
+  // 계획에서 전달된 범위는 "전체 범위로 확대"하지 않는다.
+  // 전달값이 있는데 유효한 값이 하나도 없으면 빈 선택으로 두어 시작을 차단하고 재선택을 안내한다.
+  const requestedConceptIds = initialConfig?.conceptIds ?? [];
+  const requestedTypesList = initialConfig?.selectedTypes ?? [];
+  const validRequestedConceptIds = requestedConceptIds.filter((id) =>
+    concepts.some((c) => c.id === id && c.subjectId === subject.id)
+  );
+  const validRequestedTypes = requestedTypesList.filter((t) => availableTypes.includes(t));
+  const requestedScopeInvalid =
+    (requestedConceptIds.length > 0 && validRequestedConceptIds.length === 0) ||
+    (requestedTypesList.length > 0 && validRequestedTypes.length === 0);
+
   // 계획에서 시작한 경우: 계획의 개념 범위·문제 유형·시험 시간을 그대로 사용한다.
   // 일반 메뉴에서 시작한 경우: 과목 전체 개념/유형과 기본 시간(60분)을 사용한다.
   const [conceptIds, setConceptIds] = useState<string[]>(() => {
-    const requested = initialConfig?.conceptIds;
-    if (requested && requested.length) {
-      const valid = requested.filter((id) => concepts.some((c) => c.id === id && c.subjectId === subject.id));
-      if (valid.length) return valid;
-    }
+    if (requestedConceptIds.length) return validRequestedConceptIds; // 0개면 빈 배열 유지(차단)
     return concepts.filter((c) => c.subjectId === subject.id).map((c) => c.id);
   });
   const [types, setTypes] = useState<ProblemType[]>(() => {
-    const requested = initialConfig?.selectedTypes;
-    if (requested && requested.length) {
-      const valid = requested.filter((t) => availableTypes.includes(t));
-      if (valid.length) return valid;
-    }
+    if (requestedTypesList.length) return validRequestedTypes; // 0개면 빈 배열 유지(차단)
     return Array.from(new Set(problems.filter((p) => p.subjectId === subject.id && p.isApproved !== false && isProblemAvailableForPractice(p)).map((p) => p.type)));
   });
   const [count, setCount] = useState(4);
@@ -108,8 +112,15 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
   const remaining = session ? Math.max(0, Math.ceil((new Date(session.endsAt).getTime() - now) / 1000)) : 0;
   const blocked = session?.problems.filter((p) => !eligible.some((available) => available.id === p.id)) ?? [];
   const history = isOpen ? loadMockExams().filter((s) => s.subjectId === subject.id && s.status === 'recorded') : [];
+  // 계획 범위가 무효하여 선택이 비어 있고, 아직 사용자가 새로 선택하지 않은 상태.
+  const showScopeWarning = requestedScopeInvalid && (!conceptIds.length || !types.length);
 
   const startExam = () => {
+    // 유효하지 않은 계획 범위로는 시작하지 않는다.
+    if (!conceptIds.length || !types.length) {
+      setError('시험 범위를 다시 선택해 주세요. 계획에 지정된 개념 또는 문제 유형이 더 이상 유효하지 않습니다.');
+      return;
+    }
     const chosen = selectMockExamProblems(subject, concepts, eligible, conceptIds, types, count);
     if (chosen.length < count) { setError(`조건에 맞는 문제는 ${chosen.length}개입니다. 문항 수나 범위를 조정해 주세요.`); return; }
     const createdAt = new Date();
@@ -129,6 +140,8 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
       reasonNotApplicableJustification: {},
       evaluations: {},
     });
+    // "새 계획으로 시작"을 선택한 뒤에도 설정 화면에 머무르지 않도록 시험 화면으로 전환한다.
+    if (resumeDecision === 'new') setResumeDecision('resume');
     setNow(Date.now()); setIndex(0); setError('');
   };
 
@@ -190,6 +203,7 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
     if (!session || session.status !== 'graded' || blocked.length) return;
     try {
     const settings = loadStoredSettings();
+    let partialCount = 0;
     for (const problem of session.problems) {
       const answer = session.answers[problem.id]?.trim();
       const evaluation = session.evaluations[problem.id];
@@ -202,7 +216,7 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
       const reason = session.reasons?.[problem.id];
       const justification = session.reasonNotApplicableJustification?.[problem.id];
 
-      recordAttemptAndUpdateConcept({
+      const result = recordAttemptAndUpdateConcept({
         id,
         mockExamSessionId: session.id,
         problemId: problem.id,
@@ -234,6 +248,15 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
         reasonNotApplicableJustification: isNotApplicable ? justification : undefined,
         methodSelectionDiagnosis: evaluation.methodSelectionDiagnosis,
       }, settings);
+      if (result.partial) partialCount += 1;
+    }
+    if (partialCount > 0) {
+      // 계획 연결만 실패한 부분 저장: recorded로 확정하지 않고(재시도 가능) 실제 상태를 안내한다.
+      // Attempt/ReviewEvent는 이미 저장되어 있고 재시도는 멱등하므로 중복 생성되지 않는다.
+      setError(
+        `일부 문항(${partialCount}건)의 학습 계획 연결 저장이 완료되지 않았습니다. 다시 시도하면 누락된 계획 연결만 복구됩니다. 평가 결과는 보존됩니다.`
+      );
+      return;
     }
     save({
       ...session,
@@ -275,6 +298,11 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
             </div>
           </div>
         ) : (!session || session.status === 'recorded' || resumeDecision === 'new' ? <>
+          {showScopeWarning && (
+            <p role="alert" className="p-3 bg-amber-50 border border-amber-300 text-amber-900">
+              계획에 지정된 개념 또는 문제 유형이 더 이상 유효하지 않아 시험을 시작할 수 없습니다. 아래에서 범위를 다시 선택해 주세요.
+            </p>
+          )}
           <p className="text-[#57544e]">과목의 승인 문제를 섞어 구성합니다. 신고·검토 중인 문항은 제외합니다.</p>
           <div><h3 className="font-semibold mb-2">시험 범위 · 개념 선택</h3><p className="text-xs text-[#606060]">과목 범위: {subject.scope || '별도 지정 없음'} · 아래 개념만 포함합니다.</p>
             <div className="grid sm:grid-cols-2 gap-1 max-h-40 overflow-y-auto border p-2">{concepts.filter((c) => c.subjectId === subject.id).map((c) =>

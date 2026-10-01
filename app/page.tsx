@@ -702,7 +702,17 @@ export default function RedcallDashboardPage() {
 
   // Attempt Submission Handler (Updates ReviewEvent & Retention Score)
   const handleSubmitAttempt = (attempt: Attempt) => {
-    const { updatedConcepts, updatedAttempts } = recordAttemptAndUpdateConcept(attempt, settings);
+    let result;
+    try {
+      result = recordAttemptAndUpdateConcept(attempt, settings);
+    } catch (cause) {
+      // Attempt/ReviewEvent 자체가 저장·검증되지 않은 치명적 실패: 성공으로 표시하지 않는다.
+      showToast(cause instanceof Error ? cause.message : '풀이 저장에 실패했습니다. 다시 시도해 주세요.');
+      setStudyPlanItems(loadStoredStudyPlanItems());
+      return;
+    }
+
+    const { updatedConcepts, updatedAttempts } = result;
     setAllConcepts(updatedConcepts);
     setAttempts(updatedAttempts);
     setStudyPlanItems(loadStoredStudyPlanItems()); // Sync Stage 9 plan items
@@ -714,7 +724,12 @@ export default function RedcallDashboardPage() {
       setSelectedEventId(newEvent.id);
     }
 
-    showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
+    if (result.partial) {
+      // 계획 연결만 실패한 부분 저장: 성공 알림 대신 실제 상태와 재시도 방법을 안내한다.
+      showToast('풀이는 저장되었지만 학습 계획 연결이 완료되지 않았습니다. 다시 제출하면 누락된 계획 연결만 복구됩니다.');
+    } else {
+      showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
+    }
   };
 
   // Stage 9: Study Plan Handlers
