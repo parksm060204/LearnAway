@@ -13,8 +13,8 @@ const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
-  'lib/personalization.ts',
-  'app/api/evaluate-answer/route.ts',
+  'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/learningAnalytics.ts',
+  'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -34,6 +34,9 @@ async function run() {
   const problemSources = load(path.join(output, 'lib/problemSources.js'));
   const problemFreshness = load(path.join(output, 'lib/problemFreshness.js'));
   const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
+  const logicSession = load(path.join(output, 'lib/logicSession.js'));
+  const logicValidation = load(path.join(output, 'lib/logicValidation.js'));
+  const learningAnalytics = load(path.join(output, 'lib/learningAnalytics.js'));
   const markdownUtils = load(path.join(output, 'lib/markdownUtils.js'));
   const personalization = load(path.join(output, 'lib/personalization.js'));
   const types = load(path.join(output, 'lib/types.js'));
@@ -550,6 +553,85 @@ async function run() {
     const good = personalization.computeCorrectionState({ attempts: mkAttempts(90), mockExams: [], problems, subjects: [subject], concepts: [concept], settings, referenceDate });
     const goodSignal = good.perSubject.find((s) => s.subjectId === subjectId);
     assert.equal(goodSignal.direction, 'lengthen', 'stable high performance lengthens the interval');
+  });
+
+  // ---- Stage 13: answer-logic strengthening & delayed rechallenge ----
+  const lsSubject = { ...structuredClone(INITIAL_SUBJECTS[0]), id: 'ls-subj', isDemo: false, examAt: '2026-10-20T10:00:00+09:00' };
+  const lsConcept = { ...structuredClone(INITIAL_CONCEPTS[0]), id: 'ls-c', subjectId: 'ls-subj', isDemo: false, isLearned: true, status: 'stable', exerciseCount: 0, events: [] };
+  const lsRubric = [{ id: 'r', label: 'r', maxScore: 100, weight: 1, description: 'r' }];
+  const lsProblem = { ...structuredClone(INITIAL_PROBLEMS[0]), id: 'ls-prob', subjectId: 'ls-subj', conceptIds: ['ls-c'], isDemo: false, isApproved: true, qualityStatus: 'normal', isOutdated: false, version: 1, rubric: lsRubric };
+  const lsSettings = structuredClone(types.DEFAULT_STUDY_PLAN_SETTINGS);
+  lsSettings.subjectConfigs = { 'ls-subj': { subjectId: 'ls-subj', selectedConceptIds: ['ls-c'], selectedProblemTypes: [lsProblem.type], includeMockExam: false, mockExamTargetMinutes: 45 } };
+
+  await checkAsync('starting a logic session does not modify the original Attempt', async () => {
+    storage.saveStoredConcepts([structuredClone(lsConcept)]);
+    storage.saveStoredAttempts([]);
+    const original = { id: 'ls-orig', problemId: 'ls-prob', conceptId: 'ls-c', subjectId: 'ls-subj', at: '2026-10-01T08:00:00+09:00', answer: 'orig answer', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 60, rubricResults: [], evaluatorFeedback: '', isAiEvaluated: true, attemptOrigin: 'independent' };
+    storage.recordAttemptAndUpdateConcept(original);
+    const draft = { id: 'logic-ls-orig', subjectId: 'ls-subj', conceptId: 'ls-c', problemId: 'ls-prob', problemVersion: 1, sourceAttemptId: 'ls-orig', createdAt: '2026-10-01T09:00:00+09:00', updatedAt: '2026-10-01T09:00:00+09:00', status: 'draft', problemTitleSnapshot: 't', problemPromptSnapshot: 'p', modelAnswerSnapshot: 'm', rubricSnapshot: lsRubric, originalAnswer: 'orig answer', originalScore: 60, originalRubricResults: [], questions: [], questionAnswers: {}, revisedAnswer: '' };
+    assert.equal(logicSession.saveLogicSession(draft), true);
+    assert.equal(logicSession.getLogicSession('logic-ls-orig').originalAnswer, 'orig answer', 'draft restored after refresh');
+    const after = storage.loadStoredAttempts().find((a) => a.id === 'ls-orig');
+    assert.equal(after.calculatedScore, 60, 'original score unchanged');
+    assert.equal(after.answer, 'orig answer', 'original answer unchanged');
+    assert.equal(storage.loadStoredAttempts().length, 1, 'session start creates no attempt');
+  });
+
+  await checkAsync('an assisted revision is stored once and excluded from independent analytics', async () => {
+    const before = storage.loadStoredConcepts().find((c) => c.id === 'ls-c');
+    const revised = { id: 'ls-rev', problemId: 'ls-prob', conceptId: 'ls-c', subjectId: 'ls-subj', at: '2026-10-01T10:00:00+09:00', answer: 'revised', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 95, rubricResults: [], evaluatorFeedback: '', isAiEvaluated: true, attemptOrigin: 'assisted_revision', sourceAttemptId: 'ls-orig', logicSessionId: 'logic-ls-orig' };
+    storage.recordAssistedRevisionAttempt(revised);
+    storage.recordAssistedRevisionAttempt(revised); // duplicate click
+    assert.equal(storage.loadStoredAttempts().filter((a) => a.id === 'ls-rev').length, 1, 'assisted attempt stored once');
+    const after = storage.loadStoredConcepts().find((c) => c.id === 'ls-c');
+    assert.equal(after.events.filter((e) => e.attemptId === 'ls-rev').length, 1, 'assisted event stored once');
+    assert.equal(after.currentScore, before.currentScore, 'assisted revision does not change retention score');
+    assert.equal(after.exerciseCount, before.exerciseCount, 'assisted revision does not increase exercise count');
+
+    const collection = learningAnalytics.collectValidRecords({ attempts: storage.loadStoredAttempts(), mockExams: [], problems: [lsProblem], subjects: [lsSubject], concepts: [after] });
+    assert.equal(collection.assistedRevisionCount, 1, 'assisted revision counted separately');
+    assert.ok(!collection.records.some((r) => r.attemptId === 'ls-rev'), 'assisted revision excluded from independent records');
+    assert.ok(collection.records.some((r) => r.attemptId === 'ls-orig'), 'original independent record included');
+  });
+
+  check('AI-only question validation never creates learning history', () => {
+    const attemptsBefore = storage.loadStoredAttempts().length;
+    const qs = logicValidation.validateLogicQuestionsOutput(
+      { questions: [{ id: 'q1', question: 'a', linkedCriterionId: 'r' }, { id: 'q2', question: 'b' }] },
+      lsRubric
+    );
+    assert.equal(qs.length, 2);
+    assert.throws(() => logicValidation.validateLogicQuestionsOutput({ questions: [{ id: 'q1', question: 'a' }] }, lsRubric));
+    assert.equal(storage.loadStoredAttempts().length, attemptsBefore, 'no history from AI-only validation');
+  });
+
+  check('rechallenge reservation adds a plan item without changing score or round', () => {
+    const attemptsBefore = storage.loadStoredAttempts().length;
+    const concept = storage.loadStoredConcepts().find((c) => c.id === 'ls-c');
+    const eventsBefore = concept.events.length;
+    const reservation = { id: 'rr-1', subjectId: 'ls-subj', subjectName: '과목', conceptId: 'ls-c', problemId: 'ls-prob', problemVersion: 1, problemTitle: 't', problemType: lsProblem.type, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: '2026-10-01T09:00:00+09:00', status: 'scheduled' };
+    const plan = studyPlan.generateStudyPlan({ subjects: [lsSubject], concepts: [concept], problems: [lsProblem], attempts: storage.loadStoredAttempts(), settings: lsSettings, referenceDate: new Date('2026-10-01T09:00:00+09:00'), daysCount: 7, rechallengeReservations: [reservation] });
+    const item = plan.days.flatMap((d) => d.items).concat(plan.days[0].unassignedItems).find((i) => i.kind === 'rechallenge');
+    assert.ok(item, 'rechallenge item generated');
+    assert.equal(item.rechallengeId, 'rr-1');
+    assert.equal(storage.loadStoredAttempts().length, attemptsBefore, 'reservation creates no attempt');
+    assert.equal(storage.loadStoredConcepts().find((c) => c.id === 'ls-c').events.length, eventsBefore, 'reservation adds no review event');
+  });
+
+  await checkAsync('logic-questions API rejects malformed output and accepts valid questions', async () => {
+    const { POST } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const reqBody = { subjectId: 'ls-subj', domain: 'math_stats', problemTitle: 't', problemPrompt: 'p', modelAnswer: 'm', rubric: lsRubric, originalAnswer: 'orig', solvingReason: '' };
+    const request = (value) => new NextRequest('http://localhost/api/logic-questions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+    global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'a' }, { id: 'q2', question: 'b' }] }) } }] });
+    const ok = await POST(request(reqBody));
+    assert.equal(ok.status, 200);
+    const okJson = await ok.json();
+    assert.equal(okJson.questions.length, 2);
+    global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'a' }] }) } }] });
+    const bad = await POST(request(reqBody));
+    assert.equal(bad.status, 502, 'insufficient questions rejected');
+    const badReq = await POST(request({ ...reqBody, originalAnswer: '' }));
+    assert.equal(badReq.status, 400, 'missing original answer rejected before AI call');
   });
 
   console.log(`${passed} regression checks passed`);

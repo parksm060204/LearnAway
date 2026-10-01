@@ -57,6 +57,11 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
   const requestedScopeInvalid =
     (requestedConceptIds.length > 0 && validRequestedConceptIds.length === 0) ||
     (requestedTypesList.length > 0 && validRequestedTypes.length === 0);
+  // 일부만 유효한 경우: 자동으로 넓히지 않고, 제외되는 항목을 알린 뒤 확인을 받는다.
+  const requestedScopePartial =
+    !requestedScopeInvalid &&
+    (validRequestedConceptIds.length < requestedConceptIds.length ||
+      validRequestedTypes.length < requestedTypesList.length);
 
   // 계획에서 시작한 경우: 계획의 개념 범위·문제 유형·시험 시간을 그대로 사용한다.
   // 일반 메뉴에서 시작한 경우: 과목 전체 개념/유형과 기본 시간(60분)을 사용한다.
@@ -73,16 +78,17 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
     const requested = initialConfig?.minutes;
     return requested && Number.isFinite(requested) ? Math.min(180, Math.max(5, Math.round(requested))) : 60;
   });
+  const activeStoredSession = () =>
+    loadMockExams().find(
+      (s) => s.subjectId === subject.id && s.status !== 'recorded' && s.status !== 'abandoned'
+    );
   const [session, setSession] = useState<MockExamSession | null>(() => {
-    const stored = loadMockExams().find((s) => s.subjectId === subject.id && s.status !== 'recorded');
+    const stored = activeStoredSession();
     return stored ? expireMockExam(stored, Date.now()) : null;
   });
   // 진행 중 세션이 있고 계획 설정이 전달되면 "이어서 풀기"와 "새 계획으로 시작"을 구분한다.
   const [resumeDecision, setResumeDecision] = useState<'ask' | 'resume' | 'new'>(() => {
-    if (initialConfig) {
-      const stored = loadMockExams().find((s) => s.subjectId === subject.id && s.status !== 'recorded');
-      if (stored) return 'ask';
-    }
+    if (initialConfig && activeStoredSession()) return 'ask';
     return 'resume';
   });
   const [index, setIndex] = useState(0);
@@ -116,16 +122,29 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
   const showScopeWarning = requestedScopeInvalid && (!conceptIds.length || !types.length);
 
   const startExam = () => {
-    // 유효하지 않은 계획 범위로는 시작하지 않는다.
+    // 중복 클릭으로 세션이 여러 개 생성되지 않도록 차단한다.
+    if (busy) return;
+    // 유효하지 않은 계획 범위로는 시작하지 않는다(전체 범위로 자동 확대 금지).
     if (!conceptIds.length || !types.length) {
       setError('시험 범위를 다시 선택해 주세요. 계획에 지정된 개념 또는 문제 유형이 더 이상 유효하지 않습니다.');
       return;
     }
+    if (
+      requestedScopePartial &&
+      !window.confirm(
+        '계획에 지정된 일부 개념 또는 문제 유형이 더 이상 유효하지 않아 제외됩니다. 현재 선택한 범위로 시작할까요?'
+      )
+    ) {
+      return;
+    }
     const chosen = selectMockExamProblems(subject, concepts, eligible, conceptIds, types, count);
     if (chosen.length < count) { setError(`조건에 맞는 문제는 ${chosen.length}개입니다. 문항 수나 범위를 조정해 주세요.`); return; }
+
+    setBusy(true);
     const createdAt = new Date();
-    save({
-      id: crypto.randomUUID(),
+    const newId = crypto.randomUUID();
+    const newSession: MockExamSession = {
+      id: newId,
       subjectId: subject.id,
       createdAt: createdAt.toISOString(),
       endsAt: new Date(createdAt.getTime() + minutes * 60_000).toISOString(),
@@ -139,10 +158,31 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
       isReasonNotApplicable: {},
       reasonNotApplicableJustification: {},
       evaluations: {},
-    });
-    // "새 계획으로 시작"을 선택한 뒤에도 설정 화면에 머무르지 않도록 시험 화면으로 전환한다.
-    if (resumeDecision === 'new') setResumeDecision('resume');
-    setNow(Date.now()); setIndex(0); setError('');
+    };
+    try {
+      // 기존 미완료 세션은 폐기 처리하고 새 세션을 저장한다(세션 ID로 구분/복원).
+      for (const stored of loadMockExams()) {
+        if (stored.subjectId === subject.id && stored.status !== 'recorded' && stored.status !== 'abandoned') {
+          saveMockExam({ ...stored, status: 'abandoned' });
+        }
+      }
+      saveMockExam(newSession);
+      const persisted = loadMockExams().some((s) => s.id === newId);
+      if (!persisted) {
+        setError('새 모의시험 저장에 실패했습니다. 기존 세션은 그대로 유지됩니다. 다시 시도해 주세요.');
+        return;
+      }
+      setSession(newSession);
+      // "새 계획으로 시작"을 선택한 뒤에도 설정 화면에 머무르지 않도록 시험 화면으로 전환한다.
+      setResumeDecision('resume');
+      setNow(Date.now());
+      setIndex(0);
+      setError('');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '모의시험 저장 중 오류가 발생했습니다.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const submitExam = () => {
@@ -303,6 +343,11 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
               계획에 지정된 개념 또는 문제 유형이 더 이상 유효하지 않아 시험을 시작할 수 없습니다. 아래에서 범위를 다시 선택해 주세요.
             </p>
           )}
+          {requestedScopePartial && (
+            <p role="alert" className="p-3 bg-amber-50 border border-amber-300 text-amber-900">
+              계획에 지정된 일부 개념 또는 문제 유형이 더 이상 유효하지 않아 제외되었습니다. 시작 시 확인 후 진행합니다.
+            </p>
+          )}
           <p className="text-[#57544e]">과목의 승인 문제를 섞어 구성합니다. 신고·검토 중인 문항은 제외합니다.</p>
           <div><h3 className="font-semibold mb-2">시험 범위 · 개념 선택</h3><p className="text-xs text-[#606060]">과목 범위: {subject.scope || '별도 지정 없음'} · 아래 개념만 포함합니다.</p>
             <div className="grid sm:grid-cols-2 gap-1 max-h-40 overflow-y-auto border p-2">{concepts.filter((c) => c.subjectId === subject.id).map((c) =>
@@ -311,7 +356,7 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
           <div><h3 className="font-semibold mb-2">문제 유형</h3><div className="flex flex-wrap gap-3">{availableTypes.map((type) => <label key={type} className="flex gap-1 items-center"><input type="checkbox" checked={types.includes(type)} onChange={() => setTypes(types.includes(type) ? types.filter((x) => x !== type) : [...types, type])} />{labels[type] || type}</label>)}</div></div>
           <div className="flex flex-wrap gap-4"><label>문항 수 <input type="number" min={1} max={10} value={count} onChange={(e) => setCount(Math.min(10, Math.max(1, Number(e.target.value) || 1)))} className="border p-1 w-20 ml-1" /></label><label>제한 시간(분) <input type="number" min={5} max={180} value={minutes} onChange={(e) => setMinutes(Math.min(180, Math.max(5, Number(e.target.value) || 5)))} className="border p-1 w-20 ml-1" /></label></div>
           <p className="text-xs text-[#606060]">출제 가능: {selectMockExamProblems(subject, concepts, eligible, conceptIds, types, eligible.length).length}문항 · 여러 유형을 선택하면 혼합합니다.</p>
-          <button onClick={startExam} disabled={!conceptIds.length || !types.length || !eligible.length} className="bg-[#c52828] text-white px-4 py-2 font-bold disabled:opacity-40">모의시험 시작</button>
+          <button onClick={startExam} disabled={busy || !conceptIds.length || !types.length || !eligible.length} className="bg-[#c52828] text-white px-4 py-2 font-bold disabled:opacity-40">{busy ? '저장 중...' : '모의시험 시작'}</button>
           {history.length > 0 && <section className="border-t pt-3"><h3 className="font-semibold">지난 모의시험</h3>{history.map((item) => <details key={item.id} className="border p-2 my-2 text-xs"><summary className="cursor-pointer">{new Date(item.createdAt).toLocaleString('ko-KR')} · {item.problems.length}문항 · AI 평가 평균 {getExamScore(item) ?? '미평가'}점</summary>
             {item.problems.map((p, i) => <div key={p.id} className="border-t mt-2 pt-2 space-y-1">
               <strong>{i + 1}. {p.title} · 버전 {p.version ?? 1}</strong>

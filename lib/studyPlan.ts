@@ -21,6 +21,7 @@ import {
   StudyPlanScopeRemaining,
   DEFAULT_STUDY_PLAN_SETTINGS,
   isProblemAvailableForPractice,
+  RechallengeReservation,
 } from './types';
 import {
   toSeoulDateString,
@@ -47,6 +48,8 @@ export interface GenerateStudyPlanParams {
   // Stage 10: unified personalization input (same multiplier used by today's review)
   personalizationMultiplier?: number;
   personalizationNote?: string;
+  // Stage 13: delayed rechallenge reservations reflected in the time budget
+  rechallengeReservations?: RechallengeReservation[];
 }
 
 /**
@@ -127,6 +130,7 @@ export function generateStudyPlan({
   daysCount = 14,
   personalizationMultiplier = 1,
   personalizationNote,
+  rechallengeReservations = [],
 }: GenerateStudyPlanParams): StudyPlanSummary {
   const todaySeoulStr = toSeoulDateString(referenceDate);
 
@@ -532,6 +536,46 @@ export function generateStudyPlan({
     }
   });
 
+  // 3.4 Scheduled delayed-rechallenge reservations (independent re-solve)
+  for (const reservation of rechallengeReservations) {
+    if (reservation.status !== 'scheduled') continue;
+    const subject = subjects.find((s) => s.id === reservation.subjectId);
+    if (!subject) continue;
+    const dday = calculateDDay(subject.examAt, referenceDate);
+    const examDiff = dday.isNotSet ? 999 : dday.calendarDiff;
+    const itemId = `spi-rechallenge-${reservation.id}`;
+    const existing = existingItemMap.get(itemId);
+    const priorityScore = 70;
+
+    const item: StudyPlanItem = {
+      id: itemId,
+      subjectId: reservation.subjectId,
+      subjectName: reservation.subjectName,
+      conceptId: reservation.conceptId,
+      problemId: reservation.problemId,
+      problemTitle: reservation.problemTitle,
+      problemType: reservation.problemType,
+      kind: 'rechallenge',
+      earliestDate: reservation.scheduledDate,
+      assignedDate: existing?.assignedDate || reservation.scheduledDate,
+      estimatedMinutes: reservation.estimatedMinutes,
+      isEstimatedTime: false,
+      priorityScore,
+      priorityReason: '지연 재도전: 보완 후 독립적으로 다시 풀기 예약 (점수·회차 불변)',
+      status: existing?.status || 'pending',
+      snapshotTitle: `[지연 재도전] ${reservation.problemTitle || '문제'}`,
+      snapshotDetail: `예약일 ${reservation.scheduledDate} · 원답안/보완 답안을 가리고 새로 풀기`,
+      rechallengeId: reservation.id,
+    };
+
+    candidateItems.push({
+      item,
+      examDDayDiff: examDiff,
+      urgencyPriority: priorityScore,
+      subjectOrder: subjects.indexOf(subject),
+    });
+  }
+
   // 4. Stable deterministic ordering of all candidate items across subjects:
   // - completed items keep priority
   // - higher priority score first
@@ -556,8 +600,30 @@ export function generateStudyPlan({
 
   // Separate already completed items from pending candidate pool
   const pendingPool = candidateItems.map((c) => c.item);
-  // Completed review history is placed on its actual completion date, not re-scheduled.
-  const completedCandidates = pendingPool.filter((i) => i.status === 'completed');
+
+  // Normalize ALL completed history (persisted + freshly derived) through one path
+  // so the same subject/concept/problem/round/attempt is counted exactly once,
+  // regardless of the item kind.
+  const completedKeyOf = (i: StudyPlanItem) =>
+    [i.subjectId, i.conceptId || '', i.problemId || '', i.round ?? '', i.completedAttemptId || ''].join('|');
+  const completedByKey = new Map<string, StudyPlanItem>();
+  const registerCompleted = (item: StudyPlanItem) => {
+    const key = completedKeyOf(item);
+    const existing = completedByKey.get(key);
+    if (!existing) {
+      completedByKey.set(key, item);
+      return;
+    }
+    // Prefer a record that carries a valid completedAt (real completion date).
+    if (item.completedAt && !existing.completedAt) completedByKey.set(key, item);
+  };
+  for (const item of existingItems) {
+    if (item.status === 'completed') registerCompleted(item);
+  }
+  for (const item of pendingPool) {
+    if (item.status === 'completed') registerCompleted(item);
+  }
+  const completedCandidates = Array.from(completedByKey.values());
 
   // 5. Daily budget allocation across the planning horizon
   const days: DailyStudyPlan[] = [];
@@ -612,17 +678,8 @@ export function generateStudyPlan({
     const usedProblemsToday = new Set<string>();
     allocatedProblemIdsByDate.set(dayDateStr, usedProblemsToday);
 
-    // First check existing completed items for this day
-    for (const item of existingItems) {
-      if (item.status === 'completed' && item.assignedDate === dayDateStr) {
-        dayItems.push(item);
-        scheduledItemIds.add(item.id);
-        if (item.problemId) usedProblemsToday.add(item.problemId);
-        assignedMinutes += item.estimatedMinutes;
-      }
-    }
-
-    // Place generated completed history on its real completion date
+    // Place deduplicated completed history on its REAL completion date
+    // (completedAt preferred; assignedDate only as a fallback).
     for (const item of completedCandidates) {
       if (scheduledItemIds.has(item.id)) continue;
       const completedDateStr = item.completedAt

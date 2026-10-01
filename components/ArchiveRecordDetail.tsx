@@ -7,6 +7,7 @@ import {
   ProblemReportType,
   ERROR_TYPE_LABELS,
   METHOD_REASON_RATING_LABELS,
+  isProblemAvailableForPractice,
 } from '../lib/types';
 import { ProblemReportModal } from './ProblemReportModal';
 import {
@@ -18,6 +19,7 @@ import {
   ChevronUp,
   ShieldAlert,
   Compass,
+  BrainCircuit,
 } from 'lucide-react';
 
 interface ArchiveRecordDetailProps {
@@ -30,6 +32,7 @@ interface ArchiveRecordDetailProps {
     problemId: string,
     reportData: { type: ProblemReportType; details: string; attemptId?: string }
   ) => { success: boolean; error?: string };
+  onOpenLogicStrengthen?: (attempt: Attempt) => void;
 }
 
 export function ArchiveRecordDetail({
@@ -39,6 +42,7 @@ export function ArchiveRecordDetail({
   problems = [],
   onOpenSourceModal,
   onReportProblem,
+  onOpenLogicStrengthen,
 }: ArchiveRecordDetailProps) {
   const [isAttemptExpanded, setIsAttemptExpanded] = useState(false);
   const [isModelAnswerExpanded, setIsModelAnswerExpanded] = useState(false);
@@ -80,6 +84,21 @@ export function ArchiveRecordDetail({
     (a) =>
       (event.attemptId && a.id === event.attemptId) ||
       (a.conceptId === concept.id && a.at === event.at)
+  );
+
+  // 답안 논리 강화는 확정 저장된 AI 평가 Attempt에서만 시작한다.
+  // 평가 초안/데모 기록/품질 검토 중 문제는 제외한다.
+  const matchingProblem = matchingAttempt
+    ? problems.find((p) => p.id === matchingAttempt.problemId)
+    : undefined;
+  const canStrengthen = Boolean(
+    matchingAttempt &&
+      onOpenLogicStrengthen &&
+      matchingAttempt.isAiEvaluated === true &&
+      matchingAttempt.needsReview !== true &&
+      matchingProblem &&
+      matchingProblem.isDemo !== true &&
+      isProblemAvailableForPractice(matchingProblem)
   );
 
   return (
@@ -172,6 +191,19 @@ export function ArchiveRecordDetail({
                 <span className="text-[11px] text-amber-900">{event.criticalImprovements}</span>
               </div>
             )}
+          </div>
+        )}
+
+        {canStrengthen && matchingAttempt && (
+          <div className="pt-2 border-t border-[#f1ede4]">
+            <button
+              type="button"
+              onClick={() => onOpenLogicStrengthen!(matchingAttempt)}
+              className="w-full sm:w-auto flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-[#191817] hover:bg-[#33302b] rounded-xs transition-colors"
+            >
+              <BrainCircuit className="w-3.5 h-3.5 text-amber-400" />
+              <span>답안 논리 강화 세션 시작 (질문 → 보완 답안 → 지연 재도전)</span>
+            </button>
           </div>
         )}
       </div>

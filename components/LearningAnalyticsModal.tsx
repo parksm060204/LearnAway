@@ -193,7 +193,8 @@ export function LearningAnalyticsModal({
                 <span>
                   분석 제외 기록: <strong className="text-[#191817]">{excludedInPeriod.length}건</strong> (기간 내) ·
                   초기 학습 {collection.eventStats.initialStudyCount}건 · 복습 이벤트 {collection.eventStats.reviewCount}건 ·
-                  예정/미루기 제외 {collection.eventStats.scheduledExcludedCount}건 · 데모 이벤트 제외 {collection.eventStats.demoEventExcludedCount}건
+                  예정/미루기 제외 {collection.eventStats.scheduledExcludedCount}건 · 데모 이벤트 제외 {collection.eventStats.demoEventExcludedCount}건 ·
+                  보완 풀이 {collection.assistedRevisionCount}건(독립 성과 제외) · 지연 재도전 {collection.rechallengeCount}건(독립 포함)
                 </span>
               </div>
               {excludedEntries.length > 0 && (

@@ -1724,6 +1724,9 @@ function runTests() {
       attemptId: 'att-actual-verified-123',
     });
     const completedItem = completedItems.find((i) => i.id === pendingItem.id)!;
+    // Pin the completion to the test reference date so placement is deterministic
+    // (the engine now prefers the real completedAt over assignedDate).
+    completedItem.completedAt = '2026-09-30T12:00:00+09:00';
 
     assert(
       completedItem.status === 'completed',

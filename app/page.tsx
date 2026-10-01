@@ -20,6 +20,7 @@ import {
   MockExamSession,
   PersonalizationSettings,
   DEFAULT_PERSONALIZATION_SETTINGS,
+  RechallengeReservation,
 } from '../lib/types';
 import {
   loadStoredSubjects,
@@ -43,6 +44,7 @@ import {
   loadStoredSettings,
   saveStoredSettings,
   recordAttemptAndUpdateConcept,
+  recordAssistedRevisionAttempt,
   resetToInitialDemoData,
   postponeConceptReview,
   reportProblemError,
@@ -67,7 +69,9 @@ import {
 import { generateStudyPlan } from '../lib/studyPlan';
 import { computeCorrectionState, getEffectiveIntervalMultiplier } from '../lib/personalization';
 import { loadMockExams } from '../lib/mockExam';
+import { loadRechallengeReservations, saveRechallengeReservation, updateRechallengeReservation } from '../lib/logicSession';
 import { LearningAnalyticsModal } from '../components/LearningAnalyticsModal';
+import { LogicStrengthenModal } from '../components/LogicStrengthenModal';
 import { TopUtilityBar } from '../components/TopUtilityBar';
 import { ExamRecordCard } from '../components/ExamRecordCard';
 import { StatusStrip } from '../components/StatusStrip';
@@ -156,6 +160,12 @@ export default function RedcallDashboardPage() {
   const [personalizationSettings, setPersonalizationSettings] = useState<PersonalizationSettings>(DEFAULT_PERSONALIZATION_SETTINGS);
   const [isLearningAnalyticsOpen, setIsLearningAnalyticsOpen] = useState(false);
 
+  // Stage 13: Answer-logic strengthening session & delayed rechallenge
+  const [logicTarget, setLogicTarget] = useState<{ attempt: Attempt; concept: Concept; problem: Problem } | null>(null);
+  const [logicRecommendationDate, setLogicRecommendationDate] = useState<string | null>(null);
+  const [rechallengeReservations, setRechallengeReservations] = useState<RechallengeReservation[]>([]);
+  const [activeRechallengeReservationId, setActiveRechallengeReservationId] = useState<string | null>(null);
+
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -202,6 +212,7 @@ export default function RedcallDashboardPage() {
     setStudyPlanItems(loadedPlanItems);
     setMockExams(loadedMockExams);
     setPersonalizationSettings(loadedPersonalization);
+    setRechallengeReservations(loadRechallengeReservations());
 
     // Initial concept selection prioritizing top urgent review recommendation
     const subjectConcepts = loadedConcepts.filter((c) => c.subjectId === loadedSubjectId);
@@ -327,8 +338,9 @@ export default function RedcallDashboardPage() {
       existingItems: studyPlanItems,
       personalizationMultiplier: intervalMultiplier,
       personalizationNote,
+      rechallengeReservations,
     });
-  }, [subjects, allConcepts, allProblems, attempts, studyPlanSettings, settings, studyPlanItems, intervalMultiplier, personalizationNote]);
+  }, [subjects, allConcepts, allProblems, attempts, studyPlanSettings, settings, studyPlanItems, intervalMultiplier, personalizationNote, rechallengeReservations]);
 
   const selectedConcept = useMemo(() => {
     return (
@@ -701,16 +713,9 @@ export default function RedcallDashboardPage() {
   };
 
   // Attempt Submission Handler (Updates ReviewEvent & Retention Score)
-  const handleSubmitAttempt = (attempt: Attempt) => {
-    let result;
-    try {
-      result = recordAttemptAndUpdateConcept(attempt, settings);
-    } catch (cause) {
-      // Attempt/ReviewEvent 자체가 저장·검증되지 않은 치명적 실패: 성공으로 표시하지 않는다.
-      showToast(cause instanceof Error ? cause.message : '풀이 저장에 실패했습니다. 다시 시도해 주세요.');
-      setStudyPlanItems(loadStoredStudyPlanItems());
-      return;
-    }
+  // Returns { partial } so the caller can keep the session open for a retry.
+  const handleSubmitAttempt = (attempt: Attempt): { partial: boolean } => {
+    const result = recordAttemptAndUpdateConcept(attempt, settings);
 
     const { updatedConcepts, updatedAttempts } = result;
     setAllConcepts(updatedConcepts);
@@ -724,12 +729,49 @@ export default function RedcallDashboardPage() {
       setSelectedEventId(newEvent.id);
     }
 
-    if (result.partial) {
-      // 계획 연결만 실패한 부분 저장: 성공 알림 대신 실제 상태와 재시도 방법을 안내한다.
-      showToast('풀이는 저장되었지만 학습 계획 연결이 완료되지 않았습니다. 다시 제출하면 누락된 계획 연결만 복구됩니다.');
-    } else {
-      showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
+    if (!result.partial) {
+      if (attempt.rechallengeReservationId) {
+        updateRechallengeReservation(attempt.rechallengeReservationId, { status: 'completed' });
+        setRechallengeReservations(loadRechallengeReservations());
+        showToast('지연 재도전 완료! 독립 풀이로 기록되었습니다.');
+      } else {
+        showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
+      }
     }
+    return { partial: result.partial };
+  };
+
+  // Stage 13: Answer-logic strengthening handlers
+  const handleOpenLogicStrengthen = (attempt: Attempt) => {
+    const concept = allConcepts.find((c) => c.id === attempt.conceptId);
+    const problem = allProblems.find((p) => p.id === attempt.problemId);
+    if (!concept || !problem) {
+      showToast('연결된 개념 또는 문제를 찾을 수 없어 논리 강화를 시작할 수 없습니다.');
+      return;
+    }
+    const subj = subjects.find((s) => s.id === attempt.subjectId);
+    const subjConcepts = allConcepts.filter((c) => c.subjectId === attempt.subjectId);
+    const ranking = rankConceptsForReview(subjConcepts, settings, subj?.examAt, new Date(), intervalMultiplier);
+    const rec = ranking.rankedRecommendations.find((r) => r.conceptId === attempt.conceptId);
+    setLogicRecommendationDate(rec?.recommendedDateStr ?? null);
+    setLogicTarget({ attempt, concept, problem });
+  };
+
+  const handleRecordAssistedAttempt = (attempt: Attempt) => {
+    const { updatedConcepts, updatedAttempts } = recordAssistedRevisionAttempt(attempt);
+    setAllConcepts(updatedConcepts);
+    setAttempts(updatedAttempts);
+    showToast('보완 답안이 원본과 연결된 별도 기록으로 저장되었습니다. (원본 불변, 독립 성과 아님)');
+  };
+
+  const handleReserveRechallenge = (reservation: RechallengeReservation) => {
+    const ok = saveRechallengeReservation(reservation);
+    if (!ok) {
+      showToast('재도전 예약 저장에 실패했습니다. 다시 시도해 주세요.');
+      return;
+    }
+    setRechallengeReservations(loadRechallengeReservations());
+    showToast(`재도전이 ${reservation.scheduledDate}에 예약되었습니다. 점수·복습 회차는 변경되지 않습니다.`);
   };
 
   // Stage 9: Study Plan Handlers
@@ -778,6 +820,23 @@ export default function RedcallDashboardPage() {
       return;
     }
 
+    // rechallenge: 지연 재도전은 원답안/보완 답안을 가리고 독립적으로 다시 푼다.
+    if (item.kind === 'rechallenge') {
+      const prob = item.problemId ? allProblems.find((p) => p.id === item.problemId) : undefined;
+      if (!prob || !isProblemAvailableForPractice(prob)) {
+        showToast('재도전 문제를 사용할 수 없습니다. 문제를 재생성하거나 예약을 조정해 주세요.');
+        return;
+      }
+      if (item.conceptId) setSelectedConceptId(item.conceptId);
+      if (item.problemType) setSelectedProblemType(item.problemType);
+      setActiveProblemIdForSession(item.problemId || null);
+      setActiveRechallengeReservationId(item.rechallengeId || null);
+      setIsStudyPlanOpen(false);
+      setIsProblemSessionOpen(true);
+      showToast('지연 재도전: 원답안·보완 답안을 가리고 새 답안을 먼저 작성하세요.');
+      return;
+    }
+
     // recommended_review or vulnerability_fix
     if (item.problemId) {
       const prob = allProblems.find((p) => p.id === item.problemId);
@@ -792,6 +851,7 @@ export default function RedcallDashboardPage() {
         setSelectedProblemType(item.problemType);
       }
       setActiveProblemIdForSession(item.problemId);
+      setActiveRechallengeReservationId(null);
       setIsStudyPlanOpen(false);
       setIsProblemSessionOpen(true);
       showToast(`[${item.problemTitle || '문제'}] 풀이를 시작합니다.`);
@@ -957,6 +1017,7 @@ export default function RedcallDashboardPage() {
             showToast('선택 개념에 연결된 출제 가능한 문제가 없습니다. 문제를 생성·승인해 주세요.');
             return;
           }
+          setActiveRechallengeReservationId(null);
           setIsProblemSessionOpen(true);
         }}
         onOpenMockExam={() => {
@@ -1036,6 +1097,7 @@ export default function RedcallDashboardPage() {
                 problems={allProblems}
                 onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
                 onReportProblem={handleReportProblem}
+                onOpenLogicStrengthen={handleOpenLogicStrengthen}
               />
             )}
           </div>
@@ -1053,6 +1115,7 @@ export default function RedcallDashboardPage() {
                   if (problemId) {
                     setActiveProblemIdForSession(problemId);
                   }
+                  setActiveRechallengeReservationId(null);
                   setIsProblemSessionOpen(true);
                 }}
                 onPostponeDay={handlePostponeDay}
@@ -1117,11 +1180,13 @@ export default function RedcallDashboardPage() {
           onClose={() => {
             setIsProblemSessionOpen(false);
             setActiveProblemIdForSession(null);
+            setActiveRechallengeReservationId(null);
           }}
           subject={activeSubject}
           concept={sessionConcept}
           problem={activeSessionProblem}
           onSubmitAttempt={handleSubmitAttempt}
+          rechallengeReservationId={activeRechallengeReservationId || undefined}
           onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
           onReportProblem={handleReportProblem}
         />
@@ -1410,6 +1475,22 @@ export default function RedcallDashboardPage() {
         onRecalculateCorrection={handleRecalculateCorrection}
         onOpenRecord={handleOpenAnalyticsRecord}
       />
+
+      {/* 13. Answer-Logic Strengthening Session (Stage 13) */}
+      {logicTarget && (
+        <LogicStrengthenModal
+          key={logicTarget.attempt.id}
+          isOpen
+          onClose={() => setLogicTarget(null)}
+          subject={subjects.find((s) => s.id === logicTarget.attempt.subjectId) || activeSubject}
+          concept={logicTarget.concept}
+          problem={logicTarget.problem}
+          sourceAttempt={logicTarget.attempt}
+          recommendationDate={logicRecommendationDate || undefined}
+          onRecordAssistedAttempt={handleRecordAssistedAttempt}
+          onReserveRechallenge={handleReserveRechallenge}
+        />
+      )}
     </div>
   );
 }

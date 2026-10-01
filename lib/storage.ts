@@ -1014,6 +1014,8 @@ export function resetToInitialDemoData(): void {
   localStorage.removeItem(STORAGE_KEYS.STUDY_PLAN_ITEMS);
   localStorage.removeItem(STORAGE_KEYS.PERSONALIZATION_SETTINGS);
   localStorage.removeItem(STORAGE_KEYS.PERSONALIZATION_STATE);
+  localStorage.removeItem('redcall_logic_sessions_v1');
+  localStorage.removeItem('redcall_rechallenge_reservations_v1');
 }
 
 // Stage 10: Personal review recommendation settings & correction state
@@ -1326,6 +1328,81 @@ export function recordAttemptAndUpdateConcept(
   const partial = matchingPlanItem !== undefined && !planLinkage.persisted;
 
   return { updatedConcepts, updatedAttempts: newAttempts, partial, planLinkage };
+}
+
+/**
+ * Stage 13: Records an ASSISTED revision answer as a separate Attempt + an
+ * `assisted_revision` event. The event is excluded from confirmed retention
+ * events, so it never extends the recommended interval or counts as an
+ * independent review. The original Attempt is never modified.
+ */
+export function recordAssistedRevisionAttempt(
+  attempt: Attempt
+): { updatedConcepts: Concept[]; updatedAttempts: Attempt[] } {
+  const currentConcepts = loadStoredConcepts();
+  const currentAttempts = loadStoredAttempts();
+
+  const alreadyAttemptStored = currentAttempts.some((a) => a.id === attempt.id);
+  const effectiveAttempt = alreadyAttemptStored
+    ? currentAttempts.find((a) => a.id === attempt.id) ?? attempt
+    : attempt;
+
+  const targetConcept = currentConcepts.find(
+    (c) => c.id === effectiveAttempt.conceptId && c.subjectId === effectiveAttempt.subjectId
+  );
+  if (!targetConcept) {
+    throw new Error('보완 답안의 개념과 과목이 일치하지 않습니다.');
+  }
+
+  const alreadyEventStored = targetConcept.events.some((e) => e.attemptId === effectiveAttempt.id);
+  if (alreadyAttemptStored && alreadyEventStored) {
+    return { updatedConcepts: currentConcepts, updatedAttempts: currentAttempts };
+  }
+
+  const newAttempts = alreadyAttemptStored ? currentAttempts : [effectiveAttempt, ...currentAttempts];
+  if (!alreadyAttemptStored) saveStoredAttempts(newAttempts);
+
+  const updatedConcepts = currentConcepts.map((c) => {
+    if (c.id !== effectiveAttempt.conceptId || c.subjectId !== effectiveAttempt.subjectId) return c;
+    if (alreadyEventStored) return c;
+
+    const newEvent: ReviewEvent = {
+      id: `ev-assisted-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+      conceptId: c.id,
+      at: effectiveAttempt.at,
+      dayOffset: 0,
+      kind: 'assisted_revision',
+      title: `보완 답안 (${effectiveAttempt.calculatedScore}점)`,
+      resultScore: effectiveAttempt.calculatedScore,
+      confidence: effectiveAttempt.confidence,
+      errorType: effectiveAttempt.errorType,
+      hintCount: effectiveAttempt.hintCount,
+      notes: effectiveAttempt.reasoningNotes,
+      sourceRef: c.chapterRef,
+      evaluationSummary: effectiveAttempt.evaluatorFeedback,
+      rubricScores: effectiveAttempt.rubricResults,
+      attemptId: effectiveAttempt.id,
+      strengths: effectiveAttempt.strengths,
+      criticalImprovements: effectiveAttempt.criticalImprovements,
+      needsReview: effectiveAttempt.needsReview,
+    };
+
+    // Deliberately do NOT recalculate currentScore/exerciseCount/status: an
+    // assisted revision is not an independent review performance.
+    return { ...c, events: [...c.events, newEvent] };
+  });
+
+  saveStoredConcepts(updatedConcepts);
+
+  const attemptPersisted = loadStoredAttempts().some((a) => a.id === effectiveAttempt.id);
+  const eventPersisted = loadStoredConcepts()
+    .find((c) => c.id === effectiveAttempt.conceptId && c.subjectId === effectiveAttempt.subjectId)
+    ?.events.some((e) => e.attemptId === effectiveAttempt.id);
+  if (!attemptPersisted || !eventPersisted) {
+    throw new Error('보완 답안 저장이 완료되지 않았습니다. 다시 시도해 주세요.');
+  }
+
+  return { updatedConcepts, updatedAttempts: newAttempts };
 }
 
 /**

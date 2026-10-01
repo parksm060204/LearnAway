@@ -112,7 +112,7 @@ export interface ReviewEvent {
   conceptId: string;
   at: string;             // ISO date e.g. "2026-09-26T15:30:00+09:00"
   dayOffset: number;      // Days relative to reference date (e.g. -9, -6, -2, 0)
-  kind: 'initial_study' | 'attempt' | 'review' | 'scheduled';
+  kind: 'initial_study' | 'attempt' | 'review' | 'scheduled' | 'assisted_revision';
   title: string;
   resultScore: number;    // 0 ~ 100
   confidence?: number;    // 1 ~ 5
@@ -532,6 +532,11 @@ export interface Attempt {
   isReasonNotApplicable?: boolean;         // '해당 없음' 선택 여부
   reasonNotApplicableJustification?: string; // 해당 없음 사유
   methodSelectionDiagnosis?: MethodSelectionDiagnosis; // 방법 선택 이유 진단 결과
+  // Stage 13 fields: answer-logic strengthening provenance
+  attemptOrigin?: 'independent' | 'assisted_revision' | 'rechallenge'; // 기본 independent
+  logicSessionId?: string;                 // 논리 강화 세션에서 생성된 보완 답안
+  sourceAttemptId?: string;                // 보완/재도전의 원본 Attempt ID
+  rechallengeReservationId?: string;       // 재도전 예약에서 생성된 기록
 }
 
 export interface MockExamSession {
@@ -541,7 +546,7 @@ export interface MockExamSession {
   endsAt: string;
   submittedAt?: string;
   durationMinutes: number;
-  status: 'in_progress' | 'submitted' | 'graded' | 'recorded';
+  status: 'in_progress' | 'submitted' | 'graded' | 'recorded' | 'abandoned';
   selectedConceptIds: string[];
   selectedTypes: ProblemType[];
   problems: Problem[]; // 시험 시작 당시 고정된 문제·정답·채점 기준
@@ -560,12 +565,90 @@ export interface RetentionModelSettings {
   threshold: number; // Critical review threshold score, e.g. 50.0
 }
 
+// =========================================================================
+// Stage 13: Answer-Logic Strengthening Session & Delayed Rechallenge
+// =========================================================================
+
+export interface LogicQuestion {
+  id: string;
+  question: string;
+  linkedCriterionId?: string; // 연결된 루브릭 기준 ID
+  linkedQuote?: string;       // 실제 답안/루브릭에서 확인한 근거 인용
+  guidance?: string;          // 답변 시 고려할 방향(정답 아님)
+}
+
+export type LogicSessionStatus =
+  | 'draft'              // 세션 생성, 질문 미생성
+  | 'questions_ready'    // AI 질문 생성 완료
+  | 'revised_evaluated'  // 보완 답안 평가 완료(확정 전)
+  | 'completed';         // 보완 답안 확정 저장 완료
+
+export interface LogicStrengthenSession {
+  id: string;
+  subjectId: string;
+  conceptId: string;
+  problemId: string;
+  problemVersion: number;
+  sourceAttemptId: string;
+  createdAt: string;
+  updatedAt: string;
+  status: LogicSessionStatus;
+
+  // 문제/평가 스냅샷 (원본 Attempt 보존, 재평가하지 않음)
+  problemTitleSnapshot: string;
+  problemPromptSnapshot: string;
+  modelAnswerSnapshot: string;
+  rubricSnapshot: RubricCriterion[];
+  sourceMarkdownHash?: string;
+  sourceMaterials?: ProblemSourceRef[];
+
+  originalAnswer: string;
+  originalScore: number;
+  originalRubricResults: RubricResult[];
+  originalSolvingReason?: string;
+  originalIsReasonNotApplicable?: boolean;
+  originalDiagnosisSummary?: string;
+
+  // AI 생성 질문 (2~3개)
+  questions: LogicQuestion[];
+  questionsGeneratedAt?: string;
+  questionsModel?: string;
+
+  // 학생 응답 및 보완 답안
+  questionAnswers: Record<string, string>;
+  revisedAnswer: string;
+  revisedEvaluation?: EvaluationResult;
+  revisedEvaluatedAt?: string;
+  revisedAttemptId?: string; // 확정 시 생성된 별도 Attempt
+}
+
+export type RechallengeReservationStatus = 'scheduled' | 'completed' | 'cancelled';
+
+export interface RechallengeReservation {
+  id: string;
+  subjectId: string;
+  subjectName: string;
+  conceptId: string;
+  problemId: string;
+  problemVersion: number;
+  problemTitle?: string;
+  problemType?: ProblemType;
+  scheduledDate: string; // YYYY-MM-DD (Asia/Seoul)
+  estimatedMinutes: number;
+  createdAt: string;
+  status: RechallengeReservationStatus;
+  sourceLogicSessionId?: string;
+  sourceAttemptId?: string;
+  note?: string;
+}
+
 // Stage 9: Exam Date-Driven Study Plan Types
 export type StudyPlanItemKind =
   | 'initial_study'       // 최초 학습: 미학습 개념 원문/설명
   | 'recommended_review'  // 권장 복습: 복습 기한 경과 또는 오늘 복습 필요
   | 'vulnerability_fix'   // 취약점 보완: 최근 오답 및 취약 루브릭 보완 문제풀이
-  | 'mixed_mock_exam';    // 혼합 모의시험: 종합 평가
+  | 'mixed_mock_exam'     // 혼합 모의시험: 종합 평가
+  | 'rechallenge';        // 지연 재도전: 보완 후 독립적으로 다시 풀기 예약
 
 export type StudyPlanItemStatus =
   | 'pending'     // 미완료
@@ -637,6 +720,9 @@ export interface StudyPlanItem {
     selectedTypes: ProblemType[];
     minutes: number;
   };
+
+  // Rechallenge reservation linkage (rechallenge items):
+  rechallengeId?: string;
 }
 
 export interface DailyStudyPlan {
@@ -676,6 +762,7 @@ export const STUDY_PLAN_ITEM_KIND_LABELS: Record<StudyPlanItemKind, string> = {
   recommended_review: '권장 복습',
   vulnerability_fix: '취약점 보완',
   mixed_mock_exam: '혼합 모의시험',
+  rechallenge: '지연 재도전',
 };
 
 export const DEFAULT_WEEKDAY_SETTINGS: Record<number, WeekdayStudyTime> = {

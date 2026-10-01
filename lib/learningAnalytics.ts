@@ -117,6 +117,8 @@ export interface AnalyticsRecord {
   hintCount: number;
   rubricResults: RubricResult[];
   methodSelectionDiagnosis?: MethodSelectionDiagnosis;
+  // Stage 13: 보완(도움 받은) 풀이와 독립 풀이 구분
+  origin: 'independent' | 'assisted_revision' | 'rechallenge';
 }
 
 export interface ExcludedRecord {
@@ -138,6 +140,9 @@ export interface RecordCollection {
   excluded: ExcludedRecord[];
   excludedByReason: Record<AnalyticsExclusionReason, number>;
   eventStats: EventStats;
+  // 보완(assisted) 풀이는 독립 성과와 섞지 않고 별도로 집계한다.
+  assistedRevisionCount: number;
+  rechallengeCount: number;
 }
 
 function emptyExclusionMap(): Record<AnalyticsExclusionReason, number> {
@@ -195,6 +200,8 @@ export function collectValidRecords({
   const records: AnalyticsRecord[] = [];
   const excluded: ExcludedRecord[] = [];
   const excludedByReason = emptyExclusionMap();
+  let assistedRevisionCount = 0;
+  let rechallengeCount = 0;
 
   const exclude = (recordId: string, source: AnalyticsRecordSource, reason: AnalyticsExclusionReason, at?: string) => {
     excluded.push({ recordId, source, reason, at });
@@ -256,6 +263,15 @@ export function collectValidRecords({
       continue;
     }
 
+    const origin = attempt.attemptOrigin ?? 'independent';
+    // Assisted (logic-strengthened) revisions are NOT independent performance:
+    // count them separately and keep them out of score/interval analytics.
+    if (origin === 'assisted_revision') {
+      assistedRevisionCount += 1;
+      continue;
+    }
+    if (origin === 'rechallenge') rechallengeCount += 1;
+
     const conceptIds = attempt.conceptIds && attempt.conceptIds.length > 0
       ? attempt.conceptIds
       : [attempt.conceptId];
@@ -280,6 +296,7 @@ export function collectValidRecords({
       hintCount: attempt.hintCount ?? 0,
       rubricResults: attempt.rubricResults || [],
       methodSelectionDiagnosis: attempt.methodSelectionDiagnosis,
+      origin,
     });
   }
 
@@ -344,6 +361,7 @@ export function collectValidRecords({
         hintCount: 0,
         rubricResults: evaluation.rubricResults || [],
         methodSelectionDiagnosis: evaluation.methodSelectionDiagnosis,
+        origin: 'independent',
       });
     }
   }
@@ -372,7 +390,7 @@ export function collectValidRecords({
     }
   }
 
-  return { records, excluded, excludedByReason, eventStats };
+  return { records, excluded, excludedByReason, eventStats, assistedRevisionCount, rechallengeCount };
 }
 
 // =========================================================================

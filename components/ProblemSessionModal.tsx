@@ -49,7 +49,9 @@ interface ProblemSessionModalProps {
   subject: Subject;
   concept: Concept;
   problem: Problem;
-  onSubmitAttempt: (attempt: Attempt) => void;
+  onSubmitAttempt: (attempt: Attempt) => { partial: boolean };
+  /** 지연 재도전 예약에서 시작한 경우 전달. 확정 시 예약을 완료 처리하고 독립 풀이로 표시한다. */
+  rechallengeReservationId?: string;
   onOpenSourceModal: (sourceRef: string) => void;
   onReportProblem?: (
     problemId: string,
@@ -64,6 +66,7 @@ export function ProblemSessionModal({
   concept,
   problem,
   onSubmitAttempt,
+  rechallengeReservationId,
   onOpenSourceModal,
   onReportProblem,
 }: ProblemSessionModalProps) {
@@ -85,6 +88,7 @@ export function ProblemSessionModal({
   const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
   const [evaluatedSnapshot, setEvaluatedSnapshot] = useState<EvaluationInputSnapshot | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(false);
 
   // Stage 6: Report State
@@ -273,10 +277,19 @@ export function ProblemSessionModal({
         ? snapshot.reasonNotApplicableJustification
         : undefined,
       methodSelectionDiagnosis: evaluationResult.methodSelectionDiagnosis,
+      attemptOrigin: rechallengeReservationId ? 'rechallenge' : 'independent',
+      rechallengeReservationId,
     };
 
     try {
-      onSubmitAttempt(newAttempt);
+      const result = onSubmitAttempt(newAttempt);
+      if (result.partial) {
+        // 풀이/이벤트는 저장됐지만 계획 연결이 실패한 부분 저장: 모달을 닫지 않고 재시도를 안내한다.
+        // 재시도는 같은 Attempt ID를 사용하며 AI를 다시 호출하지 않는다.
+        setSubmitNotice('풀이 기록은 저장됐지만 학습 계획 완료 반영은 실패했습니다. 재시도해 주세요.');
+        setIsSubmitting(false);
+        return;
+      }
       onClose();
     } catch (cause) {
       setEvaluationError(cause instanceof Error ? cause.message : '풀이 기록 저장에 실패했습니다.');
@@ -1050,6 +1063,12 @@ export function ProblemSessionModal({
                   </button>
                 </div>
 
+                {submitNotice && (
+                  <p role="alert" className="w-full p-2.5 bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded-xs">
+                    {submitNotice}
+                  </p>
+                )}
+
                 <button
                   type="button"
                   onClick={handleConfirmAndRecord}
@@ -1058,7 +1077,11 @@ export function ProblemSessionModal({
                 >
                   <CheckCircle className="w-4 h-4 text-emerald-400" />
                   <span>
-                    {isSubmitting ? '기록 저장 중...' : '결과 확인 및 복습 이력에 기록 확정하기'}
+                    {isSubmitting
+                      ? '기록 저장 중...'
+                      : submitNotice
+                      ? '계획 연결 재시도 (AI 재평가 없음)'
+                      : '결과 확인 및 복습 이력에 기록 확정하기'}
                   </span>
                 </button>
               </div>
