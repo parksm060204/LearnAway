@@ -142,44 +142,76 @@ export function computeCorrectionState({
         distinctDays >= constants.MIN_DISTINCT_DAYS_PER_SUBJECT &&
         distinctProblems >= constants.MIN_DISTINCT_PROBLEMS_PER_SUBJECT;
 
-      let shortSignals = 0;
-      let longSignals = 0;
+      // ── 신호 분류 ──
+      // 단순 개수 비교가 아니라, "성과/취약 신호"와 "연장 근거"를 분리해 방향을 결정한다.
+      const hasLowPerformance =
+        reccentAverage !== null && reccentAverage < constants.LOW_SCORE_THRESHOLD;
+      const hasRepeatErrors = repeatErrorCount > 0;
+      const hasHighHintDependency = hintDependencyRatio >= constants.HINT_DEPENDENCY_RATIO;
+      const hasVulnerability = hasRepeatErrors || hasHighHintDependency;
+      const isStablePerformance =
+        reccentAverage !== null && reccentAverage >= constants.HIGH_SCORE_THRESHOLD;
+      const lowHintDependency = hintDependencyRatio <= constants.LOW_HINT_RATIO;
+
+      // 명시적 방향 규칙 (단순 신호 개수 비교가 아님):
+      //  - negative: 낮은 성과 또는 취약 신호(반복 오류/높은 힌트 의존)
+      //  - positive: 충분한 기록 + 안정적 성과(높은 평균)
+      //  1) positive와 negative가 함께 있으면 → 상충 → 기본 간격 유지(neutral)
+      //  2) negative만 있으면 → 단축(shorten). 힌트 미사용만으로는 절대 연장하지 않는다.
+      //  3) positive가 충분(낮은 힌트 의존 + 반복 오류 없음)하면 → 연장(lengthen)
+      //  4) 그 외 → 기본 간격 유지(neutral)
+      const hasPositiveEvidence = eligible && isStablePerformance;
+      const hasNegativeSignal = hasLowPerformance || hasVulnerability;
+
       const reasonParts: string[] = [];
-
-      if (reccentAverage !== null && reccentAverage < constants.LOW_SCORE_THRESHOLD) {
-        shortSignals += 1;
-        reasonParts.push(`최근 평균 ${reccentAverage}점 (< ${constants.LOW_SCORE_THRESHOLD})`);
-      }
-      if (repeatErrorCount > 0) {
-        shortSignals += 1;
-        reasonParts.push(`반복 오류 ${repeatErrorCount}건`);
-      }
-      if (hintDependencyRatio >= constants.HINT_DEPENDENCY_RATIO) {
-        shortSignals += 1;
-        reasonParts.push(`힌트 의존 ${Math.round(hintDependencyRatio * 100)}%`);
-      }
-      if (reccentAverage !== null && reccentAverage >= constants.HIGH_SCORE_THRESHOLD) {
-        longSignals += 1;
-        reasonParts.push(`서로 다른 문제에서 안정적 성과 (평균 ${reccentAverage}점)`);
-      }
-      if (hintDependencyRatio <= constants.LOW_HINT_RATIO) {
-        longSignals += 1;
-        reasonParts.push(`힌트 의존 낮음 (${Math.round(hintDependencyRatio * 100)}%)`);
-      }
-      if (repeatErrorCount === 0 && distinctProblems >= constants.MIN_DISTINCT_PROBLEMS_PER_SUBJECT) {
-        longSignals += 1;
-        reasonParts.push('반복 오류 없음');
-      }
-
       let direction: PersonalizationSubjectSignal['direction'] = 'neutral';
-      if (shortSignals > longSignals) direction = 'shorten';
-      else if (longSignals > shortSignals) direction = 'lengthen';
+
+      if (hasPositiveEvidence && hasNegativeSignal) {
+        if (reccentAverage !== null) reasonParts.push(`안정적 성과 (평균 ${reccentAverage}점)`);
+        if (hasLowPerformance) {
+          reasonParts.push(`최근 평균 ${reccentAverage}점 (< ${constants.LOW_SCORE_THRESHOLD})`);
+        }
+        if (hasRepeatErrors) reasonParts.push(`반복 오류 ${repeatErrorCount}건`);
+        if (hasHighHintDependency) {
+          reasonParts.push(`힌트 의존 ${Math.round(hintDependencyRatio * 100)}%`);
+        }
+        reasonParts.push('상충하는 신호로 기본 간격 유지');
+      } else if (hasNegativeSignal) {
+        direction = 'shorten';
+        if (hasLowPerformance) {
+          reasonParts.push(`최근 평균 ${reccentAverage}점 (< ${constants.LOW_SCORE_THRESHOLD})`);
+        }
+        if (hasRepeatErrors) reasonParts.push(`반복 오류 ${repeatErrorCount}건`);
+        if (hasHighHintDependency) {
+          reasonParts.push(`힌트 의존 ${Math.round(hintDependencyRatio * 100)}%`);
+        }
+        if (!hasVulnerability && lowHintDependency) {
+          reasonParts.push('힌트 미사용만으로는 간격을 연장하지 않음');
+        }
+      } else if (hasPositiveEvidence && lowHintDependency && !hasRepeatErrors) {
+        direction = 'lengthen';
+        reasonParts.push(`서로 다른 문제에서 안정적 성과 (평균 ${reccentAverage}점)`);
+        reasonParts.push(`힌트 의존 낮음 (${Math.round(hintDependencyRatio * 100)}%)`);
+        reasonParts.push('반복 오류 없음');
+      } else {
+        direction = 'neutral';
+        if (reccentAverage !== null) reasonParts.push(`최근 평균 ${reccentAverage}점`);
+        if (lowHintDependency) {
+          reasonParts.push(`힌트 의존 낮음 (${Math.round(hintDependencyRatio * 100)}%)`);
+        }
+        reasonParts.push('안정적 성과 조건 미충족으로 기본 간격 유지');
+      }
+
+      const shortSignalCount = [hasLowPerformance, hasRepeatErrors, hasHighHintDependency].filter(
+        Boolean
+      ).length;
 
       const targetMultiplier =
         direction === 'shorten'
-          ? Number((1 - constants.SHORTEN_STEP * Math.min(shortSignals, 2)).toFixed(2))
+          ? Number((1 - constants.SHORTEN_STEP * Math.min(Math.max(shortSignalCount, 1), 2)).toFixed(2))
           : direction === 'lengthen'
-          ? Number((1 + constants.LENGTHEN_STEP * Math.min(longSignals, 2)).toFixed(2))
+          ? // 연장은 단일 단계로 보수적으로 적용한다 (증거 강도는 이후 완만 반영됨).
+            Number((1 + constants.LENGTHEN_STEP).toFixed(2))
           : 1;
 
       const evidenceStrength = clamp01(

@@ -13,6 +13,7 @@ const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
+  'lib/personalization.ts',
   'app/api/evaluate-answer/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -34,6 +35,7 @@ async function run() {
   const problemFreshness = load(path.join(output, 'lib/problemFreshness.js'));
   const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
   const markdownUtils = load(path.join(output, 'lib/markdownUtils.js'));
+  const personalization = load(path.join(output, 'lib/personalization.js'));
   const types = load(path.join(output, 'lib/types.js'));
   const { INITIAL_SUBJECTS, INITIAL_CONCEPTS, INITIAL_PROBLEMS } = load(path.join(output, 'lib/initialData.js'));
   let passed = 0;
@@ -382,6 +384,172 @@ async function run() {
     assert.equal(r.updatedProblem.sourceMaterials[0].markdownHash, markdownUtils.computeMarkdownHash('# A v2'));
     const applied = problemFreshness.applyMaterialEditToProblems([r.updatedProblem], material, []);
     assert.deepEqual(applied.outdatedIds, [], 're-saving the same source does not re-flag outdated');
+  });
+
+  // ---- Stage 12 fixes: plan/completion integrity, mock exam config, personalization ----
+  const mkPlanItem = (overrides) => ({
+    id: 'spi-x', subjectId: 's', subjectName: '과목', conceptId: 'c', conceptName: '개념',
+    problemId: 'p', problemTitle: '문제', problemType: 'essay_descriptive', kind: 'recommended_review',
+    assignedDate: '2026-10-01', estimatedMinutes: 15, isEstimatedTime: false, priorityScore: 50,
+    priorityReason: 'r', status: 'pending', round: 1, snapshotTitle: 't', snapshotDetail: 'd',
+    ...overrides,
+  });
+
+  await checkAsync('a shared composite problem does not complete another concept plan', async () => {
+    const subjectId = 'shared-subj';
+    const c1 = { ...structuredClone(INITIAL_CONCEPTS[0]), id: 'shared-c1', subjectId, isDemo: false, isLearned: true, status: 'stable', events: [], exerciseCount: 1 };
+    const c2 = { ...structuredClone(INITIAL_CONCEPTS[0]), id: 'shared-c2', subjectId, isDemo: false, isLearned: true, status: 'stable', events: [], exerciseCount: 1 };
+    storage.saveStoredConcepts([c1, c2]);
+    storage.saveStoredAttempts([]);
+    storage.saveStoredStudyPlanItems([
+      mkPlanItem({ id: 'shared-c2-item', subjectId, conceptId: c2.id, problemId: 'shared-p', status: 'pending' }),
+      mkPlanItem({ id: 'shared-c1-skipped', subjectId, conceptId: c1.id, problemId: 'shared-p', status: 'skipped' }),
+    ]);
+    const attempt = {
+      id: 'shared-att', problemId: 'shared-p', conceptId: c1.id, subjectId,
+      at: new Date().toISOString(), answer: 'a', confidence: 3, errorType: 'none', hintCount: 0,
+      reasoningNotes: '', calculatedScore: 80, rubricResults: [], evaluatorFeedback: '',
+    };
+    const res = storage.recordAttemptAndUpdateConcept(attempt);
+    const items = storage.loadStoredStudyPlanItems();
+    assert.equal(items.find((i) => i.id === 'shared-c2-item').status, 'pending', 'another concept plan stays pending');
+    assert.equal(items.find((i) => i.id === 'shared-c1-skipped').status, 'skipped', 'skipped item is not auto-completed');
+    assert.equal(res.planLinkage.linkedItemId, null, 'no plan item is linked for the wrong concept');
+
+    // A valid pending item for the attempt's own concept IS completed.
+    // C1 already has one recorded round, so this second attempt is round 2.
+    storage.saveStoredStudyPlanItems([
+      mkPlanItem({ id: 'shared-c1-item', subjectId, conceptId: c1.id, problemId: 'shared-p', status: 'pending', round: 2 }),
+    ]);
+    const res2 = storage.recordAttemptAndUpdateConcept({ ...attempt, id: 'shared-att-2', conceptId: c1.id });
+    assert.equal(storage.loadStoredStudyPlanItems().find((i) => i.id === 'shared-c1-item').status, 'completed', 'the matching concept plan is completed');
+    assert.equal(res2.planLinkage.linkedItemId, 'shared-c1-item', 'the correct plan item is linked');
+  });
+
+  await checkAsync('plan save failure is surfaced and a retry repairs only the plan link', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), id: 'fail-c', subjectId: 'fail-subj', events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredAttempts([]);
+    storage.saveStoredStudyPlanItems([
+      mkPlanItem({ id: 'fail-item', subjectId: 'fail-subj', conceptId: c.id, problemId: 'fail-p', status: 'pending' }),
+    ]);
+    const attempt = {
+      id: 'fail-att', problemId: 'fail-p', conceptId: c.id, subjectId: 'fail-subj',
+      at: new Date().toISOString(), answer: 'a', confidence: 3, errorType: 'none', hintCount: 0,
+      reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '',
+    };
+    const originalSet = localStorage.setItem;
+    const PLAN_KEY = 'redcall_study_plan_items_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === PLAN_KEY) throw new Error('plan storage down');
+      return originalSet(key, value);
+    };
+    let first;
+    try {
+      first = storage.recordAttemptAndUpdateConcept(attempt);
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+    assert.equal(first.partial, true, 'plan-only failure is reported as partial (not a false success)');
+    assert.equal(first.planLinkage.persisted, false, 'plan link did not persist');
+    assert.equal(storage.loadStoredAttempts().length, 1, 'Attempt persisted despite the plan failure');
+    assert.equal(storage.loadStoredConcepts()[0].events.filter((e) => e.attemptId === 'fail-att').length, 1, 'review event persisted once');
+    assert.equal(storage.loadStoredStudyPlanItems()[0].status, 'pending', 'plan link really failed');
+
+    const exerciseCount = storage.loadStoredConcepts()[0].exerciseCount;
+    const retry = storage.recordAttemptAndUpdateConcept(attempt);
+    assert.equal(retry.partial, false, 'retry reports a complete save');
+    assert.equal(retry.planLinkage.persisted, true, 'retry repairs the plan link');
+    assert.equal(storage.loadStoredStudyPlanItems().find((i) => i.id === 'fail-item').status, 'completed', 'plan item completed on retry');
+    assert.equal(storage.loadStoredAttempts().length, 1, 'retry does not duplicate the Attempt');
+    assert.equal(storage.loadStoredConcepts()[0].events.filter((e) => e.attemptId === 'fail-att').length, 1, 'retry does not duplicate the event');
+    assert.equal(storage.loadStoredConcepts()[0].exerciseCount, exerciseCount, 'retry does not re-increment exerciseCount');
+  });
+
+  check('completion history is not duplicated when the plan kind changes', () => {
+    const subjectId = 'hist-subj';
+    const conceptId = 'hist-c';
+    const problemId = 'hist-p';
+    const subject = { ...structuredClone(INITIAL_SUBJECTS[0]), id: subjectId, isDemo: false, examAt: '2026-10-20T10:00:00+09:00' };
+    const concept = {
+      ...structuredClone(INITIAL_CONCEPTS[0]), id: conceptId, subjectId, isDemo: false, isLearned: true, status: 'stable', exerciseCount: 1,
+      events: [{ id: 'ev-hist', conceptId, at: '2026-10-01T08:00:00+09:00', dayOffset: 0, kind: 'attempt', title: 't', resultScore: 80, confidence: 3, hintCount: 0, sourceRef: '', rubricScores: [], attemptId: 'att-hist' }],
+    };
+    const problem = {
+      ...structuredClone(INITIAL_PROBLEMS[0]), id: problemId, subjectId, conceptIds: [conceptId], isDemo: false,
+      isApproved: true, qualityStatus: 'normal', isOutdated: false, version: 1, type: 'essay_descriptive',
+      rubric: [{ id: 'r', label: 'r', maxScore: 100, weight: 1, description: 'r' }],
+    };
+    const settings = {
+      ...structuredClone(types.DEFAULT_STUDY_PLAN_SETTINGS),
+      subjectConfigs: { [subjectId]: { subjectId, selectedConceptIds: [conceptId], selectedProblemTypes: ['essay_descriptive'], includeMockExam: false, mockExamTargetMinutes: 45 } },
+    };
+    // Saved completion id uses the OLD kind; the same attempt must not be reproduced under a new kind id.
+    const existing = mkPlanItem({
+      id: `spi-recommended_review-${subjectId}-${conceptId}-${problemId}-r1`, subjectId, subjectName: subject.name,
+      conceptId, problemId, kind: 'recommended_review', status: 'completed', round: 1,
+      completedAt: '2026-10-01T08:00:00+09:00', completedAttemptId: 'att-hist',
+    });
+    const plan = studyPlan.generateStudyPlan({
+      subjects: [subject], concepts: [concept], problems: [problem], attempts: [], settings,
+      referenceDate: new Date('2026-10-01T09:00:00+09:00'), existingItems: [existing], daysCount: 7,
+    });
+    const all = plan.days.flatMap((d) => d.items).concat(plan.days[0].unassignedItems);
+    const linked = all.filter((i) => i.completedAttemptId === 'att-hist');
+    assert.equal(linked.length, 1, 'exactly one completion entry exists for the attempt');
+    assert.equal(linked[0].completedAt, '2026-10-01T08:00:00+09:00', 'completion shows the real completion date');
+  });
+
+  check('mixed mock exam plan item stores scope, types and planned minutes', () => {
+    const subjectId = 'mock-subj';
+    const c1 = { ...structuredClone(INITIAL_CONCEPTS[0]), id: 'mock-c1', subjectId, isDemo: false, isLearned: true, status: 'stable', exerciseCount: 1, events: [] };
+    const c2 = { ...structuredClone(INITIAL_CONCEPTS[0]), id: 'mock-c2', subjectId, isDemo: false, isLearned: true, status: 'stable', exerciseCount: 1, events: [] };
+    const rubric = [{ id: 'r', label: 'r', maxScore: 100, weight: 1, description: 'r' }];
+    const p1 = { ...structuredClone(INITIAL_PROBLEMS[0]), id: 'mock-p1', subjectId, conceptIds: ['mock-c1'], isDemo: false, isApproved: true, qualityStatus: 'normal', isOutdated: false, version: 1, type: 'essay_descriptive', rubric };
+    const p2 = { ...p1, id: 'mock-p2', conceptIds: ['mock-c2'] };
+    const subject = { ...structuredClone(INITIAL_SUBJECTS[0]), id: subjectId, isDemo: false, examAt: '2026-10-08T10:00:00+09:00' };
+    const settings = {
+      ...structuredClone(types.DEFAULT_STUDY_PLAN_SETTINGS),
+      subjectConfigs: { [subjectId]: { subjectId, selectedConceptIds: ['mock-c1', 'mock-c2'], selectedProblemTypes: ['essay_descriptive'], includeMockExam: true, mockExamTargetMinutes: 35 } },
+    };
+    const plan = studyPlan.generateStudyPlan({
+      subjects: [subject], concepts: [c1, c2], problems: [p1, p2], attempts: [], settings,
+      referenceDate: new Date('2026-10-01T09:00:00+09:00'), daysCount: 7,
+    });
+    const mock = plan.days.flatMap((d) => d.items).concat(plan.days[0].unassignedItems).find((i) => i.kind === 'mixed_mock_exam');
+    assert.ok(mock, 'a mixed mock exam item is generated');
+    assert.equal(mock.mockExamConfig.minutes, 35, 'planned exam minutes are stored on the item');
+    assert.deepEqual(mock.mockExamConfig.selectedTypes, ['essay_descriptive'], 'selected problem types are stored on the item');
+    assert.deepEqual([...mock.mockExamConfig.conceptIds].sort(), ['mock-c1', 'mock-c2'], 'scope concepts are stored on the item');
+  });
+
+  check('low performance does not lengthen the interval just because hints were unused', () => {
+    const subjectId = 'pers-subj';
+    const subject = { ...structuredClone(INITIAL_SUBJECTS[0]), id: subjectId, isDemo: false };
+    const concept = { ...structuredClone(INITIAL_CONCEPTS[0]), id: 'pers-c', subjectId, isDemo: false };
+    const problemIds = ['pers-p1', 'pers-p2', 'pers-p3'];
+    const problems = problemIds.map((id) => ({
+      ...structuredClone(INITIAL_PROBLEMS[0]), id, subjectId, conceptIds: ['pers-c'],
+      isDemo: false, isApproved: true, qualityStatus: 'normal', isOutdated: false, version: 1,
+    }));
+    const days = ['2026-09-26', '2026-09-27', '2026-09-28', '2026-09-29', '2026-09-30'];
+    const mkAttempts = (score) => days.map((d, idx) => ({
+      id: `pers-att-${score}-${idx}`, problemId: problemIds[idx % 3], conceptId: 'pers-c', subjectId,
+      at: `${d}T09:00:00+09:00`, answer: 'a', confidence: 3, errorType: 'none', hintCount: 0,
+      reasoningNotes: '', calculatedScore: score, rubricResults: [], evaluatorFeedback: '', problemVersion: 1,
+    }));
+    const settings = { ...structuredClone(types.DEFAULT_PERSONALIZATION_SETTINGS), enabled: true, autoAdjust: true, tendency: 'standard' };
+    const referenceDate = new Date('2026-10-01T09:00:00+09:00');
+
+    const bad = personalization.computeCorrectionState({ attempts: mkAttempts(40), mockExams: [], problems, subjects: [subject], concepts: [concept], settings, referenceDate });
+    const badSignal = bad.perSubject.find((s) => s.subjectId === subjectId);
+    assert.ok(badSignal, 'subject signal exists');
+    assert.equal(badSignal.direction, 'shorten', 'low average performance shortens the interval');
+    assert.ok(bad.appliedMultiplier < 1, `applied multiplier is below 1 (got ${bad.appliedMultiplier})`);
+
+    const good = personalization.computeCorrectionState({ attempts: mkAttempts(90), mockExams: [], problems, subjects: [subject], concepts: [concept], settings, referenceDate });
+    const goodSignal = good.perSubject.find((s) => s.subjectId === subjectId);
+    assert.equal(goodSignal.direction, 'lengthen', 'stable high performance lengthens the interval');
   });
 
   console.log(`${passed} regression checks passed`);

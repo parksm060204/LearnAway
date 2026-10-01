@@ -15,12 +15,24 @@ import { expireMockExam, getExamScore, loadMockExams, saveMockExam, selectMockEx
 import { loadStoredSettings, recordAttemptAndUpdateConcept } from '../lib/storage';
 import { X, Clock, Award, Compass, HelpCircle } from 'lucide-react';
 
+/** 계획(StudyPlanItem)에서 모의시험을 시작할 때 전달하는 실행 설정 스냅샷 */
+export interface MockExamInitialConfig {
+  conceptIds?: string[];
+  selectedTypes?: ProblemType[];
+  minutes?: number;
+  /** 실행한 계획 항목 ID (표시/추적용) */
+  planItemId?: string;
+  planItemTitle?: string;
+}
+
 interface Props {
   isOpen: boolean;
   onClose: () => void;
   subject: Subject;
   concepts: Concept[];
   problems: Problem[];
+  /** 계획에서 시작한 경우 전달되는 초기 설정. 일반 메뉴에서는 undefined. */
+  initialConfig?: MockExamInitialConfig | null;
   onExamRecorded: () => void;
 }
 
@@ -30,16 +42,44 @@ const labels: Partial<Record<ProblemType, string>> = {
   complexity_proof: '복잡도 증명', debug_counterexample: '디버깅·반례',
 };
 
-export function MockExamModal({ isOpen, onClose, subject, concepts, problems, onExamRecorded }: Props) {
+export function MockExamModal({ isOpen, onClose, subject, concepts, problems, initialConfig, onExamRecorded }: Props) {
   const eligible = useMemo(() => problems.filter((p) => p.subjectId === subject.id && p.isApproved !== false && isProblemAvailableForPractice(p)), [problems, subject.id]);
   const availableTypes = useMemo(() => Array.from(new Set(eligible.map((p) => p.type))), [eligible]);
-  const [conceptIds, setConceptIds] = useState<string[]>(() => concepts.filter((c) => c.subjectId === subject.id).map((c) => c.id));
-  const [types, setTypes] = useState<ProblemType[]>(() => Array.from(new Set(problems.filter((p) => p.subjectId === subject.id && p.isApproved !== false && isProblemAvailableForPractice(p)).map((p) => p.type))));
+
+  // 계획에서 시작한 경우: 계획의 개념 범위·문제 유형·시험 시간을 그대로 사용한다.
+  // 일반 메뉴에서 시작한 경우: 과목 전체 개념/유형과 기본 시간(60분)을 사용한다.
+  const [conceptIds, setConceptIds] = useState<string[]>(() => {
+    const requested = initialConfig?.conceptIds;
+    if (requested && requested.length) {
+      const valid = requested.filter((id) => concepts.some((c) => c.id === id && c.subjectId === subject.id));
+      if (valid.length) return valid;
+    }
+    return concepts.filter((c) => c.subjectId === subject.id).map((c) => c.id);
+  });
+  const [types, setTypes] = useState<ProblemType[]>(() => {
+    const requested = initialConfig?.selectedTypes;
+    if (requested && requested.length) {
+      const valid = requested.filter((t) => availableTypes.includes(t));
+      if (valid.length) return valid;
+    }
+    return Array.from(new Set(problems.filter((p) => p.subjectId === subject.id && p.isApproved !== false && isProblemAvailableForPractice(p)).map((p) => p.type)));
+  });
   const [count, setCount] = useState(4);
-  const [minutes, setMinutes] = useState(60);
+  const [minutes, setMinutes] = useState(() => {
+    const requested = initialConfig?.minutes;
+    return requested && Number.isFinite(requested) ? Math.min(180, Math.max(5, Math.round(requested))) : 60;
+  });
   const [session, setSession] = useState<MockExamSession | null>(() => {
     const stored = loadMockExams().find((s) => s.subjectId === subject.id && s.status !== 'recorded');
     return stored ? expireMockExam(stored, Date.now()) : null;
+  });
+  // 진행 중 세션이 있고 계획 설정이 전달되면 "이어서 풀기"와 "새 계획으로 시작"을 구분한다.
+  const [resumeDecision, setResumeDecision] = useState<'ask' | 'resume' | 'new'>(() => {
+    if (initialConfig) {
+      const stored = loadMockExams().find((s) => s.subjectId === subject.id && s.status !== 'recorded');
+      if (stored) return 'ask';
+    }
+    return 'resume';
   });
   const [index, setIndex] = useState(0);
   const [now, setNow] = useState(() => Date.now());
@@ -217,7 +257,24 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, on
       </header>
       <div className="p-5 space-y-4 text-sm">
         {error && <p role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800">{error}</p>}
-        {!session || session.status === 'recorded' ? <>
+        {resumeDecision === 'ask' ? (
+          <div className="space-y-3" role="group" aria-label="모의시험 이어풀기 선택">
+            <p className="text-[#57544e]">
+              진행 중인 모의시험이 있습니다. 이어서 풀거나, 계획된 범위·유형·시간 설정으로 새로 시작할 수 있습니다.
+            </p>
+            {initialConfig?.planItemTitle && (
+              <p className="text-xs text-[#827d73]">계획: {initialConfig.planItemTitle}</p>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <button onClick={() => setResumeDecision('resume')} className="bg-[#191817] text-white px-4 py-2 font-bold">
+                이어서 풀기
+              </button>
+              <button onClick={() => setResumeDecision('new')} className="border border-[#c8c2b5] px-4 py-2 font-bold">
+                새 계획으로 시작
+              </button>
+            </div>
+          </div>
+        ) : (!session || session.status === 'recorded' || resumeDecision === 'new' ? <>
           <p className="text-[#57544e]">과목의 승인 문제를 섞어 구성합니다. 신고·검토 중인 문항은 제외합니다.</p>
           <div><h3 className="font-semibold mb-2">시험 범위 · 개념 선택</h3><p className="text-xs text-[#606060]">과목 범위: {subject.scope || '별도 지정 없음'} · 아래 개념만 포함합니다.</p>
             <div className="grid sm:grid-cols-2 gap-1 max-h-40 overflow-y-auto border p-2">{concepts.filter((c) => c.subjectId === subject.id).map((c) =>
@@ -412,7 +469,7 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, on
           {session.status === 'submitted' && <button onClick={gradeExam} disabled={busy || Boolean(blocked.length)} className="bg-[#191817] text-white px-4 py-2 disabled:opacity-50">{busy ? 'AI 평가 중...' : '답안 평가 (미응답 0점)'}</button>}
           {session.status === 'graded' && <div className="border-t pt-3 space-y-3"><h3 className="font-bold">결과: {getExamScore(session)}점 (문항 평균)</h3><p className="text-xs text-[#606060]">미응답은 0점으로 합산하며 풀이 이력은 만들지 않습니다. 코딩 답안은 실행하지 않는 AI 정적 평가입니다.</p><button onClick={recordExam} disabled={Boolean(blocked.length)} className="bg-[#191817] text-white px-4 py-2 disabled:opacity-50">결과 확인 및 학습 이력 확정</button></div>}
           {blocked.length > 0 && <p className="text-sm text-red-700">품질 검토 상태로 바뀐 문항 {blocked.length}개가 있습니다. 평가·기록을 보류합니다.</p>}
-        </>}
+        </>)}
       </div>
     </div>
   </div>;

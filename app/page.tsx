@@ -86,7 +86,7 @@ import { ProblemGeneratorModal } from '../components/ProblemGeneratorModal';
 import { ProblemReviewModal } from '../components/ProblemReviewModal';
 import { PdfViewerModal } from '../components/PdfViewerModal';
 import { SettingsModal } from '../components/SettingsModal';
-import { MockExamModal } from '../components/MockExamModal';
+import { MockExamModal, MockExamInitialConfig } from '../components/MockExamModal';
 import { AddSubjectModal } from '../components/AddSubjectModal';
 import { StudyPlanModal } from '../components/StudyPlanModal';
 import { calculateDDay, toSeoulDateString, addDaysToDate } from '../lib/dateUtils';
@@ -128,6 +128,7 @@ export default function RedcallDashboardPage() {
   const [isProblemSessionOpen, setIsProblemSessionOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [isMockExamModalOpen, setIsMockExamModalOpen] = useState(false);
+  const [mockExamInitialConfig, setMockExamInitialConfig] = useState<MockExamInitialConfig | null>(null);
   const [isMaterialsListOpen, setIsMaterialsListOpen] = useState(false);
   const [editingMaterial, setEditingMaterial] = useState<Material | null>(null);
   const [isMaterialEditorOpen, setIsMaterialEditorOpen] = useState(false);
@@ -748,6 +749,14 @@ export default function RedcallDashboardPage() {
     }
 
     if (item.kind === 'mixed_mock_exam') {
+      // 계획에 저장된 범위·유형·시간 설정을 모의시험 모달로 전달한다.
+      setMockExamInitialConfig({
+        conceptIds: item.mockExamConfig?.conceptIds ?? item.conceptIds ?? [],
+        selectedTypes: item.mockExamConfig?.selectedTypes,
+        minutes: item.mockExamConfig?.minutes ?? item.estimatedMinutes,
+        planItemId: item.id,
+        planItemTitle: item.snapshotTitle,
+      });
       setIsStudyPlanOpen(false);
       setIsMockExamModalOpen(true);
       showToast(`[${item.subjectName}] 실전 모의시험을 시작합니다.`);
@@ -935,7 +944,11 @@ export default function RedcallDashboardPage() {
           }
           setIsProblemSessionOpen(true);
         }}
-        onOpenMockExam={() => setIsMockExamModalOpen(true)}
+        onOpenMockExam={() => {
+          // 일반 메뉴에서 시작: 계획 설정 없이 기본값을 사용한다.
+          setMockExamInitialConfig(null);
+          setIsMockExamModalOpen(true);
+        }}
         onOpenStudyPlan={() => setIsStudyPlanOpen(true)}
         onOpenLearningAnalytics={() => setIsLearningAnalyticsOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -1283,10 +1296,14 @@ export default function RedcallDashboardPage() {
       {isMockExamModalOpen && <MockExamModal
         key={activeSubject.id}
         isOpen={isMockExamModalOpen}
-        onClose={() => setIsMockExamModalOpen(false)}
+        onClose={() => {
+          setIsMockExamModalOpen(false);
+          setMockExamInitialConfig(null);
+        }}
         subject={activeSubject}
         concepts={subjectConcepts}
         problems={availableSubjectProblems}
+        initialConfig={mockExamInitialConfig}
         onExamRecorded={() => {
           setAllConcepts(loadStoredConcepts());
           setAttempts(loadStoredAttempts());

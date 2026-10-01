@@ -1110,15 +1110,41 @@ export function skipStudyPlanItem(itemId: string): StudyPlanItem[] {
   return updated;
 }
 
+/** 계획 연결 결과 (호출자가 부분 실패를 인지할 수 있도록 노출) */
+export interface PlanLinkageResult {
+  /** 계획 연결을 시도했는지 여부 */
+  attempted: boolean;
+  /** 연결 대상으로 선택된 계획 항목 ID */
+  linkedItemId: string | null;
+  /** 계획 항목 완료가 저장·검증되었는지 여부 */
+  persisted: boolean;
+  /** 연결을 건너뛴 사유 (없으면 undefined) */
+  skippedReason?: 'PLAN_ITEM_NOT_FOUND' | 'PLAN_ITEM_MISMATCH' | 'PLAN_ITEM_SKIPPED' | 'NO_MATCHING_ITEM';
+}
+
+export interface AttemptSaveResult {
+  updatedConcepts: Concept[];
+  updatedAttempts: Attempt[];
+  /** Attempt/ReviewEvent/계획 연결 중 하나라도 저장·검증에 실패하면 true */
+  partial: boolean;
+  planLinkage: PlanLinkageResult;
+}
+
 /**
  * Adds an attempt and automatically creates a new ReviewEvent on the concept,
  * recalculating its retention score and status dynamically without artificial duplicates.
- * Also automatically marks any matching uncompleted StudyPlanItem as completed.
+ * Also links the attempt to the matching StudyPlanItem of the SAME subject, concept,
+ * problem, and review round — never completing a different concept's plan merely
+ * because a shared (composite) problem was solved.
+ *
+ * Callers can pass an explicit `planItemId` to link the exact executed plan item;
+ * the id is still validated against the attempt.
  */
 export function recordAttemptAndUpdateConcept(
   attempt: Attempt,
-  settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS
-): { updatedConcepts: Concept[]; updatedAttempts: Attempt[] } {
+  settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS,
+  linkage?: { planItemId?: string }
+): AttemptSaveResult {
   const currentConcepts = loadStoredConcepts();
   const currentAttempts = loadStoredAttempts();
 
@@ -1138,33 +1164,82 @@ export function recordAttemptAndUpdateConcept(
 
   const alreadyEventStored = targetConcept.events.some((e) => e.attemptId === effectiveAttempt.id);
 
-  // Fully recorded already: do not add a second Attempt, event, or exercise count.
-  if (alreadyAttemptStored && alreadyEventStored) {
-    return { updatedConcepts: currentConcepts, updatedAttempts: currentAttempts };
-  }
-
   // Persist the Attempt if it is missing (idempotent).
   const newAttempts = alreadyAttemptStored ? currentAttempts : [effectiveAttempt, ...currentAttempts];
   if (!alreadyAttemptStored) {
     saveStoredAttempts(newAttempts);
   }
 
-  // If the Attempt exists but its review event is missing (a previous partial
-  // failure), recover by appending only the missing event.
+  // Stage 9: link the StudyPlanItem for THIS review round only.
+  // The attempt round is derived from the concept's own review history so that a
+  // retry (event already stored) still resolves the correct round instead of
+  // skipping ahead to a future round.
+  const conceptRounds = targetConcept.events
+    .filter((e) => e.kind === 'attempt' || e.kind === 'review')
+    .slice()
+    .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+  const existingEventIndex = conceptRounds.findIndex((e) => e.attemptId === effectiveAttempt.id);
+  const attemptRound = existingEventIndex >= 0 ? existingEventIndex + 1 : conceptRounds.length + 1;
 
-  // Stage 9: Auto-complete the StudyPlanItem for THIS review round only.
-  const completedRound =
-    targetConcept.events.filter((e) => e.kind === 'attempt' || e.kind === 'review').length + 1;
   const currentPlanItems = loadStoredStudyPlanItems();
-  const matchingPlanItem = currentPlanItems.find(
-    (i) =>
-      i.problemId === effectiveAttempt.problemId &&
-      i.status !== 'completed' &&
-      (i.round === undefined || i.round === completedRound)
-  );
+  const planLinkage: PlanLinkageResult = {
+    attempted: true,
+    linkedItemId: null,
+    persisted: false,
+  };
+
+  let matchingPlanItem: StudyPlanItem | undefined;
+
+  if (linkage?.planItemId) {
+    // Explicit link: still validate every dimension of the target item.
+    const byId = currentPlanItems.find((i) => i.id === linkage.planItemId);
+    if (!byId) {
+      planLinkage.skippedReason = 'PLAN_ITEM_NOT_FOUND';
+    } else if (byId.status === 'skipped') {
+      planLinkage.skippedReason = 'PLAN_ITEM_SKIPPED';
+    } else if (
+      byId.subjectId !== effectiveAttempt.subjectId ||
+      (byId.conceptId !== undefined && byId.conceptId !== effectiveAttempt.conceptId) ||
+      (byId.problemId !== undefined && byId.problemId !== effectiveAttempt.problemId) ||
+      (byId.round !== undefined && byId.round !== attemptRound)
+    ) {
+      planLinkage.skippedReason = 'PLAN_ITEM_MISMATCH';
+    } else {
+      matchingPlanItem = byId;
+    }
+  } else {
+    // Implicit link: require subject + concept + problem + round to agree.
+    // Legacy items that omit conceptId/round are handled by the validated fallback below.
+    matchingPlanItem = currentPlanItems.find((i) => {
+      if (i.status === 'completed' || i.status === 'skipped') return false;
+      if (i.subjectId !== effectiveAttempt.subjectId) return false;
+      if (i.problemId !== effectiveAttempt.problemId) return false;
+      // A plan item that names a concept must match the attempt's concept.
+      if (i.conceptId !== undefined && i.conceptId !== effectiveAttempt.conceptId) return false;
+      // A plan item that names a round must match this attempt's round.
+      if (i.round !== undefined && i.round !== attemptRound) return false;
+      // Legacy fallback (no concept, no round): only accept when the item's concept
+      // scope is absent or explicitly includes the attempt's concept.
+      if (
+        i.conceptId === undefined &&
+        i.round === undefined &&
+        Array.isArray(i.conceptIds) &&
+        i.conceptIds.length > 0 &&
+        !i.conceptIds.includes(effectiveAttempt.conceptId)
+      ) {
+        return false;
+      }
+      return true;
+    });
+    if (!matchingPlanItem) {
+      planLinkage.skippedReason = 'NO_MATCHING_ITEM';
+    }
+  }
+
   if (matchingPlanItem) {
+    const targetId = matchingPlanItem.id;
     const updatedPlanItems = currentPlanItems.map((i) =>
-      i.id === matchingPlanItem.id
+      i.id === targetId
         ? {
             ...i,
             status: 'completed' as const,
@@ -1174,6 +1249,11 @@ export function recordAttemptAndUpdateConcept(
         : i
     );
     saveStoredStudyPlanItems(updatedPlanItems);
+    const persistedItem = loadStoredStudyPlanItems().find((i) => i.id === targetId);
+    planLinkage.linkedItemId = targetId;
+    planLinkage.persisted =
+      persistedItem?.status === 'completed' &&
+      persistedItem?.completedAttemptId === effectiveAttempt.id;
   }
 
   const updatedConcepts = currentConcepts.map((c) => {
@@ -1227,17 +1307,25 @@ export function recordAttemptAndUpdateConcept(
   saveStoredConcepts(updatedConcepts);
 
   // Read-back verification: report partial persistence instead of a false success.
-  const attemptPersisted = loadStoredAttempts().some((a) => a.id === attempt.id);
-  const eventPersisted = loadStoredConcepts()
-    .find((c) => c.id === attempt.conceptId && c.subjectId === attempt.subjectId)
-    ?.events.some((e) => e.attemptId === attempt.id);
+  const attemptPersisted = loadStoredAttempts().some((a) => a.id === effectiveAttempt.id);
+  const eventPersisted =
+    loadStoredConcepts()
+      .find((c) => c.id === effectiveAttempt.conceptId && c.subjectId === effectiveAttempt.subjectId)
+      ?.events.some((e) => e.attemptId === effectiveAttempt.id) === true;
+
+  // The Attempt and its review event are the critical records. If either could not
+  // be verified, surface it as a real failure so the caller can retry the recovery.
   if (!attemptPersisted || !eventPersisted) {
     throw new Error(
       '풀이 기록 저장이 일부만 완료되었습니다. 다시 시도하면 누락된 기록이 자동으로 복구됩니다.'
     );
   }
 
-  return { updatedConcepts, updatedAttempts: newAttempts };
+  // Plan linkage is a secondary record. Its failure must not be swallowed: report it
+  // via `partial` so the caller can retry without re-incrementing Attempt/event counts.
+  const partial = matchingPlanItem !== undefined && !planLinkage.persisted;
+
+  return { updatedConcepts, updatedAttempts: newAttempts, partial, planLinkage };
 }
 
 /**
@@ -1255,11 +1343,20 @@ export function recoverMissingAttemptEvents(
   for (const attempt of attempts) {
     const concept = conceptById.get(attempt.conceptId);
     if (!concept || concept.subjectId !== attempt.subjectId) continue;
-    if (concept.events.some((e) => e.attemptId === attempt.id)) continue;
+    const hadEvent = concept.events.some((e) => e.attemptId === attempt.id);
 
     try {
-      recordAttemptAndUpdateConcept(attempt, settings);
-      recoveredCount += 1;
+      // Always run the full routine: it appends a missing review event AND repairs
+      // a missing StudyPlanItem link, even when the Attempt/event already exist.
+      const result = recordAttemptAndUpdateConcept(attempt, settings);
+      const eventNow =
+        loadStoredConcepts()
+          .find((c) => c.id === attempt.conceptId)
+          ?.events.some((e) => e.attemptId === attempt.id) === true;
+      const repairedEvent = !hadEvent && eventNow;
+      const repairedPlan =
+        result.planLinkage.linkedItemId !== null && result.planLinkage.persisted;
+      if (repairedEvent || repairedPlan) recoveredCount += 1;
     } catch {
       // Leave unresolved; the next retry can try again.
     }

@@ -629,6 +629,14 @@ export interface StudyPlanItem {
   needsProblemGeneration?: boolean; // 승인된 문제가 없어 생성 필요한 경우
   isOutdatedProblem?: boolean;      // 원문 변경으로 재확인 필요한 경우
   warningNote?: string;             // 미루는 날짜가 시험 이후 등 경고
+
+  // Mock exam launch configuration (mixed_mock_exam items):
+  // 계획에서 모의시험을 시작할 때 범위·유형·시간을 그대로 전달하기 위한 스냅샷.
+  mockExamConfig?: {
+    conceptIds: string[];
+    selectedTypes: ProblemType[];
+    minutes: number;
+  };
 }
 
 export interface DailyStudyPlan {

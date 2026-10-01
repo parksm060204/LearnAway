@@ -136,8 +136,38 @@ export function generateStudyPlan({
   const completedByMockExam = new Map<string, StudyPlanItem>();
   const existingItemMap = new Map<string, StudyPlanItem>();
 
+  // Completion identity is deliberately INDEPENDENT of the plan item kind
+  // (`recommended_review` / `vulnerability_fix`). If the recommendation kind is
+  // later re-diagnosed, the same (subject, concept, problem, round) must map to the
+  // same completion, not create a duplicate history entry.
+  const roundIdentity = (item: StudyPlanItem): string | null => {
+    if (!item.conceptId || !item.problemId || item.round === undefined) return null;
+    return `${item.subjectId}|${item.conceptId}|${item.problemId}|r${item.round}`;
+  };
+
+  const existingByRoundIdentity = new Map<string, StudyPlanItem>();
+  const completedByRoundIdentity = new Map<string, StudyPlanItem>();
+  // Any completed item that already references an Attempt/event must not be
+  // reproduced as a second history entry (covers legacy items without a round).
+  const completedByAttemptId = new Map<string, StudyPlanItem>();
+
   for (const item of existingItems) {
     existingItemMap.set(item.id, item);
+    if (item.status === 'completed' && item.completedAttemptId) {
+      completedByAttemptId.set(item.completedAttemptId, item);
+    }
+    const identity = roundIdentity(item);
+    if (identity) {
+      existingByRoundIdentity.set(identity, item);
+      if (item.status === 'completed') {
+        const prev = completedByRoundIdentity.get(identity);
+        // Keep the completion with the earliest real completion date so merged
+        // old/new duplicates display the actual first completion.
+        if (!prev || (item.completedAt || '') < (prev.completedAt || '')) {
+          completedByRoundIdentity.set(identity, item);
+        }
+      }
+    }
     if (item.status === 'completed') {
       if (item.problemId) {
         completedByProblem.set(item.problemId, item);
@@ -161,6 +191,8 @@ export function generateStudyPlan({
 
   const candidateItems: CandidateItem[] = [];
   const scopeRemainingList: StudyPlanScopeRemaining[] = [];
+  // Deduplicate generated completion history by stable identity across the whole plan.
+  const emittedHistoryIdentities = new Set<string>();
 
   subjects.forEach((subject, subIdx) => {
     const subConfig = settings.subjectConfigs[subject.id] || {
@@ -349,7 +381,11 @@ export function generateStudyPlan({
 
       const probIdSuffix = targetProblem ? targetProblem.id : 'no-prob';
       const itemId = `spi-${kind}-${subject.id}-${c.id}-${probIdSuffix}-r${nextRound}`;
-      const existing = existingItemMap.get(itemId);
+      // Resolve the previously persisted item for THIS round regardless of the current
+      // kind, so a kind re-diagnosis does not drop a completed link or reset status.
+      const existing =
+        existingItemMap.get(itemId) ||
+        existingByRoundIdentity.get(`${subject.id}|${c.id}|${probIdSuffix}|r${nextRound}`);
 
       // Only a persisted completed item for THIS round counts. A past attempt for the
       // same problem must never complete the next round's item.
@@ -397,7 +433,8 @@ export function generateStudyPlan({
       });
 
       // Preserve completed review history within the horizon, each linked to the
-      // actual attempt of its own round.
+      // actual attempt of its own round. Identity is kind-independent and any attempt
+      // already recorded as completed is not reproduced (no double counting).
       for (let k = 1; k <= reviewCount; k++) {
         const ev = reviewEvents[k - 1];
         const completedDateStr = toSeoulDateString(ev.at);
@@ -405,9 +442,18 @@ export function generateStudyPlan({
 
         const matchedAttempt = ev.attemptId ? attemptById.get(ev.attemptId) : undefined;
         const histProblemId = matchedAttempt?.problemId || targetProblem?.id;
+        const identity = `${subject.id}|${c.id}|${histProblemId || 'no-prob'}|r${k}`;
+
+        const completedAttemptRef = ev.attemptId || ev.id;
+        if (completedByRoundIdentity.has(identity)) continue;
+        if (completedByAttemptId.has(completedAttemptRef)) continue;
+        if (completedByAttemptId.has(ev.id)) continue;
+        if (emittedHistoryIdentities.has(identity)) continue;
+        emittedHistoryIdentities.add(identity);
+
         const matchedProblem = histProblemId ? problems.find((p) => p.id === histProblemId) : undefined;
         const histMinutes = matchedProblem?.timeStandardMinutes || problemMinutes;
-        const histId = `spi-${kind}-${subject.id}-${c.id}-${histProblemId || 'no-prob'}-r${k}`;
+        const histId = `spi-history-${subject.id}-${c.id}-${histProblemId || 'no-prob'}-r${k}`;
         const existingHist = existingItemMap.get(histId);
 
         const historyItem: StudyPlanItem = {
@@ -431,7 +477,7 @@ export function generateStudyPlan({
           snapshotTitle: `[복습 ${k}회차 완료] ${c.title}`,
           snapshotDetail: `완료일 ${completedDateStr} · 회차 ${k}`,
           completedAt: ev.at,
-          completedAttemptId: ev.attemptId || ev.id,
+          completedAttemptId: completedAttemptRef,
         };
 
         candidateItems.push({
@@ -469,6 +515,12 @@ export function generateStudyPlan({
         status: existing?.status || 'pending',
         snapshotTitle: `[혼합 모의시험] ${subject.name} 실전 모의평가`,
         snapshotDetail: `출제 범위: ${studied.length}개 개념 · 목표 시간 ${mockMinutes}분 · 전 문항 AI 서술형 평가`,
+        // 계획에서 시작할 때 모달로 전달할 범위·유형·시간 스냅샷
+        mockExamConfig: {
+          conceptIds: studied.map((c) => c.id),
+          selectedTypes: [...subConfig.selectedProblemTypes],
+          minutes: mockMinutes,
+        },
       };
 
       candidateItems.push({
