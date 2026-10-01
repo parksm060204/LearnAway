@@ -16,19 +16,14 @@ import {
   Sparkles,
   CheckCircle2,
   AlertTriangle,
-  FileText,
-  Mic,
   Trash2,
   Combine,
   CheckCheck,
   ExternalLink,
   RefreshCw,
   Search,
-  BookOpen,
-  ArrowRight,
   ShieldCheck,
   ShieldAlert,
-  Info,
   Edit3,
 } from 'lucide-react';
 
@@ -107,18 +102,19 @@ export function ConceptReviewModal({
     );
   }, [subjectDrafts, selectedDraftId, filteredDrafts]);
 
-  // Sync edit form when activeDraft changes
-  React.useEffect(() => {
-    if (activeDraft) {
-      setEditTitle(activeDraft.title);
-      setEditDescription(activeDraft.description);
-      setEditFormula(activeDraft.coreDefinitionFormulaOrAlgorithm || '');
-      setEditPrereq(activeDraft.prerequisites.join(', '));
-      setEditRelated(activeDraft.relatedConcepts.join(', '));
-      setEditMisconceptions(activeDraft.commonMisconceptions.join(', '));
-      setEditExamples(activeDraft.examples.join('\n'));
-    }
-  }, [activeDraft?.id]);
+  // Reset the edit form when the active draft changes. This runs during render
+  // (guarded), which is hydration-safe and avoids cascading effect renders.
+  const [syncedDraftId, setSyncedDraftId] = useState<string | null>(null);
+  if (activeDraft && syncedDraftId !== activeDraft.id) {
+    setSyncedDraftId(activeDraft.id);
+    setEditTitle(activeDraft.title);
+    setEditDescription(activeDraft.description);
+    setEditFormula(activeDraft.coreDefinitionFormulaOrAlgorithm || '');
+    setEditPrereq(activeDraft.prerequisites.join(', '));
+    setEditRelated(activeDraft.relatedConcepts.join(', '));
+    setEditMisconceptions(activeDraft.commonMisconceptions.join(', '));
+    setEditExamples(activeDraft.examples.join('\n'));
+  }
 
   if (!isOpen) return null;
 

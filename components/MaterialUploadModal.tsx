@@ -11,12 +11,10 @@ import {
   Mic,
   CheckCircle2,
   AlertTriangle,
-  FileCode,
   Info,
   Loader2,
   ArrowRight,
   FileUp,
-  ClipboardPaste,
 } from 'lucide-react';
 
 interface MaterialUploadModalProps {
@@ -60,7 +58,6 @@ export function MaterialUploadModal({
   const [transcriptHasTimestamps, setTranscriptHasTimestamps] = useState(false);
   const [transcriptParsedMarkdown, setTranscriptParsedMarkdown] = useState('');
 
-  const [activeTab, setActiveTab] = useState<'upload' | 'preview'>('upload');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -130,9 +127,9 @@ export function MaterialUploadModal({
       if (!sourceRefs.trim()) {
         setSourceRefs(`제1페이지 ~ 제${data.pageCount}페이지`);
       }
-    } catch (err: any) {
+    } catch (err) {
       setPdfConvertStatus('error');
-      setPdfConvertMessage(`변환 요청 실패: ${err.message}`);
+      setPdfConvertMessage(`변환 요청 실패: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
       setIsConvertingPdf(false);
     }
@@ -240,7 +237,7 @@ export function MaterialUploadModal({
     };
 
     // 1. Save heavy content to decoupled storage
-    await saveMaterialContent(newMaterial.id, {
+    const saveResult = await saveMaterialContent(newMaterial.id, {
       markdown: finalMarkdown,
       rawText: finalRawText,
       pages: kind === 'pdf' ? pdfPages : undefined,
@@ -248,6 +245,14 @@ export function MaterialUploadModal({
 
     // 2. Add material metadata
     onAddMaterial(newMaterial);
+
+    if (!saveResult.persisted) {
+      // Surface the limitation instead of pretending the save was durable.
+      alert(
+        `자료 본문이 브라우저 저장소에 기록되지 않고 메모리에만 보관되었습니다. 새로고침하면 사라질 수 있습니다.\n사유: ${saveResult.error}`
+      );
+    }
+
     onClose();
 
     // 3. Option to immediately open editor

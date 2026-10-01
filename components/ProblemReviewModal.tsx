@@ -3,10 +3,8 @@
 import React, { useState, useMemo } from 'react';
 import {
   Subject,
-  Concept,
   Problem,
   ProblemDraft,
-  ProblemType,
   RubricCriterion,
   PROBLEM_DIFFICULTY_LABELS,
   Material,
@@ -29,11 +27,7 @@ import {
   HelpCircle,
   BrainCircuit,
   BookOpen,
-  ArrowRight,
-  ShieldCheck,
   ShieldAlert,
-  Info,
-  Layers,
   Plus,
 } from 'lucide-react';
 import { ProblemQualityReviewTab } from './ProblemQualityReviewTab';
@@ -45,7 +39,6 @@ interface ProblemReviewModalProps {
   activeSubject: Subject;
   drafts: ProblemDraft[];
   problems?: Problem[];
-  concepts: Concept[];
   materials?: Material[];
   onUpdateDraft: (draft: ProblemDraft) => void;
   onApproveDraft: (draftId: string) => void;
@@ -59,7 +52,6 @@ interface ProblemReviewModalProps {
   onReviseProblem?: (problemId: string, updates: Partial<Problem>, editReason: string) => { success: boolean; error?: string };
   onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
-  onOpenSourceModal?: (sourceRef: string) => void;
   initialMode?: 'drafts' | 'quality_reports';
 }
 
@@ -69,7 +61,6 @@ export function ProblemReviewModal({
   activeSubject,
   drafts,
   problems = [],
-  concepts,
   materials,
   onUpdateDraft,
   onApproveDraft,
@@ -82,7 +73,6 @@ export function ProblemReviewModal({
   onReviseProblem,
   onReapproveProblem,
   onSuspendProblem,
-  onOpenSourceModal,
   initialMode,
 }: ProblemReviewModalProps) {
   // Mode switcher: 'drafts' vs 'quality_reports'
@@ -149,23 +139,23 @@ export function ProblemReviewModal({
     return filteredDrafts[0] || subjectDrafts[0] || null;
   }, [selectedDraftId, filteredDrafts, subjectDrafts]);
 
-  // Sync edit state when active draft changes
-  React.useEffect(() => {
-    if (activeDraft) {
-      setEditTitle(activeDraft.title);
-      setEditPrompt(activeDraft.promptText);
-      setEditFormula(activeDraft.mathFormula || '');
-      setEditCodeSnippet(activeDraft.codeSnippet || '');
-      setEditDesignIntent(activeDraft.designIntent || '');
-      setEditAppliedNote(activeDraft.appliedConditionNote || '');
-      setEditHints([...activeDraft.hints]);
-      setEditModelAnswer(activeDraft.modelAnswer || '');
-      setEditRubric([...activeDraft.rubric]);
-      setEditTimeMinutes(activeDraft.timeStandardMinutes || 20);
-      setIsEditing(false);
-      setIsModelAnswerVisible(false);
-    }
-  }, [activeDraft?.id]);
+  // Reset edit state when the active draft changes (render-phase, hydration-safe).
+  const [syncedDraftId, setSyncedDraftId] = useState<string | null>(null);
+  if (activeDraft && syncedDraftId !== activeDraft.id) {
+    setSyncedDraftId(activeDraft.id);
+    setEditTitle(activeDraft.title);
+    setEditPrompt(activeDraft.promptText);
+    setEditFormula(activeDraft.mathFormula || '');
+    setEditCodeSnippet(activeDraft.codeSnippet || '');
+    setEditDesignIntent(activeDraft.designIntent || '');
+    setEditAppliedNote(activeDraft.appliedConditionNote || '');
+    setEditHints([...activeDraft.hints]);
+    setEditModelAnswer(activeDraft.modelAnswer || '');
+    setEditRubric([...activeDraft.rubric]);
+    setEditTimeMinutes(activeDraft.timeStandardMinutes || 20);
+    setIsEditing(false);
+    setIsModelAnswerVisible(false);
+  }
 
   // Check if active draft's source markdown hash differs from current subject material hash
   const isDraftOutdated = useMemo(() => {
@@ -380,7 +370,6 @@ export function ProblemReviewModal({
             onReviseProblem={onReviseProblem}
             onReapproveProblem={onReapproveProblem}
             onSuspendProblem={onSuspendProblem}
-            onOpenSourceModal={onOpenSourceModal}
           />
         ) : (
           <>

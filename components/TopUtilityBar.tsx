@@ -3,10 +3,10 @@
 import React, { useState } from 'react';
 import { Subject } from '../lib/types';
 import {
-  BookOpen,
   Upload,
   PenTool,
   Award,
+  Calendar,
   CalendarCheck,
   Settings,
   ChevronDown,
@@ -17,6 +17,7 @@ import {
   Sparkles,
   FileQuestion,
   ShieldAlert,
+  BarChart3,
 } from 'lucide-react';
 
 interface TopUtilityBarProps {
@@ -32,11 +33,12 @@ interface TopUtilityBarProps {
   onOpenProblemReview?: () => void;
   problemDraftCount?: number;
   problemReportedCount?: number;
+  onOpenStudyPlan?: () => void;
+  onOpenLearningAnalytics?: () => void;
   onOpenProblemSession: () => void;
   onOpenMockExam: () => void;
   onOpenSettings: () => void;
   onScrollToTodayReview: () => void;
-  activeView: 'dashboard' | 'session' | 'materials';
 }
 
 export function TopUtilityBar({
@@ -52,11 +54,12 @@ export function TopUtilityBar({
   onOpenProblemReview,
   problemDraftCount = 0,
   problemReportedCount = 0,
+  onOpenStudyPlan,
+  onOpenLearningAnalytics,
   onOpenProblemSession,
   onOpenMockExam,
   onOpenSettings,
   onScrollToTodayReview,
-  activeView,
 }: TopUtilityBarProps) {
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
@@ -256,6 +259,28 @@ export function TopUtilityBar({
             <span>모의시험</span>
           </button>
 
+          {onOpenStudyPlan && (
+            <button
+              onClick={onOpenStudyPlan}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#191817] bg-[#fef2f2] hover:bg-[#fee2e2] border border-[#fecaca] font-bold transition-colors"
+              title="시험일까지의 학습 계획 설정 및 조회"
+            >
+              <Calendar className="w-3.5 h-3.5 text-[#c52828]" />
+              <span>학습 계획</span>
+            </button>
+          )}
+
+          {onOpenLearningAnalytics && (
+            <button
+              onClick={onOpenLearningAnalytics}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#191817] bg-[#faf8f4] hover:bg-[#f1ede4] border border-[#e2ded6] font-semibold transition-colors"
+              title="실제 학습 기록 분석과 개인별 복습 추천 근거"
+            >
+              <BarChart3 className="w-3.5 h-3.5 text-indigo-600" />
+              <span>학습 분석</span>
+            </button>
+          )}
+
           <button
             onClick={onScrollToTodayReview}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#191817] bg-[#faf8f4] hover:bg-[#f1ede4] border border-[#e2ded6] font-semibold transition-colors"
@@ -401,6 +426,32 @@ export function TopUtilityBar({
             <Award className="w-4 h-4 text-purple-600" />
             <span>혼합형 모의시험 응시</span>
           </button>
+
+          {onOpenStudyPlan && (
+            <button
+              onClick={() => {
+                onOpenStudyPlan();
+                setIsMobileMenuOpen(false);
+              }}
+              className="w-full flex items-center gap-2 py-2 px-3 text-xs font-bold text-[#c52828] bg-[#fef2f2] hover:bg-[#fee2e2] rounded-xs"
+            >
+              <Calendar className="w-4 h-4 text-[#c52828]" />
+              <span>학습 계획 (시간·범위 설정)</span>
+            </button>
+          )}
+
+          {onOpenLearningAnalytics && (
+            <button
+              onClick={() => {
+                onOpenLearningAnalytics();
+                setIsMobileMenuOpen(false);
+              }}
+              className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+            >
+              <BarChart3 className="w-4 h-4 text-indigo-600" />
+              <span>학습 분석 (개인별 복습 추천)</span>
+            </button>
+          )}
 
           <button
             onClick={() => {

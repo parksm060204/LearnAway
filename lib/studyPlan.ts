@@ -1,0 +1,633 @@
+/**
+ * REDCALL Academic Suite - Study Plan Engine (Stage 9)
+ * Pure deterministic rule-based planning engine.
+ * Connects exam schedule, exam scope, retention priorities, and daily time budget.
+ *
+ * NO AI calls, NO artificial score inflation, NO fake study events.
+ */
+
+import {
+  Subject,
+  Concept,
+  Problem,
+  Attempt,
+  ProblemType,
+  RetentionModelSettings,
+  StudyPlanSettings,
+  StudyPlanItem,
+  StudyPlanItemKind,
+  DailyStudyPlan,
+  StudyPlanSummary,
+  StudyPlanScopeRemaining,
+  DEFAULT_STUDY_PLAN_SETTINGS,
+  isProblemAvailableForPractice,
+} from './types';
+import {
+  toSeoulDateString,
+  calculateDDay,
+  formatSeoulDate,
+  addDaysToDate,
+  getCurrentDate,
+} from './dateUtils';
+import {
+  DEFAULT_RETENTION_SETTINGS,
+  calculateNextReviewRecommendation,
+} from './retentionModel';
+
+export interface GenerateStudyPlanParams {
+  subjects: Subject[];
+  concepts: Concept[];
+  problems: Problem[];
+  attempts: Attempt[];
+  settings?: StudyPlanSettings;
+  retentionSettings?: RetentionModelSettings;
+  referenceDate?: Date;
+  existingItems?: StudyPlanItem[];
+  daysCount?: number;
+  // Stage 10: unified personalization input (same multiplier used by today's review)
+  personalizationMultiplier?: number;
+  personalizationNote?: string;
+}
+
+/**
+ * Returns available approved problems for a subject and concept,
+ * strictly excluding demo problems from real user plans and verifying
+ * composite problem concepts are entirely within selected scope.
+ */
+export function getEligibleProblemsForPlan(
+  subject: Subject,
+  concept: Concept,
+  allProblems: Problem[],
+  selectedScopeConceptIds: string[],
+  preferredTypes?: ProblemType[]
+): {
+  eligibleProblems: Problem[];
+  outdatedProblems: Problem[];
+  quarantinedCount: number;
+} {
+  const scopeSet = new Set(selectedScopeConceptIds);
+  const subjectProblems = allProblems.filter((p) => p.subjectId === subject.id);
+
+  const conceptProblems = subjectProblems.filter((p) => {
+    // Problem must be linked to target concept
+    const legacyConceptId = (p as Problem & { conceptId?: string }).conceptId;
+    const linksConcept = p.conceptIds?.includes(concept.id) || legacyConceptId === concept.id;
+    if (!linksConcept) return false;
+
+    // Real plan constraint: exclude demo problems
+    if (p.isDemo === true) return false;
+
+    // Composite problem constraint: all linked concepts must be within exam scope
+    if (p.conceptIds && p.conceptIds.length > 1) {
+      const allInScope = p.conceptIds.every((cid) => scopeSet.has(cid));
+      if (!allInScope) return false;
+    }
+
+    return true;
+  });
+
+  const available = conceptProblems.filter(
+    (p) => p.isApproved !== false && isProblemAvailableForPractice(p)
+  );
+  const quarantinedCount = conceptProblems.length - available.length;
+
+  const outdatedProblems = available.filter((p) => p.isOutdated === true);
+  const currentProblems = available.filter((p) => !p.isOutdated);
+
+  // Sort by preferred types if specified
+  const pool = currentProblems.length > 0 ? currentProblems : outdatedProblems;
+  if (preferredTypes && preferredTypes.length > 0) {
+    const typeSet = new Set(preferredTypes);
+    pool.sort((a, b) => {
+      const aPref = typeSet.has(a.type) ? 1 : 0;
+      const bPref = typeSet.has(b.type) ? 1 : 0;
+      return bPref - aPref || a.id.localeCompare(b.id);
+    });
+  }
+
+  return {
+    eligibleProblems: pool,
+    outdatedProblems,
+    quarantinedCount,
+  };
+}
+
+/**
+ * Main Deterministic Study Plan Generation Engine.
+ */
+export function generateStudyPlan({
+  subjects,
+  concepts,
+  problems,
+  attempts,
+  settings = DEFAULT_STUDY_PLAN_SETTINGS,
+  retentionSettings = DEFAULT_RETENTION_SETTINGS,
+  referenceDate = getCurrentDate(),
+  existingItems = [],
+  daysCount = 14,
+  personalizationMultiplier = 1,
+  personalizationNote,
+}: GenerateStudyPlanParams): StudyPlanSummary {
+  const todaySeoulStr = toSeoulDateString(referenceDate);
+
+  // 1. Map existing completed, postponed, and skipped items by unique key or id
+  const completedByProblem = new Map<string, StudyPlanItem>();
+  const completedByConceptInitial = new Map<string, StudyPlanItem>();
+  const completedByMockExam = new Map<string, StudyPlanItem>();
+  const existingItemMap = new Map<string, StudyPlanItem>();
+
+  for (const item of existingItems) {
+    existingItemMap.set(item.id, item);
+    if (item.status === 'completed') {
+      if (item.problemId) {
+        completedByProblem.set(item.problemId, item);
+      }
+      if (item.kind === 'initial_study' && item.conceptId) {
+        completedByConceptInitial.set(item.conceptId, item);
+      }
+      if (item.kind === 'mixed_mock_exam') {
+        completedByMockExam.set(`${item.subjectId}-${item.assignedDate}`, item);
+      }
+    }
+  }
+
+  // 2. Auto-match attempts saved in storage to mark matching uncompleted plan items as completed
+  const recentAttemptsByProblem = new Map<string, Attempt>();
+  for (const att of attempts) {
+    if (!recentAttemptsByProblem.has(att.problemId)) {
+      recentAttemptsByProblem.set(att.problemId, att);
+    }
+  }
+
+  // 3. For each active subject, extract scope and build candidate plan items
+  interface CandidateItem {
+    item: StudyPlanItem;
+    examDDayDiff: number;
+    urgencyPriority: number;
+    subjectOrder: number;
+  }
+
+  const candidateItems: CandidateItem[] = [];
+  const scopeRemainingList: StudyPlanScopeRemaining[] = [];
+
+  subjects.forEach((subject, subIdx) => {
+    const subConfig = settings.subjectConfigs[subject.id] || {
+      subjectId: subject.id,
+      selectedConceptIds: concepts.filter((c) => c.subjectId === subject.id).map((c) => c.id),
+      selectedProblemTypes: [
+        subject.domain === 'math_stats' ? 'essay_descriptive' : 'impl_descriptive',
+      ],
+      includeMockExam: true,
+      mockExamTargetMinutes: 45,
+    };
+
+    const selectedConceptIds =
+      subConfig.selectedConceptIds && subConfig.selectedConceptIds.length > 0
+        ? subConfig.selectedConceptIds
+        : concepts.filter((c) => c.subjectId === subject.id).map((c) => c.id);
+
+    const scopeSet = new Set(selectedConceptIds);
+    const subjectConcepts = concepts.filter((c) => c.subjectId === subject.id && scopeSet.has(c.id));
+
+    // Exam timeline analysis
+    const dday = calculateDDay(subject.examAt, referenceDate);
+    const examDiff = dday.isNotSet ? 999 : dday.calendarDiff;
+
+    // Remaining scope statistics
+    const unstudied = subjectConcepts.filter(
+      (c) => c.status === 'unstudied' || (!c.isLearned && (!c.events || c.events.length === 0))
+    );
+    const studied = subjectConcepts.filter((c) => !unstudied.includes(c));
+
+    scopeRemainingList.push({
+      subjectId: subject.id,
+      subjectName: subject.name,
+      totalScopeConcepts: subjectConcepts.length,
+      unstudiedConceptsCount: unstudied.length,
+      studiedConceptsCount: studied.length,
+      unstudiedConceptTitles: unstudied.map((c) => c.title),
+    });
+
+    // 3.1 Generate 'initial_study' items for unstudied concepts in scope
+    unstudied.forEach((c) => {
+      // Check if already completed
+      const existingComp = completedByConceptInitial.get(c.id);
+      if (existingComp) return;
+
+      // Priority calculation:
+      // D-8 or earlier: high priority to finish base learning early (75 - order*0.2)
+      // D-7 to D-3: medium priority (60 - order*0.2)
+      // D-2 to D-1: lower priority (35 - order*0.2)
+      // No exam: 60 - order*0.2
+      let basePri = 60;
+      if (examDiff > 7) basePri = 80;
+      else if (examDiff >= 3 && examDiff <= 7) basePri = 65;
+      else if (examDiff >= 0 && examDiff < 3) basePri = 35;
+
+      const priorityScore = Number((basePri - (c.order || 0) * 0.2).toFixed(1));
+      const reason =
+        examDiff > 7
+          ? '시험 범위 내 미학습 개념 (조기 1회독 권장)'
+          : examDiff >= 0 && examDiff <= 2
+          ? '시험 임박 미학습 개념 (핵심 정의 및 공식 속성 확인)'
+          : '시험 범위 내 미학습 개념 원문 및 핵심 정리 학습';
+
+      const itemId = `spi-init-${subject.id}-${c.id}`;
+      const existing = existingItemMap.get(itemId);
+
+      const item: StudyPlanItem = {
+        id: itemId,
+        subjectId: subject.id,
+        subjectName: subject.name,
+        conceptId: c.id,
+        conceptName: c.title,
+        kind: 'initial_study',
+        assignedDate: existing?.assignedDate || todaySeoulStr,
+        estimatedMinutes: 20, // Explicit estimated time for reading & understanding
+        isEstimatedTime: true,
+        priorityScore,
+        priorityReason: reason,
+        status: existing?.status || 'pending',
+        snapshotTitle: `[최초 학습] ${c.title}`,
+        snapshotDetail: `출처: ${c.chapterRef || '교재'} · 핵심 개념 및 수식/불변식 정독`,
+      };
+
+      candidateItems.push({
+        item,
+        examDDayDiff: examDiff,
+        urgencyPriority: priorityScore,
+        subjectOrder: subIdx,
+      });
+    });
+
+    // 3.2 Generate 'recommended_review' & 'vulnerability_fix' for studied concepts
+    studied.forEach((c) => {
+      const rec = calculateNextReviewRecommendation(
+        c,
+        retentionSettings,
+        subject.examAt,
+        referenceDate,
+        personalizationMultiplier
+      );
+
+      // Check recent attempts for vulnerabilities & Stage 8 diagnosis
+      const conceptAttempts = attempts
+        .filter((a) => a.conceptId === c.id || a.conceptIds?.includes(c.id))
+        .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+      const lastAttempt = conceptAttempts[0];
+
+      const hasMethodError = lastAttempt?.errorType === 'method_selection_error';
+      const hasCalcError = lastAttempt?.errorType === 'calc_or_impl_mistake';
+      const hasNeedsImprovementDiagnosis =
+        lastAttempt?.methodSelectionDiagnosis?.criteria.some((cr) => cr.rating === 'needs_improvement');
+      const hasVulnerableRubric =
+        lastAttempt?.rubricResults?.some((r) => r.isVulnerable || r.score < r.maxScore * 0.6);
+
+      const isVulnerabilityTarget =
+        hasMethodError || hasCalcError || hasNeedsImprovementDiagnosis || hasVulnerableRubric;
+
+      // Find available problem for practice
+      const { eligibleProblems } = getEligibleProblemsForPlan(
+        subject,
+        c,
+        problems,
+        selectedConceptIds,
+        subConfig.selectedProblemTypes
+      );
+
+      const targetProblem = eligibleProblems[0] || null;
+      const isOutdated = targetProblem?.isOutdated === true;
+      const needsGeneration = !targetProblem;
+
+      const problemMinutes = targetProblem?.timeStandardMinutes || 15;
+
+      // Plan item kind: vulnerability_fix or recommended_review
+      const kind: StudyPlanItemKind = isVulnerabilityTarget ? 'vulnerability_fix' : 'recommended_review';
+
+      // Priority calculation:
+      // Base from retention urgency score
+      let priorityScore = rec ? rec.urgencyScore : 50;
+
+      // Boost for vulnerability in mid/final phases (D-7~D-1)
+      const reasonParts: string[] = [];
+      if (rec) {
+        if (rec.daysUntilReview <= 0) {
+          reasonParts.push(
+            rec.daysUntilReview < 0
+              ? `복습 기한 ${Math.abs(rec.daysUntilReview)}일 경과`
+              : '오늘 복습 권장일 도래'
+          );
+        } else {
+          reasonParts.push(`D+${rec.daysUntilReview} 권장`);
+        }
+      }
+
+      if (hasMethodError || hasNeedsImprovementDiagnosis) {
+        priorityScore += 30;
+        reasonParts.push('최근 방법 선택 이유 보완 필요');
+      } else if (hasCalcError) {
+        priorityScore += 20;
+        reasonParts.push('최근 계산/구현 오답 보완');
+      } else if (hasVulnerableRubric) {
+        priorityScore += 15;
+        reasonParts.push('취약 루브릭 감점 보완');
+      }
+
+      if (examDiff >= 0 && examDiff <= 7) {
+        priorityScore += (8 - examDiff) * 5; // Exam proximity boost
+        reasonParts.push(`시험 D-${examDiff}`);
+      }
+
+      if (personalizationMultiplier !== 1 && personalizationNote) {
+        reasonParts.push(personalizationNote);
+      }
+
+      priorityScore = Number(priorityScore.toFixed(1));
+      const reason = reasonParts.join(' · ') || '기억 감쇠 방지 권장 복습';
+
+      const probIdSuffix = targetProblem ? targetProblem.id : 'no-prob';
+      const itemId = `spi-${kind}-${subject.id}-${c.id}-${probIdSuffix}`;
+      const existing = existingItemMap.get(itemId);
+
+      // Check if attempt already completed today
+      let isCompleted = existing?.status === 'completed';
+      let completedAttId = existing?.completedAttemptId;
+      let completedAt = existing?.completedAt;
+
+      if (!isCompleted && targetProblem && recentAttemptsByProblem.has(targetProblem.id)) {
+        const matchingAtt = recentAttemptsByProblem.get(targetProblem.id)!;
+        isCompleted = true;
+        completedAttId = matchingAtt.id;
+        completedAt = matchingAtt.at;
+      }
+
+      const item: StudyPlanItem = {
+        id: itemId,
+        subjectId: subject.id,
+        subjectName: subject.name,
+        conceptId: c.id,
+        conceptName: c.title,
+        problemId: targetProblem?.id,
+        problemTitle: targetProblem?.title,
+        problemType: targetProblem?.type,
+        kind,
+        assignedDate: existing?.assignedDate || todaySeoulStr,
+        estimatedMinutes: problemMinutes,
+        isEstimatedTime: false,
+        priorityScore,
+        priorityReason: reason,
+        status: isCompleted ? 'completed' : existing?.status || 'pending',
+        snapshotTitle: targetProblem ? `[${kind === 'vulnerability_fix' ? '취약점 보완' : '권장 복습'}] ${targetProblem.title}` : `[문제 생성 필요] ${c.title}`,
+        snapshotDetail: targetProblem
+          ? `개념: ${c.title} · ${targetProblem.categoryLabel} · 권장 ${problemMinutes}분`
+          : `승인된 문제가 없습니다. 문제 출제 및 검토 화면에서 새 문제를 생성해 주세요.`,
+        completedAt,
+        completedAttemptId: completedAttId,
+        needsProblemGeneration: needsGeneration,
+        isOutdatedProblem: isOutdated,
+      };
+
+      candidateItems.push({
+        item,
+        examDDayDiff: examDiff,
+        urgencyPriority: priorityScore,
+        subjectOrder: subIdx,
+      });
+    });
+
+    // 3.3 Generate 'mixed_mock_exam' if enabled and subject has studied concepts
+    if (subConfig.includeMockExam && studied.length >= 2 && examDiff >= 0 && examDiff <= 14) {
+      const mockMinutes = subConfig.mockExamTargetMinutes || 45;
+      // Schedule at D-7, D-5, D-3, or D-1
+      const isMockTiming = examDiff === 7 || examDiff === 5 || examDiff === 3 || examDiff === 1;
+      const priorityScore = isMockTiming ? 95 : 75;
+      const reason = `시험 D-${examDiff} 대비 전 범위 실전 모의시험 (${studied.length}개 개념 종합 점검)`;
+
+      const itemId = `spi-mock-${subject.id}`;
+      const existing = existingItemMap.get(itemId);
+
+      const item: StudyPlanItem = {
+        id: itemId,
+        subjectId: subject.id,
+        subjectName: subject.name,
+        conceptIds: studied.map((c) => c.id),
+        kind: 'mixed_mock_exam',
+        assignedDate: existing?.assignedDate || todaySeoulStr,
+        estimatedMinutes: mockMinutes,
+        isEstimatedTime: false,
+        priorityScore,
+        priorityReason: reason,
+        status: existing?.status || 'pending',
+        snapshotTitle: `[혼합 모의시험] ${subject.name} 실전 모의평가`,
+        snapshotDetail: `출제 범위: ${studied.length}개 개념 · 목표 시간 ${mockMinutes}분 · 전 문항 AI 서술형 평가`,
+      };
+
+      candidateItems.push({
+        item,
+        examDDayDiff: examDiff,
+        urgencyPriority: priorityScore,
+        subjectOrder: subIdx,
+      });
+    }
+  });
+
+  // 4. Stable deterministic ordering of all candidate items across subjects:
+  // - completed items keep priority
+  // - higher priority score first
+  // - earlier exam D-day first
+  // - stable subject order, then concept order, then item ID
+  candidateItems.sort((a, b) => {
+    // Priority score descending
+    if (b.urgencyPriority !== a.urgencyPriority) {
+      return b.urgencyPriority - a.urgencyPriority;
+    }
+    // Earlier exam D-day first
+    if (a.examDDayDiff !== b.examDDayDiff) {
+      return a.examDDayDiff - b.examDDayDiff;
+    }
+    // Subject order
+    if (a.subjectOrder !== b.subjectOrder) {
+      return a.subjectOrder - b.subjectOrder;
+    }
+    // Stable ID
+    return a.item.id.localeCompare(b.item.id);
+  });
+
+  // Separate already completed items from pending candidate pool
+  const pendingPool = candidateItems.map((c) => c.item);
+
+  // 5. Daily budget allocation across the planning horizon
+  const days: DailyStudyPlan[] = [];
+  const allocatedProblemIdsByDate = new Map<string, Set<string>>();
+  const scheduledItemIds = new Set<string>();
+
+  // Extract preserved postponed or skipped items
+  const postponedOrSkipped = new Map<string, StudyPlanItem>();
+  for (const item of existingItems) {
+    if (item.status === 'postponed' || item.status === 'skipped') {
+      postponedOrSkipped.set(item.id, item);
+    }
+  }
+
+  for (let dayOffset = 0; dayOffset < daysCount; dayOffset++) {
+    const dayIso = addDaysToDate(referenceDate, dayOffset);
+    const dayDateStr = toSeoulDateString(dayIso);
+
+    // Day of week in Asia/Seoul (0 = Sun, 1 = Mon, ..., 6 = Sat)
+    const seoulDateObj = new Date(new Date(dayIso).toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+    const dayOfWeek = seoulDateObj.getDay();
+
+    const weekdayCfg = settings.weekdaySettings[dayOfWeek] || {
+      dayOfWeek,
+      minutes: settings.defaultDailyMinutes || 60,
+      isRestDay: false,
+    };
+
+    const isRestDay = weekdayCfg.isRestDay || weekdayCfg.minutes === 0;
+    let dayAvailableMinutes = isRestDay ? 0 : weekdayCfg.minutes;
+
+    // Check if any subject has exam on this day
+    const examOnThisDay = subjects.find((s) => {
+      if (!s.examAt) return false;
+      return toSeoulDateString(s.examAt) === dayDateStr;
+    });
+
+    if (examOnThisDay && dayOffset === 0) {
+      // On exam day, remaining available study time is capped by hours until exam start
+      const dday = calculateDDay(examOnThisDay.examAt, referenceDate);
+      if (dday.exactHoursRemaining !== undefined) {
+        const remainingMinutesToExam = Math.max(0, dday.exactHoursRemaining * 60);
+        dayAvailableMinutes = Math.min(dayAvailableMinutes, remainingMinutesToExam);
+      }
+    }
+
+    const dayLabel = formatSeoulDate(dayIso, { includeYear: true, includeDayName: true });
+    const dayItems: StudyPlanItem[] = [];
+    const dayUnassigned: StudyPlanItem[] = [];
+    let assignedMinutes = 0;
+
+    const usedProblemsToday = new Set<string>();
+    allocatedProblemIdsByDate.set(dayDateStr, usedProblemsToday);
+
+    // First check existing completed items for this day
+    for (const item of existingItems) {
+      if (item.status === 'completed' && item.assignedDate === dayDateStr) {
+        dayItems.push(item);
+        scheduledItemIds.add(item.id);
+        if (item.problemId) usedProblemsToday.add(item.problemId);
+        assignedMinutes += item.estimatedMinutes;
+      }
+    }
+
+    // Next, allocate pending items if budget remains and not rest day
+    if (!isRestDay && dayAvailableMinutes > 0) {
+      for (const item of pendingPool) {
+        if (scheduledItemIds.has(item.id)) continue;
+
+        // Check if item was postponed or skipped
+        const override = postponedOrSkipped.get(item.id);
+        if (override) {
+          if (override.status === 'skipped') {
+            scheduledItemIds.add(item.id);
+            continue;
+          }
+          if (override.status === 'postponed') {
+            // Only consider on or after postponed date
+            if (dayDateStr < override.assignedDate) {
+              continue;
+            }
+          }
+        }
+
+        // Avoid duplicate problem on same date
+        if (item.problemId && usedProblemsToday.has(item.problemId)) {
+          continue;
+        }
+
+        // Check time budget
+        if (assignedMinutes + item.estimatedMinutes <= dayAvailableMinutes) {
+          const scheduledItem: StudyPlanItem = {
+            ...item,
+            assignedDate: dayDateStr,
+          };
+
+          // Postponement warning check against exam date
+          const sub = subjects.find((s) => s.id === item.subjectId);
+          if (sub?.examAt) {
+            const subExamStr = toSeoulDateString(sub.examAt);
+            if (dayDateStr > subExamStr) {
+              scheduledItem.warningNote = '배정 날짜가 시험일 이후입니다. 일정 조정이 필요합니다.';
+            }
+          }
+
+          dayItems.push(scheduledItem);
+          scheduledItemIds.add(item.id);
+          if (item.problemId) usedProblemsToday.add(item.problemId);
+          assignedMinutes += item.estimatedMinutes;
+        }
+      }
+    }
+
+    days.push({
+      date: dayDateStr,
+      dayOfWeek,
+      dayLabel,
+      availableMinutes: dayAvailableMinutes,
+      isRestDay,
+      assignedMinutes,
+      items: dayItems,
+      unassignedItems: dayUnassigned,
+    });
+  }
+
+  // 6. Any pending items not scheduled in the horizon are gathered into unassigned items
+  const allUnassignedItems: StudyPlanItem[] = [];
+  for (const item of pendingPool) {
+    if (!scheduledItemIds.has(item.id)) {
+      allUnassignedItems.push({
+        ...item,
+        assignedDate: '',
+      });
+    }
+  }
+
+  // Distribute unassigned items to today's unassigned list for clear UI visibility
+  if (days.length > 0) {
+    days[0].unassignedItems = allUnassignedItems;
+  }
+
+  // 7. Calculate total time shortage before exam dates
+  let totalShortageMinutes = 0;
+  for (const unassigned of allUnassignedItems) {
+    const sub = subjects.find((s) => s.id === unassigned.subjectId);
+    if (sub?.examAt) {
+      const dday = calculateDDay(sub.examAt, referenceDate);
+      if (!dday.isNotSet && dday.calendarDiff >= 0) {
+        totalShortageMinutes += unassigned.estimatedMinutes;
+      }
+    }
+  }
+
+  const todayPlan = days[0] || {
+    date: todaySeoulStr,
+    availableMinutes: 60,
+    assignedMinutes: 0,
+    items: [],
+    unassignedItems: [],
+  };
+
+  const todayCompletedCount = todayPlan.items.filter((i) => i.status === 'completed').length;
+  const todayPendingCount = todayPlan.items.filter((i) => i.status !== 'completed').length;
+
+  return {
+    todayDate: todaySeoulStr,
+    todayAvailableMinutes: todayPlan.availableMinutes,
+    todayAssignedMinutes: todayPlan.assignedMinutes,
+    todayCompletedCount,
+    todayPendingCount,
+    todayUnassignedCount: allUnassignedItems.length,
+    totalShortageMinutes,
+    scopeRemainingBySubject: scopeRemainingList,
+    days,
+  };
+}

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useSyncExternalStore } from 'react';
 import {
   Subject,
   Material,
@@ -14,6 +14,12 @@ import {
   ProblemQualityStatus,
   ProblemReportType,
   isProblemAvailableForPractice,
+  StudyPlanSettings,
+  StudyPlanItem,
+  DEFAULT_STUDY_PLAN_SETTINGS,
+  MockExamSession,
+  PersonalizationSettings,
+  DEFAULT_PERSONALIZATION_SETTINGS,
 } from '../lib/types';
 import {
   loadStoredSubjects,
@@ -23,7 +29,6 @@ import {
   loadStoredMaterials,
   saveStoredMaterials,
   loadStoredConcepts,
-  saveStoredConcepts,
   loadStoredConceptDrafts,
   saveStoredConceptDrafts,
   loadStoredProblems,
@@ -46,12 +51,23 @@ import {
   editAndReviseProblem,
   reapproveProblem,
   suspendProblem,
+  loadStoredStudyPlanSettings,
+  saveStoredStudyPlanSettings,
+  loadStoredStudyPlanItems,
+  postponeStudyPlanItem,
+  skipStudyPlanItem,
+  loadStoredPersonalizationSettings,
+  saveStoredPersonalizationSettings,
+  saveStoredPersonalizationState,
 } from '../lib/storage';
 import {
   DEFAULT_RETENTION_SETTINGS,
   rankConceptsForReview,
 } from '../lib/retentionModel';
-import { computeMarkdownHash } from '../lib/markdownUtils';
+import { generateStudyPlan } from '../lib/studyPlan';
+import { computeCorrectionState, getEffectiveIntervalMultiplier } from '../lib/personalization';
+import { loadMockExams } from '../lib/mockExam';
+import { LearningAnalyticsModal } from '../components/LearningAnalyticsModal';
 import { TopUtilityBar } from '../components/TopUtilityBar';
 import { ExamRecordCard } from '../components/ExamRecordCard';
 import { StatusStrip } from '../components/StatusStrip';
@@ -72,8 +88,14 @@ import { PdfViewerModal } from '../components/PdfViewerModal';
 import { SettingsModal } from '../components/SettingsModal';
 import { MockExamModal } from '../components/MockExamModal';
 import { AddSubjectModal } from '../components/AddSubjectModal';
-import { calculateDDay, toSeoulDateString } from '../lib/dateUtils';
-import { CheckCircle2, Info } from 'lucide-react';
+import { StudyPlanModal } from '../components/StudyPlanModal';
+import { calculateDDay, toSeoulDateString, addDaysToDate } from '../lib/dateUtils';
+import { clearAllMaterialContent, deleteMaterialContent } from '../lib/materialStorage';
+import { applyMaterialEditToProblems } from '../lib/problemFreshness';
+import { CheckCircle2 } from 'lucide-react';
+
+// Stable no-op subscription used only to detect client hydration.
+const hydrationSubscribe = () => () => {};
 
 export default function RedcallDashboardPage() {
   // Hydration safety flag
@@ -123,6 +145,16 @@ export default function RedcallDashboardPage() {
   const [isProblemReviewOpen, setIsProblemReviewOpen] = useState(false);
   const [activeProblemIdForSession, setActiveProblemIdForSession] = useState<string | null>(null);
 
+  // Stage 9: Study Plan State
+  const [studyPlanSettings, setStudyPlanSettings] = useState<StudyPlanSettings>(DEFAULT_STUDY_PLAN_SETTINGS);
+  const [studyPlanItems, setStudyPlanItems] = useState<StudyPlanItem[]>([]);
+  const [isStudyPlanOpen, setIsStudyPlanOpen] = useState(false);
+
+  // Stage 10: Learning Analytics & Personalization State
+  const [mockExams, setMockExams] = useState<MockExamSession[]>([]);
+  const [personalizationSettings, setPersonalizationSettings] = useState<PersonalizationSettings>(DEFAULT_PERSONALIZATION_SETTINGS);
+  const [isLearningAnalyticsOpen, setIsLearningAnalyticsOpen] = useState(false);
+
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -133,8 +165,15 @@ export default function RedcallDashboardPage() {
     }, 3800);
   };
 
-  // Initial Load from LocalStorage
-  useEffect(() => {
+  // Hydration-safe flag: false during SSR/first hydration commit, true after.
+  const isHydrated = useSyncExternalStore(hydrationSubscribe, () => true, () => false);
+
+  // Initial load runs during a guarded render phase rather than inside an effect.
+  // This avoids cascading renders while remaining hydration-safe (the first client
+  // commit still matches the server render).
+  if (isHydrated && !isLoaded) {
+    setIsLoaded(true);
+
     const loadedSubjects = loadStoredSubjects();
     const loadedSubjectId = loadActiveSubjectId();
     const loadedMaterials = loadStoredMaterials();
@@ -144,6 +183,10 @@ export default function RedcallDashboardPage() {
     const loadedProblemDrafts = loadStoredProblemDrafts();
     const loadedAttempts = loadStoredAttempts();
     const loadedSettings = loadStoredSettings();
+    const loadedPlanSettings = loadStoredStudyPlanSettings();
+    const loadedPlanItems = loadStoredStudyPlanItems();
+    const loadedMockExams = loadMockExams();
+    const loadedPersonalization = loadStoredPersonalizationSettings();
 
     setSubjects(loadedSubjects);
     setActiveSubjectId(loadedSubjectId);
@@ -154,6 +197,10 @@ export default function RedcallDashboardPage() {
     setProblemDrafts(loadedProblemDrafts);
     setAttempts(loadedAttempts);
     setSettings(loadedSettings);
+    setStudyPlanSettings(loadedPlanSettings);
+    setStudyPlanItems(loadedPlanItems);
+    setMockExams(loadedMockExams);
+    setPersonalizationSettings(loadedPersonalization);
 
     // Initial concept selection prioritizing top urgent review recommendation
     const subjectConcepts = loadedConcepts.filter((c) => c.subjectId === loadedSubjectId);
@@ -176,8 +223,16 @@ export default function RedcallDashboardPage() {
         setSelectedEventId(lastEvent.id);
       }
     }
+  }
 
-    setIsLoaded(true);
+  // Re-check plan storage and KST date sync on window focus
+  useEffect(() => {
+    const handleFocus = () => {
+      setStudyPlanItems(loadStoredStudyPlanItems());
+      setStudyPlanSettings(loadStoredStudyPlanSettings());
+    };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
   }, []);
 
   // Filtered Subject Data
@@ -220,25 +275,71 @@ export default function RedcallDashboardPage() {
 
   const activeSessionProblem = useMemo(() => {
     if (activeProblemIdForSession) {
-      const found = subjectProblems.find((p) => p.id === activeProblemIdForSession);
-      if (found && isProblemAvailableForPractice(found)) return found;
-      if (found) return found;
+      return availableSubjectProblems.find((p) => p.id === activeProblemIdForSession);
     }
+    const conceptId = subjectConcepts.find((c) => c.id === selectedConceptId)?.id || subjectConcepts[0]?.id;
+    const linked = availableSubjectProblems.filter((p) => p.conceptIds.includes(conceptId || ''));
     return (
-      availableSubjectProblems.find((p) => p.type === selectedProblemType) ||
-      availableSubjectProblems[0] ||
-      subjectProblems.find((p) => p.type === selectedProblemType) ||
-      subjectProblems[0]
+      linked.find((p) => p.type === selectedProblemType) || linked[0]
     );
-  }, [subjectProblems, availableSubjectProblems, activeProblemIdForSession, selectedProblemType]);
+  }, [subjectConcepts, selectedConceptId, availableSubjectProblems, activeProblemIdForSession, selectedProblemType]);
+
+  // Stage 10: Deterministic personal correction state recomputed from real records.
+  // Same inputs (records, problems, settings, reference date) always yield the same state.
+  const correctionStateComputed = useMemo(() => {
+    return computeCorrectionState({
+      attempts,
+      mockExams,
+      problems: allProblems,
+      subjects,
+      concepts: allConcepts,
+      settings: personalizationSettings,
+      referenceDate: new Date(),
+    });
+  }, [attempts, mockExams, allProblems, subjects, allConcepts, personalizationSettings]);
+
+  // Persist the recalculated state so it is recoverable after refresh and
+  // is invalidated whenever records or quality status change.
+  useEffect(() => {
+    if (!isLoaded) return;
+    saveStoredPersonalizationState(correctionStateComputed);
+  }, [isLoaded, correctionStateComputed]);
+
+  const effectiveCorrectionState = correctionStateComputed;
+  const intervalMultiplier = getEffectiveIntervalMultiplier(personalizationSettings, effectiveCorrectionState);
+  const personalizationNote =
+    effectiveCorrectionState.appliedMultiplier !== 1
+      ? `개인별 보정 x${effectiveCorrectionState.appliedMultiplier.toFixed(2)}`
+      : undefined;
+
+  // Stage 9: Deterministic Study Plan Summary Memo (uses the SAME personalization multiplier
+  // as today's review so both paths can never diverge).
+  const studyPlanSummary = useMemo(() => {
+    return generateStudyPlan({
+      subjects,
+      concepts: allConcepts,
+      problems: allProblems,
+      attempts,
+      settings: studyPlanSettings,
+      retentionSettings: settings,
+      referenceDate: new Date(),
+      existingItems: studyPlanItems,
+      personalizationMultiplier: intervalMultiplier,
+      personalizationNote,
+    });
+  }, [subjects, allConcepts, allProblems, attempts, studyPlanSettings, settings, studyPlanItems, intervalMultiplier, personalizationNote]);
 
   const selectedConcept = useMemo(() => {
     return (
       subjectConcepts.find((c) => c.id === selectedConceptId) ||
-      subjectConcepts[0] ||
-      allConcepts[0]
+      subjectConcepts[0]
     );
-  }, [subjectConcepts, selectedConceptId, allConcepts]);
+  }, [subjectConcepts, selectedConceptId]);
+
+  const sessionConcept = activeSessionProblem && (
+    subjectConcepts.find((c) => c.id === selectedConcept?.id && activeSessionProblem.conceptIds.includes(c.id)) ||
+    subjectConcepts.find((c) => activeSessionProblem.conceptIds.includes(c.id))
+  );
 
   const selectedEvent = useMemo(() => {
     if (!selectedConcept || !selectedConcept.events) return null;
@@ -271,9 +372,10 @@ export default function RedcallDashboardPage() {
       subjectConcepts,
       settings,
       activeSubject.examAt,
-      new Date()
+      new Date(),
+      intervalMultiplier
     );
-  }, [subjectConcepts, settings, activeSubject]);
+  }, [subjectConcepts, settings, activeSubject, intervalMultiplier]);
 
   const selectedConceptRecommendation = useMemo(() => {
     if (!selectedConcept) return null;
@@ -432,8 +534,8 @@ export default function RedcallDashboardPage() {
       setConceptReviewMaterial(targetMaterial);
       setIsConceptReviewOpen(true);
       showToast(`[${targetMaterial.title}] 분석 완료! ${newDrafts.length}개 개념 초안이 생성되었습니다.`);
-    } catch (err: any) {
-      showToast(`네트워크 또는 서버 오류: ${err?.message || '알 수 없는 오류'}`);
+    } catch (err) {
+      showToast(`네트워크 또는 서버 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
       setIsAiAnalyzing(false);
     }
@@ -602,6 +704,7 @@ export default function RedcallDashboardPage() {
     const { updatedConcepts, updatedAttempts } = recordAttemptAndUpdateConcept(attempt, settings);
     setAllConcepts(updatedConcepts);
     setAttempts(updatedAttempts);
+    setStudyPlanItems(loadStoredStudyPlanItems()); // Sync Stage 9 plan items
 
     // Set selected event to the newly added event
     const updatedConcept = updatedConcepts.find((c) => c.id === attempt.conceptId);
@@ -611,6 +714,145 @@ export default function RedcallDashboardPage() {
     }
 
     showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
+  };
+
+  // Stage 9: Study Plan Handlers
+  const handleStartPlanItem = (item: StudyPlanItem) => {
+    if (item.needsProblemGeneration) {
+      if (item.conceptId) {
+        setSelectedConceptId(item.conceptId);
+      }
+      setIsStudyPlanOpen(false);
+      setIsProblemGeneratorOpen(true);
+      showToast('승인된 문제가 부족하여 문제 출제 화면으로 이동합니다.');
+      return;
+    }
+
+    if (item.kind === 'initial_study') {
+      const concept = allConcepts.find((c) => c.id === item.conceptId);
+      setIsStudyPlanOpen(false);
+      if (concept?.chapterRef) {
+        setPdfViewerSourceRef(concept.chapterRef);
+      } else {
+        setIsMaterialsListOpen(true);
+      }
+      showToast(`[${item.conceptName || '개념'}] 원문 및 핵심 정리 학습을 시작합니다.`);
+      return;
+    }
+
+    if (item.kind === 'mixed_mock_exam') {
+      setIsStudyPlanOpen(false);
+      setIsMockExamModalOpen(true);
+      showToast(`[${item.subjectName}] 실전 모의시험을 시작합니다.`);
+      return;
+    }
+
+    // recommended_review or vulnerability_fix
+    if (item.problemId) {
+      const prob = allProblems.find((p) => p.id === item.problemId);
+      if (prob && !isProblemAvailableForPractice(prob)) {
+        showToast('해당 문제는 현재 오류 신고 검토 중으로 출제에서 제외되었습니다. 검토를 완료하거나 새 문제를 생성해 주세요.');
+        return;
+      }
+      if (item.conceptId) {
+        setSelectedConceptId(item.conceptId);
+      }
+      if (item.problemType) {
+        setSelectedProblemType(item.problemType);
+      }
+      setActiveProblemIdForSession(item.problemId);
+      setIsStudyPlanOpen(false);
+      setIsProblemSessionOpen(true);
+      showToast(`[${item.problemTitle || '문제'}] 풀이를 시작합니다.`);
+    }
+  };
+
+  const handlePostponePlanItem = (item: StudyPlanItem) => {
+    const currentAssigned = item.assignedDate || toSeoulDateString(new Date());
+    const nextDate = toSeoulDateString(addDaysToDate(currentAssigned, 1));
+    const updated = postponeStudyPlanItem(item.id, nextDate);
+    setStudyPlanItems(updated);
+    showToast(`[${item.snapshotTitle}] 일정이 내일(${nextDate})로 미뤄졌습니다. (학습 점수 불변)`);
+  };
+
+  const handleSkipPlanItem = (item: StudyPlanItem) => {
+    const updated = skipStudyPlanItem(item.id);
+    setStudyPlanItems(updated);
+    showToast(`[${item.snapshotTitle}] 이번 계획에서 건너뛰었습니다. (시험 범위는 유지됩니다)`);
+  };
+
+  const handleRecalculatePlan = () => {
+    const reloadedSettings = loadStoredStudyPlanSettings();
+    const reloadedItems = loadStoredStudyPlanItems();
+    setStudyPlanSettings(reloadedSettings);
+    setStudyPlanItems(reloadedItems);
+    showToast('학습 계획이 최신 데이터로 재산출되었습니다.');
+  };
+
+  // Stage 10: Personalization handlers
+  const handleUpdatePersonalizationSettings = (next: PersonalizationSettings) => {
+    setPersonalizationSettings(next);
+    saveStoredPersonalizationSettings(next);
+    showToast('개인별 복습 추천 설정이 저장되었습니다. 미완료 미래 계획이 재계산되며 완료 기록은 보존됩니다.');
+  };
+
+  const handleResetPersonalizationSettings = () => {
+    const reset = { ...DEFAULT_PERSONALIZATION_SETTINGS, updatedAt: new Date().toISOString() };
+    setPersonalizationSettings(reset);
+    saveStoredPersonalizationSettings(reset);
+    saveStoredPersonalizationState(
+      computeCorrectionState({
+        attempts,
+        mockExams,
+        problems: allProblems,
+        subjects,
+        concepts: allConcepts,
+        settings: reset,
+        referenceDate: new Date(),
+      })
+    );
+    showToast('개인별 보정값이 초기화되어 기본 추천으로 복구되었습니다.');
+  };
+
+  const handleRecalculateCorrection = () => {
+    saveStoredPersonalizationState(
+      computeCorrectionState({
+        attempts,
+        mockExams,
+        problems: allProblems,
+        subjects,
+        concepts: allConcepts,
+        settings: personalizationSettings,
+        referenceDate: new Date(),
+      })
+    );
+    showToast('현재 기록 기준으로 개인별 보정이 재계산되었습니다.');
+  };
+
+  const handleOpenAnalyticsRecord = (subjectId: string, conceptId: string, attemptId?: string) => {
+    setIsLearningAnalyticsOpen(false);
+    setActiveSubjectId(subjectId);
+    saveActiveSubjectId(subjectId);
+    setSelectedConceptId(conceptId);
+
+    const concept = allConcepts.find((c) => c.id === conceptId);
+    if (attemptId && concept) {
+      const matchedEvent = concept.events.find((e) => e.attemptId === attemptId);
+      if (matchedEvent) {
+        setSelectedEventId(matchedEvent.id);
+      } else {
+        const lastEvent = concept.events[concept.events.length - 1];
+        setSelectedEventId(lastEvent ? lastEvent.id : null);
+      }
+    } else if (concept && concept.events.length > 0) {
+      const lastEvent = concept.events[concept.events.length - 1];
+      setSelectedEventId(lastEvent ? lastEvent.id : null);
+    }
+
+    setTimeout(() => {
+      const el = document.getElementById('archive-record-detail');
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 80);
   };
 
   // Postpone 1 day (Schedule shift only: does not boost score or create events)
@@ -637,9 +879,10 @@ export default function RedcallDashboardPage() {
     }
   };
 
-  // Reset to initial demo data
-  const handleResetData = () => {
+  // Reset to initial demo data (also clears IndexedDB material bodies + memory cache)
+  const handleResetData = async () => {
     resetToInitialDemoData();
+    await clearAllMaterialContent();
     window.location.reload();
   };
 
@@ -678,11 +921,18 @@ export default function RedcallDashboardPage() {
         onOpenProblemReview={() => setIsProblemReviewOpen(true)}
         problemDraftCount={activeSubjectProblemDrafts.length}
         problemReportedCount={activeSubjectReportedCount}
-        onOpenProblemSession={() => setIsProblemSessionOpen(true)}
+        onOpenProblemSession={() => {
+          if (!activeSessionProblem) {
+            showToast('선택 개념에 연결된 출제 가능한 문제가 없습니다. 문제를 생성·승인해 주세요.');
+            return;
+          }
+          setIsProblemSessionOpen(true);
+        }}
         onOpenMockExam={() => setIsMockExamModalOpen(true)}
+        onOpenStudyPlan={() => setIsStudyPlanOpen(true)}
+        onOpenLearningAnalytics={() => setIsLearningAnalyticsOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
         onScrollToTodayReview={handleScrollToTodayReview}
-        activeView="dashboard"
       />
 
       {/* Main Workspace Container */}
@@ -693,6 +943,7 @@ export default function RedcallDashboardPage() {
           materialCount={materials.filter((m) => m.subjectId === activeSubject.id).length}
           onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
           onOpenScopeModal={() => setIsScopeModalOpen(true)}
+          onOpenStudyPlanModal={() => setIsStudyPlanOpen(true)}
           onOpenUploadModal={() => setIsUploadModalOpen(true)}
           onOpenMaterialsListModal={() => setIsMaterialsListOpen(true)}
         />
@@ -824,15 +1075,16 @@ export default function RedcallDashboardPage() {
 
       {/* Modals */}
       {/* 1. Problem Session Workspace Modal */}
-      {selectedConcept && (
+      {isProblemSessionOpen && sessionConcept && activeSessionProblem && (
         <ProblemSessionModal
+          key={`${activeSubject.id}-${activeSessionProblem.id}-${activeSessionProblem.version ?? 1}`}
           isOpen={isProblemSessionOpen}
           onClose={() => {
             setIsProblemSessionOpen(false);
             setActiveProblemIdForSession(null);
           }}
           subject={activeSubject}
-          concept={selectedConcept}
+          concept={sessionConcept}
           problem={activeSessionProblem}
           onSubmitAttempt={handleSubmitAttempt}
           onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
@@ -884,11 +1136,16 @@ export default function RedcallDashboardPage() {
           setEditingMaterial(mat);
           setIsMaterialEditorOpen(true);
         }}
-        onDeleteMaterial={(materialId) => {
+        onDeleteMaterial={async (materialId) => {
           const updated = materials.filter((m) => m.id !== materialId);
           setMaterials(updated);
           saveStoredMaterials(updated);
-          showToast('자료가 삭제되었습니다.');
+          const result = await deleteMaterialContent(materialId);
+          showToast(
+            result.deleted
+              ? '자료와 저장된 본문이 삭제되었습니다.'
+              : `자료 목록에서는 제거했지만 본문 저장소 정리에 실패했습니다. (${result.error || '알 수 없는 오류'})`
+          );
         }}
         onOpenConceptReview={(mat) => {
           setIsMaterialsListOpen(false);
@@ -900,8 +1157,10 @@ export default function RedcallDashboardPage() {
       />
 
       {/* 4.2 Material Side-by-Side Comparison Editor Modal */}
+      {isMaterialEditorOpen && editingMaterial && (
       <MaterialEditorModal
-        isOpen={isMaterialEditorOpen && !!editingMaterial}
+        key={editingMaterial.id}
+        isOpen
         onClose={() => {
           setIsMaterialEditorOpen(false);
           setEditingMaterial(null);
@@ -917,18 +1176,28 @@ export default function RedcallDashboardPage() {
           saveStoredMaterials(updated);
           setEditingMaterial(updatedMat);
 
-          // Mark problems created from prior version of markdown as outdated
-          const newHash = computeMarkdownHash(updatedMat.parsedMarkdown || '');
-          const newProblems = allProblems.map((p) => {
-            if (p.subjectId === updatedMat.subjectId && p.sourceMarkdownHash && p.sourceMarkdownHash !== newHash) {
-              return { ...p, isOutdated: true };
-            }
-            return p;
-          });
+          // Mark ONLY problems that actually referenced the edited material as outdated.
+          // Problems with per-material hashes are compared per material; legacy problems
+          // without per-material hashes are flagged as "needs source review" (not auto-outdated).
+          const { updatedProblems: newProblems, outdatedIds, reviewIds } = applyMaterialEditToProblems(
+            allProblems,
+            updatedMat,
+            allConcepts
+          );
           setAllProblems(newProblems);
           saveStoredProblems(newProblems);
 
-          showToast(`[${updatedMat.title}] 수정 내용이 저장되었습니다.`);
+          if (outdatedIds.length > 0) {
+            showToast(
+              `[${updatedMat.title}] 수정으로 문제 ${outdatedIds.length}건이 구버전으로 표시되어 재검토가 필요합니다.`
+            );
+          } else if (reviewIds.length > 0) {
+            showToast(
+              `[${updatedMat.title}] 수정과 연관된 문제 ${reviewIds.length}건을 확인 필요 상태로 표시했습니다.`
+            );
+          } else {
+            showToast(`[${updatedMat.title}] 수정 내용이 저장되었습니다.`);
+          }
         }}
         onOpenConceptReview={(mat) => {
           setConceptReviewMaterial(mat || null);
@@ -937,6 +1206,7 @@ export default function RedcallDashboardPage() {
         onTriggerAnalysis={handleTriggerAiAnalysis}
         isAnalyzing={isAiAnalyzing}
       />
+      )}
 
       {/* 4.3 AI Concept Extraction & Review Modal (Stage 2) */}
       <ConceptReviewModal
@@ -964,10 +1234,12 @@ export default function RedcallDashboardPage() {
       />
 
       {/* 5. PDF Reference Excerpt Reader Modal */}
+      {pdfViewerSourceRef && (
       <PdfViewerModal
-        isOpen={!!pdfViewerSourceRef}
+        key={pdfViewerSourceRef}
+        isOpen
         onClose={() => setPdfViewerSourceRef(null)}
-        sourceRef={pdfViewerSourceRef || ''}
+        sourceRef={pdfViewerSourceRef}
         conceptTitle={selectedConcept?.title}
         material={
           materials.find(
@@ -985,6 +1257,7 @@ export default function RedcallDashboardPage() {
           setIsMaterialEditorOpen(true);
         }}
       />
+      )}
 
       {/* 6. Settings Modal */}
       <SettingsModal
@@ -1010,6 +1283,7 @@ export default function RedcallDashboardPage() {
         onExamRecorded={() => {
           setAllConcepts(loadStoredConcepts());
           setAttempts(loadStoredAttempts());
+          setMockExams(loadMockExams());
           showToast('모의시험 답안과 평가가 학습 이력에 저장되었습니다.');
         }}
       />}
@@ -1022,17 +1296,16 @@ export default function RedcallDashboardPage() {
       />
 
       {/* 9. AI Problem Generator Modal (Stage 3) */}
-      <ProblemGeneratorModal
+      {isProblemGeneratorOpen && <ProblemGeneratorModal
+        key={`${activeSubject.id}-${selectedConceptId}`}
         isOpen={isProblemGeneratorOpen}
         onClose={() => setIsProblemGeneratorOpen(false)}
         activeSubject={activeSubject}
         concepts={subjectConcepts}
+        materials={materials.filter((m) => m.subjectId === activeSubject.id)}
         selectedConceptId={selectedConceptId}
         onGenerateSuccess={handleProblemGenerateSuccess}
-        sourceMarkdown={
-          materials.find((m) => m.subjectId === activeSubject.id && m.parsedMarkdown)?.parsedMarkdown
-        }
-      />
+      />}
 
       {/* 10. AI Problem Review & Approval Modal (Stage 3 & 6) */}
       <ProblemReviewModal
@@ -1041,7 +1314,6 @@ export default function RedcallDashboardPage() {
         activeSubject={activeSubject}
         drafts={problemDrafts}
         problems={allProblems}
-        concepts={subjectConcepts}
         materials={materials}
         onUpdateDraft={handleUpdateProblemDraft}
         onApproveDraft={handleApproveProblemDraft}
@@ -1057,7 +1329,47 @@ export default function RedcallDashboardPage() {
         onReviseProblem={handleReviseProblem}
         onReapproveProblem={handleReapproveProblem}
         onSuspendProblem={handleSuspendProblem}
-        onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
+      />
+
+      {/* 11. Study Plan Modal (Stage 9) */}
+      {isStudyPlanOpen && (
+      <StudyPlanModal
+        key={activeSubject.id}
+        isOpen
+        onClose={() => setIsStudyPlanOpen(false)}
+        subjects={subjects}
+        activeSubject={activeSubject}
+        concepts={allConcepts}
+        studyPlanSummary={studyPlanSummary}
+        settings={studyPlanSettings}
+        onUpdateSettings={(newSettings) => {
+          setStudyPlanSettings(newSettings);
+          saveStoredStudyPlanSettings(newSettings);
+          showToast('학습 계획 설정이 저장되었습니다.');
+        }}
+        onStartItem={handleStartPlanItem}
+        onPostponeItem={handlePostponePlanItem}
+        onSkipItem={handleSkipPlanItem}
+        onRecalculatePlan={handleRecalculatePlan}
+      />
+      )}
+
+      {/* 12. Learning Analytics & Personalization Modal (Stage 10) */}
+      <LearningAnalyticsModal
+        isOpen={isLearningAnalyticsOpen}
+        onClose={() => setIsLearningAnalyticsOpen(false)}
+        subjects={subjects}
+        concepts={allConcepts}
+        problems={allProblems}
+        attempts={attempts}
+        mockExams={mockExams}
+        activeSubjectId={activeSubject.id}
+        personalizationSettings={personalizationSettings}
+        correctionState={effectiveCorrectionState}
+        onUpdatePersonalizationSettings={handleUpdatePersonalizationSettings}
+        onResetPersonalizationSettings={handleResetPersonalizationSettings}
+        onRecalculateCorrection={handleRecalculateCorrection}
+        onOpenRecord={handleOpenAnalyticsRecord}
       />
     </div>
   );

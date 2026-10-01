@@ -54,19 +54,16 @@ export function TodayReviewPanel({
 }: TodayReviewPanelProps) {
   // Find problems linked to this concept that are available for practice (normal or reapproved)
   const allConceptProblems = problems.filter(
-    (p) => p.conceptIds?.includes(concept.id) || (p as any).conceptId === concept.id
+    (p) => p.subjectId === subject.id && p.conceptIds?.includes(concept.id)
   );
   const conceptProblems = allConceptProblems.filter((p) => isProblemAvailableForPractice(p));
   const quarantinedCount = allConceptProblems.length - conceptProblems.length;
   const hasApprovedProblems = conceptProblems.length > 0;
 
   // Find problem matching selected category or fallback from available problems
-  const availableAll = problems.filter((p) => isProblemAvailableForPractice(p));
   const activeProblem =
     (hasApprovedProblems ? conceptProblems.find((p) => p.type === selectedProblemType) : null) ||
     conceptProblems[0] ||
-    availableAll.find((p) => p.type === selectedProblemType) ||
-    availableAll[0] ||
     null;
 
   const isMath = subject.domain === 'math_stats';

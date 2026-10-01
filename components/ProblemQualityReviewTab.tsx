@@ -1,13 +1,11 @@
 'use client';
 
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Subject,
   Problem,
   ProblemQualityStatus,
-  PROBLEM_QUALITY_STATUS_LABELS,
   ProblemReport,
-  ProblemReportType,
   PROBLEM_REPORT_TYPE_LABELS,
   RubricCriterion,
   ProblemQualityReviewResult,
@@ -23,7 +21,6 @@ import {
   Edit3,
   Sparkles,
   BookOpen,
-  RotateCcw,
   X,
   Plus,
   Trash2,
@@ -38,7 +35,6 @@ import {
   EyeOff,
   Save,
   Loader2,
-  ArrowRight,
 } from 'lucide-react';
 
 interface ProblemQualityReviewTabProps {
@@ -50,7 +46,6 @@ interface ProblemQualityReviewTabProps {
   onReviseProblem?: (problemId: string, updates: Partial<Problem>, editReason: string) => { success: boolean; error?: string };
   onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
-  onOpenSourceModal?: (sourceRef: string) => void;
 }
 
 export function ProblemQualityReviewTab({
@@ -62,7 +57,6 @@ export function ProblemQualityReviewTab({
   onReviseProblem,
   onReapproveProblem,
   onSuspendProblem,
-  onOpenSourceModal,
 }: ProblemQualityReviewTabProps) {
   // Filter problems for active subject
   const subjectProblems = useMemo(() => {
@@ -140,25 +134,25 @@ export function ProblemQualityReviewTab({
     return reported || filteredProblems[0] || subjectProblems[0] || null;
   }, [selectedProblemId, filteredProblems, subjectProblems]);
 
-  // Sync edit form when active problem changes
-  useEffect(() => {
-    if (activeProblem) {
-      setEditTitle(activeProblem.title);
-      setEditPrompt(activeProblem.promptText);
-      setEditFormula(activeProblem.mathFormula || '');
-      setEditCodeSnippet(activeProblem.codeSnippet || '');
-      setEditHints([...activeProblem.hints]);
-      setEditModelAnswer(activeProblem.modelAnswer || '');
-      setEditRubric([...activeProblem.rubric]);
-      setEditTimeMinutes(activeProblem.timeStandardMinutes || 20);
-      setEditReasonText('');
-      setEditValidationError(null);
-      setIsEditing(false);
-      setAiReviewResult(null);
-      setAiReviewError(null);
-      setExpandedVersionNum(null);
-    }
-  }, [activeProblem?.id]);
+  // Reset the edit/review form when the active problem changes (render-phase, hydration-safe).
+  const [syncedProblemId, setSyncedProblemId] = useState<string | null>(null);
+  if (activeProblem && syncedProblemId !== activeProblem.id) {
+    setSyncedProblemId(activeProblem.id);
+    setEditTitle(activeProblem.title);
+    setEditPrompt(activeProblem.promptText);
+    setEditFormula(activeProblem.mathFormula || '');
+    setEditCodeSnippet(activeProblem.codeSnippet || '');
+    setEditHints([...activeProblem.hints]);
+    setEditModelAnswer(activeProblem.modelAnswer || '');
+    setEditRubric([...activeProblem.rubric]);
+    setEditTimeMinutes(activeProblem.timeStandardMinutes || 20);
+    setEditReasonText('');
+    setEditValidationError(null);
+    setIsEditing(false);
+    setAiReviewResult(null);
+    setAiReviewError(null);
+    setExpandedVersionNum(null);
+  }
 
   // Calculate rubric sum
   const rubricScoreSum = (isEditing ? editRubric : activeProblem?.rubric || []).reduce(
@@ -212,8 +206,8 @@ export function ProblemQualityReviewTab({
       }
 
       setAiReviewResult(data.review);
-    } catch (err: any) {
-      setAiReviewError(`네트워크 오류: ${err?.message || '알 수 없는 오류'}`);
+    } catch (err) {
+      setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
       setIsAiReviewing(false);
     }

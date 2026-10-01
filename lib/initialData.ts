@@ -1,4 +1,4 @@
-import { Subject, Material, Concept, Problem, Attempt } from './types';
+import { Subject, Material, Concept, Problem } from './types';
 
 export const INITIAL_SUBJECTS: Subject[] = [
   {

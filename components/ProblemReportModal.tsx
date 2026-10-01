@@ -6,16 +6,7 @@ import {
   ProblemReportType,
   PROBLEM_REPORT_TYPE_LABELS,
 } from '../lib/types';
-import {
-  AlertTriangle,
-  X,
-  Send,
-  CheckCircle,
-  HelpCircle,
-  ShieldAlert,
-  FileText,
-  Clock,
-} from 'lucide-react';
+import { AlertTriangle, X, Send, ShieldAlert } from 'lucide-react';
 
 interface ProblemReportModalProps {
   isOpen: boolean;
@@ -82,8 +73,8 @@ export function ProblemReportModal({
       // Reset and close
       setIsSubmitting(false);
       onClose();
-    } catch (err: any) {
-      setSubmissionError(err?.message || '신고 처리 중 오류가 발생했습니다.');
+    } catch (err) {
+      setSubmissionError(err instanceof Error ? err.message : '신고 처리 중 오류가 발생했습니다.');
       setIsSubmitting(false);
     }
   };

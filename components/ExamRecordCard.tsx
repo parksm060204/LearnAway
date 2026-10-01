@@ -12,6 +12,7 @@ interface ExamRecordCardProps {
   onOpenScopeModal: () => void;
   onOpenUploadModal: () => void;
   onOpenMaterialsListModal?: () => void;
+  onOpenStudyPlanModal?: () => void;
 }
 
 export function ExamRecordCard({
@@ -21,6 +22,7 @@ export function ExamRecordCard({
   onOpenScopeModal,
   onOpenUploadModal,
   onOpenMaterialsListModal,
+  onOpenStudyPlanModal,
 }: ExamRecordCardProps) {
   const dday = calculateDDay(subject.examAt);
 
@@ -130,6 +132,17 @@ export function ExamRecordCard({
               <Sliders className="w-3.5 h-3.5 text-[#827d73]" />
               <span>출제범위 관리</span>
             </button>
+
+            {onOpenStudyPlanModal && (
+              <button
+                onClick={onOpenStudyPlanModal}
+                className="flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-[#c52828] bg-[#fef2f2] hover:bg-[#fee2e2] border border-[#fecaca] rounded-xs shadow-2xs transition-all"
+                title="시험일까지의 맞춤 학습 계획"
+              >
+                <Calendar className="w-3.5 h-3.5 text-[#c52828]" />
+                <span>학습 계획</span>
+              </button>
+            )}
 
             {onOpenMaterialsListModal && (
               <button

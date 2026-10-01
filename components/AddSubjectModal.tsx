@@ -3,7 +3,7 @@
 import React, { useState } from 'react';
 import { Subject } from '../lib/types';
 import { calculateDDay } from '../lib/dateUtils';
-import { X, Plus, Calendar, BookOpen, Layers, Check } from 'lucide-react';
+import { X, Plus, Check } from 'lucide-react';
 
 interface AddSubjectModalProps {
   isOpen: boolean;
@@ -14,7 +14,7 @@ interface AddSubjectModalProps {
 export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectModalProps) {
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
-  const [semester, setSemester] = useState('2026-2');
+  const [semester] = useState('2026-2');
   const [examDate, setExamDate] = useState('');
   const [startTime, setStartTime] = useState('10:00');
   const [endTime, setEndTime] = useState('12:00');

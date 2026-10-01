@@ -13,6 +13,12 @@ import {
   ProblemReportType,
   ProblemQualityStatus,
   ProblemVersionSnapshot,
+  StudyPlanSettings,
+  StudyPlanItem,
+  DEFAULT_STUDY_PLAN_SETTINGS,
+  PersonalizationSettings,
+  PersonalizationCorrectionState,
+  DEFAULT_PERSONALIZATION_SETTINGS,
 } from './types';
 import {
   INITIAL_SUBJECTS,
@@ -37,6 +43,10 @@ const STORAGE_KEYS = {
   PROBLEM_DRAFTS: 'redcall_problem_drafts_v1',
   ATTEMPTS: 'redcall_attempts_v1',
   SETTINGS: 'redcall_retention_settings_v1',
+  STUDY_PLAN_SETTINGS: 'redcall_study_plan_settings_v1',
+  STUDY_PLAN_ITEMS: 'redcall_study_plan_items_v1',
+  PERSONALIZATION_SETTINGS: 'redcall_personalization_settings_v1',
+  PERSONALIZATION_STATE: 'redcall_personalization_state_v1',
 };
 
 const inMemoryStore: Record<string, string> = {};
@@ -101,7 +111,9 @@ export function loadStoredMaterials(): Material[] {
 export function saveStoredMaterials(materials: Material[]): void {
   // Decouple storage: strip heavy rawText and pages from localStorage
   const lightMaterials = materials.map((m) => {
-    const { pages, rawText, ...rest } = m;
+    const rest: Material = { ...m };
+    delete rest.pages;
+    delete rest.rawText;
     return rest;
   });
   safeSetItem(STORAGE_KEYS.MATERIALS, lightMaterials);
@@ -245,7 +257,7 @@ export function batchApproveConceptDrafts(draftIds: string[]): {
   updatedConcepts: Concept[];
 } {
   const drafts = loadStoredConceptDrafts();
-  let concepts = loadStoredConcepts();
+  const concepts = loadStoredConcepts();
   const targetIdsSet = new Set(draftIds);
 
   const updatedDrafts = drafts.map((d) =>
@@ -484,6 +496,7 @@ export function approveProblemDraft(draftId: string): {
       rubric: targetDraft.rubric,
       sourceRefs: targetDraft.sourceRefs,
       sourceMarkdownHash: targetDraft.sourceMarkdownHash,
+      sourceMaterials: targetDraft.sourceMaterials,
       isApproved: true,
       isDemo: false,
       qualityStatus: problems[existingIndex].qualityStatus || 'normal',
@@ -519,6 +532,7 @@ export function approveProblemDraft(draftId: string): {
       designIntent: targetDraft.designIntent,
       appliedConditionNote: targetDraft.appliedConditionNote,
       sourceMarkdownHash: targetDraft.sourceMarkdownHash,
+      sourceMaterials: targetDraft.sourceMaterials,
       createdAt: now,
       version: 1,
       qualityStatus: 'normal',
@@ -575,6 +589,7 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
         rubric: draft.rubric,
         sourceRefs: draft.sourceRefs,
         sourceMarkdownHash: draft.sourceMarkdownHash,
+        sourceMaterials: draft.sourceMaterials,
         isApproved: true,
         isDemo: false,
         qualityStatus: problems[existingIndex].qualityStatus || 'normal',
@@ -609,6 +624,7 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
         designIntent: draft.designIntent,
         appliedConditionNote: draft.appliedConditionNote,
         sourceMarkdownHash: draft.sourceMarkdownHash,
+        sourceMaterials: draft.sourceMaterials,
         createdAt: now,
         version: 1,
         qualityStatus: 'normal',
@@ -905,6 +921,10 @@ export function reapproveProblem(
     ...target,
     reports: updatedReports,
     qualityStatus: 'reapproved',
+    // Explicit user re-approval clears the outdated/review flags so the problem
+    // is not permanently excluded from circulation.
+    isOutdated: false,
+    needsSourceReview: false,
     lastReviewedAt: now,
     reviewNotes: reapprovalNote || '품질 검증 통과 및 재승인 완료 (출제 가능 복귀)',
   };
@@ -973,11 +993,110 @@ export function resetToInitialDemoData(): void {
   localStorage.removeItem(STORAGE_KEYS.ATTEMPTS);
   localStorage.removeItem('redcall_mock_exam_sessions_v1');
   localStorage.removeItem(STORAGE_KEYS.SETTINGS);
+  localStorage.removeItem(STORAGE_KEYS.STUDY_PLAN_SETTINGS);
+  localStorage.removeItem(STORAGE_KEYS.STUDY_PLAN_ITEMS);
+  localStorage.removeItem(STORAGE_KEYS.PERSONALIZATION_SETTINGS);
+  localStorage.removeItem(STORAGE_KEYS.PERSONALIZATION_STATE);
+}
+
+// Stage 10: Personal review recommendation settings & correction state
+export function loadStoredPersonalizationSettings(): PersonalizationSettings {
+  const loaded = safeGetItem<Partial<PersonalizationSettings>>(
+    STORAGE_KEYS.PERSONALIZATION_SETTINGS,
+    DEFAULT_PERSONALIZATION_SETTINGS
+  );
+  return {
+    enabled: loaded.enabled ?? DEFAULT_PERSONALIZATION_SETTINGS.enabled,
+    tendency: loaded.tendency ?? DEFAULT_PERSONALIZATION_SETTINGS.tendency,
+    autoAdjust: loaded.autoAdjust ?? DEFAULT_PERSONALIZATION_SETTINGS.autoAdjust,
+    updatedAt: loaded.updatedAt ?? DEFAULT_PERSONALIZATION_SETTINGS.updatedAt,
+  };
+}
+
+export function saveStoredPersonalizationSettings(settings: PersonalizationSettings): void {
+  safeSetItem(STORAGE_KEYS.PERSONALIZATION_SETTINGS, settings);
+}
+
+export function loadStoredPersonalizationState(): PersonalizationCorrectionState | null {
+  return safeGetItem<PersonalizationCorrectionState | null>(STORAGE_KEYS.PERSONALIZATION_STATE, null);
+}
+
+export function saveStoredPersonalizationState(state: PersonalizationCorrectionState): void {
+  safeSetItem(STORAGE_KEYS.PERSONALIZATION_STATE, state);
+}
+
+// Stage 9: Study Plan Storage Operations
+export function loadStoredStudyPlanSettings(): StudyPlanSettings {
+  return safeGetItem<StudyPlanSettings>(STORAGE_KEYS.STUDY_PLAN_SETTINGS, DEFAULT_STUDY_PLAN_SETTINGS);
+}
+
+export function saveStoredStudyPlanSettings(settings: StudyPlanSettings): void {
+  safeSetItem(STORAGE_KEYS.STUDY_PLAN_SETTINGS, settings);
+}
+
+export function loadStoredStudyPlanItems(): StudyPlanItem[] {
+  return safeGetItem<StudyPlanItem[]>(STORAGE_KEYS.STUDY_PLAN_ITEMS, []);
+}
+
+export function saveStoredStudyPlanItems(items: StudyPlanItem[]): void {
+  safeSetItem(STORAGE_KEYS.STUDY_PLAN_ITEMS, items);
+}
+
+export function markStudyPlanItemCompleted(
+  itemId: string,
+  linkage: { attemptId?: string; eventId?: string; mockSessionId?: string }
+): StudyPlanItem[] {
+  const items = loadStoredStudyPlanItems();
+  const now = new Date().toISOString();
+  const updated = items.map((i) =>
+    i.id === itemId
+      ? {
+          ...i,
+          status: 'completed' as const,
+          completedAt: now,
+          completedAttemptId: linkage.attemptId || i.completedAttemptId,
+          completedEventId: linkage.eventId || i.completedEventId,
+          completedMockSessionId: linkage.mockSessionId || i.completedMockSessionId,
+        }
+      : i
+  );
+  saveStoredStudyPlanItems(updated);
+  return updated;
+}
+
+export function postponeStudyPlanItem(itemId: string, nextDate: string): StudyPlanItem[] {
+  const items = loadStoredStudyPlanItems();
+  const updated = items.map((i) =>
+    i.id === itemId
+      ? {
+          ...i,
+          status: 'postponed' as const,
+          assignedDate: nextDate,
+        }
+      : i
+  );
+  saveStoredStudyPlanItems(updated);
+  return updated;
+}
+
+export function skipStudyPlanItem(itemId: string): StudyPlanItem[] {
+  const items = loadStoredStudyPlanItems();
+  const updated = items.map((i) =>
+    i.id === itemId
+      ? {
+          ...i,
+          status: 'skipped' as const,
+        }
+      : i
+  );
+  saveStoredStudyPlanItems(updated);
+  return updated;
 }
 
 /**
  * Adds an attempt and automatically creates a new ReviewEvent on the concept,
  * recalculating its retention score and status dynamically without artificial duplicates.
+ * Also automatically marks any matching uncompleted StudyPlanItem as completed.
  */
 export function recordAttemptAndUpdateConcept(
   attempt: Attempt,
@@ -986,16 +1105,54 @@ export function recordAttemptAndUpdateConcept(
   const currentConcepts = loadStoredConcepts();
   const currentAttempts = loadStoredAttempts();
 
-  // Guard against duplicate submission (e.g. double click or retry)
-  const alreadyExists = currentAttempts.some((a) => a.id === attempt.id);
-  const newAttempts = alreadyExists ? currentAttempts : [attempt, ...currentAttempts];
-  if (!alreadyExists) {
+  const targetConcept = currentConcepts.find(
+    (c) => c.id === attempt.conceptId && c.subjectId === attempt.subjectId
+  );
+  if (!targetConcept) {
+    throw new Error('풀이 기록의 개념과 과목이 일치하지 않습니다.');
+  }
+
+  const alreadyAttemptStored = currentAttempts.some((a) => a.id === attempt.id);
+  const alreadyEventStored = targetConcept.events.some((e) => e.attemptId === attempt.id);
+
+  // Fully recorded already: do not add a second Attempt, event, or exercise count.
+  if (alreadyAttemptStored && alreadyEventStored) {
+    return { updatedConcepts: currentConcepts, updatedAttempts: currentAttempts };
+  }
+
+  // Persist the Attempt if it is missing (idempotent).
+  const newAttempts = alreadyAttemptStored ? currentAttempts : [attempt, ...currentAttempts];
+  if (!alreadyAttemptStored) {
     saveStoredAttempts(newAttempts);
+  }
+
+  // If the Attempt exists but its review event is missing (a previous partial
+  // failure), recover by appending only the missing event.
+
+  // Stage 9: Auto-complete any uncompleted StudyPlanItem matching this problem
+  const currentPlanItems = loadStoredStudyPlanItems();
+  const matchingPlanItem = currentPlanItems.find(
+    (i) => i.problemId === attempt.problemId && i.status !== 'completed'
+  );
+  if (matchingPlanItem) {
+    const updatedPlanItems = currentPlanItems.map((i) =>
+      i.id === matchingPlanItem.id
+        ? {
+            ...i,
+            status: 'completed' as const,
+            completedAt: attempt.at,
+            completedAttemptId: attempt.id,
+          }
+        : i
+    );
+    saveStoredStudyPlanItems(updatedPlanItems);
   }
 
   const updatedConcepts = currentConcepts.map((c) => {
     // Only update the primary concept connected to this attempt
-    if (c.id !== attempt.conceptId) return c;
+    if (c.id !== attempt.conceptId || c.subjectId !== attempt.subjectId) return c;
+    // Never append a duplicate event for the same Attempt.
+    if (alreadyEventStored) return c;
 
     const newEvent: ReviewEvent = {
       id: `ev-${Date.now()}-${Math.random().toString(36).substring(7)}`,
@@ -1040,7 +1197,47 @@ export function recordAttemptAndUpdateConcept(
   });
 
   saveStoredConcepts(updatedConcepts);
+
+  // Read-back verification: report partial persistence instead of a false success.
+  const attemptPersisted = loadStoredAttempts().some((a) => a.id === attempt.id);
+  const eventPersisted = loadStoredConcepts()
+    .find((c) => c.id === attempt.conceptId && c.subjectId === attempt.subjectId)
+    ?.events.some((e) => e.attemptId === attempt.id);
+  if (!attemptPersisted || !eventPersisted) {
+    throw new Error(
+      '풀이 기록 저장이 일부만 완료되었습니다. 다시 시도하면 누락된 기록이 자동으로 복구됩니다.'
+    );
+  }
+
   return { updatedConcepts, updatedAttempts: newAttempts };
+}
+
+/**
+ * Scans stored Attempts and rebuilds any missing review events on their concepts.
+ * Used to recover after a partial save (Attempt persisted, event missing).
+ */
+export function recoverMissingAttemptEvents(
+  settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS
+): { recoveredCount: number; updatedConcepts: Concept[] } {
+  const concepts = loadStoredConcepts();
+  const attempts = loadStoredAttempts();
+  const conceptById = new Map(concepts.map((c) => [c.id, c]));
+
+  let recoveredCount = 0;
+  for (const attempt of attempts) {
+    const concept = conceptById.get(attempt.conceptId);
+    if (!concept || concept.subjectId !== attempt.subjectId) continue;
+    if (concept.events.some((e) => e.attemptId === attempt.id)) continue;
+
+    try {
+      recordAttemptAndUpdateConcept(attempt, settings);
+      recoveredCount += 1;
+    } catch {
+      // Leave unresolved; the next retry can try again.
+    }
+  }
+
+  return { recoveredCount, updatedConcepts: loadStoredConcepts() };
 }
 
 /**

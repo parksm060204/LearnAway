@@ -2,9 +2,9 @@
 
 import React, { useState, useEffect } from 'react';
 import { Material } from '../lib/types';
-import { loadMaterialContent } from '../lib/materialStorage';
+import { loadMaterialContentResult } from '../lib/materialStorage';
 import { MarkdownRenderer } from './MarkdownRenderer';
-import { X, BookOpen, ExternalLink, FileText, Mic, AlertTriangle } from 'lucide-react';
+import { X, BookOpen, ExternalLink, Mic, AlertTriangle } from 'lucide-react';
 
 interface PdfViewerModalProps {
   isOpen: boolean;
@@ -24,23 +24,29 @@ export function PdfViewerModal({
   onOpenEditor,
 }: PdfViewerModalProps) {
   const [contentMarkdown, setContentMarkdown] = useState<string>('');
-  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isLoading, setIsLoading] = useState<boolean>(() => Boolean(material));
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || !material) return;
 
-    if (material) {
-      setIsLoading(true);
-      loadMaterialContent(material.id)
-        .then((saved) => {
-          setContentMarkdown(saved?.markdown || material.parsedMarkdown || '');
-        })
-        .finally(() => {
-          setIsLoading(false);
-        });
-    } else {
-      setContentMarkdown('');
-    }
+    let isMounted = true;
+    loadMaterialContentResult(material.id).then((result) => {
+      if (!isMounted) return;
+      if (result.status === 'found') {
+        setContentMarkdown(result.content.markdown || material.parsedMarkdown || '');
+      } else if (result.status === 'missing') {
+        setContentMarkdown(material.parsedMarkdown || '');
+      } else {
+        setLoadError(result.error);
+        setContentMarkdown('');
+      }
+      setIsLoading(false);
+    });
+
+    return () => {
+      isMounted = false;
+    };
   }, [isOpen, material]);
 
   if (!isOpen) return null;
@@ -77,6 +83,15 @@ export function PdfViewerModal({
             <div className="py-20 flex flex-col items-center justify-center gap-2 text-xs text-[#57544e]">
               <div className="w-6 h-6 border-2 border-[#c52828] border-t-transparent rounded-full animate-spin" />
               <span>자료를 불러오는 중입니다...</span>
+            </div>
+          ) : loadError ? (
+            <div className="py-16 text-center space-y-2">
+              <AlertTriangle className="w-8 h-8 text-red-500 mx-auto" />
+              <div className="font-bold text-sm text-[#191817]">자료 본문을 읽지 못했습니다.</div>
+              <p className="text-xs max-w-sm mx-auto leading-relaxed text-[#57544e]">
+                저장소 접근 중 오류가 발생했습니다(본문 없음과는 다른 상태입니다). 새로고침 후 다시 시도해 주세요.
+              </p>
+              <p className="text-[11px] font-academic-mono text-[#827d73]">{loadError}</p>
             </div>
           ) : contentMarkdown ? (
             <MarkdownRenderer content={contentMarkdown} />

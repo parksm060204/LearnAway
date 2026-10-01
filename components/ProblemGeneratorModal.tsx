@@ -1,36 +1,18 @@
 'use client';
 
-import React, { useState } from 'react';
-import {
-  Subject,
-  Concept,
-  ProblemType,
-  ProblemDifficulty,
-  PROBLEM_DIFFICULTY_LABELS,
-  ProblemDraft,
-} from '../lib/types';
-import {
-  X,
-  Sparkles,
-  HelpCircle,
-  AlertCircle,
-  CheckCircle2,
-  BrainCircuit,
-  BookOpen,
-  Layers,
-  ArrowRight,
-  Clock,
-  Loader2,
-} from 'lucide-react';
+import React, { useState, useMemo } from 'react';
+import { Subject, Concept, Material, ProblemType, ProblemDifficulty, ProblemDraft } from '../lib/types';
+import { collectProblemSources } from '../lib/problemSources';
+import { X, Sparkles, AlertCircle, BrainCircuit, Loader2 } from 'lucide-react';
 
 interface ProblemGeneratorModalProps {
   isOpen: boolean;
   onClose: () => void;
   activeSubject: Subject;
   concepts: Concept[];
+  materials: Material[];
   selectedConceptId?: string;
   onGenerateSuccess: (newDrafts: ProblemDraft[]) => void;
-  sourceMarkdown?: string;
 }
 
 const MATH_PROBLEM_TYPES: { type: ProblemType; label: string; desc: string; estMin: number }[] = [
@@ -92,9 +74,9 @@ export function ProblemGeneratorModal({
   onClose,
   activeSubject,
   concepts,
+  materials,
   selectedConceptId,
   onGenerateSuccess,
-  sourceMarkdown,
 }: ProblemGeneratorModalProps) {
   const isMath = activeSubject.domain === 'math_stats';
   const availableTypes = isMath ? MATH_PROBLEM_TYPES : CS_PROBLEM_TYPES;
@@ -121,6 +103,15 @@ export function ProblemGeneratorModal({
   const [isGenerating, setIsGenerating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  // Materials actually linked to the currently selected concepts (same subject only).
+  const selectedSourceMaterials = useMemo(() => {
+    const ids = new Set<string>();
+    eligibleConcepts
+      .filter((c) => selectedConceptIds.includes(c.id))
+      .forEach((c) => (c.materialIds || []).forEach((id) => ids.add(id)));
+    return materials.filter((m) => m.subjectId === activeSubject.id && ids.has(m.id));
+  }, [eligibleConcepts, selectedConceptIds, materials, activeSubject.id]);
+
   if (!isOpen) return null;
 
   const toggleConceptSelection = (conceptId: string) => {
@@ -146,6 +137,7 @@ export function ProblemGeneratorModal({
   };
 
   const handleGenerate = async () => {
+    if (isGenerating) return;
     if (selectedConceptIds.length === 0) {
       setErrorMessage('문제를 생성할 대상 개념을 최소 1개 이상 선택해 주세요.');
       return;
@@ -157,6 +149,16 @@ export function ProblemGeneratorModal({
     setErrorMessage(null);
 
     try {
+      const collected = await collectProblemSources({
+        concepts: targetConcepts,
+        materials,
+        subjectId: activeSubject.id,
+      });
+      if (!collected.ok) {
+        setErrorMessage(collected.error);
+        return;
+      }
+
       const response = await fetch('/api/generate-problems', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -167,7 +169,7 @@ export function ProblemGeneratorModal({
           problemType: selectedType,
           difficulty,
           problemCount,
-          sourceMarkdown,
+          sources: collected.sources,
         }),
       });
 
@@ -180,7 +182,7 @@ export function ProblemGeneratorModal({
         return;
       }
 
-      const generatedDrafts: ProblemDraft[] = data.drafts || [];
+      const generatedDrafts: ProblemDraft[] = Array.isArray(data.drafts) ? data.drafts : [];
       if (generatedDrafts.length === 0) {
         setErrorMessage('생성된 문제가 없습니다. 다시 시도해 주세요.');
         return;
@@ -188,8 +190,10 @@ export function ProblemGeneratorModal({
 
       onGenerateSuccess(generatedDrafts);
       onClose();
-    } catch (err: any) {
-      setErrorMessage(`네트워크 또는 서버 오류: ${err.message || '알 수 없는 오류'}`);
+    } catch (err) {
+      setErrorMessage(
+        `네트워크 또는 서버 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`
+      );
     } finally {
       setIsGenerating(false);
     }
@@ -331,6 +335,26 @@ export function ProblemGeneratorModal({
             )}
           </div>
 
+          {/* Linked source materials (grounding) */}
+          <div className="p-3 rounded-xs border border-[#ded6c8] bg-[#faf8f4] text-[11.5px] space-y-1">
+            <div className="font-bold font-academic-mono text-[#57544e] uppercase tracking-wider">
+              연결된 학습 자료 (원문 근거)
+            </div>
+            {selectedSourceMaterials.length === 0 ? (
+              <p className="text-red-700 leading-relaxed">
+                선택한 개념에 연결된 자료 본문이 없습니다. 자료를 등록하고 개념에 연결한 뒤 출제할 수 있습니다.
+              </p>
+            ) : (
+              <ul className="space-y-0.5 text-[#57544e]">
+                {selectedSourceMaterials.map((m) => (
+                  <li key={m.id} className="line-clamp-1">
+                    · <strong className="text-[#191817]">{m.title}</strong> <span className="text-[#827d73]">({m.sourceRefs})</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
           {/* Section 2: Problem Type Selection */}
           <div className="space-y-2">
             <label className="text-xs font-bold font-academic-mono text-[#57544e] uppercase flex items-center justify-between">
@@ -444,7 +468,7 @@ export function ProblemGeneratorModal({
             <button
               type="button"
               onClick={handleGenerate}
-              disabled={isGenerating || eligibleConcepts.length === 0}
+              disabled={isGenerating || eligibleConcepts.length === 0 || selectedSourceMaterials.length === 0}
               className="flex items-center gap-2 px-5 py-2 bg-[#c52828] hover:bg-[#a82020] text-white text-xs font-bold rounded-xs shadow-xs transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isGenerating ? (

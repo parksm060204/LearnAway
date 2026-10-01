@@ -28,7 +28,7 @@ export function MarkdownRenderer({
           equation.trim(),
           { displayMode: true, throwOnError: false }
         )}</div>`;
-      } catch (err) {
+      } catch {
         return `<div class="my-2 p-2 bg-red-50 text-red-700 font-mono text-xs">$$\n${equation}\n$$</div>`;
       }
     });
@@ -40,7 +40,7 @@ export function MarkdownRenderer({
           displayMode: false,
           throwOnError: false,
         });
-      } catch (err) {
+      } catch {
         return `<code class="bg-red-50 text-red-600 px-1 py-0.5 rounded text-xs">$${equation}$</code>`;
       }
     });

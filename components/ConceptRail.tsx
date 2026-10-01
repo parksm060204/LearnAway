@@ -1,9 +1,9 @@
 'use client';
 
 import React from 'react';
-import { Concept, ConceptStatus } from '../lib/types';
+import { Concept } from '../lib/types';
 import { CONCEPT_STATUS_METADATA } from '../lib/retentionModel';
-import { formatRelativeDay, formatSeoulDate, getSeoulCalendarDiff } from '../lib/dateUtils';
+import { formatSeoulDate, getSeoulCalendarDiff } from '../lib/dateUtils';
 import { ArrowUpDown, CheckSquare, Square } from 'lucide-react';
 
 export type SortMode = 'vulnerability' | 'recent_study' | 'chapter_order';

@@ -2,7 +2,6 @@ import { Concept, ConceptStatus, RetentionModelSettings, ReviewEvent, ReviewReco
 import {
   toSeoulDateString,
   getSeoulCalendarDiff,
-  getElapsedDays,
   formatSeoulDate,
   addDaysToDate,
   calculateDDay,
@@ -225,7 +224,8 @@ export function calculateNextReviewRecommendation(
   concept: Concept,
   settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS,
   examAtIso?: string,
-  referenceDate: Date = new Date()
+  referenceDate: Date = new Date(),
+  intervalMultiplier: number = 1
 ): ReviewRecommendation | null {
   if (concept.status === 'unstudied' || !concept.events || concept.events.length === 0) {
     return null;
@@ -281,10 +281,16 @@ export function calculateNextReviewRecommendation(
     settings.threshold
   );
 
+  // Stage 10: personal interval multiplier. Keeps the base formula and coefficients
+  // intact and only scales the model-derived interval (postpone offset is preserved).
+  const safeMultiplier =
+    Number.isFinite(intervalMultiplier) && intervalMultiplier > 0 ? intervalMultiplier : 1;
+
   // Base calendar interval: round theoretical interval (at least 1 day if initial score was above threshold)
-  const baseIntervalDays = lastEvent.resultScore <= settings.threshold
-    ? 0
-    : Math.max(1, Math.round(theoreticalIntervalDays));
+  const rawBaseIntervalDays =
+    lastEvent.resultScore <= settings.threshold ? 0 : Math.max(1, theoreticalIntervalDays);
+  const baseIntervalDays =
+    rawBaseIntervalDays === 0 ? 0 : Math.max(1, Math.round(rawBaseIntervalDays * safeMultiplier));
 
   // Postpone days (pure schedule offset without boosting memory score)
   const postponeDays = concept.postponeDays || 0;
@@ -346,6 +352,12 @@ export function calculateNextReviewRecommendation(
   if (examProximityWeight > 10) {
     rationaleParts.push('시험 임박 가중치 적용');
   }
+  if (safeMultiplier !== 1) {
+    const baseRounded = Math.max(0, Math.round(rawBaseIntervalDays));
+    rationaleParts.push(
+      `개인별 간격 보정 x${safeMultiplier.toFixed(2)} (모델 기본 ${baseRounded}일 → 적용 ${baseIntervalDays}일)`
+    );
+  }
 
   const priorityReason = rationaleParts.join(' · ');
 
@@ -368,6 +380,9 @@ export function calculateNextReviewRecommendation(
       examProximityWeight,
       postponeDays,
     },
+    baseIntervalDays,
+    intervalMultiplier: safeMultiplier,
+    isPersonalized: safeMultiplier !== 1,
   };
 }
 
@@ -384,7 +399,8 @@ export function rankConceptsForReview(
   concepts: Concept[],
   settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS,
   examAtIso?: string,
-  referenceDate: Date = new Date()
+  referenceDate: Date = new Date(),
+  intervalMultiplier: number = 1
 ): {
   rankedRecommendations: ReviewRecommendation[];
   dueTodayCount: number;
@@ -398,7 +414,7 @@ export function rankConceptsForReview(
       unstudied.push(c);
       continue;
     }
-    const rec = calculateNextReviewRecommendation(c, settings, examAtIso, referenceDate);
+    const rec = calculateNextReviewRecommendation(c, settings, examAtIso, referenceDate, intervalMultiplier);
     if (rec) {
       recommendations.push(rec);
     } else {

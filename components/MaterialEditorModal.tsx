@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Material, MaterialPage, Subject } from '../lib/types';
-import { loadMaterialContent, saveMaterialContent } from '../lib/materialStorage';
+import { loadMaterialContentResult, saveMaterialContent } from '../lib/materialStorage';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import {
   X,
@@ -17,10 +17,7 @@ import {
   Code2,
   Eye,
   Columns,
-  Maximize2,
-  Minimize2,
   BookmarkPlus,
-  HelpCircle,
   Sparkles,
 } from 'lucide-react';
 
@@ -57,32 +54,34 @@ export function MaterialEditorModal({
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [saveSuccessMsg, setSaveSuccessMsg] = useState<string | null>(null);
+  const [saveWarning, setSaveWarning] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'split' | 'edit_only' | 'preview_only'>('split');
-  const [activeTabLeft, setActiveTabLeft] = useState<'source' | 'summary'>('source');
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Load decoupled content when modal opens or material changes
+  // Load decoupled content when modal opens or material changes.
+  // The component is mounted fresh per material (keyed by the parent), so the
+  // initial loading state is correct without setting state inside the effect.
   useEffect(() => {
     if (!isOpen || !material) return;
 
     let isMounted = true;
-    setIsLoading(true);
-    setSaveSuccessMsg(null);
-    setCurrentPage(1);
 
-    loadMaterialContent(material.id).then((content) => {
+    loadMaterialContentResult(material.id).then((result) => {
       if (!isMounted) return;
 
-      if (content) {
-        setMarkdown(content.markdown || material.parsedMarkdown || '');
-        setRawText(content.rawText || material.rawText || '');
-        setPages(content.pages || material.pages || []);
-      } else {
-        // Fallback to material object
+      if (result.status === 'found') {
+        setMarkdown(result.content.markdown || material.parsedMarkdown || '');
+        setRawText(result.content.rawText || material.rawText || '');
+        setPages(result.content.pages || material.pages || []);
+      } else if (result.status === 'missing') {
         setMarkdown(material.parsedMarkdown || '');
         setRawText(material.rawText || '');
         setPages(material.pages || []);
+      } else {
+        setLoadError(result.error);
+        setMarkdown(material.parsedMarkdown || '');
       }
       setIsLoading(false);
     });
@@ -121,18 +120,13 @@ export function MaterialEditorModal({
     insertAtCursor(snippet);
   };
 
-  const handleInsertSpeechRef = (blockIndex: number, speaker?: string, timestamp?: string) => {
-    const tsStr = timestamp ? `⏱️ **${timestamp}** | ` : '';
-    const spkStr = speaker ? `👤 **${speaker}**` : '';
-    const snippet = `\n<!-- [발화 #${blockIndex}] -->\n> ${tsStr}${spkStr}\n`;
-    insertAtCursor(snippet);
-  };
-
   const handleSave = async () => {
     setIsSaving(true);
+    setSaveSuccessMsg(null);
+    setSaveWarning(null);
     try {
       // 1. Save heavy content into decoupled storage
-      await saveMaterialContent(material.id, {
+      const result = await saveMaterialContent(material.id, {
         markdown,
         rawText,
         pages,
@@ -151,10 +145,16 @@ export function MaterialEditorModal({
       onSave(updatedMaterial, { markdown, pages });
 
       const now = new Date().toLocaleTimeString('ko-KR', { hour12: false });
-      setSaveSuccessMsg(`저장 완료 (${now})`);
-      setTimeout(() => setSaveSuccessMsg(null), 4000);
-    } catch (e: any) {
-      alert(`저장 중 오류가 발생했습니다: ${e.message}`);
+      if (result.persisted) {
+        setSaveSuccessMsg(`저장 완료 (${now})`);
+      } else {
+        // Do not claim a durable save when only the in-memory cache holds the content.
+        setSaveWarning(
+          `메모리에만 보관되었습니다. 새로고침하면 사라질 수 있습니다. (${result.error})`
+        );
+      }
+    } catch (e) {
+      alert(`저장 중 오류가 발생했습니다: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
     } finally {
       setIsSaving(false);
     }
@@ -228,6 +228,13 @@ export function MaterialEditorModal({
               </span>
             )}
 
+            {saveWarning && (
+              <span className="text-amber-400 text-[11px] font-academic-mono animate-fade-in flex items-center gap-1 max-w-[280px] text-right">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                {saveWarning}
+              </span>
+            )}
+
             {onTriggerAnalysis && (
               <button
                 onClick={() => onTriggerAnalysis(material)}
@@ -269,6 +276,15 @@ export function MaterialEditorModal({
             </button>
           </div>
         </div>
+
+        {loadError && (
+          <div className="bg-red-50 border-b border-red-200 px-5 py-2 text-xs text-red-800 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>
+              저장된 본문을 읽지 못했습니다(본문 없음과는 다른 상태입니다). 아래 내용을 저장하면 복구를 시도합니다. ({loadError})
+            </span>
+          </div>
+        )}
 
         {/* Sub-header / View Mode Controls */}
         <div className="bg-[#faf8f4] border-b border-[#ded6c8] px-5 py-2 flex items-center justify-between text-xs">

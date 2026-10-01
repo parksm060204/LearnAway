@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Material, MaterialKind, Subject } from '../lib/types';
+import { Material, Subject } from '../lib/types';
 import {
   X,
   Plus,
@@ -10,11 +10,9 @@ import {
   FileSpreadsheet,
   CheckCircle2,
   AlertTriangle,
-  Clock,
   Trash2,
   ExternalLink,
   FolderOpen,
-  Filter,
   Sparkles,
 } from 'lucide-react';
 import { ConceptDraft } from '../lib/types';

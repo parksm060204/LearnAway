@@ -126,6 +126,8 @@ export interface ReviewEvent {
   strengths?: string;
   criticalImprovements?: string;
   needsReview?: boolean;
+  solvingReason?: string;
+  methodSelectionDiagnosis?: MethodSelectionDiagnosis;
 }
 
 export interface ConceptEvidence {
@@ -213,6 +215,11 @@ export interface ReviewRecommendation {
     examProximityWeight: number;
     postponeDays: number;
   };
+  // Stage 10 fields: personal review-interval adjustment layer
+  baseIntervalDays?: number;        // 모델이 산출한 기본 권장 간격(일)
+  intervalMultiplier?: number;      // 개인별 보정 배율 (1.0 = 기본)
+  isPersonalized?: boolean;         // 개인별 보정이 실제로 적용되었는지
+  personalizationNote?: string;     // 개인별 보정 사유 (데이터 부족/조정 방향 등)
 }
 
 export type ProblemDifficulty = 'advanced_college' | 'intermediate' | 'graduate_challenging';
@@ -222,6 +229,13 @@ export const PROBLEM_DIFFICULTY_LABELS: Record<ProblemDifficulty, string> = {
   intermediate: '중간고사 표준형 (응용 및 개념 통합)',
   graduate_challenging: '대학원·심화 도전형 (일반화 및 엄밀 증명)',
 };
+
+/** Stage 11: per-material source reference captured at generation time. */
+export interface ProblemSourceRef {
+  materialId: string;
+  title: string;
+  markdownHash: string; // 생성 당시 해당 자료 본문 해시
+}
 
 export interface ProblemDraftVerification {
   hasRequiredFields: boolean;
@@ -249,7 +263,8 @@ export interface ProblemDraft {
   appliedConditionNote?: string;   // 원문에 없는 새 상황은 AI가 설계한 응용 조건임을 명시
   sourceRefs: string;              // 학습 자료 출처
   sourceEvidenceQuote?: string;    // 원문 인용 근거
-  sourceMarkdownHash?: string;     // 분석/생성에 참조된 자료 버전 해시
+  sourceMarkdownHash?: string;     // 분석/생성에 참조된 자료 버전 해시 (하위 호환)
+  sourceMaterials?: ProblemSourceRef[]; // 자료별 출처 ID·제목·생성 당시 본문 해시
   timeStandardMinutes: number;
   timeBreakdownDesc: string;
   coreEvaluationHighlight: string;
@@ -364,7 +379,8 @@ export interface ProblemVersionSnapshot {
 
 export function isProblemAvailableForPractice(problem: Problem): boolean {
   const status = problem.qualityStatus || 'normal';
-  return status === 'normal' || status === 'reapproved';
+  return problem.isApproved !== false && !problem.isOutdated &&
+    (status === 'normal' || status === 'reapproved');
 }
 
 export interface ProblemQualityRuleCheck {
@@ -411,8 +427,10 @@ export interface Problem {
   difficulty?: ProblemDifficulty;
   designIntent?: string;         // 출제 의도
   appliedConditionNote?: string; // AI 설계 응용 조건
-  sourceMarkdownHash?: string;   // 생성 당시 원문 해시
+  sourceMarkdownHash?: string;   // 생성 당시 원문 해시 (하위 호환)
+  sourceMaterials?: ProblemSourceRef[]; // 자료별 출처 ID·제목·생성 당시 본문 해시
   isOutdated?: boolean;          // 원문 Markdown 사후 수정 시 구버전 플래그
+  needsSourceReview?: boolean;   // 출처 불명확(자료별 해시 없음)으로 사용자 확인 필요
   createdAt?: string;
   // Stage 6 fields:
   version?: number;                      // 문제 버전 (기본 1)
@@ -421,6 +439,51 @@ export interface Problem {
   versionHistory?: ProblemVersionSnapshot[]; // 이전 버전 스냅샷 이력
   lastReviewedAt?: string;               // 최근 검토 시각
   reviewNotes?: string;                  // 검토/처리 메모
+}
+
+// Stage 8: Solving Reason Explanation & Method Selection Diagnosis
+export type MethodReasonCriterionKey =
+  | 'appropriate_method'         // 적절한 방법 선택
+  | 'precondition_understanding'  // 전제조건 이해
+  | 'constraint_alignment'       // 문제의 제약과의 연결
+  | 'alternatives_limitations';   // 대안·한계 인식
+
+export type MethodReasonRating =
+  | 'proficient'        // 충분
+  | 'partially_met'     // 부분 충족
+  | 'needs_improvement' // 보완 필요
+  | 'not_applicable';   // 평가 불가
+
+export const METHOD_REASON_CRITERION_LABELS: Record<MethodReasonCriterionKey, string> = {
+  appropriate_method: '적절한 방법 선택',
+  precondition_understanding: '전제조건 이해',
+  constraint_alignment: '문제의 제약과의 연결',
+  alternatives_limitations: '대안·한계 인식',
+};
+
+export const METHOD_REASON_RATING_LABELS: Record<MethodReasonRating, string> = {
+  proficient: '충분',
+  partially_met: '부분 충족',
+  needs_improvement: '보완 필요',
+  not_applicable: '평가 불가',
+};
+
+export interface MethodReasonCriterionResult {
+  key: MethodReasonCriterionKey;
+  label: string;
+  rating: MethodReasonRating;
+  evidence: string;      // 학생 답안 또는 이유 설명에서 확인한 근거 인용
+  feedback: string;      // 구체적 첨삭 및 평가 피드백
+}
+
+export interface MethodSelectionDiagnosis {
+  isApplicable: boolean;                 // 문제 유형 및 풀이 접근상 방법 선택 평가 가능 여부
+  applicabilityAssessment: string;       // AI의 평가 가능 여부 판단 및 사유
+  criteria: MethodReasonCriterionResult[]; // 4개 항목 진단 결과
+  summary: string;                       // 방법 선택 이유 종합 진단 요약
+  suggestedImprovements: string[];       // 구체적인 보완 문장 제안
+  nextConceptsToReview: string[];        // 다음에 확인할 개념 제안
+  evaluatedAt: string;                   // 진단 일시 (ISO 문자열)
 }
 
 export interface EvaluationResult {
@@ -433,6 +496,8 @@ export interface EvaluationResult {
   staticAnalysisNotice: string;
   needsReview: boolean;
   isAiEvaluated: boolean;
+  // Stage 8 field:
+  methodSelectionDiagnosis?: MethodSelectionDiagnosis;
 }
 
 export interface Attempt {
@@ -462,6 +527,11 @@ export interface Attempt {
   problemVersion?: number;         // 풀이 당시 문제 버전 (기본 1)
   rubricSnapshot?: RubricCriterion[]; // 풀이 당시 루브릭 기준 스냅샷
   mockExamSessionId?: string;
+  // Stage 8 fields:
+  solvingReason?: string;                  // 학생이 작성한 방법 선택 이유 원문
+  isReasonNotApplicable?: boolean;         // '해당 없음' 선택 여부
+  reasonNotApplicableJustification?: string; // 해당 없음 사유
+  methodSelectionDiagnosis?: MethodSelectionDiagnosis; // 방법 선택 이유 진단 결과
 }
 
 export interface MockExamSession {
@@ -478,6 +548,10 @@ export interface MockExamSession {
   answers: Record<string, string>;
   evaluations: Record<string, EvaluationResult>;
   recordedAttemptIds?: string[];
+  // Stage 8 fields:
+  reasons?: Record<string, string>; // 문항별 방법 선택 이유
+  isReasonNotApplicable?: Record<string, boolean>; // 문항별 해당 없음 선택 여부
+  reasonNotApplicableJustification?: Record<string, string>; // 문항별 해당 없음 사유
 }
 
 export interface RetentionModelSettings {
@@ -485,3 +559,196 @@ export interface RetentionModelSettings {
   alpha: number;     // Power law exponent, e.g. 0.45
   threshold: number; // Critical review threshold score, e.g. 50.0
 }
+
+// Stage 9: Exam Date-Driven Study Plan Types
+export type StudyPlanItemKind =
+  | 'initial_study'       // 최초 학습: 미학습 개념 원문/설명
+  | 'recommended_review'  // 권장 복습: 복습 기한 경과 또는 오늘 복습 필요
+  | 'vulnerability_fix'   // 취약점 보완: 최근 오답 및 취약 루브릭 보완 문제풀이
+  | 'mixed_mock_exam';    // 혼합 모의시험: 종합 평가
+
+export type StudyPlanItemStatus =
+  | 'pending'     // 미완료
+  | 'in_progress' // 진행 중 (예: 모의시험 진행 중)
+  | 'completed'   // 완료 (실제 Attempt/ReviewEvent/MockExam 기록 완료)
+  | 'postponed'   // 내일로 미룸
+  | 'skipped';    // 이번 계획에서 건너뜀
+
+export interface WeekdayStudyTime {
+  dayOfWeek: number;    // 0 = 일, 1 = 월, 2 = 화, 3 = 수, 4 = 목, 5 = 금, 6 = 토
+  minutes: number;      // 분 (0 = 휴식일)
+  isRestDay: boolean;   // 휴식일 여부
+}
+
+export interface SubjectPlanConfig {
+  subjectId: string;
+  selectedConceptIds: string[]; // 시험 범위 개념 목록 (명시적 선택)
+  selectedProblemTypes: ProblemType[]; // 문제 유형 선택
+  includeMockExam: boolean; // 모의시험 포함 여부
+  mockExamTargetMinutes: number; // 모의시험 목표 시간 (분, 기본 45분)
+}
+
+export interface StudyPlanSettings {
+  defaultDailyMinutes: number; // 전 과목 합산 기본 60분
+  weekdaySettings: Record<number, WeekdayStudyTime>; // 0~6 요일별 시간 및 휴식일
+  subjectConfigs: Record<string, SubjectPlanConfig>; // 과목별 설정
+  updatedAt: string;
+}
+
+export interface StudyPlanItem {
+  id: string; // 고유 ID (e.g. `spi-${date}-${kind}-${conceptId}-${problemId || 'mock'}`)
+  subjectId: string;
+  subjectName: string;
+  conceptId?: string;
+  conceptName?: string;
+  conceptIds?: string[]; // 복합 문제 또는 모의시험용
+  problemId?: string;
+  problemTitle?: string;
+  problemType?: ProblemType;
+  kind: StudyPlanItemKind;
+  assignedDate: string; // YYYY-MM-DD (Asia/Seoul)
+  estimatedMinutes: number; // 예상 학습/풀이 시간
+  isEstimatedTime: boolean; // 최초 학습 등 추정 시간 여부 플래그
+  priorityScore: number; // 우선순위 계산값 (내림차순 정렬)
+  priorityReason: string; // 실제 데이터에 근거한 추천 이유
+  status: StudyPlanItemStatus;
+
+  // Snapshots for persistence & history:
+  snapshotTitle: string;
+  snapshotDetail: string;
+
+  // Completion linkage:
+  completedAt?: string;
+  completedAttemptId?: string;
+  completedEventId?: string;
+  completedMockSessionId?: string;
+
+  // Problem quarantine / shortage flag:
+  needsProblemGeneration?: boolean; // 승인된 문제가 없어 생성 필요한 경우
+  isOutdatedProblem?: boolean;      // 원문 변경으로 재확인 필요한 경우
+  warningNote?: string;             // 미루는 날짜가 시험 이후 등 경고
+}
+
+export interface DailyStudyPlan {
+  date: string; // YYYY-MM-DD
+  dayOfWeek: number; // 0~6
+  dayLabel: string; // "2026.09.30 (수)"
+  availableMinutes: number; // 해당 날짜 가용 시간
+  isRestDay: boolean; // 휴식일 여부
+  assignedMinutes: number; // 배정된 시간 합계
+  items: StudyPlanItem[];
+  unassignedItems: StudyPlanItem[]; // 예산 초과 미배정 항목
+}
+
+export interface StudyPlanScopeRemaining {
+  subjectId: string;
+  subjectName: string;
+  totalScopeConcepts: number;
+  unstudiedConceptsCount: number;
+  studiedConceptsCount: number;
+  unstudiedConceptTitles: string[];
+}
+
+export interface StudyPlanSummary {
+  todayDate: string; // YYYY-MM-DD
+  todayAvailableMinutes: number;
+  todayAssignedMinutes: number;
+  todayCompletedCount: number;
+  todayPendingCount: number;
+  todayUnassignedCount: number;
+  totalShortageMinutes: number; // 시험일까지 처리 못할 예상 부족 시간
+  scopeRemainingBySubject: StudyPlanScopeRemaining[];
+  days: DailyStudyPlan[]; // 날짜별 계획
+}
+
+export const STUDY_PLAN_ITEM_KIND_LABELS: Record<StudyPlanItemKind, string> = {
+  initial_study: '최초 학습',
+  recommended_review: '권장 복습',
+  vulnerability_fix: '취약점 보완',
+  mixed_mock_exam: '혼합 모의시험',
+};
+
+export const DEFAULT_WEEKDAY_SETTINGS: Record<number, WeekdayStudyTime> = {
+  0: { dayOfWeek: 0, minutes: 60, isRestDay: false }, // 일
+  1: { dayOfWeek: 1, minutes: 60, isRestDay: false }, // 월
+  2: { dayOfWeek: 2, minutes: 60, isRestDay: false }, // 화
+  3: { dayOfWeek: 3, minutes: 60, isRestDay: false }, // 수
+  4: { dayOfWeek: 4, minutes: 60, isRestDay: false }, // 목
+  5: { dayOfWeek: 5, minutes: 60, isRestDay: false }, // 금
+  6: { dayOfWeek: 6, minutes: 60, isRestDay: false }, // 토
+};
+
+export const DEFAULT_STUDY_PLAN_SETTINGS: StudyPlanSettings = {
+  defaultDailyMinutes: 60,
+  weekdaySettings: DEFAULT_WEEKDAY_SETTINGS,
+  subjectConfigs: {},
+  updatedAt: '2026-09-30T09:00:00+09:00',
+};
+
+// =========================================================================
+// Stage 10: Personal Review Recommendation & Learning Analytics Types
+// =========================================================================
+
+/**
+ * 복습 성향 (제품 초기 설정값, 검증된 학술 상수가 아님)
+ * - dense: 촘촘하게 (간격을 짧게)
+ * - standard: 기본
+ * - relaxed: 여유 있게 (간격을 길게)
+ */
+export type ReviewTendency = 'dense' | 'standard' | 'relaxed';
+
+export const REVIEW_TENDENCY_LABELS: Record<ReviewTendency, string> = {
+  dense: '촘촘하게',
+  standard: '기본',
+  relaxed: '여유 있게',
+};
+
+export interface PersonalizationSettings {
+  enabled: boolean;        // 개인별 추천 사용 여부 (기본 false)
+  tendency: ReviewTendency; // 복습 성향 (기본 'standard')
+  autoAdjust: boolean;     // 자동 보정 사용 여부 (기본 false)
+  updatedAt: string;
+}
+
+export const DEFAULT_PERSONALIZATION_SETTINGS: PersonalizationSettings = {
+  enabled: false,
+  tendency: 'standard',
+  autoAdjust: false,
+  updatedAt: '2026-09-30T09:00:00+09:00',
+};
+
+export type PersonalizationDirection = 'shorten' | 'lengthen' | 'neutral';
+
+export interface PersonalizationSubjectSignal {
+  subjectId: string;
+  subjectName: string;
+  eligible: boolean;                // 최소 기록/날짜/문제 수 조건 충족 여부
+  attemptCount: number;
+  distinctDays: number;
+  distinctProblems: number;
+  recentAverageScore: number | null;
+  hintDependencyRatio: number;
+  repeatErrorCount: number;
+  direction: PersonalizationDirection;
+  targetMultiplier: number;
+  evidenceStrength: number;
+  reason: string;
+}
+
+export interface PersonalizationCorrectionState {
+  ruleVersion: string;              // 보정 규칙 버전
+  computedAt: string;               // 계산 시각 (ISO)
+  dataSufficient: boolean;          // 자동 보정 가능한 근거 확보 여부
+  basisRefs: string[];              // 사용한 기록(Attempt) ID 참조
+  tendencyMultiplier: number;       // 성향 배율
+  autoMultiplier: number;           // 자동 보정 배율 (데이터 부족 시 1)
+  appliedMultiplier: number;        // 최종 적용 배율 (0.75 ~ 1.25)
+  reasons: string[];                // 보정 근거 요약
+  usedAttemptCount: number;
+  usedDistinctDays: number;
+  usedDistinctProblems: number;
+  perSubject: PersonalizationSubjectSignal[];
+}
+
+export const PERSONALIZATION_RULE_VERSION = 'personal-interval-v1';
+

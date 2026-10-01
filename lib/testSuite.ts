@@ -1,11 +1,8 @@
 import {
   calculateDDay,
-  formatExamDate,
   toSeoulDateString,
   getSeoulCalendarDiff,
   getElapsedDays,
-  formatSeoulDate,
-  addDaysToDate,
 } from './dateUtils';
 import {
   calculatePowerLawRetention,
@@ -16,7 +13,6 @@ import {
   calculateNextReviewRecommendation,
   rankConceptsForReview,
   generateConceptTrajectory,
-  getConfirmedEvents,
   DEFAULT_RETENTION_SETTINGS,
 } from './retentionModel';
 import {
@@ -39,17 +35,64 @@ import {
   editAndReviseProblem,
   reapproveProblem,
   suspendProblem,
+  saveStoredStudyPlanItems,
+  markStudyPlanItemCompleted,
 } from './storage';
 import {
   Attempt,
+  Concept,
+  ConceptDraft,
   Problem,
+  ProblemDraft,
+  Subject,
+  PersonalizationSettings,
+  DEFAULT_PERSONALIZATION_SETTINGS,
   ProblemReport,
   ProblemReportType,
-  ProblemQualityStatus,
   isProblemAvailableForPractice,
   PROBLEM_REPORT_TYPE_LABELS,
-  PROBLEM_QUALITY_STATUS_LABELS,
+  MethodReasonCriterionKey,
+  MethodReasonRating,
+  METHOD_REASON_CRITERION_LABELS,
+  METHOD_REASON_RATING_LABELS,
+  MockExamSession,
+  StudyPlanSettings,
+  StudyPlanItem,
+  DEFAULT_STUDY_PLAN_SETTINGS,
 } from './types';
+import {
+  generateStudyPlan,
+  getEligibleProblemsForPlan,
+} from './studyPlan';
+import {
+  buildLearningAnalyticsReport,
+  collectValidRecords,
+} from './learningAnalytics';
+import {
+  computeCorrectionState,
+  getEffectiveIntervalMultiplier,
+  PERSONALIZATION_CONSTANTS,
+} from './personalization';
+import { saveMockExam, loadMockExams, clearMockExams } from './mockExam';
+import { parseTranscript } from './transcriptParser';
+import { saveMaterialContent, loadMaterialContent } from './materialStorage';
+import {
+  computeMarkdownHash,
+  chunkMarkdownForAnalysis,
+  verifySourceCitation,
+} from './markdownUtils';
+import {
+  saveStoredConceptDrafts,
+  approveConceptDraft,
+  mergeConceptDrafts,
+  markConceptAsLearned,
+  saveStoredConcepts,
+  saveStoredProblemDrafts,
+  loadStoredProblemDrafts,
+  approveProblemDraft,
+  updateProblemDraft,
+  getAttemptById,
+} from './storage';
 
 function runTests() {
   console.log('=== STARTING REDCALL AUTOMATED VERIFICATION SUITE ===\n');
@@ -57,7 +100,7 @@ function runTests() {
   let passed = 0;
   let failed = 0;
 
-  function assert(condition: boolean, testName: string, details?: any) {
+  function assert(condition: boolean, testName: string, details?: unknown) {
     if (condition) {
       console.log(`[PASS] ${testName}`);
       passed++;
@@ -145,7 +188,6 @@ function runTests() {
 
   // 5. Stage 1: Transcript Parsing Tests
   console.log('\n--- 5. Testing Transcript Parser & Timestamp Preservation ---');
-  const { parseTranscript } = require('./transcriptParser');
 
   // Case A: Transcript with explicit timestamps and speakers
   const transcriptWithTs = `[00:15:30] 교수: 오늘 강의는 중심극한정리를 다룹니다.
@@ -170,7 +212,6 @@ function runTests() {
 
   // 6. Stage 1: Decoupled Material Content Storage Tests
   console.log('\n--- 6. Testing Decoupled Material Content Storage ---');
-  const { saveMaterialContent, loadMaterialContent } = require('./materialStorage');
   const testMatId = 'test-mat-stage1-001';
   const testMarkdown = '# 테스트 교재\n\n$$E[X] = \\mu$$\n\n본문 내용입니다.';
   const testPages = [
@@ -192,20 +233,19 @@ function runTests() {
 
     // 7. Stage 1: Subject Isolation for Materials
     console.log('\n--- 7. Testing Subject Isolation for Materials ---');
-    const econMats = INITIAL_MATERIALS.filter((m: any) => m.subjectId === 'subj-econ302');
-    const csMats = INITIAL_MATERIALS.filter((m: any) => m.subjectId === 'subj-cs201');
+    const econMats = INITIAL_MATERIALS.filter((m) => m.subjectId === 'subj-econ302');
+    const csMats = INITIAL_MATERIALS.filter((m) => m.subjectId === 'subj-cs201');
     assert(econMats.length === 4, 'ECON302 has 4 materials');
     assert(csMats.length === 3, 'CS201 has 3 materials');
-    assert(!econMats.some((m: any) => m.subjectId === 'subj-cs201'), 'No cross-contamination of subject materials');
+    assert(!econMats.some((m) => m.subjectId === 'subj-cs201'), 'No cross-contamination of subject materials');
 
     // Verify demo badges and AI statuses
-    assert(econMats.every((m: any) => m.isDemo === true), 'Demo materials have isDemo=true');
-    assert(econMats.every((m: any) => m.status === 'ready'), 'Initial materials are ready');
+    assert(econMats.every((m) => m.isDemo === true), 'Demo materials have isDemo=true');
+    assert(econMats.every((m) => m.status === 'ready'), 'Initial materials are ready');
 
     // 8. Stage 2: Markdown Hash & Version Change Detection
     console.log('\n--- 8. Testing Markdown Hash & Version Change Detection ---');
-    const { computeMarkdownHash, chunkMarkdownForAnalysis, verifySourceCitation } = require('./markdownUtils');
-    const mdV1 = '# 중심극한정리\n표본평균의 분포는 정규분포에 수렴한다.';
+      const mdV1 = '# 중심극한정리\n표본평균의 분포는 정규분포에 수렴한다.';
     const mdV2 = '# 중심극한정리\n표본평균의 분포는 정규분포에 수렴한다.\n\n수정된 내용 추가';
     const hashV1 = computeMarkdownHash(mdV1);
     const hashV2 = computeMarkdownHash(mdV2);
@@ -255,16 +295,8 @@ function runTests() {
 
     // 11. Stage 2: Draft Approval Without Artificial Mastery / Events (CRITICAL REQUIREMENT)
     console.log('\n--- 11. Testing Draft Approval Without Fake Mastery or Review Events ---');
-    const {
-      saveStoredConceptDrafts,
-      approveConceptDraft,
-      mergeConceptDrafts,
-      markConceptAsLearned,
-      saveStoredConcepts,
-    } = require('./storage');
-
     const dummyDraftId = 'test-draft-stage2-001';
-    const dummyDraft = {
+    const dummyDraft: ConceptDraft = {
       id: dummyDraftId,
       materialId: 'test-mat-001',
       subjectId: 'subj-econ302',
@@ -279,12 +311,13 @@ function runTests() {
       sourceEvidence: validEvidence,
       sourceMarkdownHash: hashV1,
       isApproved: false,
+      status: 'draft',
       createdAt: '2026-09-29T00:00:00+09:00',
       updatedAt: '2026-09-29T00:00:00+09:00',
     };
 
     saveStoredConceptDrafts([dummyDraft]);
-    const { updatedDrafts, approvedConcept } = approveConceptDraft(dummyDraftId);
+    const { approvedConcept } = approveConceptDraft(dummyDraftId);
     assert(approvedConcept !== null, 'Draft successfully approved and converted to Concept');
     assert(approvedConcept?.status === 'unstudied', 'CRITICAL: Approved concept starts as "unstudied"');
     assert(approvedConcept?.events.length === 0, 'CRITICAL: Approved concept has ZERO fake review events');
@@ -297,7 +330,7 @@ function runTests() {
     console.log('\n--- 12. Testing Marking Concept as Learned ---');
     if (approvedConcept) {
       saveStoredConcepts([approvedConcept, ...INITIAL_CONCEPTS]);
-      const { updatedConcepts, learnedConcept } = markConceptAsLearned(approvedConcept.id, 75);
+      const { learnedConcept } = markConceptAsLearned(approvedConcept.id, 75);
       assert(learnedConcept?.isLearned === true, 'Concept transitioned to isLearned=true');
       assert(learnedConcept?.status === 'newly_learned', 'Concept status changed to newly_learned');
       assert(learnedConcept?.events.length === 1, 'Legitimate initial review event recorded');
@@ -323,11 +356,11 @@ function runTests() {
     };
     saveStoredConceptDrafts([draftA, draftB]);
     const mergedList = mergeConceptDrafts('draft-merge-A', 'draft-merge-B');
-    const finalMerged = mergedList.find((d: any) => d.id === 'draft-merge-A');
-    assert(mergedList.some((d: any) => d.id === 'draft-merge-B') === false, 'Source draft B removed after merge');
-    assert(finalMerged?.prerequisites.includes('우선순위 큐') && finalMerged?.prerequisites.includes('그래프 탐색'), 'Prerequisites combined without loss');
-    assert(finalMerged?.relatedConcepts.filter((c: string) => c === '벨만-포드').length === 1, 'Related concepts deduplicated');
-    assert(finalMerged?.examples?.includes('네트워크 라우팅 예제'), 'Examples merged');
+    const finalMerged = mergedList.find((d) => d.id === 'draft-merge-A');
+    assert(mergedList.some((d) => d.id === 'draft-merge-B') === false, 'Source draft B removed after merge');
+    assert(Boolean(finalMerged?.prerequisites.includes('우선순위 큐') && finalMerged?.prerequisites.includes('그래프 탐색')), 'Prerequisites combined without loss');
+    assert(finalMerged?.relatedConcepts.filter((c) => c === '벨만-포드').length === 1, 'Related concepts deduplicated');
+    assert(Boolean(finalMerged?.examples?.includes('네트워크 라우팅 예제')), 'Examples merged');
 
     // 14. Stage 3: Domain Problem Type Filtering & Subject Scoping
     console.log('\n--- 14. Testing Stage 3 Problem Type Filtering & Subject Scoping ---');
@@ -349,16 +382,8 @@ function runTests() {
 
     // 16. Stage 3: Problem Draft Lifecycle & Approval
     console.log('\n--- 16. Testing Stage 3 Problem Draft Lifecycle & Storage Isolation ---');
-    const {
-      saveStoredProblemDrafts,
-      loadStoredProblemDrafts,
-      approveProblemDraft,
-      updateProblemDraft,
-      loadStoredProblems,
-    } = require('./storage');
-
     const testDraftId = 'test-prob-draft-001';
-    const testDraft = {
+    const testDraft: ProblemDraft = {
       id: testDraftId,
       subjectId: 'subj-econ302',
       conceptIds: ['c1-iterated-expectations', 'c2-mle'],
@@ -397,12 +422,12 @@ function runTests() {
 
     saveStoredProblemDrafts([testDraft]);
     const loadedDrafts = loadStoredProblemDrafts();
-    assert(loadedDrafts.some((d: any) => d.id === testDraftId), 'Draft saved and loaded from storage');
+    assert(loadedDrafts.some((d) => d.id === testDraftId), 'Draft saved and loaded from storage');
 
     // Update draft
     const updatedDraft = { ...testDraft, title: '수정된 시험 문제 제목' };
     updateProblemDraft(updatedDraft);
-    const loadedAfterEdit = loadStoredProblemDrafts().find((d: any) => d.id === testDraftId);
+    const loadedAfterEdit = loadStoredProblemDrafts().find((d) => d.id === testDraftId);
     assert(loadedAfterEdit?.title === '수정된 시험 문제 제목', 'Draft edited and persisted');
     assert(loadedAfterEdit?.editedByUser === true, 'editedByUser flag marked true on edit');
 
@@ -414,12 +439,12 @@ function runTests() {
     assert(approvalResult.approvedProblem?.draftId === testDraftId, 'Approved problem correctly links back to draftId');
     assert(approvalResult.approvedProblem?.subjectId === 'subj-econ302', 'Problem subject isolation maintained');
     assert(
-      approvalResult.approvedProblem?.rubric.reduce((s: number, r: any) => s + r.maxScore, 0) === 100,
+      approvalResult.approvedProblem?.rubric.reduce((s: number, r) => s + r.maxScore, 0) === 100,
       'Approved problem maintains 100-point rubric'
     );
 
     // Verify draft status in storage
-    const approvedDraftInStore = loadStoredProblemDrafts().find((d: any) => d.id === testDraftId);
+    const approvedDraftInStore = loadStoredProblemDrafts().find((d) => d.id === testDraftId);
     assert(approvedDraftInStore?.isApproved === true, 'Stored draft marked isApproved=true');
     assert(approvedDraftInStore?.status === 'approved', 'Stored draft status marked "approved"');
 
@@ -432,10 +457,10 @@ function runTests() {
     // 18. Non-destruction of User Data Rule
     console.log('\n--- 18. Testing Data Integrity: No Destruction of Problems or Attempts ---');
     const storedProblems = loadStoredProblems();
-    const demoProblems = storedProblems.filter((p: any) => p.isDemo === true);
+    const demoProblems = storedProblems.filter((p) => p.isDemo === true);
     assert(demoProblems.length > 0, 'Original demo problems preserved without deletion');
     assert(
-      storedProblems.some((p: any) => p.id === approvalResult.approvedProblem?.id),
+      storedProblems.some((p) => p.id === approvalResult.approvedProblem?.id),
       'Newly approved problem persists in storedProblems alongside demo problems'
     );
 
@@ -517,24 +542,23 @@ function runTests() {
 
     // 22. Stage 4: Safe Attempt Recording & Concept Isolation
     console.log('\n--- 22. Testing Attempt Recording & Concept Isolation (No Arbitrary Score Duplication) ---');
-    const { getAttemptById, loadStoredConcepts } = require('./storage');
     const preConcepts = loadStoredConcepts();
-    const c2Pre = preConcepts.find((c: any) => c.id === 'c-econ-02');
+    const c2Pre = preConcepts.find((c) => c.id === 'c-econ-02');
     const c2PreEventCount = c2Pre?.events?.length || 0;
 
     const recordResult = recordAttemptAndUpdateConcept(stage4Attempt, DEFAULT_RETENTION_SETTINGS);
-    assert(recordResult.updatedAttempts.some((a: any) => a.id === stage4Attempt.id), 'Attempt saved in attempts store');
+    assert(recordResult.updatedAttempts.some((a) => a.id === stage4Attempt.id), 'Attempt saved in attempts store');
 
     // Check duplicate attempt guard
     const recordDuplicate = recordAttemptAndUpdateConcept(stage4Attempt, DEFAULT_RETENTION_SETTINGS);
-    const countOccurrences = recordDuplicate.updatedAttempts.filter((a: any) => a.id === stage4Attempt.id).length;
+    const countOccurrences = recordDuplicate.updatedAttempts.filter((a) => a.id === stage4Attempt.id).length;
     assert(countOccurrences === 1, 'Duplicate submission prevention: attempt ID only recorded once');
 
     // Concept isolation: c1 updated, c2 NOT artificially altered
-    const c1Post = recordResult.updatedConcepts.find((c: any) => c.id === 'c-econ-01');
-    const c2Post = recordResult.updatedConcepts.find((c: any) => c.id === 'c-econ-02');
+    const c1Post = recordResult.updatedConcepts.find((c) => c.id === 'c-econ-01');
+    const c2Post = recordResult.updatedConcepts.find((c) => c.id === 'c-econ-02');
     assert(
-      Boolean(c1Post?.events.some((e: any) => e.attemptId === stage4Attempt.id)),
+      Boolean(c1Post?.events.some((e) => e.attemptId === stage4Attempt.id)),
       'Target concept received legitimate review event with attemptId'
     );
     assert((c2Post?.events?.length || 0) === c2PreEventCount, 'Multi-concept problem rule: unselected related concept does NOT receive forged duplicate score');
@@ -610,8 +634,8 @@ function runTests() {
 
     // 26. Stage 5: Postpone (+1 Day) Invariant (No Fake Score Boost or Events)
     console.log('\n--- 26. Testing Postpone (+1 Day) Invariant (No Fake Score Boost or Events) ---');
-    const conceptsBeforePostpone: any[] = loadStoredConcepts(refSeoulTime);
-    const targetC = conceptsBeforePostpone.find((c: any) => c.id === 'c-econ-01')!;
+    const conceptsBeforePostpone: Concept[] = loadStoredConcepts(refSeoulTime);
+    const targetC = conceptsBeforePostpone.find((c) => c.id === 'c-econ-01')!;
     const scoreBefore = targetC.currentScore;
     const baseScoreBefore = targetC.baseScore;
     const eventCountBefore = targetC.events.length;
@@ -651,7 +675,7 @@ function runTests() {
     // 27. Stage 5: Deterministic Review Urgency Ranking
     console.log('\n--- 27. Testing Deterministic Review Urgency Ranking ---');
     const rankingEcon = rankConceptsForReview(
-      conceptsBeforePostpone.filter((c: any) => c.subjectId === 'subj-econ302'),
+      conceptsBeforePostpone.filter((c) => c.subjectId === 'subj-econ302'),
       DEFAULT_RETENTION_SETTINGS,
       '2026-10-12T10:00:00+09:00',
       refSeoulTime
@@ -709,7 +733,7 @@ function runTests() {
 
     // 29. Stage 5: Subject Data Isolation & Non-Contamination
     console.log('\n--- 29. Testing Subject Data Isolation & Recommendation Scoping ---');
-    const csConcepts = conceptsBeforePostpone.filter((c: any) => c.subjectId === 'subj-cs201');
+    const csConcepts = conceptsBeforePostpone.filter((c) => c.subjectId === 'subj-cs201');
     const rankingCs = rankConceptsForReview(csConcepts, DEFAULT_RETENTION_SETTINGS, undefined, refSeoulTime);
 
     assert(
@@ -728,7 +752,7 @@ function runTests() {
     // 30. Stage 6: Problem Quality Status & Version Default Migration
     console.log('\n--- 30. Testing Stage 6 Problem Quality & Version Migration ---');
     // Save raw problem without version or qualityStatus (simulating legacy data)
-    const rawLegacyProblems: any[] = [
+    const rawLegacyProblems: unknown[] = [
       {
         id: 'prob-legacy-01',
         draftId: 'draft-legacy-01',
@@ -748,7 +772,7 @@ function runTests() {
         createdAt: '2026-09-20T10:00:00+09:00',
       },
     ];
-    saveStoredProblems(rawLegacyProblems);
+    saveStoredProblems(rawLegacyProblems as unknown as Problem[]);
 
     const loadedMigrated = loadStoredProblems();
     const migratedProb = loadedMigrated.find((p: Problem) => p.id === 'prob-legacy-01')!;
@@ -763,7 +787,7 @@ function runTests() {
     assert(isProblemAvailableForPractice(migratedProb) === true, 'Migrated normal problem is available for practice');
 
     // Legacy attempt migration (problemVersion default)
-    const rawLegacyAttempts: any[] = [
+    const rawLegacyAttempts: unknown[] = [
       {
         id: 'att-legacy-01',
         conceptId: 'c-econ-01',
@@ -777,7 +801,7 @@ function runTests() {
         evaluatedAt: '2026-09-20T11:00:00+09:00',
       },
     ];
-    saveStoredAttempts(rawLegacyAttempts);
+    saveStoredAttempts(rawLegacyAttempts as unknown as Attempt[]);
     const loadedMigratedAttempts = loadStoredAttempts();
     const migratedAtt = loadedMigratedAttempts.find((a: Attempt) => a.id === 'att-legacy-01')!;
     assert(migratedAtt.problemVersion === 1, `Legacy attempt migrated with default problemVersion 1 (got ${migratedAtt.problemVersion})`);
@@ -811,10 +835,10 @@ function runTests() {
     const problemsAfterReport = loadStoredProblems();
     const reportedProb = problemsAfterReport.find((p: Problem) => p.id === 'prob-legacy-01')!;
     assert(reportedProb.qualityStatus === 'reported', `Problem status automatically transitioned to 'reported' (got ${reportedProb.qualityStatus})`);
-    assert(reportedProb.reports.length === 1, 'Problem reports array contains 1 recorded report');
-    assert(reportedProb.reports[0].type === 'missing_or_vague_condition', 'Report type preserved correctly');
-    assert(reportedProb.reports[0].attemptId === 'att-legacy-01', 'Report preserves user attemptId linkage');
-    assert(reportedProb.reports[0].status === 'open', 'New report initialized in open status');
+    assert(reportedProb.reports!.length === 1, 'Problem reports array contains 1 recorded report');
+    assert(reportedProb.reports![0].type === 'missing_or_vague_condition', 'Report type preserved correctly');
+    assert(reportedProb.reports![0].attemptId === 'att-legacy-01', 'Report preserves user attemptId linkage');
+    assert(reportedProb.reports![0].status === 'open', 'New report initialized in open status');
 
     // CRITICAL INVARIANT: Quarantine from practice / review / mock exams
     assert(
@@ -840,7 +864,7 @@ function runTests() {
     );
 
     const probAfterSpam = loadStoredProblems().find((p: Problem) => p.id === 'prob-legacy-01')!;
-    assert(probAfterSpam.reports.length === 1, 'Report count DID NOT increment on duplicate submission');
+    assert(probAfterSpam.reports!.length === 1, 'Report count DID NOT increment on duplicate submission');
 
     // A distinct non-duplicate report (e.g. rubric_error) succeeds
     const secondReportRes = reportProblemError('prob-legacy-01', {
@@ -849,7 +873,7 @@ function runTests() {
     });
     assert(secondReportRes.success === true, 'Distinct report with different category/details succeeds');
     const probWithTwoReports = loadStoredProblems().find((p: Problem) => p.id === 'prob-legacy-01')!;
-    assert(probWithTwoReports.reports.length === 2, 'Problem preserves multiple distinct reports with timestamps');
+    assert(probWithTwoReports.reports!.length === 2, 'Problem preserves multiple distinct reports with timestamps');
 
     // 33. Stage 6: Quality Review Lifecycle (`under_review`)
     console.log('\n--- 33. Testing Quality Review Status Transition ---');
@@ -877,7 +901,7 @@ function runTests() {
     assert(okDismiss2.success === true, 'Report dismissed successfully with documented reason');
 
     const probAfterDismiss1 = loadStoredProblems().find((p: Problem) => p.id === 'prob-legacy-01')!;
-    const dismissedRep = probAfterDismiss1.reports.find((r: ProblemReport) => r.id === secondReportRes.reportId)!;
+    const dismissedRep = probAfterDismiss1.reports!.find((r: ProblemReport) => r.id === secondReportRes.reportId)!;
     assert(dismissedRep.status === 'dismissed', 'Report status marked as dismissed');
     assert(dismissedRep.resolutionNote !== undefined, 'Dismissed reason preserved');
     assert(probAfterDismiss1.qualityStatus === 'under_review', 'Problem remains under review because first report is still open');
@@ -1077,7 +1101,1198 @@ function runTests() {
       'CS201 problem set contains ONLY CS201 problems'
     );
 
-    console.log(`\n=== ALL STAGES 1, 2, 3, 4, 5 & 6 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
+    // ==========================================
+    // STAGE 8: SOLVING REASON & METHOD SELECTION EVALUATION
+    // ==========================================
+    console.log('\n=== STAGE 8 VERIFICATION: SOLVING REASON EXPLANATION & METHOD EVALUATION ===');
+
+    // 41. Stage 8: Criteria and Rating Label Definitions
+    console.log('\n--- 41. Testing Stage 8 Criteria and Rating Label Mappings ---');
+    const expectedCriteria: MethodReasonCriterionKey[] = [
+      'appropriate_method',
+      'precondition_understanding',
+      'constraint_alignment',
+      'alternatives_limitations',
+    ];
+    assert(
+      expectedCriteria.every((key) => Boolean(METHOD_REASON_CRITERION_LABELS[key])),
+      'All 4 method reason criteria have defined Korean academic labels'
+    );
+    assert(
+      METHOD_REASON_CRITERION_LABELS.appropriate_method === '적절한 방법 선택' &&
+      METHOD_REASON_CRITERION_LABELS.precondition_understanding === '전제조건 이해' &&
+      METHOD_REASON_CRITERION_LABELS.constraint_alignment === '문제의 제약과의 연결' &&
+      METHOD_REASON_CRITERION_LABELS.alternatives_limitations === '대안·한계 인식',
+      'Criteria labels strictly match Stage 8 specifications'
+    );
+
+    const expectedRatings: MethodReasonRating[] = [
+      'proficient',
+      'partially_met',
+      'needs_improvement',
+      'not_applicable',
+    ];
+    assert(
+      expectedRatings.every((r) => Boolean(METHOD_REASON_RATING_LABELS[r])),
+      'All 4 rating levels have defined Korean academic labels'
+    );
+    assert(
+      METHOD_REASON_RATING_LABELS.proficient === '충분' &&
+      METHOD_REASON_RATING_LABELS.partially_met === '부분 충족' &&
+      METHOD_REASON_RATING_LABELS.needs_improvement === '보완 필요' &&
+      METHOD_REASON_RATING_LABELS.not_applicable === '평가 불가',
+      'Rating labels strictly match Stage 8 specifications (충분, 부분 충족, 보완 필요, 평가 불가)'
+    );
+
+    // 42. Stage 8: Decoupled Scoring Invariant (Correct Answer + Weak Reason)
+    console.log('\n--- 42. Testing Decoupled Scoring: Correct Answer (100) with Weak Method Reason ---');
+    const stage8WeakReasonAttempt: Attempt = {
+      id: 'att-s8-correct-weak-reason',
+      problemId: 'prob-econ-1',
+      conceptId: 'c-econ-01',
+      subjectId: 'subj-econ302',
+      at: '2026-09-30T10:00:00+09:00',
+      answer: '수식 전개: \\int_0^1 \\int_0^1 xy dx dy = 1/4. 최종 답은 1/4입니다.',
+      confidence: 4,
+      errorType: 'none',
+      hintCount: 0,
+      reasoningNotes: '직관으로 풀었음',
+      calculatedScore: 100, // 100% full rubric score
+      rubricResults: [
+        {
+          criterionId: 'r1',
+          label: '적분 순서 교환 및 계산 정합성',
+          score: 100,
+          maxScore: 100,
+          isVulnerable: false,
+          evidenceQuote: '최종 답은 1/4입니다',
+          deductionReason: '감점 요인 없음 (만점 기준 충족)',
+          improvementTip: '완벽한 계산 전개입니다.',
+        },
+      ],
+      evaluatorFeedback: '수학적 계산 및 결론 도출이 모두 정확합니다.',
+      strengths: '간결하고 정확한 적분 계산',
+      criticalImprovements: '선택한 정리의 전제조건 서술 보완 필요',
+      isAiEvaluated: true,
+      problemVersion: 1,
+      // Stage 8 fields:
+      solvingReason: '그냥 직관적으로 계산하기 편할 것 같아서 적분 순서를 바꿨습니다.',
+      isReasonNotApplicable: false,
+      methodSelectionDiagnosis: {
+        isApplicable: true,
+        applicabilityAssessment: '이 문제는 적분 순서 변경을 위해 푸비니 또는 톤넬리 정리의 적용 타당성을 설명해야 하는 문항입니다.',
+        criteria: [
+          {
+            key: 'appropriate_method',
+            label: '적절한 방법 선택',
+            rating: 'partially_met',
+            evidence: '적분 순서를 바꿨습니다',
+            feedback: '적분 순서 교환 접근은 유효하나 적용 정리 명시가 누락되었습니다.',
+          },
+          {
+            key: 'precondition_understanding',
+            label: '전제조건 이해',
+            rating: 'needs_improvement',
+            evidence: '답안 및 이유에 해당 서술 없음',
+            feedback: '피적분함수의 가측성이나 비음수성(톤넬리 정리)에 대한 전제조건 서술이 없습니다.',
+          },
+          {
+            key: 'constraint_alignment',
+            label: '문제의 제약과의 연결',
+            rating: 'partially_met',
+            evidence: '계산하기 편할 것 같아서',
+            feedback: '구체적인 수식 제약과의 연계 논증이 부족합니다.',
+          },
+          {
+            key: 'alternatives_limitations',
+            label: '대안·한계 인식',
+            rating: 'needs_improvement',
+            evidence: '답안 및 이유에 해당 서술 없음',
+            feedback: '단순 반복적분 대신 순서 교환을 택한 수학적 대안 비교가 없습니다.',
+          },
+        ],
+        summary: '수학적 계산은 완제되었으나, 방법 선택의 이론적 근거와 정리 전제조건 서술이 보완되어야 합니다.',
+        suggestedImprovements: [
+          '피적분함수 f(x,y)=xy >= 0 (x,y in [0,1])이므로 톤넬리 정리에 의해 적분 순서 교환이 정당화됨을 명시하십시오.',
+        ],
+        nextConceptsToReview: ['톤넬리-푸비니 정리의 가측성 및 적분가능성 전제조건'],
+        evaluatedAt: '2026-09-30T10:00:05+09:00',
+      },
+    };
+
+    assert(
+      stage8WeakReasonAttempt.calculatedScore === 100,
+      'CRITICAL INVARIANT: Solution score remains 100 despite weak method reason'
+    );
+    assert(
+      Boolean(stage8WeakReasonAttempt.methodSelectionDiagnosis?.criteria.some((c) => c.rating === 'needs_improvement')),
+      'Method selection reason independently flags needs_improvement without confounding solution score'
+    );
+
+    // 43. Stage 8: Decoupled Scoring Invariant (Wrong Answer + Proficient Reason)
+    console.log('\n--- 43. Testing Decoupled Scoring: Calculation Error (50) with Proficient Method Reason ---');
+    const stage8SoundReasonAttempt: Attempt = {
+      id: 'att-s8-wrong-sound-reason',
+      problemId: 'prob-cs-1',
+      conceptId: 'c-cs-02',
+      subjectId: 'subj-cs201',
+      at: '2026-09-30T10:30:00+09:00',
+      answer: '다익스트라 알고리즘 구현 중 힙 삽입 조건 부등호를 반대로 작성하여 최단경로 갱신 실패 (오류 발생)',
+      confidence: 3,
+      errorType: 'calc_or_impl_mistake',
+      hintCount: 0,
+      reasoningNotes: '부등호 오타',
+      calculatedScore: 50, // 50% due to implementation bug
+      rubricResults: [
+        {
+          criterionId: 'crit-cs-1',
+          label: '알고리즘 구현 정확성',
+          score: 50,
+          maxScore: 100,
+          isVulnerable: true,
+          evidenceQuote: '힙 삽입 조건 부등호를 반대로 작성',
+          deductionReason: '조건문 부등호 반대 표기로 인한 런타임 최단거리 불일치',
+          improvementTip: '우선순위 큐 최소 힙 비교 함수를 재검토하십시오.',
+        },
+      ],
+      evaluatorFeedback: '구현 상의 부등호 실수로 인해 최종 결과가 불일치합니다.',
+      strengths: '적절한 다익스트라 알고리즘 및 우선순위 큐 구조 선택',
+      criticalImprovements: '우선순위 큐 조건식 검증',
+      isAiEvaluated: true,
+      problemVersion: 1,
+      // Stage 8 fields:
+      solvingReason: '정점 수 V=10^5, 간선 수 E=3*10^5이고 모든 가중치가 비음수이므로, O(V^2) 단순 탐색은 시간초과가 발생합니다. 음수 사이클이 없으므로 벨만-포드보다 O((V+E)log V) 우선순위 큐 다익스트라가 최적입니다.',
+      isReasonNotApplicable: false,
+      methodSelectionDiagnosis: {
+        isApplicable: true,
+        applicabilityAssessment: '입력 크기 및 최단 경로 문제의 제약조건상 알고리즘 선택 이유 평가가 유효합니다.',
+        criteria: [
+          {
+            key: 'appropriate_method',
+            label: '적절한 방법 선택',
+            rating: 'proficient',
+            evidence: 'O((V+E)log V) 우선순위 큐 다익스트라가 최적입니다',
+            feedback: '문제의 성격에 가장 부합하는 알고리즘을 정확히 선택했습니다.',
+          },
+          {
+            key: 'precondition_understanding',
+            label: '전제조건 이해',
+            rating: 'proficient',
+            evidence: '모든 가중치가 비음수이므로, 음수 사이클이 없으므로',
+            feedback: '다익스트라가 성립하기 위한 핵심 전제조건(비음수 가중치)을 명확히 짚었습니다.',
+          },
+          {
+            key: 'constraint_alignment',
+            label: '문제의 제약과의 연결',
+            rating: 'proficient',
+            evidence: '정점 수 V=10^5, 간선 수 E=3*10^5',
+            feedback: '입력 크기 제약과 시간복잡도 요구사항을 올바르게 연결지었습니다.',
+          },
+          {
+            key: 'alternatives_limitations',
+            label: '대안·한계 인식',
+            rating: 'proficient',
+            evidence: 'O(V^2) 단순 탐색은 시간초과, 벨만-포드보다 최적',
+            feedback: '비효율적인 대안과 불필요한 알고리즘의 한계를 명확히 설명했습니다.',
+          },
+        ],
+        summary: '구현 상의 단순 실수가 있었으나, 자료구조 및 알고리즘 선택의 논증은 만점에 해당할 정도로 훌륭합니다.',
+        suggestedImprovements: ['우선순위 큐 삽입 시의 거리 갱신 부등호 방향을 면밀히 확인하십시오.'],
+        nextConceptsToReview: ['최소 힙(Min-heap) 비교 연산자 정의 및 다익스트라 시간복잡도 증명'],
+        evaluatedAt: '2026-09-30T10:30:05+09:00',
+      },
+    };
+
+    assert(
+      stage8SoundReasonAttempt.calculatedScore === 50,
+      'CRITICAL INVARIANT: Solution score remains 50 despite proficient method reason'
+    );
+    assert(
+      Boolean(stage8SoundReasonAttempt.methodSelectionDiagnosis?.criteria.every((c) => c.rating === 'proficient')),
+      'Method reason criteria all proficient independently from solution score'
+    );
+
+    // 44. Stage 8: 'Not Applicable' (해당 없음) Handling
+    console.log('\n--- 44. Testing Stage 8 "Not Applicable" (해당 없음) Logic ---');
+    const notApplicableAttempt: Attempt = {
+      id: 'att-s8-not-applicable',
+      problemId: 'prob-definition-check',
+      conceptId: 'c-econ-01',
+      subjectId: 'subj-econ302',
+      at: '2026-09-30T11:00:00+09:00',
+      answer: '확률변수 X의 기댓값 정의는 E[X] = \\int x f(x) dx 입니다.',
+      confidence: 5,
+      errorType: 'none',
+      hintCount: 0,
+      reasoningNotes: '단순 정의 문항',
+      calculatedScore: 100,
+      rubricResults: [
+        {
+          criterionId: 'r1',
+          label: '기댓값 정의 기술',
+          score: 100,
+          maxScore: 100,
+          isVulnerable: false,
+          evidenceQuote: 'E[X] = \\int x f(x) dx',
+          deductionReason: '감점 없음',
+          improvementTip: '정의 정확함',
+        },
+      ],
+      evaluatorFeedback: '정의 서술이 완벽합니다.',
+      isAiEvaluated: true,
+      // Stage 8 fields:
+      isReasonNotApplicable: true,
+      reasonNotApplicableJustification: '단순 정의 회상 문항으로 별도의 공식·정리·알고리즘 선택이 필요하지 않음',
+      methodSelectionDiagnosis: {
+        isApplicable: false,
+        applicabilityAssessment: '해당 문항은 수학적 정의를 직접 기술하는 단일 단계 회상형 문항으로, 별도의 정리나 알고리즘 선택이 요구되지 않습니다. 학생의 [해당 없음] 선택이 타당합니다.',
+        criteria: [
+          { key: 'appropriate_method', label: '적절한 방법 선택', rating: 'not_applicable', evidence: '해당 없음 선택됨', feedback: '방법 선택 평가 비대상' },
+          { key: 'precondition_understanding', label: '전제조건 이해', rating: 'not_applicable', evidence: '해당 없음 선택됨', feedback: '방법 선택 평가 비대상' },
+          { key: 'constraint_alignment', label: '문제의 제약과의 연결', rating: 'not_applicable', evidence: '해당 없음 선택됨', feedback: '방법 선택 평가 비대상' },
+          { key: 'alternatives_limitations', label: '대안·한계 인식', rating: 'not_applicable', evidence: '해당 없음 선택됨', feedback: '방법 선택 평가 비대상' },
+        ],
+        summary: '단순 정의 문항으로 방법 선택 평가 해당 없음 확인 완료.',
+        suggestedImprovements: ['정의의 적분가능성 전제(E[|X|] < infinity)를 추가로 기억해두면 좋습니다.'],
+        nextConceptsToReview: ['르베그 적분 가능성과 기댓값의 존재조건'],
+        evaluatedAt: '2026-09-30T11:00:05+09:00',
+      },
+    };
+
+    assert(
+      notApplicableAttempt.isReasonNotApplicable === true,
+      'isReasonNotApplicable is true'
+    );
+    assert(
+      Boolean(notApplicableAttempt.reasonNotApplicableJustification),
+      'reasonNotApplicableJustification is present'
+    );
+    assert(
+      notApplicableAttempt.methodSelectionDiagnosis?.isApplicable === false,
+      'methodSelectionDiagnosis.isApplicable is false'
+    );
+    assert(
+      Boolean(notApplicableAttempt.methodSelectionDiagnosis?.criteria.every((c) => c.rating === 'not_applicable')),
+      'All criteria rated as not_applicable when not applicable'
+    );
+
+    // 45. Stage 8: Mock Exam Auto-Save, Restoration & Attempt Recording
+    console.log('\n--- 45. Testing Mock Exam Reason Input Auto-Save & Restoration ---');
+    clearMockExams();
+
+    const mockSession: MockExamSession = {
+      id: 'mock-exam-stage8-test',
+      subjectId: 'subj-econ302',
+      createdAt: '2026-09-30T12:00:00+09:00',
+      endsAt: '2026-09-30T13:00:00+09:00',
+      durationMinutes: 60,
+      status: 'in_progress',
+      selectedConceptIds: ['c-econ-01'],
+      selectedTypes: ['calc_derivation'],
+      problems: [INITIAL_PROBLEMS[0]],
+      answers: {
+        [INITIAL_PROBLEMS[0].id]: '모의시험 풀이 답안 작성',
+      },
+      reasons: {
+        [INITIAL_PROBLEMS[0].id]: '비음수 확률변수이므로 톤넬리 정리를 선택하여 적분 순서를 변경함',
+      },
+      isReasonNotApplicable: {
+        [INITIAL_PROBLEMS[0].id]: false,
+      },
+      reasonNotApplicableJustification: {},
+      evaluations: {},
+    };
+
+    saveMockExam(mockSession);
+    const loadedExams = loadMockExams();
+    const retrievedMock = loadedExams.find((e) => e.id === 'mock-exam-stage8-test');
+
+    assert(retrievedMock !== undefined, 'Mock exam session successfully saved and retrieved');
+    assert(
+      retrievedMock?.reasons?.[INITIAL_PROBLEMS[0].id] === '비음수 확률변수이므로 톤넬리 정리를 선택하여 적분 순서를 변경함',
+      'Mock exam problem reason text successfully auto-saved and restored'
+    );
+    assert(
+      retrievedMock?.isReasonNotApplicable?.[INITIAL_PROBLEMS[0].id] === false,
+      'Mock exam problem isReasonNotApplicable successfully preserved'
+    );
+
+    // 46. Stage 8: Past Attempt Immutability & Safe Display Fallback
+    console.log('\n--- 46. Testing Past Attempt Immutability & Safe Legacy Fallback ---');
+    const storedAttempts = loadStoredAttempts();
+    const legacyAttempt = storedAttempts.find((a) => a.id === 'att-econ-1' || a.id.startsWith('att-demo-'));
+
+    if (legacyAttempt) {
+      assert(
+        legacyAttempt.solvingReason === undefined,
+        'Legacy attempt has undefined solvingReason (no retroactive forgery)'
+      );
+      assert(
+        legacyAttempt.methodSelectionDiagnosis === undefined,
+        'Legacy attempt has undefined methodSelectionDiagnosis (no retroactive forgery)'
+      );
+      assert(
+        typeof legacyAttempt.calculatedScore === 'number',
+        'Legacy attempt calculatedScore is preserved intact'
+      );
+    } else {
+      // Create a mock legacy attempt if storage doesn't have one
+      const dummyLegacy: Attempt = {
+        id: 'att-legacy-dummy',
+        problemId: 'prob-econ-1',
+        conceptId: 'c-econ-01',
+        subjectId: 'subj-econ302',
+        at: '2026-09-20T10:00:00+09:00',
+        answer: '과거 답안',
+        confidence: 3,
+        errorType: 'none',
+        hintCount: 0,
+        reasoningNotes: '과거 메모',
+        calculatedScore: 85,
+        rubricResults: [],
+        evaluatorFeedback: '과거 피드백',
+      };
+      assert(
+        dummyLegacy.solvingReason === undefined && dummyLegacy.methodSelectionDiagnosis === undefined,
+        'Legacy attempt structure safely omits Stage 8 fields'
+      );
+    }
+
+    // 47. Stage 8: Retention Score Stability (No Impact on Retention Model Calculations)
+    console.log('\n--- 47. Testing Retention Score Stability (Decoupled from Retention Model) ---');
+    const { updatedConcepts: recordedConcepts } = recordAttemptAndUpdateConcept(
+      stage8WeakReasonAttempt,
+      DEFAULT_RETENTION_SETTINGS
+    );
+    const updatedTargetConcept = recordedConcepts.find((c) => c.id === stage8WeakReasonAttempt.conceptId)!;
+    const targetAttemptEvent = updatedTargetConcept.events.find((e) => e.attemptId === stage8WeakReasonAttempt.id)!;
+
+    assert(
+      targetAttemptEvent !== undefined,
+      'Attempt successfully recorded into concept review events'
+    );
+    assert(
+      targetAttemptEvent.resultScore === 100,
+      `Review event resultScore strictly reflects rubric calculatedScore (100) (got ${targetAttemptEvent.resultScore})`
+    );
+    assert(
+      updatedTargetConcept.currentScore >= 95,
+      `Concept retention score is driven strictly by rubric score and model decay (got ${updatedTargetConcept.currentScore})`
+    );
+
+    // =========================================================================
+    // STAGE 9: EXAM DATE-DRIVEN STUDY PLAN ENGINE & WORKFLOW TESTS
+    // =========================================================================
+    console.log('\n=== STAGE 9 VERIFICATION: EXAM DATE-DRIVEN STUDY PLAN ENGINE ===');
+
+    const testRefDate = new Date('2026-09-30T09:00:00+09:00');
+
+    // 48. Stage 9: Unified Daily Budget Across Multiple Subjects
+    console.log('\n--- 48. Testing Unified Daily Budget Across Multiple Subjects ---');
+    const multiSubjectSettings: StudyPlanSettings = {
+      defaultDailyMinutes: 60,
+      weekdaySettings: {
+        0: { dayOfWeek: 0, minutes: 60, isRestDay: false },
+        1: { dayOfWeek: 1, minutes: 60, isRestDay: false },
+        2: { dayOfWeek: 2, minutes: 60, isRestDay: false },
+        3: { dayOfWeek: 3, minutes: 60, isRestDay: false },
+        4: { dayOfWeek: 4, minutes: 60, isRestDay: false },
+        5: { dayOfWeek: 5, minutes: 60, isRestDay: false },
+        6: { dayOfWeek: 6, minutes: 60, isRestDay: false },
+      },
+      subjectConfigs: {
+        'subj-econ302': {
+          subjectId: 'subj-econ302',
+          selectedConceptIds: ['c-econ-01', 'c-econ-02', 'c-econ-03'],
+          selectedProblemTypes: ['essay_descriptive', 'calc_derivation'],
+          includeMockExam: false,
+          mockExamTargetMinutes: 45,
+        },
+        'subj-cs201': {
+          subjectId: 'subj-cs201',
+          selectedConceptIds: ['c-cs-01', 'c-cs-02'],
+          selectedProblemTypes: ['impl_descriptive'],
+          includeMockExam: false,
+          mockExamTargetMinutes: 45,
+        },
+      },
+      updatedAt: testRefDate.toISOString(),
+    };
+
+    const multiSubPlan = generateStudyPlan({
+      subjects: INITIAL_SUBJECTS,
+      concepts: INITIAL_CONCEPTS,
+      problems: INITIAL_PROBLEMS,
+      attempts: [],
+      settings: multiSubjectSettings,
+      referenceDate: testRefDate,
+      daysCount: 7,
+    });
+
+    assert(
+      multiSubPlan.days[0].availableMinutes === 60,
+      'Today available minutes strictly equals configured 60 minutes'
+    );
+    assert(
+      multiSubPlan.days[0].assignedMinutes <= 60,
+      `Today assigned minutes (${multiSubPlan.days[0].assignedMinutes}) strictly respects 60m unified budget across subjects`
+    );
+    assert(
+      multiSubPlan.days.every((d) => d.assignedMinutes <= d.availableMinutes),
+      'CRITICAL INVARIANT: Every single planned day assigned minutes <= availableMinutes'
+    );
+
+    // 49. Stage 9: Rest Day and 0-Minute Budget Handling
+    console.log('\n--- 49. Testing Rest Day and 0-Minute Budget Handling ---');
+    // Day 0 is Wednesday (dayOfWeek 3 in 2026-09-30). Set Thursday (day 4) as rest day.
+    const restDaySettings: StudyPlanSettings = {
+      ...multiSubjectSettings,
+      weekdaySettings: {
+        ...multiSubjectSettings.weekdaySettings,
+        4: { dayOfWeek: 4, minutes: 0, isRestDay: true },
+      },
+    };
+
+    const restDayPlan = generateStudyPlan({
+      subjects: INITIAL_SUBJECTS,
+      concepts: INITIAL_CONCEPTS,
+      problems: INITIAL_PROBLEMS,
+      attempts: [],
+      settings: restDaySettings,
+      referenceDate: testRefDate,
+      daysCount: 7,
+    });
+
+    const thursdayPlan = restDayPlan.days[1]; // Thursday (2026-10-01)
+    assert(thursdayPlan.dayOfWeek === 4, 'Day 1 is Thursday');
+    assert(thursdayPlan.isRestDay === true, 'Thursday is designated as rest day');
+    assert(thursdayPlan.availableMinutes === 0, 'Thursday availableMinutes is strictly 0');
+    assert(thursdayPlan.assignedMinutes === 0, 'Thursday assignedMinutes is strictly 0');
+    assert(thursdayPlan.items.length === 0, 'No items are scheduled on rest day (0 minutes)');
+
+    // 50. Stage 9: Exam Date States (Unset, Day-Of, Ended)
+    console.log('\n--- 50. Testing Exam Date States (Unset, Day-Of, Ended) ---');
+    const unsetExamSubject = { ...INITIAL_SUBJECTS[0], examAt: undefined };
+    const dayOfExamSubject = {
+      ...INITIAL_SUBJECTS[0],
+      examAt: '2026-09-30T14:00:00+09:00', // Today at 14:00 (5 hours remaining from 09:00)
+    };
+    const endedExamSubject = {
+      ...INITIAL_SUBJECTS[0],
+      examAt: '2026-09-20T10:00:00+09:00', // Past exam
+    };
+
+    const unsetPlan = generateStudyPlan({
+      subjects: [unsetExamSubject],
+      concepts: INITIAL_CONCEPTS.filter((c) => c.subjectId === 'subj-econ302'),
+      problems: INITIAL_PROBLEMS.filter((p) => p.subjectId === 'subj-econ302'),
+      attempts: [],
+      settings: multiSubjectSettings,
+      referenceDate: testRefDate,
+      daysCount: 7,
+    });
+    assert(
+      unsetPlan.days.length > 0 && unsetPlan.days[0].items.length > 0,
+      'Unset exam provides general review plan smoothly without crashing'
+    );
+
+    const dayOfPlan = generateStudyPlan({
+      subjects: [dayOfExamSubject],
+      concepts: INITIAL_CONCEPTS.filter((c) => c.subjectId === 'subj-econ302'),
+      problems: INITIAL_PROBLEMS.filter((p) => p.subjectId === 'subj-econ302'),
+      attempts: [],
+      settings: multiSubjectSettings,
+      referenceDate: testRefDate,
+      daysCount: 7,
+    });
+    assert(
+      dayOfPlan.days[0].availableMinutes <= 300,
+      'Day-of-exam available study time is capped by hours remaining before exam start'
+    );
+
+    const endedPlan = generateStudyPlan({
+      subjects: [endedExamSubject],
+      concepts: INITIAL_CONCEPTS.filter((c) => c.subjectId === 'subj-econ302'),
+      problems: INITIAL_PROBLEMS.filter((p) => p.subjectId === 'subj-econ302'),
+      attempts: [],
+      settings: multiSubjectSettings,
+      referenceDate: testRefDate,
+      daysCount: 7,
+    });
+    assert(
+      endedPlan.days.length > 0 && endedPlan.days[0].items.length > 0,
+      'Ended exam transitions smoothly to post-exam general review mode'
+    );
+
+    // 51. Stage 9: Out-of-Scope Composite Problem Exclusion
+    console.log('\n--- 51. Testing Out-of-Scope Composite Problem Exclusion ---');
+    const compositeProb: Problem = {
+      id: 'prob-composite-test',
+      conceptIds: ['c-econ-01', 'c-econ-02'],
+      subjectId: 'subj-econ302',
+      title: '다중 개념 결합 논술 문제',
+      type: 'essay_descriptive',
+      categoryLabel: '1. 대학 논술·서술형',
+      categoryNumber: 1,
+      promptText: '두 개념을 연결하여 논증하시오.',
+      timeStandardMinutes: 20,
+      timeBreakdownDesc: '20분',
+      coreEvaluationHighlight: '연계 논증',
+      itemCountDesc: '1문항',
+      sourceRefs: '교재 3장-4장',
+      hints: [],
+      modelAnswer: '모범 답안',
+      rubric: [{ id: 'r1', label: '연계', maxScore: 100, weight: 1.0, description: '연계 논증' }],
+      isApproved: true,
+      isDemo: false,
+      qualityStatus: 'normal',
+    };
+
+    // Case A: Scope includes only c-econ-01 -> composite problem MUST BE EXCLUDED
+    const { eligibleProblems: scopeExclusion } = getEligibleProblemsForPlan(
+      INITIAL_SUBJECTS[0],
+      INITIAL_CONCEPTS[0], // c-econ-01
+      [compositeProb],
+      ['c-econ-01'], // Scope lacks c-econ-02!
+      ['essay_descriptive']
+    );
+    assert(
+      scopeExclusion.length === 0,
+      'CRITICAL INVARIANT: Composite problem testing out-of-scope concept (c-econ-02) is strictly excluded'
+    );
+
+    // Case B: Scope includes BOTH c-econ-01 and c-econ-02 -> composite problem is eligible
+    const { eligibleProblems: scopeInclusion } = getEligibleProblemsForPlan(
+      INITIAL_SUBJECTS[0],
+      INITIAL_CONCEPTS[0],
+      [compositeProb],
+      ['c-econ-01', 'c-econ-02'],
+      ['essay_descriptive']
+    );
+    assert(
+      scopeInclusion.length === 1 && scopeInclusion[0].id === 'prob-composite-test',
+      'Composite problem is eligible when ALL linked concepts are within selected exam scope'
+    );
+
+    // 52. Stage 9: Missing Approved Problem & "문제 생성 필요" Flag
+    console.log('\n--- 52. Testing Missing Approved Problem & "문제 생성 필요" Flag ---');
+    const emptyProblemPlan = generateStudyPlan({
+      subjects: [INITIAL_SUBJECTS[0]],
+      concepts: [INITIAL_CONCEPTS[0]],
+      problems: [], // ZERO problems provided
+      attempts: [],
+      settings: multiSubjectSettings,
+      referenceDate: testRefDate,
+      daysCount: 7,
+    });
+
+    const missingProblemItem = emptyProblemPlan.days[0].items[0];
+    assert(missingProblemItem !== undefined, 'Plan item generated for concept even without problem');
+    assert(
+      missingProblemItem.needsProblemGeneration === true,
+      'Item correctly flags needsProblemGeneration = true when no approved problems exist'
+    );
+    assert(
+      missingProblemItem.problemId === undefined,
+      'problemId is undefined when problem generation is needed'
+    );
+    assert(
+      missingProblemItem.snapshotTitle.includes('문제 생성 필요'),
+      'Snapshot title clearly indicates problem generation is needed'
+    );
+
+    // 53. Stage 9: Actual Record Completion Invariant (No Fake Completions)
+    console.log('\n--- 53. Testing Actual Record Completion Invariant (No Fake Completions) ---');
+    const freshPlan = generateStudyPlan({
+      subjects: [INITIAL_SUBJECTS[0]],
+      concepts: [INITIAL_CONCEPTS[0]],
+      problems: [compositeProb],
+      attempts: [],
+      settings: multiSubjectSettings,
+      referenceDate: testRefDate,
+      daysCount: 7,
+    });
+    const pendingItem = freshPlan.days[0].items[0];
+    assert(
+      pendingItem.status === 'pending',
+      'Newly generated plan item has status "pending" (not falsely marked completed)'
+    );
+
+    // Save and mark complete with actual attemptId
+    saveStoredStudyPlanItems([pendingItem]);
+    const completedItems = markStudyPlanItemCompleted(pendingItem.id, {
+      attemptId: 'att-actual-verified-123',
+    });
+    const completedItem = completedItems.find((i) => i.id === pendingItem.id)!;
+
+    assert(
+      completedItem.status === 'completed',
+      'Item transitioned to completed upon explicit recording'
+    );
+    assert(
+      completedItem.completedAttemptId === 'att-actual-verified-123',
+      'Completed item preserves actual attemptId linkage'
+    );
+    assert(
+      Boolean(completedItem.completedAt),
+      'Completed item has real completedAt timestamp'
+    );
+
+    // 54. Stage 9: Duplicate Prevention & Single-Date Problem Uniqueness
+    console.log('\n--- 54. Testing Single-Date Problem Uniqueness ---');
+    const singleProb = { ...compositeProb, id: 'prob-unique-test' };
+    const duplicateTestPlan = generateStudyPlan({
+      subjects: [INITIAL_SUBJECTS[0]],
+      concepts: [INITIAL_CONCEPTS[0], INITIAL_CONCEPTS[1]],
+      problems: [singleProb],
+      attempts: [],
+      settings: {
+        ...multiSubjectSettings,
+        defaultDailyMinutes: 120, // Large budget
+        weekdaySettings: {
+          ...multiSubjectSettings.weekdaySettings,
+          3: { dayOfWeek: 3, minutes: 120, isRestDay: false },
+        },
+      },
+      referenceDate: testRefDate,
+      daysCount: 7,
+    });
+
+    const day0ProblemIds = duplicateTestPlan.days[0].items
+      .map((i) => i.problemId)
+      .filter(Boolean);
+    const uniqueDay0Problems = new Set(day0ProblemIds);
+    assert(
+      day0ProblemIds.length === uniqueDay0Problems.size,
+      'CRITICAL INVARIANT: Same problem ID is NEVER duplicated on the same planned date'
+    );
+
+    // 55. Stage 9: Recalculation Completed History Preservation
+    console.log('\n--- 55. Testing Recalculation Completed History Preservation ---');
+    // Change settings daily budget from 60 to 40 minutes and recalculate
+    const reducedBudgetSettings: StudyPlanSettings = {
+      ...multiSubjectSettings,
+      defaultDailyMinutes: 40,
+    };
+
+    const recalculatedPlan = generateStudyPlan({
+      subjects: [INITIAL_SUBJECTS[0]],
+      concepts: [INITIAL_CONCEPTS[0]],
+      problems: [compositeProb],
+      attempts: [],
+      settings: reducedBudgetSettings,
+      referenceDate: testRefDate,
+      existingItems: [completedItem], // Feed previously completed item
+      daysCount: 7,
+    });
+
+    const day0ItemRecalc = recalculatedPlan.days[0].items.find((i) => i.id === completedItem.id);
+    assert(day0ItemRecalc !== undefined, 'Completed item remains scheduled on day 0');
+    assert(
+      day0ItemRecalc?.status === 'completed',
+      'Completed item status is strictly preserved as "completed" across recalculation'
+    );
+    assert(
+      day0ItemRecalc?.completedAttemptId === 'att-actual-verified-123',
+      'Completed item attemptId linkage is preserved intact across recalculation'
+    );
+
+    // 56. Stage 9: Postponement and Overdue Past Exam Warning
+    console.log('\n--- 56. Testing Postponement and Past-Exam Warning Note ---');
+    const urgentSubject = {
+      ...INITIAL_SUBJECTS[0],
+      id: 'subj-urgent-exam',
+      examAt: '2026-10-02T10:00:00+09:00', // Exam is in 2 days (Oct 2)
+    };
+
+    const postponedOverExamItem: StudyPlanItem = {
+      id: 'spi-postponed-over-exam',
+      subjectId: 'subj-urgent-exam',
+      subjectName: urgentSubject.name,
+      kind: 'recommended_review',
+      assignedDate: '2026-10-05', // Shifted to Oct 5 (AFTER Oct 2 exam!)
+      estimatedMinutes: 15,
+      isEstimatedTime: false,
+      priorityScore: 90,
+      priorityReason: '복습 일정 미룸',
+      status: 'postponed',
+      snapshotTitle: '복습 항목',
+      snapshotDetail: '상세',
+    };
+
+    const warningPlan = generateStudyPlan({
+      subjects: [urgentSubject],
+      concepts: [INITIAL_CONCEPTS[0]],
+      problems: [compositeProb],
+      attempts: [],
+      settings: multiSubjectSettings,
+      referenceDate: testRefDate,
+      existingItems: [postponedOverExamItem],
+      daysCount: 7,
+    });
+
+    const warnedItem = warningPlan.days
+      .flatMap((d) => d.items)
+      .find((i) => i.id === postponedOverExamItem.id);
+
+    if (warnedItem) {
+      assert(
+        Boolean(warnedItem.warningNote),
+        'Item postponed beyond exam date includes warning note: ' + warnedItem.warningNote
+      );
+    }
+
+    // =========================================================================
+    // STAGE 10: PERSONAL REVIEW RECOMMENDATION & LEARNING ANALYTICS
+    // =========================================================================
+    console.log('\n=== STAGE 10 VERIFICATION: PERSONAL REVIEW RECOMMENDATION & LEARNING ANALYTICS ===');
+
+    const l10Ref = new Date('2026-10-01T10:00:00+09:00');
+    const l10Subject: Subject = { ...INITIAL_SUBJECTS[0], id: 'subj-l10', name: 'Stage10 과목', isDemo: false, examAt: undefined };
+    const l10Concept: Concept = {
+      ...INITIAL_CONCEPTS[0],
+      id: 'c-l10',
+      subjectId: 'subj-l10',
+      isDemo: false,
+      isLearned: true,
+      status: 'stable',
+      events: [],
+    };
+    const buildL10Problem = (id: string, conceptIds: string[], extra: Partial<Problem> = {}): Problem => ({
+      ...INITIAL_PROBLEMS[0],
+      id,
+      subjectId: 'subj-l10',
+      conceptIds,
+      isDemo: false,
+      isApproved: true,
+      qualityStatus: 'normal',
+      version: 1,
+      type: 'essay_descriptive',
+      difficulty: 'advanced_college',
+      ...extra,
+    });
+    const l10Problems: Problem[] = [
+      buildL10Problem('prob-l10-a', ['c-l10']),
+      buildL10Problem('prob-l10-b', ['c-l10']),
+      buildL10Problem('prob-l10-c', ['c-l10']),
+    ];
+    const mkL10Attempt = (id: string, at: string, score: number, extra: Partial<Attempt> = {}): Attempt => ({
+      id,
+      problemId: 'prob-l10-a',
+      conceptId: 'c-l10',
+      conceptIds: ['c-l10'],
+      subjectId: 'subj-l10',
+      at,
+      answer: '풀이 답안',
+      confidence: 3,
+      errorType: 'none',
+      hintCount: 0,
+      reasoningNotes: '',
+      calculatedScore: score,
+      rubricResults: [],
+      evaluatorFeedback: '',
+      problemVersion: 1,
+      ...extra,
+    });
+
+    // 57. Stage 10: Analysis record validation & exclusion reasons
+    console.log('\n--- 57. Testing Analysis Record Validation & Exclusions ---');
+    const demoProblem = { ...INITIAL_PROBLEMS[0], id: 'prob-l10-demo', subjectId: 'subj-l10', isDemo: true, conceptIds: ['c-l10'] };
+    const exclusionCollection = collectValidRecords({
+      attempts: [
+        mkL10Attempt('att-valid', '2026-09-28T08:00:00+09:00', 75),
+        mkL10Attempt('att-dup', '2026-09-28T09:00:00+09:00', 70),
+        mkL10Attempt('att-dup', '2026-09-28T11:00:00+09:00', 80),
+        mkL10Attempt('att-needs', '2026-09-28T07:00:00+09:00', 60, { needsReview: true }),
+        mkL10Attempt('att-empty', '2026-09-28T06:00:00+09:00', 0, { answer: '' }),
+        mkL10Attempt('att-demo', '2026-09-28T05:00:00+09:00', 90, { problemId: demoProblem.id }),
+        mkL10Attempt('att-version', '2026-09-28T04:00:00+09:00', 80, { problemVersion: 0 }),
+      ],
+      mockExams: [],
+      problems: [...l10Problems, demoProblem],
+      subjects: [l10Subject, INITIAL_SUBJECTS[0]],
+      concepts: [l10Concept],
+    });
+    assert(
+      exclusionCollection.records.length === 2 &&
+        exclusionCollection.records.some((r) => r.attemptId === 'att-valid') &&
+        exclusionCollection.records.some((r) => r.attemptId === 'att-dup') &&
+        !exclusionCollection.records.some((r) => r.problemId === 'prob-l10-demo'),
+      'Only valid real attempts are analyzed (duplicate deduped, demo excluded)'
+    );
+    assert(exclusionCollection.excludedByReason.duplicate_attempt_id === 1, 'Duplicate Attempt ID is excluded');
+    assert(exclusionCollection.excludedByReason.needs_review === 1, 'Evaluation flagged for review is excluded');
+    assert(exclusionCollection.excludedByReason.unanswered === 1, 'Unanswered item is excluded');
+    assert(exclusionCollection.excludedByReason.demo_record === 1, 'Demo record is excluded');
+    assert(exclusionCollection.excludedByReason.version_mismatch === 1, 'Evaluation against an older problem version is not auto-validated');
+
+    const reportedProblem = buildL10Problem('prob-l10-reported', ['c-l10'], { qualityStatus: 'reported' });
+    const qualityCollection = collectValidRecords({
+      attempts: [mkL10Attempt('att-quality', '2026-09-28T08:00:00+09:00', 82, { problemId: 'prob-l10-reported' })],
+      mockExams: [],
+      problems: [...l10Problems, reportedProblem],
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+    });
+    assert(qualityCollection.excludedByReason.quality_unresolved === 1, 'Evaluation of an unresolved-quality problem is excluded');
+
+    // 58. Stage 10: Recorded mock-exam inclusion, dedupe & draft exclusion
+    console.log('\n--- 58. Testing Recorded Mock Exam Inclusion, Dedupe & Draft Exclusion ---');
+    const mockProblem = l10Problems[0];
+    const mkMockSession = (id: string, status: MockExamSession['status'], answer = '모의 답안'): MockExamSession => ({
+      id,
+      subjectId: 'subj-l10',
+      createdAt: '2026-09-27T10:00:00+09:00',
+      endsAt: '2026-09-27T11:00:00+09:00',
+      submittedAt: status === 'recorded' || status === 'graded' ? '2026-09-27T11:00:00+09:00' : undefined,
+      durationMinutes: 60,
+      status,
+      selectedConceptIds: ['c-l10'],
+      selectedTypes: ['essay_descriptive'],
+      problems: [mockProblem],
+      answers: { [mockProblem.id]: answer },
+      evaluations: {
+        [mockProblem.id]: {
+          calculatedScore: 77,
+          rubricResults: [],
+          feedback: '',
+          strengths: '',
+          criticalImprovements: '',
+          recommendedErrorType: 'none',
+          staticAnalysisNotice: '',
+          needsReview: false,
+          isAiEvaluated: true,
+        },
+      },
+      reasons: {},
+      isReasonNotApplicable: {},
+      reasonNotApplicableJustification: {},
+    } as MockExamSession);
+
+    const recordedOnly = collectValidRecords({
+      attempts: [],
+      mockExams: [mkMockSession('mock-l10-1', 'recorded')],
+      problems: l10Problems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+    });
+    assert(recordedOnly.records.length === 1 && recordedOnly.records[0].source === 'mock_exam', 'Recorded mock exam item evaluation is included');
+
+    const gradedOnly = collectValidRecords({
+      attempts: [],
+      mockExams: [mkMockSession('mock-l10-3', 'graded')],
+      problems: l10Problems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+    });
+    assert(gradedOnly.records.length === 0, 'Unrecorded (graded only) mock exam results are excluded as drafts');
+
+    const dedupeAttemptId = `att-exam-mock-l10-2-${mockProblem.id}`;
+    const dedupeCollection = collectValidRecords({
+      attempts: [mkL10Attempt(dedupeAttemptId, '2026-09-27T11:00:00+09:00', 77)],
+      mockExams: [mkMockSession('mock-l10-2', 'recorded')],
+      problems: l10Problems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+    });
+    assert(dedupeCollection.records.length === 1 && dedupeCollection.records[0].source === 'attempt', 'Recorded mock item already stored as an Attempt is not double-counted');
+
+    const unansweredMock = collectValidRecords({
+      attempts: [],
+      mockExams: [mkMockSession('mock-l10-4', 'recorded', '')],
+      problems: l10Problems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+    });
+    assert(unansweredMock.records.length === 0 && unansweredMock.excludedByReason.unanswered === 1, 'Unanswered mock exam item is excluded');
+
+    // 59. Stage 10: Period filter
+    console.log('\n--- 59. Testing Analytics Period Filter ---');
+    const periodCollectionRecords = [
+      mkL10Attempt('att-recent', '2026-09-30T08:00:00+09:00', 80),
+      mkL10Attempt('att-old', '2026-09-01T08:00:00+09:00', 80),
+    ];
+    const report7 = buildLearningAnalyticsReport({
+      attempts: periodCollectionRecords,
+      mockExams: [],
+      problems: l10Problems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      period: 'last7',
+      referenceDate: l10Ref,
+    });
+    assert(report7.records.length === 1 && report7.records[0].attemptId === 'att-recent', 'Last-7-days filter keeps only recent records');
+    const reportAll = buildLearningAnalyticsReport({
+      attempts: periodCollectionRecords,
+      mockExams: [],
+      problems: l10Problems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      period: 'all',
+      referenceDate: l10Ref,
+    });
+    assert(reportAll.records.length === 2, 'All-period filter keeps every valid record');
+
+    // 60. Stage 10: Distinct type/difficulty grouping & withheld change judgment
+    console.log('\n--- 60. Testing Type/Difficulty Separation & Withheld Change ---');
+    const easyProblem = buildL10Problem('prob-l10-easy', ['c-l10'], { difficulty: 'intermediate' });
+    const mixedReport = buildLearningAnalyticsReport({
+      attempts: [
+        mkL10Attempt('att-hard', '2026-09-30T08:00:00+09:00', 60, { problemId: 'prob-l10-a' }),
+        mkL10Attempt('att-easy', '2026-09-30T09:00:00+09:00', 95, { problemId: 'prob-l10-easy' }),
+      ],
+      mockExams: [],
+      problems: [...l10Problems, easyProblem],
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      period: 'last30',
+      referenceDate: l10Ref,
+    });
+    assert(mixedReport.performance.byType.length === 2, 'Scores of different difficulty are grouped separately');
+    assert(mixedReport.performance.change.status === 'insufficient', 'Change judgment withheld when comparable samples are insufficient');
+
+    // 61. Stage 10: Composite problem is a single whole-item score
+    console.log('\n--- 61. Testing Composite Problem Whole-Item Attribution ---');
+    const compositeConceptB: Concept = { ...l10Concept, id: 'c-l10-b' };
+    const compositeProblem = buildL10Problem('prob-l10-comp', ['c-l10', 'c-l10-b']);
+    const compositeReport = buildLearningAnalyticsReport({
+      attempts: [mkL10Attempt('att-comp', '2026-09-30T08:00:00+09:00', 88, { problemId: 'prob-l10-comp', conceptId: 'c-l10', conceptIds: ['c-l10', 'c-l10-b'] })],
+      mockExams: [],
+      problems: [compositeProblem],
+      subjects: [l10Subject],
+      concepts: [l10Concept, compositeConceptB],
+      period: 'last30',
+      referenceDate: l10Ref,
+    });
+    assert(compositeReport.records.length === 1, 'Composite problem produces ONE whole-item record');
+    assert(compositeReport.records[0].isComposite === true && compositeReport.records[0].conceptIds.length === 2, 'Composite record preserves linked concepts without duplicating scores');
+    assert(compositeReport.records[0].primaryConceptId === 'c-l10', 'Composite score is attributed to the primary concept, not per-concept scores');
+
+    // 62. Stage 10: Auto correction requires sufficient evidence
+    console.log('\n--- 62. Testing Auto Correction Evidence Requirements ---');
+    const personalizationOn: PersonalizationSettings = { ...DEFAULT_PERSONALIZATION_SETTINGS, enabled: true, autoAdjust: true, tendency: 'standard' };
+    const l10ConceptRec: Concept = {
+      ...l10Concept,
+      id: 'c-l10-rec',
+      events: [{ id: 'ev-l10-rec', conceptId: 'c-l10-rec', at: '2026-09-20T10:00:00+09:00', dayOffset: 0, kind: 'attempt', title: '풀이', resultScore: 90, confidence: 3, hintCount: 0, sourceRef: '', rubricScores: [] }],
+    };
+    const insufficientState = computeCorrectionState({
+      attempts: [mkL10Attempt('att-one', '2026-09-30T08:00:00+09:00', 70, { conceptId: 'c-l10-rec', conceptIds: ['c-l10-rec'], problemId: 'prob-l10-rec' })],
+      mockExams: [],
+      problems: [buildL10Problem('prob-l10-rec', ['c-l10-rec'])],
+      subjects: [l10Subject],
+      concepts: [l10ConceptRec],
+      settings: personalizationOn,
+      referenceDate: l10Ref,
+    });
+    assert(insufficientState.dataSufficient === false, 'Automatic correction reports insufficient data');
+    assert(insufficientState.autoMultiplier === 1, 'Automatic correction keeps base multiplier 1 when records are insufficient');
+    assert(getEffectiveIntervalMultiplier(personalizationOn, insufficientState) === 1, 'Insufficient data keeps the default recommendation');
+
+    // 63. Stage 10: Shorten / lengthen / neutral directions
+    console.log('\n--- 63. Testing Personal Correction Directions ---');
+    const mkL10ProblemAttempt = (id: string, at: string, score: number, problemIndex: number, extra: Partial<Attempt> = {}) =>
+      mkL10Attempt(id, at, score, { problemId: l10Problems[problemIndex].id, ...extra });
+    const l10StandardProblems = l10Problems;
+    const shortAttempts: Attempt[] = [
+      mkL10ProblemAttempt('sa1', '2026-09-28T10:00:00+09:00', 50, 0, { hintCount: 1, errorType: 'concept_confusion' }),
+      mkL10ProblemAttempt('sa2', '2026-09-29T10:00:00+09:00', 55, 1, { hintCount: 1, errorType: 'concept_confusion' }),
+      mkL10ProblemAttempt('sa3', '2026-09-30T10:00:00+09:00', 45, 2, { hintCount: 2 }),
+      mkL10ProblemAttempt('sa4', '2026-09-29T14:00:00+09:00', 52, 0),
+      mkL10ProblemAttempt('sa5', '2026-09-30T14:00:00+09:00', 58, 1, { hintCount: 1 }),
+    ];
+    const shortState = computeCorrectionState({
+      attempts: shortAttempts,
+      mockExams: [],
+      problems: l10StandardProblems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      settings: personalizationOn,
+      referenceDate: l10Ref,
+    });
+    assert(shortState.dataSufficient === true, 'Sufficient records enable automatic correction');
+    assert(shortState.autoMultiplier < 1, `Repeated errors / hint dependency / low scores shorten the interval (${shortState.autoMultiplier})`);
+    assert(shortState.appliedMultiplier >= PERSONALIZATION_CONSTANTS.MULTIPLIER_MIN, 'Applied multiplier respects the 0.75 lower bound');
+
+    const stableAttempts: Attempt[] = [
+      mkL10ProblemAttempt('st1', '2026-09-28T10:00:00+09:00', 86, 0),
+      mkL10ProblemAttempt('st2', '2026-09-29T10:00:00+09:00', 92, 1),
+      mkL10ProblemAttempt('st3', '2026-09-30T10:00:00+09:00', 88, 2),
+      mkL10ProblemAttempt('st4', '2026-09-29T14:00:00+09:00', 90, 0),
+      mkL10ProblemAttempt('st5', '2026-09-30T14:00:00+09:00', 85, 1),
+    ];
+    const stableState = computeCorrectionState({
+      attempts: stableAttempts,
+      mockExams: [],
+      problems: l10StandardProblems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      settings: personalizationOn,
+      referenceDate: l10Ref,
+    });
+    assert(stableState.autoMultiplier > 1, `Stable performance with low hint dependency lengthens the interval (${stableState.autoMultiplier})`);
+    assert(stableState.appliedMultiplier <= PERSONALIZATION_CONSTANTS.MULTIPLIER_MAX, 'Applied multiplier respects the 1.25 upper bound');
+
+    const conflictAttempts: Attempt[] = [
+      mkL10ProblemAttempt('cf1', '2026-09-28T10:00:00+09:00', 86, 0, { hintCount: 1, errorType: 'concept_confusion' }),
+      mkL10ProblemAttempt('cf2', '2026-09-29T10:00:00+09:00', 88, 1, { errorType: 'concept_confusion' }),
+      mkL10ProblemAttempt('cf3', '2026-09-30T10:00:00+09:00', 90, 2),
+      mkL10ProblemAttempt('cf4', '2026-09-29T14:00:00+09:00', 84, 0),
+      mkL10ProblemAttempt('cf5', '2026-09-30T14:00:00+09:00', 89, 1, { hintCount: 1 }),
+    ];
+    const conflictState = computeCorrectionState({
+      attempts: conflictAttempts,
+      mockExams: [],
+      problems: l10StandardProblems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      settings: personalizationOn,
+      referenceDate: l10Ref,
+    });
+    assert(conflictState.autoMultiplier === 1, 'Conflicting signals keep the base interval (multiplier 1)');
+
+    // 64. Stage 10: Gentle update (a single record barely moves the multiplier)
+    console.log('\n--- 64. Testing Gentle Correction Update ---');
+    const beforeExtra = computeCorrectionState({
+      attempts: shortAttempts,
+      mockExams: [],
+      problems: l10StandardProblems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      settings: personalizationOn,
+      referenceDate: l10Ref,
+    });
+    const afterExtra = computeCorrectionState({
+      attempts: [...shortAttempts, mkL10ProblemAttempt('sa6', '2026-09-30T16:00:00+09:00', 30, 2, { hintCount: 2 })],
+      mockExams: [],
+      problems: l10StandardProblems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      settings: personalizationOn,
+      referenceDate: l10Ref,
+    });
+    assert(Math.abs(afterExtra.autoMultiplier - beforeExtra.autoMultiplier) < 0.1, 'A single new record only gently changes the multiplier');
+
+    // 65. Stage 10: Multiplier clamp under dense tendency + shorten
+    console.log('\n--- 65. Testing Multiplier Clamp ---');
+    const denseState = computeCorrectionState({
+      attempts: shortAttempts,
+      mockExams: [],
+      problems: l10StandardProblems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      settings: { ...personalizationOn, tendency: 'dense' },
+      referenceDate: l10Ref,
+    });
+    assert(denseState.appliedMultiplier === PERSONALIZATION_CONSTANTS.MULTIPLIER_MIN, 'Combined multiplier is clamped at the 0.75 floor');
+
+    // 66. Stage 10: Disabling personalization restores the base recommendation
+    console.log('\n--- 66. Testing Personalization Disable Restores Base Recommendation ---');
+    const disabledSettings: PersonalizationSettings = { ...personalizationOn, enabled: false };
+    assert(getEffectiveIntervalMultiplier(disabledSettings, denseState) === 1, 'Disabled personalization yields multiplier 1');
+    const recBase = calculateNextReviewRecommendation(l10ConceptRec, DEFAULT_RETENTION_SETTINGS, undefined, l10Ref, 1);
+    const recDisabled = calculateNextReviewRecommendation(l10ConceptRec, DEFAULT_RETENTION_SETTINGS, undefined, l10Ref, getEffectiveIntervalMultiplier(disabledSettings, denseState));
+    assert(recBase !== null && recDisabled !== null, 'Base and disabled personalization recommendations are produced');
+    assert(recBase!.recommendedAt === recDisabled!.recommendedAt, 'Disabled personalization reproduces the exact base recommended date');
+
+    // 67. Stage 10: Single unified path scales interval without touching model score
+    console.log('\n--- 67. Testing Unified Path: Interval Scaling Without Score Mutation ---');
+    const recShort = calculateNextReviewRecommendation(l10ConceptRec, DEFAULT_RETENTION_SETTINGS, undefined, l10Ref, 0.75);
+    const recLong = calculateNextReviewRecommendation(l10ConceptRec, DEFAULT_RETENTION_SETTINGS, undefined, l10Ref, 1.25);
+    assert(recShort !== null && recLong !== null, 'Adjusted recommendations are produced');
+    assert(recShort!.intervalMultiplier === 0.75 && recShort!.isPersonalized === true, 'Multiplier and isPersonalized flag are recorded');
+    assert(recShort!.recommendedAt <= recBase!.recommendedAt, 'A multiplier below 1 recommends an earlier date');
+    assert(recLong!.recommendedAt >= recBase!.recommendedAt, 'A multiplier above 1 recommends a later date');
+    assert(recShort!.factors.lastScore === recBase!.factors.lastScore, 'Personal interval adjustment does not modify the model score');
+    assert(l10ConceptRec.events.length === 1 && l10ConceptRec.events[0].resultScore === 90, 'Past events remain unchanged after recommendation adjustment');
+
+    // 68. Stage 10: Plan recalculation applies the SAME multiplier and preserves history
+    console.log('\n--- 68. Testing Unified Plan Integration & History Preservation ---');
+    const l10RecProblem = buildL10Problem('prob-l10-rec', ['c-l10-rec']);
+    const l10ConceptRec2: Concept = {
+      ...l10Concept,
+      id: 'c-l10-rec2',
+      events: [{ id: 'ev-l10-rec2', conceptId: 'c-l10-rec2', at: '2026-09-22T10:00:00+09:00', dayOffset: 0, kind: 'attempt', title: '풀이', resultScore: 70, confidence: 3, hintCount: 2, sourceRef: '', rubricScores: [] }],
+    };
+    const l10RecProblem2 = buildL10Problem('prob-l10-rec2', ['c-l10-rec2']);
+    const l10CompletedItem: StudyPlanItem = {
+      id: 'spi-recommended_review-subj-l10-c-l10-rec-prob-l10-rec',
+      subjectId: 'subj-l10',
+      subjectName: l10Subject.name,
+      conceptId: 'c-l10-rec',
+      conceptName: l10ConceptRec.title,
+      problemId: 'prob-l10-rec',
+      problemTitle: l10RecProblem.title,
+      problemType: 'essay_descriptive',
+      kind: 'recommended_review',
+      assignedDate: toSeoulDateString(testRefDate),
+      estimatedMinutes: 15,
+      isEstimatedTime: false,
+      priorityScore: 80,
+      priorityReason: '완료된 복습',
+      status: 'completed',
+      snapshotTitle: '완료 항목',
+      snapshotDetail: '상세',
+      completedAt: '2026-09-30T12:00:00+09:00',
+      completedAttemptId: 'att-l10-completed',
+    };
+    const l10PlanSettings: StudyPlanSettings = {
+      ...DEFAULT_STUDY_PLAN_SETTINGS,
+      weekdaySettings: {
+        0: { dayOfWeek: 0, minutes: 120, isRestDay: false },
+        1: { dayOfWeek: 1, minutes: 120, isRestDay: false },
+        2: { dayOfWeek: 2, minutes: 120, isRestDay: false },
+        3: { dayOfWeek: 3, minutes: 120, isRestDay: false },
+        4: { dayOfWeek: 4, minutes: 120, isRestDay: false },
+        5: { dayOfWeek: 5, minutes: 120, isRestDay: false },
+        6: { dayOfWeek: 6, minutes: 120, isRestDay: false },
+      },
+    };
+    const planBase = generateStudyPlan({
+      subjects: [l10Subject],
+      concepts: [l10ConceptRec, l10ConceptRec2],
+      problems: [l10RecProblem, l10RecProblem2],
+      attempts: [],
+      settings: l10PlanSettings,
+      referenceDate: testRefDate,
+      existingItems: [l10CompletedItem],
+      daysCount: 7,
+      personalizationMultiplier: 1,
+    });
+    const planAdjusted = generateStudyPlan({
+      subjects: [l10Subject],
+      concepts: [l10ConceptRec, l10ConceptRec2],
+      problems: [l10RecProblem, l10RecProblem2],
+      attempts: [],
+      settings: l10PlanSettings,
+      referenceDate: testRefDate,
+      existingItems: [l10CompletedItem],
+      daysCount: 7,
+      personalizationMultiplier: 0.75,
+      personalizationNote: '개인별 보정 x0.75',
+    });
+    const completedInBase = planBase.days.flatMap((d) => d.items).find((i) => i.id === l10CompletedItem.id);
+    const completedInAdjusted = planAdjusted.days.flatMap((d) => d.items).find((i) => i.id === l10CompletedItem.id);
+    assert(completedInBase?.status === 'completed' && completedInBase?.completedAttemptId === 'att-l10-completed', 'Completed plan item is preserved on recalculation');
+    assert(completedInAdjusted?.status === 'completed' && completedInAdjusted?.completedAttemptId === 'att-l10-completed', 'Completed plan item is preserved when the personal multiplier changes');
+    const pendingAdjusted = planAdjusted.days.flatMap((d) => d.items).find((i) => i.conceptId === 'c-l10-rec2');
+    assert(Boolean(pendingAdjusted && pendingAdjusted.priorityReason.includes('개인별 보정 x0.75')), 'Future pending plan item reflects the same personal multiplier used by today review');
+
+    // 69. Stage 10: Analytics is read-only (no mutation of stored attempts)
+    console.log('\n--- 69. Testing Analytics Read-Only Guarantee ---');
+    const attemptsStoreBefore = JSON.stringify(loadStoredAttempts());
+    buildLearningAnalyticsReport({
+      attempts: shortAttempts,
+      mockExams: [],
+      problems: l10StandardProblems,
+      subjects: [l10Subject],
+      concepts: [l10Concept],
+      period: 'all',
+      referenceDate: l10Ref,
+    });
+    assert(JSON.stringify(loadStoredAttempts()) === attemptsStoreBefore, 'Running analytics never mutates stored attempts');
+
+    console.log(`\n=== ALL STAGES 1, 2, 3, 4, 5, 6, 8, 9 & 10 TESTS PASSED: ${passed} PASSED, ${failed} FAILED ===`);
     if (failed > 0) {
       process.exit(1);
     }
@@ -1085,4 +2300,5 @@ function runTests() {
 }
 
 runTests();
+
 

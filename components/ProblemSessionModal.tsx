@@ -6,16 +6,15 @@ import {
   Problem,
   Attempt,
   ErrorType,
-  RubricResult,
   Subject,
   EvaluationResult,
   ProblemReportType,
+  METHOD_REASON_RATING_LABELS,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
 import { ProblemReportModal } from './ProblemReportModal';
 import {
   X,
-  Clock,
   Lightbulb,
   CheckCircle,
   AlertTriangle,
@@ -26,11 +25,12 @@ import {
   Sparkles,
   BookOpen,
   RotateCcw,
-  CheckSquare,
   Loader2,
   HelpCircle,
   ShieldCheck,
   ShieldAlert,
+  Lock,
+  Compass,
 } from 'lucide-react';
 
 interface ProblemSessionModalProps {
@@ -64,10 +64,17 @@ export function ProblemSessionModal({
   const [errorType, setErrorType] = useState<ErrorType>('none');
   const [reasoningNotes, setReasoningNotes] = useState('');
 
+  // Stage 8: Method selection reason input state
+  const [solvingReason, setSolvingReason] = useState('');
+  const [isReasonNotApplicable, setIsReasonNotApplicable] = useState(false);
+  const [reasonNotApplicableJustification, setReasonNotApplicableJustification] = useState('');
+
   // Stage 4: AI Evaluation State
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [evaluationError, setEvaluationError] = useState<string | null>(null);
   const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
+  const [evaluatedAnswer, setEvaluatedAnswer] = useState<string | null>(null);
+  const [evaluatedHintCount, setEvaluatedHintCount] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(false);
 
@@ -78,20 +85,36 @@ export function ProblemSessionModal({
   if (!isOpen) return null;
 
   const handleRevealHint = (index: number) => {
+    if (isEvaluating) return;
     if (!revealedHints.includes(index)) {
       setRevealedHints([...revealedHints, index]);
     }
   };
 
-  const insertMathSnippet = (snippet: string) => {
-    setAnswerText((prev) => prev + snippet);
+  const changeAnswer = (value: string) => {
+    if (isEvaluating) return;
+    setAnswerText(value);
+    setEvaluationResult(null);
+    setEvaluatedAnswer(null);
+    setEvaluationError(null);
+    setCurrentAttemptId(undefined);
   };
 
-  // Stage 4: Real AI Answer Evaluation Request
+  const insertMathSnippet = (snippet: string) => {
+    changeAnswer(answerText + snippet);
+  };
+
+  // Stage 4 & 8: Real AI Answer & Method Reason Evaluation Request
   const handleRequestEvaluation = async () => {
+    if (isEvaluating) return;
     const trimmed = answerText.trim();
     if (!trimmed) {
       alert('답안을 작성한 후 평가를 요청해 주세요.');
+      return;
+    }
+
+    if (isReasonNotApplicable && !reasonNotApplicableJustification.trim()) {
+      alert('방법 선택 이유 [해당 없음]을 선택한 경우, 사유를 간단히 입력해 주세요.');
       return;
     }
 
@@ -117,7 +140,13 @@ export function ProblemSessionModal({
           rubric: problem.rubric,
           userAnswer: trimmed,
           revealedHintCount: revealedHints.length,
-          hints: problem.hints,
+          hints: revealedHints.map((index) => problem.hints[index]),
+          // Stage 8 fields
+          solvingReason: isReasonNotApplicable ? undefined : solvingReason.trim(),
+          isReasonNotApplicable,
+          reasonNotApplicableJustification: isReasonNotApplicable
+            ? reasonNotApplicableJustification.trim()
+            : undefined,
         }),
       });
 
@@ -129,22 +158,24 @@ export function ProblemSessionModal({
 
       const evalData: EvaluationResult = data.evaluation;
       setEvaluationResult(evalData);
+      setEvaluatedAnswer(trimmed);
+      setEvaluatedHintCount(revealedHints.length);
       setCurrentAttemptId(`att-${Date.now()}-${Math.random().toString(36).substring(7)}`);
 
       // Pre-fill error diagnosis with AI recommendation
       if (evalData.recommendedErrorType) {
         setErrorType(evalData.recommendedErrorType);
       }
-    } catch (err: any) {
-      setEvaluationError(`네트워크 연결 오류: ${err?.message || '알 수 없는 오류'}`);
+    } catch (err) {
+      setEvaluationError(`네트워크 연결 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
       setIsEvaluating(false);
     }
   };
 
-  // Stage 4: Confirm and Commit Attempt
+  // Stage 4 & 8: Confirm and Commit Attempt
   const handleConfirmAndRecord = () => {
-    if (!evaluationResult || isSubmitting) return;
+    if (!evaluationResult || isSubmitting || evaluatedAnswer !== answerText.trim()) return;
     setIsSubmitting(true);
 
     const attemptIdToUse = currentAttemptId || `att-${Date.now()}-${Math.random().toString(36).substring(7)}`;
@@ -156,10 +187,10 @@ export function ProblemSessionModal({
       conceptIds: problem.conceptIds || [concept.id],
       subjectId: subject.id,
       at: new Date().toISOString(),
-      answer: answerText,
+      answer: evaluatedAnswer,
       confidence,
       errorType,
-      hintCount: revealedHints.length,
+      hintCount: evaluatedHintCount,
       reasoningNotes,
       calculatedScore: evaluationResult.calculatedScore,
       rubricResults: evaluationResult.rubricResults,
@@ -174,10 +205,22 @@ export function ProblemSessionModal({
       problemPromptSnapshot: problem.promptText,
       problemVersion: problem.version || 1,
       rubricSnapshot: problem.rubric,
+      // Stage 8 fields
+      solvingReason: isReasonNotApplicable ? undefined : solvingReason,
+      isReasonNotApplicable,
+      reasonNotApplicableJustification: isReasonNotApplicable
+        ? reasonNotApplicableJustification
+        : undefined,
+      methodSelectionDiagnosis: evaluationResult.methodSelectionDiagnosis,
     };
 
-    onSubmitAttempt(newAttempt);
-    onClose();
+    try {
+      onSubmitAttempt(newAttempt);
+      onClose();
+    } catch (cause) {
+      setEvaluationError(cause instanceof Error ? cause.message : '풀이 기록 저장에 실패했습니다.');
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -367,98 +410,183 @@ export function ProblemSessionModal({
             </div>
           )}
 
-          {/* Model Answer (Spoiler Prevention: Hidden by default before submission) */}
-          <div className="border border-[#ded6c8] rounded-xs bg-[#fcfbf9] overflow-hidden">
-            <button
-              type="button"
-              onClick={() => setIsModelAnswerVisible(!isModelAnswerVisible)}
-              className="w-full px-4 py-2 bg-[#f6f3eb] hover:bg-[#ede8dc] flex items-center justify-between text-xs transition-colors"
-            >
-              <div className="flex items-center gap-1.5 font-bold text-[#57544e]">
-                {isModelAnswerVisible ? (
-                  <EyeOff className="w-3.5 h-3.5 text-[#827d73]" />
-                ) : (
-                  <Eye className="w-3.5 h-3.5 text-[#827d73]" />
-                )}
-                <span>출제자 모범 답안 (스포일러 방지)</span>
-              </div>
-              <span className="text-[11px] font-academic-mono text-[#827d73]">
-                {isModelAnswerVisible ? '답안 접기' : '풀이 전 스포일러 주의 (클릭하여 확인)'}
-              </span>
-            </button>
-
-            {isModelAnswerVisible && (
-              <div className="p-4 border-t border-[#ded6c8] bg-white space-y-2 text-xs leading-relaxed text-[#191817] korean-prose whitespace-pre-wrap">
-                <div className="font-academic-mono text-[11px] text-[#827d73] font-semibold mb-1">
-                  모범 답안 및 핵심 논증 단계:
+          {/* Model Answer (Spoiler Prevention: Hidden strictly before submission/evaluation) */}
+          {!evaluationResult ? (
+            <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs text-xs text-[#827d73] font-academic-mono flex items-center gap-2">
+              <Lock className="w-4 h-4 text-[#827d73] shrink-0" />
+              <span>출제자 모범 답안 및 AI 채점 결과는 풀이와 방법 선택 이유를 작성하여 제출한 후에 공개됩니다 (스포일러 방지).</span>
+            </div>
+          ) : (
+            <div className="border border-[#ded6c8] rounded-xs bg-[#fcfbf9] overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setIsModelAnswerVisible(!isModelAnswerVisible)}
+                className="w-full px-4 py-2 bg-[#f6f3eb] hover:bg-[#ede8dc] flex items-center justify-between text-xs transition-colors"
+              >
+                <div className="flex items-center gap-1.5 font-bold text-[#57544e]">
+                  {isModelAnswerVisible ? (
+                    <EyeOff className="w-3.5 h-3.5 text-[#827d73]" />
+                  ) : (
+                    <Eye className="w-3.5 h-3.5 text-[#827d73]" />
+                  )}
+                  <span>출제자 모범 답안 열람</span>
                 </div>
-                {problem.modelAnswer}
-              </div>
-            )}
-          </div>
+                <span className="text-[11px] font-academic-mono text-[#827d73]">
+                  {isModelAnswerVisible ? '답안 접기' : '모범 답안 펼치기'}
+                </span>
+              </button>
 
-          {/* Answer Workspace Area */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              {/* Tab Selector */}
-              <div className="flex items-center gap-1 bg-[#faf8f4] p-1 border border-[#ded6c8] rounded-xs">
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('editor')}
-                  className={`px-3 py-1 text-xs font-academic-mono rounded-xs transition-colors ${
-                    activeTab === 'editor'
-                      ? 'bg-white font-bold text-[#191817] shadow-2xs'
-                      : 'text-[#827d73] hover:text-[#191817]'
-                  }`}
-                >
-                  답안 작성 (Editor)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('preview')}
-                  className={`px-3 py-1 text-xs font-academic-mono rounded-xs transition-colors ${
-                    activeTab === 'preview'
-                      ? 'bg-white font-bold text-[#191817] shadow-2xs'
-                      : 'text-[#827d73] hover:text-[#191817]'
-                  }`}
-                >
-                  수식 & 서술 미리보기
-                </button>
+              {isModelAnswerVisible && (
+                <div className="p-4 border-t border-[#ded6c8] bg-white space-y-2 text-xs leading-relaxed text-[#191817] korean-prose whitespace-pre-wrap">
+                  <div className="font-academic-mono text-[11px] text-[#827d73] font-semibold mb-1">
+                    출제자 모범 답안 및 핵심 논증 단계:
+                  </div>
+                  {problem.modelAnswer}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Dual Input Workspace Area: 1. Solution & Conclusion, 2. Method Selection Reason */}
+          <div className="space-y-4">
+            {/* Input Section 1: Solution & Conclusion */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="font-academic-mono text-xs font-bold text-[#191817] bg-[#f4f1ea] px-2 py-0.5 border border-[#ded6c8] rounded-2xs">
+                    1. 풀이 및 결론 (SOLUTION & CONCLUSION)
+                  </span>
+                </div>
+
+                {/* Tab Selector */}
+                <div className="flex items-center gap-1 bg-[#faf8f4] p-1 border border-[#ded6c8] rounded-xs">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('editor')}
+                    className={`px-2.5 py-0.5 text-xs font-academic-mono rounded-xs transition-colors ${
+                      activeTab === 'editor'
+                        ? 'bg-white font-bold text-[#191817] shadow-2xs'
+                        : 'text-[#827d73] hover:text-[#191817]'
+                    }`}
+                  >
+                    에디터
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('preview')}
+                    className={`px-2.5 py-0.5 text-xs font-academic-mono rounded-xs transition-colors ${
+                      activeTab === 'preview'
+                        ? 'bg-white font-bold text-[#191817] shadow-2xs'
+                        : 'text-[#827d73] hover:text-[#191817]'
+                    }`}
+                  >
+                    미리보기
+                  </button>
+                </div>
               </div>
 
               {/* Math / Quick Snippets */}
-              <div className="hidden sm:flex items-center gap-1 text-[11px] font-academic-mono text-[#827d73]">
-                <span>빠른 기호 입력:</span>
-                {['\\int', 'E[Y|X]', '\\iint', '\\le', '\\infty', 'f(x,y)'].map((snip) => (
-                  <button
-                    key={snip}
-                    type="button"
-                    onClick={() => insertMathSnippet(` $${snip}$ `)}
-                    className="px-1.5 py-0.5 border border-[#ded6c8] bg-[#faf8f4] hover:bg-white text-[#191817] rounded-xs"
-                  >
-                    {snip}
-                  </button>
-                ))}
+              <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] font-academic-mono text-[#827d73]">
+                <span>단계별 증명 전개, 정리 적용, 또는 코드 알고리즘 논증을 상세히 서술하십시오.</span>
+                <div className="hidden sm:flex items-center gap-1">
+                  <span>빠른 기호:</span>
+                  {['\\int', 'E[Y|X]', '\\iint', '\\le', '\\infty', 'f(x,y)'].map((snip) => (
+                    <button
+                      key={snip}
+                      type="button"
+                      disabled={isEvaluating}
+                      onClick={() => insertMathSnippet(` $${snip}$ `)}
+                      className="px-1.5 py-0.5 border border-[#ded6c8] bg-[#faf8f4] hover:bg-white text-[#191817] rounded-xs"
+                    >
+                      {snip}
+                    </button>
+                  ))}
+                </div>
               </div>
+
+              {activeTab === 'editor' ? (
+                <textarea
+                  value={answerText}
+                  onChange={(e) => changeAnswer(e.target.value)}
+                  disabled={isEvaluating}
+                  placeholder="단계별 증명 전개, 정리 적용 정당화, 또는 코드 알고리즘 논증을 상세히 서술하십시오... (LaTeX 수식 기호 $...$ 사용 가능)"
+                  rows={8}
+                  className="w-full p-3.5 essay-answer border border-[#ded6c8] rounded-xs focus:border-[#191817] focus:ring-1 focus:ring-[#191817] resize-y bg-[#fefefe]"
+                />
+              ) : (
+                <div className="w-full min-h-[180px] p-3.5 essay-answer border border-[#ded6c8] rounded-xs bg-[#faf8f4] overflow-y-auto whitespace-pre-wrap">
+                  {answerText ? (
+                    <div>{answerText}</div>
+                  ) : (
+                    <span className="text-[#827d73]">작성된 풀이가 없습니다.</span>
+                  )}
+                </div>
+              )}
             </div>
 
-            {activeTab === 'editor' ? (
-              <textarea
-                value={answerText}
-                onChange={(e) => setAnswerText(e.target.value)}
-                placeholder="단계별 증명 전개, 정리 적용 정당화, 또는 코드 알고리즘 논증을 상세히 서술하십시오... (LaTeX 수식 기호 $...$ 사용 가능)"
-                rows={9}
-                className="w-full p-3.5 essay-answer border border-[#ded6c8] rounded-xs focus:border-[#191817] focus:ring-1 focus:ring-[#191817] resize-y bg-[#fefefe]"
-              />
-            ) : (
-              <div className="w-full min-h-[200px] p-3.5 essay-answer border border-[#ded6c8] rounded-xs bg-[#faf8f4] overflow-y-auto whitespace-pre-wrap">
-                {answerText ? (
-                  <div>{answerText}</div>
-                ) : (
-                  <span className="text-[#827d73]">작성된 답안이 없습니다.</span>
-                )}
+            {/* Input Section 2: Method Selection Reason */}
+            <div className="border border-[#ded6c8] bg-[#fcfbf9] p-3.5 rounded-xs space-y-2.5">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#f1ede4] pb-2">
+                <div className="flex items-center gap-2">
+                  <Compass className="w-4 h-4 text-indigo-700" />
+                  <span className="font-academic-mono text-xs font-bold text-[#191817] bg-indigo-50 text-indigo-900 px-2 py-0.5 border border-indigo-200 rounded-2xs">
+                    2. 방법 선택 이유 (WHY THIS METHOD)
+                  </span>
+                </div>
+
+                <label className="flex items-center gap-1.5 text-xs text-[#57544e] cursor-pointer hover:text-[#191817]">
+                  <input
+                    type="checkbox"
+                    checked={isReasonNotApplicable}
+                    onChange={(e) => setIsReasonNotApplicable(e.target.checked)}
+                    className="rounded-2xs border-[#ded6c8] text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <span className="font-academic-mono text-[11.5px]">방법 선택 &apos;해당 없음&apos; (선택할 방법 자체가 없는 문항)</span>
+                </label>
               </div>
-            )}
+
+              {isReasonNotApplicable ? (
+                <div className="space-y-1.5 p-2.5 bg-amber-50/70 border border-amber-200 rounded-xs">
+                  <div className="flex items-center gap-1 text-[11px] font-academic-mono text-amber-900 font-semibold">
+                    <HelpCircle className="w-3.5 h-3.5 text-amber-700" />
+                    <span>해당 없음 사유 입력 (AI가 문제 유형을 보고 적합성을 판단합니다):</span>
+                  </div>
+                  <input
+                    type="text"
+                    value={reasonNotApplicableJustification}
+                    onChange={(e) => setReasonNotApplicableJustification(e.target.value)}
+                    placeholder="예: 단순 정의 확인 및 단일 사칙연산 문항으로 별도의 공식·정리·알고리즘 선택 과정이 필요하지 않음"
+                    className="w-full p-2 text-xs border border-amber-300 rounded-xs bg-white text-[#191817] focus:ring-1 focus:ring-amber-500"
+                  />
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {/* Domain-specific guidance banner */}
+                  <div className="p-2.5 bg-indigo-50/60 border border-indigo-200/80 rounded-xs text-xs text-indigo-950 space-y-1">
+                    <div className="font-bold text-[11px] font-academic-mono text-indigo-900 flex items-center gap-1">
+                      <span>{subject.domain === 'computer_science' ? '💻 코딩 문제 방법 선택 안내' : '📐 수학·통계 문제 방법 선택 안내'}</span>
+                    </div>
+                    <p className="text-[11.5px] leading-relaxed text-indigo-900">
+                      {subject.domain === 'computer_science'
+                        ? '선택한 자료구조·알고리즘의 선택 이유, 문제의 입력 크기와 제약조건(시간·공간 복잡도)과의 부합성, 대안적 접근법의 한계와 이 방식을 택한 이유를 서술해 주세요.'
+                        : '적용한 정리·공식의 선택 이유, 정리에 필요한 필수 전제조건(예: 가측성, 미분가능성, 양의 정부호 등), 다른 접근 방식보다 이 정리가 더 적절한 이유를 서술해 주세요.'}
+                    </p>
+                  </div>
+
+                  <textarea
+                    value={solvingReason}
+                    onChange={(e) => setSolvingReason(e.target.value)}
+                    placeholder={
+                      subject.domain === 'computer_science'
+                        ? '예: N<=10^5 제약으로 O(N^2) 완전탐색 대신 O(N log N) 우선순위 큐 다익스트라를 선택함. 음수 가중치가 없으므로 다익스트라 전제조건을 만족함.'
+                        : '예: 피적분함수가 비음수이므로 톤넬리 정리를 적용하여 반복적분의 순서를 자유롭게 변경할 수 있음. 푸비니 정리와 달리 절대적분가능성을 사전에 보일 필요가 없어 더 적합함.'
+                    }
+                    rows={4}
+                    className="w-full p-3 text-xs essay-answer border border-[#ded6c8] rounded-xs focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 resize-y bg-white"
+                  />
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Self-Reflection & Diagnostic Area (Always visible, pre-filled after evaluation) */}
@@ -709,9 +837,134 @@ export function ProblemSessionModal({
               {/* Comprehensive Feedback Prose */}
               <div className="p-3.5 bg-white border border-[#ded6c8] rounded-xs text-xs sm:text-sm korean-prose text-[#191817] leading-relaxed space-y-1">
                 <strong className="text-[#827d73] block font-academic-mono text-[11px] font-semibold">
-                  종합 학술 첨삭 총평:
+                  풀이 종합 학술 첨삭 총평:
                 </strong>
                 <p>{evaluationResult.feedback}</p>
+              </div>
+
+              {/* Stage 8: Method Selection Reason Diagnosis Zone (Independent from rubric score) */}
+              <div className="border border-indigo-200 bg-indigo-50/40 p-4 rounded-xs space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 border-b border-indigo-200/70 pb-2">
+                  <div className="flex items-center gap-2">
+                    <Compass className="w-4 h-4 text-indigo-700" />
+                    <span className="font-bold text-sm sm:text-base text-[#191817] font-academic-serif">
+                      방법 선택 이유 진단 (METHOD SELECTION DIAGNOSIS)
+                    </span>
+                    <span className="text-[10px] font-academic-mono bg-indigo-100 text-indigo-900 border border-indigo-300 px-1.5 py-0.5 rounded-2xs font-semibold">
+                      별도 독립 진단
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-academic-mono text-indigo-900 font-semibold">
+                    {evaluationResult.methodSelectionDiagnosis?.isApplicable ? '방법 평가 적용 문항' : '해당 없음 검토'}
+                  </span>
+                </div>
+
+                {/* Applicability Assessment Note */}
+                {evaluationResult.methodSelectionDiagnosis?.applicabilityAssessment && (
+                  <div className="p-2.5 bg-white/90 border border-indigo-200 rounded-xs text-xs text-indigo-950 flex items-start gap-2">
+                    <HelpCircle className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                    <div>
+                      <strong className="block font-bold text-[11px] font-academic-mono">AI 평가 판단:</strong>
+                      <p className="text-[11.5px] leading-relaxed">
+                        {evaluationResult.methodSelectionDiagnosis.applicabilityAssessment}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* 4 Criteria Diagnosis Cards */}
+                {evaluationResult.methodSelectionDiagnosis?.criteria && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+                    {evaluationResult.methodSelectionDiagnosis.criteria.map((crit) => {
+                      const ratingBadgeClass =
+                        crit.rating === 'proficient'
+                          ? 'bg-emerald-100 text-emerald-900 border-emerald-300'
+                          : crit.rating === 'partially_met'
+                          ? 'bg-amber-100 text-amber-900 border-amber-300'
+                          : crit.rating === 'needs_improvement'
+                          ? 'bg-rose-100 text-rose-900 border-rose-300'
+                          : 'bg-gray-100 text-gray-700 border-gray-300';
+
+                      return (
+                        <div
+                          key={crit.key}
+                          className="p-3 rounded-xs border border-indigo-200/80 bg-white space-y-2 shadow-2xs"
+                        >
+                          <div className="flex items-center justify-between gap-1 border-b border-gray-100 pb-1.5">
+                            <span className="font-bold text-[#191817] text-xs">
+                              {crit.label}
+                            </span>
+                            <span
+                              className={`text-[10.5px] font-academic-mono font-bold px-2 py-0.5 rounded-2xs border ${ratingBadgeClass}`}
+                            >
+                              {METHOD_REASON_RATING_LABELS[crit.rating] || crit.rating}
+                            </span>
+                          </div>
+
+                          {/* Student evidence quote */}
+                          <div className="text-[11px] text-[#57544e]">
+                            <strong className="text-[#827d73] font-academic-mono text-[10.5px]">확인된 근거: </strong>
+                            <span className="italic text-[#2e2c29]">&ldquo;{crit.evidence}&rdquo;</span>
+                          </div>
+
+                          {/* Feedback */}
+                          <div className="text-[11px] text-[#191817] bg-[#fbfbfe] p-1.5 rounded-2xs border border-indigo-100">
+                            <strong className="text-indigo-900 font-academic-mono text-[10.5px]">진단 내용: </strong>
+                            <span>{crit.feedback}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Diagnosis Summary */}
+                {evaluationResult.methodSelectionDiagnosis?.summary && (
+                  <div className="p-3 bg-white border border-indigo-200 rounded-xs text-xs text-[#191817] space-y-1">
+                    <strong className="font-academic-mono text-[11px] text-indigo-900 block">
+                      이유 진단 종합 총평:
+                    </strong>
+                    <p className="leading-relaxed">
+                      {evaluationResult.methodSelectionDiagnosis.summary}
+                    </p>
+                  </div>
+                )}
+
+                {/* Suggestions and Next Concepts */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                  {/* Suggested Improvements */}
+                  {evaluationResult.methodSelectionDiagnosis?.suggestedImprovements && (
+                    <div className="p-3 bg-white border border-indigo-200 rounded-xs space-y-1.5">
+                      <strong className="font-academic-mono text-[11px] text-[#191817] flex items-center gap-1">
+                        <span>✍️ 구체적인 보완 제안 문장</span>
+                      </strong>
+                      <ul className="list-disc list-inside space-y-1 text-[11.5px] text-[#2e2c29]">
+                        {evaluationResult.methodSelectionDiagnosis.suggestedImprovements.map((s, idx) => (
+                          <li key={idx} className="leading-relaxed">{s}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Next Concepts To Review */}
+                  {evaluationResult.methodSelectionDiagnosis?.nextConceptsToReview && (
+                    <div className="p-3 bg-white border border-indigo-200 rounded-xs space-y-1.5">
+                      <strong className="font-academic-mono text-[11px] text-[#191817] flex items-center gap-1">
+                        <span>📚 다음에 확인할 개념</span>
+                      </strong>
+                      <ul className="list-disc list-inside space-y-1 text-[11.5px] text-[#2e2c29]">
+                        {evaluationResult.methodSelectionDiagnosis.nextConceptsToReview.map((c, idx) => (
+                          <li key={idx} className="leading-relaxed">{c}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+
+                {/* Decoupling invariant notice */}
+                <div className="text-[10.5px] font-academic-mono text-[#827d73] bg-white/70 p-2 rounded-2xs border border-indigo-100">
+                  ※ 방법 선택 이유 진단은 학생의 메타인지 및 알고리즘/정리 선택 타당성을 진단하는 독립 평가 영역이며, 100점 만점 루브릭 점수에 가감되거나 중복 감점되지 않습니다.
+                </div>
               </div>
 
               {/* Action Buttons: Revise vs Confirm & Commit vs Report Error */}

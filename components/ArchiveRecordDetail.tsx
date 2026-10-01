@@ -6,24 +6,18 @@ import {
   Problem,
   ProblemReportType,
   ERROR_TYPE_LABELS,
+  METHOD_REASON_RATING_LABELS,
 } from '../lib/types';
-import { MathFormula } from './MathFormula';
 import { ProblemReportModal } from './ProblemReportModal';
 import {
   FileText,
   ExternalLink,
   AlertTriangle,
-  CheckCircle2,
-  HelpCircle,
   Eye,
-  EyeOff,
   ChevronDown,
   ChevronUp,
-  Sparkles,
-  BookOpen,
-  ShieldCheck,
   ShieldAlert,
-  RotateCcw,
+  Compass,
 } from 'lucide-react';
 
 interface ArchiveRecordDetailProps {
@@ -89,7 +83,7 @@ export function ArchiveRecordDetail({
   );
 
   return (
-    <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 sm:p-5 shadow-2xs space-y-3.5">
+    <div id="archive-record-detail" className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 sm:p-5 shadow-2xs space-y-3.5 scroll-mt-20">
       {/* Archive Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-[#f1ede4]">
         <div className="flex flex-wrap items-center gap-2">
@@ -367,12 +361,135 @@ export function ArchiveRecordDetail({
                 {/* User Answer Text */}
                 <div className="space-y-1">
                   <span className="font-academic-mono text-[11px] font-bold text-[#57544e] block">
-                    학생이 제출한 답안 전문:
+                    학생이 제출한 답안 전문 (풀이 및 결론):
                   </span>
                   <div className="p-3.5 bg-[#fcfbf9] border border-[#ded6c8] rounded-xs font-serif text-xs leading-relaxed text-[#191817] whitespace-pre-wrap selection:bg-amber-100">
                     {matchingAttempt.answer}
                   </div>
                 </div>
+
+                {/* Stage 8: User Method Selection Reason Text */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-academic-mono text-[11px] font-bold text-[#57544e] flex items-center gap-1">
+                      <Compass className="w-3.5 h-3.5 text-indigo-700" />
+                      <span>작성한 방법 선택 이유 (WHY THIS METHOD):</span>
+                    </span>
+                    {matchingAttempt.isReasonNotApplicable ? (
+                      <span className="text-[10px] font-mono bg-amber-100 text-amber-900 border border-amber-300 px-1.5 py-0.2 rounded-2xs font-semibold">
+                        방법 선택 해당 없음 지정
+                      </span>
+                    ) : matchingAttempt.solvingReason ? (
+                      <span className="text-[10px] font-mono bg-indigo-50 text-indigo-800 border border-indigo-200 px-1.5 py-0.2 rounded-2xs font-semibold">
+                        이유 서술 작성됨
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-mono bg-gray-100 text-gray-600 px-1.5 py-0.2 rounded-2xs">
+                        이유 진단 없음 (8단계 이전 기록)
+                      </span>
+                    )}
+                  </div>
+
+                  {matchingAttempt.isReasonNotApplicable ? (
+                    <div className="p-3 bg-amber-50/70 border border-amber-200 rounded-xs text-xs text-amber-950">
+                      <strong>해당 없음 사유: </strong>
+                      <span>{matchingAttempt.reasonNotApplicableJustification || '사유 서술 없음'}</span>
+                    </div>
+                  ) : matchingAttempt.solvingReason ? (
+                    <div className="p-3 bg-[#fbfbfe] border border-indigo-200/80 rounded-xs text-xs leading-relaxed text-[#191817] whitespace-pre-wrap">
+                      {matchingAttempt.solvingReason}
+                    </div>
+                  ) : (
+                    <div className="p-2.5 bg-[#faf8f4] border border-[#ded6c8] text-[11px] text-[#827d73] rounded-xs font-academic-mono">
+                      이유 진단 없음 (8단계 이전 풀이 기록 - 과거 점수 및 사건 안전하게 보존)
+                    </div>
+                  )}
+                </div>
+
+                {/* Stage 8: Method Selection Reason Diagnosis Display */}
+                {matchingAttempt.methodSelectionDiagnosis ? (
+                  <div className="border border-indigo-200 bg-indigo-50/40 p-3.5 rounded-xs space-y-3">
+                    <div className="flex items-center justify-between border-b border-indigo-200/80 pb-1.5">
+                      <div className="flex items-center gap-1.5 font-bold text-xs text-indigo-950 font-academic-serif">
+                        <Compass className="w-3.5 h-3.5 text-indigo-700" />
+                        <span>방법 선택 이유 진단 결과 (독립 평가)</span>
+                      </div>
+                      <span className="text-[10.5px] font-academic-mono text-indigo-900 font-semibold">
+                        {matchingAttempt.methodSelectionDiagnosis.isApplicable ? '방법 평가 적용 문항' : '해당 없음 검토'}
+                      </span>
+                    </div>
+
+                    {matchingAttempt.methodSelectionDiagnosis.applicabilityAssessment && (
+                      <div className="p-2 bg-white/90 border border-indigo-100 rounded-xs text-xs text-indigo-950">
+                        <strong className="text-[10.5px] font-mono text-indigo-800">AI 평가 판단: </strong>
+                        <span>{matchingAttempt.methodSelectionDiagnosis.applicabilityAssessment}</span>
+                      </div>
+                    )}
+
+                    {/* Criteria Cards */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                      {matchingAttempt.methodSelectionDiagnosis.criteria.map((crit) => {
+                        const badgeColor =
+                          crit.rating === 'proficient'
+                            ? 'bg-emerald-100 text-emerald-900 border-emerald-300'
+                            : crit.rating === 'partially_met'
+                            ? 'bg-amber-100 text-amber-900 border-amber-300'
+                            : crit.rating === 'needs_improvement'
+                            ? 'bg-rose-100 text-rose-900 border-rose-300'
+                            : 'bg-gray-100 text-gray-700 border-gray-300';
+
+                        return (
+                          <div key={crit.key} className="bg-white p-2.5 rounded-xs border border-indigo-100 space-y-1.5 shadow-2xs">
+                            <div className="flex items-center justify-between">
+                              <span className="font-bold text-[11px] text-[#191817]">{crit.label}</span>
+                              <span className={`text-[10px] font-mono font-bold px-1.5 py-0.2 rounded-2xs border ${badgeColor}`}>
+                                {METHOD_REASON_RATING_LABELS[crit.rating] || crit.rating}
+                              </span>
+                            </div>
+                            <div className="text-[10.5px] text-[#57544e]">
+                              <span className="font-mono text-[#827d73]">근거: </span>
+                              <span className="italic line-clamp-2">&ldquo;{crit.evidence}&rdquo;</span>
+                            </div>
+                            <p className="text-[11px] text-[#191817] bg-[#fbfbfe] p-1.5 rounded-2xs border border-indigo-50">
+                              {crit.feedback}
+                            </p>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {matchingAttempt.methodSelectionDiagnosis.summary && (
+                      <div className="p-2.5 bg-white border border-indigo-200/70 rounded-xs text-xs text-[#191817]">
+                        <strong className="block text-[11px] font-mono text-indigo-900 mb-0.5">이유 진단 종합 총평:</strong>
+                        <span>{matchingAttempt.methodSelectionDiagnosis.summary}</span>
+                      </div>
+                    )}
+
+                    {/* Improvements and Next Concepts */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                      {matchingAttempt.methodSelectionDiagnosis.suggestedImprovements?.length > 0 && (
+                        <div className="p-2.5 bg-white border border-indigo-100 rounded-xs space-y-1">
+                          <strong className="text-[10.5px] font-mono text-indigo-900 block">✍️ 보완 제안 문장:</strong>
+                          <ul className="list-disc list-inside space-y-0.5 text-[11px] text-[#2e2c29]">
+                            {matchingAttempt.methodSelectionDiagnosis.suggestedImprovements.map((s, idx) => (
+                              <li key={idx} className="leading-snug">{s}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {matchingAttempt.methodSelectionDiagnosis.nextConceptsToReview?.length > 0 && (
+                        <div className="p-2.5 bg-white border border-indigo-100 rounded-xs space-y-1">
+                          <strong className="text-[10.5px] font-mono text-indigo-900 block">📚 다음에 확인할 개념:</strong>
+                          <ul className="list-disc list-inside space-y-0.5 text-[11px] text-[#2e2c29]">
+                            {matchingAttempt.methodSelectionDiagnosis.nextConceptsToReview.map((c, idx) => (
+                              <li key={idx} className="leading-snug">{c}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : null}
 
                 {/* Model Answer Toggle if snapshot available */}
                 {matchingAttempt.modelAnswerSnapshot && (

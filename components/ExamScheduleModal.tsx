@@ -3,7 +3,7 @@
 import React, { useState } from 'react';
 import { Subject } from '../lib/types';
 import { toSeoulDateString, calculateDDay } from '../lib/dateUtils';
-import { X, Calendar, Clock, MapPin, Check } from 'lucide-react';
+import { X, Calendar, Check } from 'lucide-react';
 
 interface ExamScheduleModalProps {
   isOpen: boolean;

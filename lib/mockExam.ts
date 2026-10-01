@@ -1,22 +1,38 @@
 import { Concept, MockExamSession, Problem, ProblemType, Subject, isProblemAvailableForPractice } from './types';
 
 const STORAGE_KEY = 'redcall_mock_exam_sessions_v1';
+let inMemoryMockStore: MockExamSession[] = [];
 
 export function loadMockExams(): MockExamSession[] {
   try {
-    if (typeof window === 'undefined') return [];
-    const parsed: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-    return Array.isArray(parsed) ? parsed as MockExamSession[] : [];
-  } catch { return []; }
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const parsed: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+      return Array.isArray(parsed) ? (parsed as MockExamSession[]) : [];
+    }
+    return inMemoryMockStore;
+  } catch {
+    return inMemoryMockStore;
+  }
 }
 
 export function saveMockExam(session: MockExamSession): void {
   const existing = loadMockExams();
-  localStorage.setItem(STORAGE_KEY, JSON.stringify([session, ...existing.filter((item) => item.id !== session.id)]));
+  const updated = [session, ...existing.filter((item) => item.id !== session.id)];
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+    }
+  } catch {}
+  inMemoryMockStore = updated;
 }
 
 export function clearMockExams(): void {
-  if (typeof window !== 'undefined') localStorage.removeItem(STORAGE_KEY);
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+  } catch {}
+  inMemoryMockStore = [];
 }
 
 /** Deterministic selection favors distinct topics and formats, then weak concepts. */
@@ -24,12 +40,13 @@ export function selectMockExamProblems(
   subject: Subject, concepts: Concept[], problems: Problem[],
   conceptIds: string[], types: ProblemType[], count: number
 ): Problem[] {
-  const selected = new Set(conceptIds);
+  const subjectConceptIds = new Set(concepts.filter((c) => c.subjectId === subject.id).map((c) => c.id));
+  const selected = new Set(conceptIds.filter((id) => subjectConceptIds.has(id)));
   const allowedTypes = new Set(types);
   const scores = new Map(concepts.filter((c) => c.subjectId === subject.id).map((c) => [c.id, c.currentScore]));
   const pool = problems.filter((p) => p.subjectId === subject.id &&
     p.isApproved !== false && isProblemAvailableForPractice(p) &&
-    allowedTypes.has(p.type) && p.conceptIds.some((id) => selected.has(id)));
+    allowedTypes.has(p.type) && p.conceptIds.length > 0 && p.conceptIds.every((id) => selected.has(id)));
   const result: Problem[] = [];
   const covered = new Set<string>();
   const usedTypes = new Set<ProblemType>();
@@ -49,6 +66,20 @@ export function selectMockExamProblems(
     usedTypes.add(picked.type);
   }
   return result;
+}
+
+/** Deadline is authoritative even when the modal was closed or the tab was asleep. */
+export function expireMockExam(session: MockExamSession, now: number): MockExamSession {
+  const deadline = Date.parse(session.endsAt);
+  if (session.status !== 'in_progress' || (Number.isFinite(deadline) && now < deadline)) return session;
+  return { ...session, status: 'submitted', submittedAt: Number.isFinite(deadline)
+    ? new Date(deadline).toISOString() : new Date(now).toISOString() };
+}
+
+export function updateMockExamAnswer(session: MockExamSession, problemId: string, answer: string, now: number): MockExamSession {
+  const active = expireMockExam(session, now);
+  if (active.status !== 'in_progress' || !active.problems.some((p) => p.id === problemId)) return active;
+  return { ...active, answers: { ...active.answers, [problemId]: answer } };
 }
 
 export function getExamScore(session: MockExamSession): number | null {

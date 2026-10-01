@@ -1,12 +1,12 @@
 'use client';
 
-import React, { useMemo } from 'react';
-import { Concept, RetentionModelSettings, ReviewEvent } from '../lib/types';
+import React, { useCallback, useMemo } from 'react';
+import { Concept, RetentionModelSettings } from '../lib/types';
 import {
   generateConceptTrajectory,
   DEFAULT_RETENTION_SETTINGS,
 } from '../lib/retentionModel';
-import { Layers, Grid, AlertCircle, Info, Calendar, Sparkles } from 'lucide-react';
+import { Layers, Grid, AlertCircle } from 'lucide-react';
 import { formatSeoulDate } from '../lib/dateUtils';
 
 interface ForgettingCurveChartProps {
@@ -50,14 +50,18 @@ export function ForgettingCurveChart({
   const totalDays = Math.max(1, maxDay - minDay);
 
   // Coordinate conversion helpers
-  const dayToX = (day: number) => {
-    return padding.left + ((day - minDay) / totalDays) * plotWidth;
-  };
+  const dayToX = useCallback(
+    (day: number) => padding.left + ((day - minDay) / totalDays) * plotWidth,
+    [minDay, totalDays, plotWidth, padding.left]
+  );
 
-  const scoreToY = (score: number) => {
-    const clamped = Math.min(100, Math.max(0, score));
-    return padding.top + plotHeight - (clamped / 100) * plotHeight;
-  };
+  const scoreToY = useCallback(
+    (score: number) => {
+      const clamped = Math.min(100, Math.max(0, score));
+      return padding.top + plotHeight - (clamped / 100) * plotHeight;
+    },
+    [plotHeight, padding.top]
+  );
 
   // Comparison trajectories
   const comparedTrajectories = useMemo(() => {
@@ -77,7 +81,7 @@ export function ForgettingCurveChart({
       const y = scoreToY(pt.score);
       return idx === 0 ? `M ${x} ${y}` : `${acc} L ${x} ${y}`;
     }, '');
-  }, [trajectory.historyCurve, minDay, totalDays]);
+  }, [trajectory.historyCurve, dayToX, scoreToY]);
 
   const neglectedPathD = useMemo(() => {
     const pts = trajectory.neglectedProjection;
@@ -87,7 +91,7 @@ export function ForgettingCurveChart({
       const y = scoreToY(pt.score);
       return idx === 0 ? `M ${x} ${y}` : `${acc} L ${x} ${y}`;
     }, '');
-  }, [trajectory.neglectedProjection, minDay, totalDays]);
+  }, [trajectory.neglectedProjection, dayToX, scoreToY]);
 
   const reviewedPathD = useMemo(() => {
     const pts = trajectory.reviewedProjection;
@@ -97,7 +101,7 @@ export function ForgettingCurveChart({
       const y = scoreToY(pt.score);
       return idx === 0 ? `M ${x} ${y}` : `${acc} L ${x} ${y}`;
     }, '');
-  }, [trajectory.reviewedProjection, minDay, totalDays]);
+  }, [trajectory.reviewedProjection, dayToX, scoreToY]);
 
   const yTicks = [0, 20, 40, 60, 80, 100];
   const thresholdY = scoreToY(trajectory.criticalThreshold);
