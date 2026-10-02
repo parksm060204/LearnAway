@@ -31,6 +31,20 @@
 - `supabase/migrations/20260101000001_materials_storage.sql` — 비공개 버킷 + Storage 정책
 - `supabase/migrations/20260101000002_ids_and_pending_uploads.sql` — ID 정책(text + 사용자별 PK), pending 업로드 컬럼, `deleting` 상태
 - `supabase/migrations/20260101000003_version_and_job_paths.sql` — `version >= 0`, `pending_version > 0`, pending job 인덱스
+- `supabase/migrations/20260101000004_learning_content.sql` — 개념·개념 초안·문제·문제 초안·문제-개념 연결·불변 문제 버전 + RLS + 승인 RPC
+
+### 학습 콘텐츠(개념·문제) 저장
+- `concepts`, `concept_drafts`, `problems`, `problem_drafts`는 각 행에 인덱스용 키 컬럼과 함께
+  전체 애플리케이션 객체를 담는 `payload jsonb`를 저장합니다(루브릭·힌트·모범답안·전이 연결·출처 해시 보존).
+- `problem_concepts`는 `(problem_id, concept_id, subject_id, user_id)` 복합 외래키로
+  **같은 사용자·같은 과목의 개념만** 연결되도록 강제합니다.
+- `problem_versions`는 append-only(불변)이며 select/insert 정책만 있습니다.
+- 승인은 RPC `approve_concept_draft` / `approve_problem_draft`로 **단일 트랜잭션**에서 처리합니다:
+  사용자·상태·수정 버전(`content_version`) 검증, 루브릭 합계 100, 개념 범위, 중복 승인 방지
+  (`approved_*_id`). 클라이언트 검증만으로 승인 무결성을 확보하지 않습니다.
+- AI 분석/생성 결과는 `generation_job_id`로 식별되는 결정적 초안 ID로 서버에 저장됩니다.
+  저장만 실패하면 `POST /api/persist-drafts`로 **AI 재호출 없이** 다시 저장할 수 있습니다.
+- 답안·모의시험·복습 이력은 이번 단계에서도 로컬에 남습니다.
 
 ### 방법 A — Supabase CLI
 ```bash

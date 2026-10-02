@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { AI_CONFIG, isAiConfigured } from '@/lib/aiConfig';
+import { createClient } from '@/lib/supabase/server';
+import { upsertConceptDrafts } from '@/lib/cloud/learningRepository';
 import { ConceptDraft, ConceptEvidence } from '@/lib/types';
 import {
   computeMarkdownHash,
@@ -314,13 +316,41 @@ ${chunk.text}
       }
     }
 
+    // Persist drafts server-side so they survive refresh and appear on other
+    // devices. Deterministic ids + a generation job id make retries idempotent
+    // and let a persistence retry avoid re-calling the paid AI.
+    const generationJobId =
+      asString(payload.generationJobId) ||
+      `gen-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const draftsWithIds = deduplicatedDrafts.map((draft, index) => ({
+      ...draft,
+      id: `${generationJobId}-c${index + 1}`,
+    }));
+
+    let persisted = false;
+    let persistError: string | undefined;
+    try {
+      const supabase = await createClient();
+      const saved = await upsertConceptDrafts(supabase, draftsWithIds, generationJobId);
+      if (saved.ok) {
+        persisted = true;
+      } else {
+        persistError = saved.error;
+      }
+    } catch (e) {
+      persistError = e instanceof Error ? e.message : '초안 저장에 실패했습니다.';
+    }
+
     return NextResponse.json({
       success: true,
-      drafts: deduplicatedDrafts,
-      count: deduplicatedDrafts.length,
+      drafts: draftsWithIds,
+      count: draftsWithIds.length,
       markdownHash,
       model: AI_CONFIG.model,
       chunkCount: chunks.length,
+      generationJobId,
+      persisted,
+      persistError,
     });
   } catch (err) {
     console.error('AI Analysis Route Exception:', err);

@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { AI_CONFIG, isAiConfigured } from '@/lib/aiConfig';
+import { createClient } from '@/lib/supabase/server';
+import { upsertProblemDrafts } from '@/lib/cloud/learningRepository';
 import {
   ProblemDraft,
   ProblemType,
@@ -583,10 +585,38 @@ ${combinedSource}
         generatedDrafts.push(draft);
       }
 
+      // Persist drafts server-side (idempotent by generation job id) so they
+      // survive refresh and appear on other devices; retrying persistence does
+      // not re-call the paid AI.
+      const generationJobId =
+        asString(payload.generationJobId) ||
+        `gen-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      const draftsWithIds = generatedDrafts.map((draft, index) => ({
+        ...draft,
+        id: `${generationJobId}-p${index + 1}`,
+      }));
+
+      let persisted = false;
+      let persistError: string | undefined;
+      try {
+        const supabase = await createClient();
+        const saved = await upsertProblemDrafts(supabase, draftsWithIds, generationJobId);
+        if (saved.ok) {
+          persisted = true;
+        } else {
+          persistError = saved.error;
+        }
+      } catch (e) {
+        persistError = e instanceof Error ? e.message : '초안 저장에 실패했습니다.';
+      }
+
       return NextResponse.json({
         success: true,
-        drafts: generatedDrafts,
-        count: generatedDrafts.length,
+        drafts: draftsWithIds,
+        count: draftsWithIds.length,
+        generationJobId,
+        persisted,
+        persistError,
       });
     } catch (fetchErr) {
       clearTimeout(timeoutId);

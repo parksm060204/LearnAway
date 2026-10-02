@@ -19,6 +19,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/hash.ts', 'lib/cloud/mappers.ts', 'lib/cloud/plan.ts',
   'lib/cloud/subjectsRepository.ts', 'lib/cloud/materialsRepository.ts', 'lib/cloud/library.ts',
   'lib/cloud/migrationOriginals.ts', 'lib/cloud/localMigration.ts',
+  'lib/cloud/learningMappers.ts', 'lib/cloud/learningPlan.ts', 'lib/cloud/learningRepository.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -80,6 +81,9 @@ exports.requireApiUser = async () => {
   const cloudMaterials = load(path.join(output, 'lib/cloud/materialsRepository.js'));
   const cloudOriginals = load(path.join(output, 'lib/cloud/migrationOriginals.js'));
   const cloudMigration = load(path.join(output, 'lib/cloud/localMigration.js'));
+  const cloudLearningMappers = load(path.join(output, 'lib/cloud/learningMappers.js'));
+  const cloudLearningPlan = load(path.join(output, 'lib/cloud/learningPlan.js'));
+  const cloudLearningRepo = load(path.join(output, 'lib/cloud/learningRepository.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
@@ -360,6 +364,8 @@ exports.requireApiUser = async () => {
       materials: options.materials ? [...options.materials] : [],
       objects: new Map(options.objects ? Object.entries(options.objects) : []),
       fail: options.fail || {},
+      rpcCalls: [],
+      rpcResult: options.rpcResult,
     };
     const clone = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
     const nowIso = () => new Date().toISOString();
@@ -381,7 +387,7 @@ exports.requireApiUser = async () => {
       };
 
       async function exec(maybe) {
-        const rows = state[table];
+        const rows = (state[table] = state[table] || []);
         try {
           if (ctx.op === 'select') {
             let result = matchFilters(rows, ctx.filters);
@@ -400,18 +406,25 @@ exports.requireApiUser = async () => {
           if (ctx.op === 'upsert') {
             if (state.fail.upsert) return { data: null, error: { message: 'injected upsert failure' } };
             const keys = (ctx.onConflict || 'id').split(',').map((s) => s.trim());
-            const payload = { ...ctx.payload };
-            if (payload.user_id === undefined) payload.user_id = state.user ? state.user.id : null;
-            const idx = rows.findIndex((row) => keys.every((k) => row[k] === payload[k]));
-            let saved;
-            if (idx >= 0) {
-              saved = { ...rows[idx], ...payload, updated_at: nowIso() };
-              rows[idx] = saved;
-            } else {
-              saved = { created_at: nowIso(), updated_at: nowIso(), ...payload };
-              rows.push(saved);
+            const items = Array.isArray(ctx.payload) ? ctx.payload : [ctx.payload];
+            const savedItems = [];
+            for (const raw of items) {
+              const payload = { ...raw };
+              if (payload.user_id === undefined) payload.user_id = state.user ? state.user.id : null;
+              const idx = rows.findIndex((row) => keys.every((k) => row[k] === payload[k]));
+              let saved;
+              if (idx >= 0) {
+                saved = { ...rows[idx], ...payload, updated_at: nowIso() };
+                rows[idx] = saved;
+              } else {
+                saved = { created_at: nowIso(), updated_at: nowIso(), ...payload };
+                rows.push(saved);
+              }
+              savedItems.push(saved);
             }
-            return { data: clone(saved), error: null };
+            if (maybe === false) return { data: clone(savedItems[0] ?? null), error: null };
+            if (maybe === true) return { data: savedItems[0] ? clone(savedItems[0]) : null, error: null };
+            return { data: savedItems.map(clone), error: null };
           }
           if (ctx.op === 'update') {
             if (state.fail.update) return { data: null, error: { message: 'injected update failure' } };
@@ -498,6 +511,13 @@ exports.requireApiUser = async () => {
         },
       },
       from(table) { return tableBuilder(table); },
+      rpc(name, params) {
+        if (state.fail.rpc) {
+          return Promise.resolve({ data: null, error: { message: state.fail.rpcMessage || 'injected rpc failure' } });
+        }
+        state.rpcCalls.push({ name, params });
+        return Promise.resolve({ data: state.rpcResult ?? 'created-id', error: null });
+      },
       storage,
     };
   }
@@ -1326,6 +1346,92 @@ exports.requireApiUser = async () => {
       assert.ok(localStorage.getItem(markerKey) !== null, 'completion marker written on retry');
       assert.equal(client.__state.materials.length, 1, 'no duplicate material');
       assert.equal(client.__state.subjects.length, 1, 'no duplicate subject');
+    });
+  });
+
+  // ---- Learning content (concepts / problems / drafts / versions) ----
+  check('learning migration plan skips identical and conflicts on different content', () => {
+    const base = {
+      id: 'c1', subjectId: 's1', materialIds: ['m1'], title: 'A', chapterRef: '',
+      baseScore: 0, currentScore: 0, status: 'unstudied', order: 1, events: [], exerciseCount: 0,
+    };
+    // Scores / review events are NOT identity (review history stays local).
+    const sameDefinition = { ...base, currentScore: 88, events: [{ id: 'e1' }] };
+    const differentDefinition = { ...base, title: 'A changed' };
+
+    const skipPlan = cloudLearningPlan.planLearningMigration({
+      localConcepts: [sameDefinition, { ...base, id: 'c2' }],
+      localConceptDrafts: [], localProblems: [], localProblemDrafts: [],
+      cloudConcepts: [{ ...base }], cloudConceptDrafts: [], cloudProblems: [], cloudProblemDrafts: [],
+    });
+    assert.deepEqual(skipPlan.concepts.map((c) => c.id).sort(), ['c2']);
+    assert.equal(skipPlan.skipped, 1);
+    assert.equal(skipPlan.conflicts.length, 0);
+
+    const conflictPlan = cloudLearningPlan.planLearningMigration({
+      localConcepts: [differentDefinition],
+      localConceptDrafts: [], localProblems: [], localProblemDrafts: [],
+      cloudConcepts: [{ ...base }], cloudConceptDrafts: [], cloudProblems: [], cloudProblemDrafts: [],
+    });
+    assert.equal(conflictPlan.conflicts.length, 1);
+    assert.equal(conflictPlan.conflicts[0].id, 'c1');
+  });
+
+  check('learning mappers round-trip payload and overlay key columns', () => {
+    const concept = { id: 'c1', subjectId: 's1', title: 'A', status: 'unstudied', order: 1, currentScore: 2, events: [] };
+    const cUp = cloudLearningMappers.conceptToUpsert(concept);
+    assert.equal(cUp.id, 'c1');
+    assert.equal(cUp.subject_id, 's1');
+    const cBack = cloudLearningMappers.rowToConcept({ ...cUp, user_id: 'u1', created_at: '', updated_at: '' });
+    assert.equal(cBack.id, 'c1');
+    assert.equal(cBack.subjectId, 's1');
+    assert.equal(cBack.title, 'A');
+
+    const problem = {
+      id: 'p1', subjectId: 's1', conceptIds: ['c1'], title: 'P', type: 'essay_descriptive',
+      rubric: [], hints: [], modelAnswer: '', promptText: 'q', version: 2,
+      isApproved: true, isOutdated: false, qualityStatus: 'normal',
+    };
+    const pUp = cloudLearningMappers.problemToUpsert(problem);
+    const pBack = cloudLearningMappers.rowToProblem({ ...pUp, user_id: 'u1', created_at: '', updated_at: '' });
+    assert.equal(pBack.version, 2);
+    assert.equal(pBack.qualityStatus, 'normal');
+    assert.equal(pBack.isApproved, true);
+    assert.deepEqual(pBack.conceptIds, ['c1']);
+  });
+
+  await checkAsync('learning repository approves via RPC and maps error codes', async () => {
+    const draft = { id: 'd1', subjectId: 's1', title: 'A', type: 'essay_descriptive', status: 'draft', isApproved: false };
+    const concept = { id: 'c1', subjectId: 's1', title: 'A', status: 'unstudied', order: 1, events: [] };
+
+    await withFakeSupabase({ user: { id: 'u1' }, fail: { rpc: true, rpcMessage: 'DRAFT_STALE' } }, async (client) => {
+      const result = await cloudLearningRepo.approveConceptDraft(client, draft, concept, 't');
+      assert.equal(result.ok, false);
+      assert.match(result.error, /stale/);
+    });
+
+    await withFakeSupabase({ user: { id: 'u1' }, rpcResult: 'c1' }, async (client) => {
+      const result = await cloudLearningRepo.approveConceptDraft(client, draft, concept, null);
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      assert.equal(result.data.id, 'c1');
+      assert.ok(client.__state.rpcCalls.some((c) => c.name === 'approve_concept_draft'));
+    });
+  });
+
+  await checkAsync('learning repository upserts drafts idempotently by id', async () => {
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const draft = {
+        id: 'd1', subjectId: 's1', materialId: 'm1', materialTitle: 'M', title: 'A',
+        domain: 'math_stats', description: '', prerequisites: [], relatedConcepts: [],
+        commonMisconceptions: [], examples: [],
+        sourceEvidence: { type: 'page', quote: 'q', verified: true },
+        status: 'draft', isApproved: false, sourceMarkdownHash: 'h', createdAt: '', updatedAt: '',
+      };
+      const first = await cloudLearningRepo.upsertConceptDrafts(client, [draft], 'job-1');
+      assert.equal(first.ok, true, first.ok ? '' : first.error);
+      const second = await cloudLearningRepo.upsertConceptDrafts(client, [draft], 'job-1');
+      assert.equal(second.ok, true, second.ok ? '' : second.error);
+      assert.equal(client.__state.concept_drafts.length, 1, 'idempotent by draft id');
     });
   });
 

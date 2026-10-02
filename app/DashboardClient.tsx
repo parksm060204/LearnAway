@@ -127,6 +127,12 @@ import {
   hasServerCache,
   markServerCache,
 } from '../lib/cloud/migrationOriginals';
+import {
+  getLearningMigrationState,
+  migrateLocalLearningToCloud,
+  declineLearningMigration,
+  LearningMigrationState,
+} from '../lib/cloud/learningMigration';
 import { applyMaterialEditToProblems } from '../lib/problemFreshness';
 import { setStorageScope } from '../lib/storageScope';
 import {
@@ -242,6 +248,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [cloudReloadToken, setCloudReloadToken] = useState(0);
   const [cloudMigrationState, setCloudMigrationState] = useState<CloudMigrationState | null>(null);
   const [isMigratingCloud, setIsMigratingCloud] = useState(false);
+  const [learningMigrationState, setLearningMigrationState] = useState<LearningMigrationState | null>(null);
+  const [isMigratingLearning, setIsMigratingLearning] = useState(false);
   const [cloudOriginalPaths, setCloudOriginalPaths] = useState<Record<string, string>>({});
   // Ensures a single full-page handoff when the session changes (this tab or another).
   const authRedirectStarted = useRef(false);
@@ -317,6 +325,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             : result.data.subjects[0]?.id ?? ''
         );
         setCloudMigrationState(getCloudMigrationState(currentUser.id));
+        setLearningMigrationState(getLearningMigrationState(currentUser.id));
         setCloudStatus('ready');
       })
       .catch((error) => {
@@ -337,6 +346,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     setCloudError(null);
     setCloudReloadToken((token) => token + 1);
   };
+
+
 
   // Detect sign-out / account changes in other tabs and reset to the correct
   // user context. A full navigation discards in-memory state and in-flight
@@ -509,6 +520,27 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const handleDeclineCloudMigration = () => {
     declineCloudMigration(currentUser.id);
     setCloudMigrationState((prev) => (prev ? { ...prev, declined: true } : prev));
+  };
+
+  // Explicit, resumable migration of local concepts / drafts / problems / versions.
+  const handleMigrateLearning = async () => {
+    if (isMigratingLearning) return;
+    setIsMigratingLearning(true);
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const result = await migrateLocalLearningToCloud(currentUser.id, supabase);
+      showToast(result.message);
+      if (result.ok) {
+        setLearningMigrationState((prev) => (prev ? { ...prev, imported: true } : prev));
+      }
+    } finally {
+      setIsMigratingLearning(false);
+    }
+  };
+
+  const handleDeclineLearning = () => {
+    declineLearningMigration(currentUser.id);
+    setLearningMigrationState((prev) => (prev ? { ...prev, declined: true } : prev));
   };
 
   // Original files are private: open them through a short-lived signed URL.
@@ -935,6 +967,25 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       if (newDrafts.length === 0) {
         showToast('추출된 새로운 개념이 없습니다.');
         return;
+      }
+
+      if (data.persisted === false) {
+        // Retry saving the already-generated drafts WITHOUT re-calling the AI.
+        try {
+          const retry = await fetch('/api/persist-drafts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'concept', generationJobId: data.generationJobId, drafts: newDrafts }),
+          });
+          const retryData = await retry.json();
+          if (!retry.ok || !retryData.persisted) {
+            showToast(
+              `개념 초안을 서버에 저장하지 못했습니다. 로컬에 보관했으며 다시 시도할 수 있습니다. (${data.persistError || retryData.error || '오류'})`
+            );
+          }
+        } catch {
+          showToast('개념 초안 서버 저장 재시도에 실패했습니다. 로컬에 보관되어 있습니다.');
+        }
       }
 
       // Replace or prepend drafts for this material, preserving drafts for other materials
@@ -1802,6 +1853,40 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                   type="button"
                   onClick={handleDeclineCloudMigration}
                   disabled={isMigratingCloud}
+                  className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
+                >
+                  나중에
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+      {learningMigrationState &&
+        learningMigrationState.hasLocalData &&
+        !learningMigrationState.imported &&
+        !learningMigrationState.declined && (
+          <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
+            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+              <div className="text-xs text-[#57544e] leading-relaxed">
+                <span className="font-bold text-[#191817]">로컬 개념·문제·버전을 클라우드로 이전할 수 있습니다.</span>{' '}
+                이전하면 다른 기기에서도 승인한 개념과 문제를 이어서 사용할 수 있습니다. 로컬 원본은 그대로
+                보존되며, 같은 ID의 다른 내용은 자동으로 덮어쓰지 않습니다. (답안·복습 이력은 이번 단계에서
+                로컬에 남습니다.) 과목·자료 이전을 먼저 완료해야 합니다.
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleMigrateLearning}
+                  disabled={isMigratingLearning}
+                  className="text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {isMigratingLearning ? '이전 중...' : '학습 콘텐츠 이전'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeclineLearning}
+                  disabled={isMigratingLearning}
                   className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
                 >
                   나중에
