@@ -97,7 +97,7 @@ export async function POST(req: NextRequest) {
         {
           success: false,
           error:
-            'AI API 키가 설정되지 않았습니다. .env.local 파일에 DEEPSEEK_API_KEY 또는 OPENAI_API_KEY를 설정해 주세요.',
+            'AI API 키가 설정되지 않았습니다. .env.local 파일에 GEMINI_API_KEY 또는 AI_API_KEY를 설정해 주세요.',
         },
         { status: 400 }
       );

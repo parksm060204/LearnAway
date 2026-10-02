@@ -510,7 +510,7 @@ export default function RedcallDashboardPage() {
     }
 
     setIsAiAnalyzing(true);
-    showToast(`[${targetMaterial.title}] AI 개념 분석 시작... (OpenAI/DeepSeek API 호출 중)`);
+    showToast(`[${targetMaterial.title}] AI 개념 분석 시작... (Gemini API 호출 중)`);
 
     try {
       const res = await fetch('/api/analyze-concepts', {

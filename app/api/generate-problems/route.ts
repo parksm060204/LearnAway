@@ -146,7 +146,7 @@ export async function POST(req: NextRequest) {
         {
           success: false,
           error:
-            '서버 환경 변수에 유효한 AI API 키(AI_API_KEY 또는 OPENAI_API_KEY 또는 DEEPSEEK_API_KEY)가 설정되어 있지 않습니다. .env.local 설정을 확인해 주세요.',
+            '서버 환경 변수에 유효한 AI API 키(AI_API_KEY 또는 GEMINI_API_KEY 또는 OPENAI_API_KEY)가 설정되어 있지 않습니다. .env.local 설정을 확인해 주세요.',
           errorCode: 'API_KEY_MISSING',
         },
         { status: 400 }
