@@ -439,6 +439,9 @@ exports.requireApiUser = async () => {
       from() {
         return {
           async upload(path, blob, opts) {
+            if (state.fail.delayPath && state.fail.delayGate && path.includes(state.fail.delayPath)) {
+              await state.fail.delayGate;
+            }
             if (state.fail.upload) return { data: null, error: { message: 'injected upload failure' } };
             if (state.fail.uploadPath && path.includes(state.fail.uploadPath)) {
               return { data: null, error: { message: 'injected upload failure' } };
@@ -834,12 +837,15 @@ exports.requireApiUser = async () => {
     assert.deepEqual(mapped.chapters, ['1', '2']);
   });
 
-  check('material object paths are deterministic and owner/version scoped', () => {
-    const paths = cloudMappers.materialObjectPaths('u1', 'm1', 2, 'pdf');
-    assert.equal(paths.markdown, 'u1/m1/v2/markdown.md');
-    assert.equal(paths.original, 'u1/m1/v2/original.pdf');
-    assert.equal(paths.pages, 'u1/m1/v2/pages.json');
-    assert.equal(paths.transcript, 'u1/m1/v2/transcript.txt');
+  check('material object paths are job-scoped so different jobs never collide', () => {
+    const a = cloudMappers.materialObjectPaths('u1', 'm1', 'job-a', 'pdf');
+    const b = cloudMappers.materialObjectPaths('u1', 'm1', 'job-b', 'pdf');
+    assert.equal(a.markdown, 'u1/m1/job-a/markdown.md');
+    assert.equal(a.original, 'u1/m1/job-a/original.pdf');
+    assert.equal(a.pages, 'u1/m1/job-a/pages.json');
+    assert.equal(a.transcript, 'u1/m1/job-a/transcript.txt');
+    assert.notEqual(a.markdown, b.markdown, 'different jobs use different objects');
+    assert.notEqual(a.original, b.original);
   });
 
   check('migration plan skips identical, conflicts on different, retries failed uploads', () => {
@@ -940,7 +946,7 @@ exports.requireApiUser = async () => {
         original_path: 'u1/m-edit/v1/original.pdf', markdown_path: 'u1/m-edit/v1/markdown.md',
       })],
       objects: { 'u1/m-edit/v1/markdown.md': new Blob(['# v1']) },
-      fail: { uploadPath: 'v2/markdown.md' },
+      fail: { uploadPath: 'markdown.md' },
     }, async (client) => {
       const result = await cloudMaterials.writeMaterial({ material, content: { markdown: '# v2' } });
       assert.equal(result.ok, false);
@@ -1006,7 +1012,8 @@ exports.requireApiUser = async () => {
       assert.equal(result.ok, true, result.ok ? '' : result.error);
       const row = client.__state.materials[0];
       assert.equal(row.upload_state, 'ready');
-      assert.equal(row.pages_path, 'u1/m-pages/v1/pages.json');
+      assert.equal(row.version, 1, 'new material activates version 1 from version 0');
+      assert.ok(String(row.pages_path).startsWith('u1/m-pages/') && String(row.pages_path).endsWith('/pages.json'));
     });
   });
 
@@ -1062,24 +1069,102 @@ exports.requireApiUser = async () => {
     });
   });
 
-  await checkAsync('retry after a failed upload reuses the same pending version', async () => {
+  await checkAsync('retry of the same job reuses the same pending version and folder', async () => {
     const material = {
       id: 'm-retry', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
       isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
     };
+    const jobId = 'job-retry-1';
     await withFakeSupabase({
       user: { id: 'u1' },
-      fail: { uploadPath: 'v1/markdown.md' },
+      fail: { uploadPath: 'markdown.md' },
     }, async (client) => {
-      const first = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' } });
+      const first = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' }, jobId });
       assert.equal(first.ok, false);
       assert.equal(client.__state.materials[0].pending_version, 1);
 
       client.__state.fail.uploadPath = null;
-      const retry = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' } });
+      const retry = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' }, jobId });
       assert.equal(retry.ok, true, retry.ok ? '' : retry.error);
       assert.equal(client.__state.materials.length, 1, 'no duplicate material row');
       assert.equal(client.__state.materials[0].version, 1, 'same version reused');
+      assert.equal(client.__state.materials[0].upload_state, 'ready');
+      for (const path of client.__state.objects.keys()) {
+        assert.ok(path.startsWith(`u1/m-retry/${jobId}/`), `objects stay in the job folder: ${path}`);
+      }
+    });
+  });
+
+  await checkAsync('a delayed job cannot overwrite a newer job that already activated', async () => {
+    const baseMaterial = {
+      subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const jobA = 'job-A';
+    const jobB = 'job-B';
+    let releaseA;
+    const gate = new Promise((resolve) => { releaseA = resolve; });
+
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      materials: [readyMaterialRow({
+        id: 'm-conc', version: 1, content_hash: 'base',
+        original_path: 'u1/m-conc/base/original.pdf', markdown_path: 'u1/m-conc/base/markdown.md',
+      })],
+      objects: { 'u1/m-conc/base/markdown.md': new Blob(['# base']) },
+      fail: { delayPath: jobA, delayGate: gate },
+    }, async (client) => {
+      const aPromise = cloudMaterials.writeMaterial({
+        material: { ...baseMaterial, id: 'm-conc', parsedMarkdown: '# A' },
+        content: { markdown: '# A' },
+        jobId: jobA,
+      });
+      // A is paused during its upload. B claims and activates.
+      const b = await cloudMaterials.writeMaterial({
+        material: { ...baseMaterial, id: 'm-conc', parsedMarkdown: '# B' },
+        content: { markdown: '# B' },
+        jobId: jobB,
+      });
+      assert.equal(b.ok, true, b.ok ? '' : b.error);
+
+      releaseA();
+      const a = await aPromise;
+      assert.equal(a.ok, false, 'A must not activate after B');
+
+      const row = client.__state.materials[0];
+      assert.equal(row.version, 2, 'B active version');
+      assert.ok(String(row.markdown_path).includes(`/${jobB}/`), 'active body is B');
+      assert.equal(row.content_hash, cloudHash.materialContentHash({ markdown: '# B' }));
+      assert.equal(row.original_path, 'u1/m-conc/base/original.pdf', 'B original preserved');
+      assert.ok(client.__state.objects.has(`u1/m-conc/${jobB}/markdown.md`), 'B object intact');
+      assert.ok(
+        ![...client.__state.objects.keys()].some((p) => p.includes(`/${jobA}/`)),
+        'A objects cleaned up'
+      );
+    });
+  });
+
+  await checkAsync('a different job does not reuse another job pending state', async () => {
+    const material = {
+      id: 'm-claim', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# x',
+    };
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      fail: { uploadPath: 'markdown.md' },
+    }, async (client) => {
+      const a = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' }, jobId: 'job-A' });
+      assert.equal(a.ok, false);
+      assert.equal(client.__state.materials[0].pending_job_id, 'job-A');
+
+      client.__state.fail.uploadPath = null;
+      const b = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' }, jobId: 'job-B' });
+      assert.equal(b.ok, true, b.ok ? '' : b.error);
+      const row = client.__state.materials[0];
+      assert.equal(row.upload_state, 'ready');
+      assert.equal(row.pending_job_id, null, 'B did not keep A pending job');
+      assert.ok(String(row.markdown_path).includes('/job-B/'), 'B used its own folder');
+      assert.ok(![...client.__state.objects.keys()].some((p) => p.includes('/job-A/')), 'A objects cleaned');
     });
   });
 
@@ -1102,6 +1187,80 @@ exports.requireApiUser = async () => {
     assert.equal(loaded.ok, true);
     assert.equal(loaded.subjects.length, 1, 'original preserved in the origin area');
     assert.equal(loaded.source, 'origin');
+  });
+
+  await checkAsync('an empty first snapshot does not drop a later legacy import', async () => {
+    const userId = 'cloud-user-import';
+    for (const base of ['__subjects_v1', '__materials_v1', '__origin_snapshot_v1', '__origin_subjects_v1', '__origin_materials_v1', '__server_cache_v1', '__cloud_migration_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+    // First login with no local records: empty snapshot, then server cache.
+    const first = await cloudOriginals.ensureMigrationOriginals(userId);
+    assert.equal(first.ok, true, first.ok ? '' : first.error);
+    assert.equal(first.addedSubjects, 0);
+    cloudOriginals.markServerCache(userId);
+    assert.equal(cloudOriginals.hasServerCache(userId), true);
+
+    // A legacy import copies records into the live scope.
+    const imported = JSON.stringify([{ id: 'subj-imported', name: 'Imported', code: '', timezone: 'Asia/Seoul' }]);
+    localStorage.setItem('redcall_user_' + userId + '__subjects_v1', imported);
+
+    // The import handler merges into the originals BEFORE reloading/mirroring.
+    const merged = await cloudOriginals.ensureMigrationOriginals(userId);
+    assert.equal(merged.ok, true, merged.ok ? '' : merged.error);
+    assert.equal(merged.addedSubjects, 1, 'imported subject added to originals');
+
+    const originals = cloudOriginals.loadMigrationOriginals(userId);
+    assert.equal(originals.ok, true);
+    assert.ok(originals.subjects.some((s) => s.id === 'subj-imported'), 'imported subject kept as a migration target');
+  });
+
+  await checkAsync('a preservation failure aborts the cache overwrite', async () => {
+    const userId = 'cloud-user-preserve-fail';
+    for (const base of ['__origin_snapshot_v1', '__origin_subjects_v1', '__subjects_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+    localStorage.setItem('redcall_user_' + userId + '__subjects_v1', '{not valid json');
+    const result = await cloudOriginals.ensureMigrationOriginals(userId);
+    assert.equal(result.ok, false, 'caller must not mirror on preservation failure');
+  });
+
+  await checkAsync('an existing original wins over a conflicting imported record', async () => {
+    const userId = 'cloud-user-conflict-origin';
+    for (const base of ['__origin_snapshot_v1', '__origin_subjects_v1', '__subjects_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+    localStorage.setItem(
+      'redcall_user_' + userId + '__origin_subjects_v1',
+      JSON.stringify([{ id: 'subj-x', name: 'Original', code: '', timezone: 'Asia/Seoul' }])
+    );
+    localStorage.setItem(
+      'redcall_user_' + userId + '__subjects_v1',
+      JSON.stringify([{ id: 'subj-x', name: 'Imported', code: '', timezone: 'Asia/Seoul' }])
+    );
+    const result = await cloudOriginals.ensureMigrationOriginals(userId);
+    assert.equal(result.ok, true, result.ok ? '' : result.error);
+    assert.equal(result.conflicts, 1);
+    const originals = cloudOriginals.loadMigrationOriginals(userId);
+    const subject = originals.subjects.find((s) => s.id === 'subj-x');
+    assert.equal(subject.name, 'Original', 'existing original preserved');
+  });
+
+  await checkAsync('originals are scoped per account', async () => {
+    const userA = 'cloud-acct-a';
+    const userB = 'cloud-acct-b';
+    for (const base of ['__subjects_v1', '__origin_snapshot_v1', '__origin_subjects_v1']) {
+      localStorage.removeItem('redcall_user_' + userA + base);
+      localStorage.removeItem('redcall_user_' + userB + base);
+    }
+    localStorage.setItem('redcall_user_' + userA + '__subjects_v1', JSON.stringify([{ id: 'subj-a', name: 'A', code: '', timezone: 'Asia/Seoul' }]));
+    localStorage.setItem('redcall_user_' + userB + '__subjects_v1', JSON.stringify([{ id: 'subj-b', name: 'B', code: '', timezone: 'Asia/Seoul' }]));
+
+    await cloudOriginals.ensureMigrationOriginals(userA);
+    assert.equal(localStorage.getItem('redcall_user_' + userB + '__origin_subjects_v1'), null, 'B origin untouched');
+    const bLive = cloudOriginals.loadMigrationOriginals(userB);
+    assert.equal(bLive.ok, true);
+    assert.deepEqual(bLive.subjects.map((s) => s.id), ['subj-b']);
   });
 
   await checkAsync('same id with different body is a conflict and preserves originals', async () => {

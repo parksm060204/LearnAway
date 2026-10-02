@@ -330,7 +330,13 @@ export async function migrateLocalLibraryToCloud(userId: string): Promise<CloudM
   let materialsUploaded = 0;
   for (const material of plan.materials) {
     const content = local.contents.get(material.id) ?? { markdown: material.parsedMarkdown ?? '' };
-    const result = await writeMaterial({ material, content });
+    // Stable per-material job id so a resumed migration reuses the same upload
+    // job/version instead of creating duplicates.
+    const result = await writeMaterial({
+      material,
+      content,
+      jobId: `${job.jobId}:${material.id}`,
+    });
     if (!result.ok) {
       writeVerified(storage, userId, JOB_BASE, { ...job, updatedAt: new Date().toISOString() });
       return failure(`자료 저장 실패: ${result.error}`, resuming);

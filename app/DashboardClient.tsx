@@ -122,7 +122,11 @@ import {
   declineCloudMigration,
   CloudMigrationState,
 } from '../lib/cloud/localMigration';
-import { ensureMigrationOriginals } from '../lib/cloud/migrationOriginals';
+import {
+  ensureMigrationOriginals,
+  hasServerCache,
+  markServerCache,
+} from '../lib/cloud/migrationOriginals';
 import { applyMaterialEditToProblems } from '../lib/problemFreshness';
 import { setStorageScope } from '../lib/storageScope';
 import {
@@ -271,13 +275,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }
 
         // Preserve this account's pre-cloud local records (metadata + bodies)
-        // in a dedicated area BEFORE the cloud mirror can overwrite them.
-        const snapshot = await ensureMigrationOriginals(currentUser.id);
-        if (cancelled) return;
-        if (!snapshot.ok) {
-          setCloudStatus('error');
-          setCloudError(snapshot.error);
-          return;
+        // in a dedicated area BEFORE the first cloud mirror can overwrite them.
+        // Merges, never overwrites, so a later legacy import is also captured.
+        if (!hasServerCache(currentUser.id)) {
+          const merged = await ensureMigrationOriginals(currentUser.id);
+          if (cancelled) return;
+          if (!merged.ok) {
+            setCloudStatus('error');
+            setCloudError(merged.error ?? '로컬 원본을 보존하지 못해 클라우드 동기화를 중단했습니다.');
+            return;
+          }
         }
 
         // Mirror the server library into the local cache for offline reads.
@@ -297,6 +304,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           }
         }
         if (cancelled) return;
+        // Record that the live scope now holds the server cache, so a later
+        // load does not merge server records back into the migration originals.
+        markServerCache(currentUser.id);
 
         setSubjects(result.data.subjects);
         setMaterials(result.data.materials);
@@ -451,6 +461,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         return;
       }
       if (result.verified) {
+        // Preserve the freshly imported metadata + bodies into the migration
+        // originals BEFORE reloading (which triggers the cloud mirror). If this
+        // fails, do not reload and do not let the cache overwrite the import.
+        const preserved = await ensureMigrationOriginals(currentUser.id);
+        if (!preserved.ok) {
+          showToast(
+            `가져온 기록을 보존하지 못해 클라우드 동기화를 중단했습니다. (${preserved.error ?? '보존 실패'})`
+          );
+          return;
+        }
         // Reload so the freshly imported records populate the scoped state.
         window.location.reload();
         return;
@@ -846,7 +866,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   // Material Add Handler — uploads original + body to Storage and metadata to DB.
   // Returns true only after the server confirms, so the upload modal can keep
   // the form open on failure.
-  const handleAddMaterial = async (newMat: Material, originalFile?: File): Promise<boolean> => {
+  const handleAddMaterial = async (
+    newMat: Material,
+    originalFile?: File,
+    jobId?: string
+  ): Promise<boolean> => {
     const content = {
       markdown: newMat.parsedMarkdown ?? '',
       rawText: newMat.rawText,
@@ -858,6 +882,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       original: originalFile
         ? { blob: originalFile, contentType: originalFile.type || 'application/pdf' }
         : null,
+      jobId,
     });
     if (!result.ok) {
       showToast(`자료 서버 저장 실패: ${result.error}`);

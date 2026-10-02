@@ -23,7 +23,7 @@ interface MaterialUploadModalProps {
   subjects: Subject[];
   activeSubject: Subject;
   /** Resolves true only after the server confirmed the save. */
-  onAddMaterial: (material: Material, originalFile?: File) => Promise<boolean>;
+  onAddMaterial: (material: Material, originalFile?: File, jobId?: string) => Promise<boolean>;
   onOpenEditor?: (material: Material) => void;
 }
 
@@ -74,8 +74,10 @@ export function MaterialUploadModal({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // Stable id reused across retries so a failed attempt never creates a duplicate.
+  // Stable id/job reused across retries so a failed attempt never creates a
+  // duplicate row, version, or Storage folder.
   const materialIdRef = useRef<string | null>(null);
+  const jobIdRef = useRef<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -236,6 +238,9 @@ export function MaterialUploadModal({
     if (!materialIdRef.current) {
       materialIdRef.current = createMaterialId();
     }
+    if (!jobIdRef.current) {
+      jobIdRef.current = createMaterialId();
+    }
     const newMaterial: Material = {
       id: materialIdRef.current,
       subjectId: selectedSubjectId,
@@ -269,7 +274,8 @@ export function MaterialUploadModal({
       // 2. Persist metadata + original + body to the server and wait for it.
       const serverOk = await onAddMaterial(
         newMaterial,
-        kind === 'pdf' ? pdfFile ?? undefined : undefined
+        kind === 'pdf' ? pdfFile ?? undefined : undefined,
+        jobIdRef.current ?? undefined
       );
 
       if (!serverOk) {
@@ -287,8 +293,9 @@ export function MaterialUploadModal({
         );
       }
 
-      // Success: reset the id so the next upload is a new material.
+      // Success: reset the id/job so the next upload is a new material.
       materialIdRef.current = null;
+      jobIdRef.current = null;
       onClose();
 
       // 3. Option to immediately open editor

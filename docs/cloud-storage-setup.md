@@ -30,6 +30,7 @@
 - `supabase/migrations/20260101000000_subjects_materials.sql` — 테이블·제약·RLS·트리거
 - `supabase/migrations/20260101000001_materials_storage.sql` — 비공개 버킷 + Storage 정책
 - `supabase/migrations/20260101000002_ids_and_pending_uploads.sql` — ID 정책(text + 사용자별 PK), pending 업로드 컬럼, `deleting` 상태
+- `supabase/migrations/20260101000003_version_and_job_paths.sql` — `version >= 0`, `pending_version > 0`, pending job 인덱스
 
 ### 방법 A — Supabase CLI
 ```bash
@@ -38,13 +39,18 @@ supabase db push
 ```
 
 ### 방법 B — Dashboard SQL Editor
-두 파일의 내용을 순서대로 붙여 실행합니다.
+파일을 번호 순서대로 붙여 실행합니다.
 
 ### ID 정책
 - `subjects.id`, `materials.id`, `materials.subject_id`는 **text**입니다.
   - 기존 로컬 문자열 ID(`subj-…`, `mat-…`)를 그대로 보존해 개념·문제·답안 참조가 끊기지 않습니다.
   - 신규 생성은 앱에서 UUID(`crypto.randomUUID()`)로 만듭니다.
 - 기본 키는 `(id, user_id)`이므로 **서로 다른 계정이 같은 이전 ID를 가질 수 있습니다.**
+
+### 버전 정책
+- `version = 0`은 **활성 버전 없음**(신규 자료)을 의미합니다. 첫 업로드가 성공하면 `version = 1`이 됩니다.
+- `pending_version`은 진행 중 업로드의 버전이며 항상 `> 0`입니다(없으면 NULL).
+- 제약: `check (version >= 0)`, `check (pending_version is null or pending_version > 0)`.
 
 ### 제약 요약
 - `subjects.user_id` 기본값은 `auth.uid()`이며, 클라이언트는 `user_id`를 보내지 않습니다.
@@ -57,9 +63,11 @@ supabase db push
 ## 3. Storage 버킷
 
 - 버킷 이름: `materials` (private)
-- 경로 규칙: `<auth.uid()>/<material_id>/v<version>/<file>`
+- 경로 규칙: `<auth.uid()>/<material_id>/<job_id>/<file>` (업로드 작업별 고유 폴더)
   - `original.pdf` (또는 `original.txt`)
   - `transcript.txt`, `markdown.md`, `pages.json`
+- 서로 다른 작업은 같은 객체에 쓰지 않습니다. 활성 행은 승리한 작업의 경로를 가리키고,
+  실패/경합에서 진 작업은 **자기 작업 폴더의 객체만** 정리합니다(활성 객체·원본 PDF 제외).
 - Storage 정책: 첫 경로 세그먼트가 `auth.uid()`와 일치해야 읽기/쓰기/수정/삭제 가능.
 
 원본 보기/다운로드는 앱이 `createSignedUrl(path, 300)`로 만든 **5분 유효 signed URL**을
@@ -71,17 +79,19 @@ supabase db push
 
 파일 업로드와 DB 저장은 하나의 트랜잭션이 아니므로 다음 순서로 처리합니다.
 
-1. 메타데이터 행을 `upload_state='uploading'`으로 기록
-2. Storage에 본문(markdown/pages/transcript)과 원본 업로드
+1. 메타데이터 행을 `upload_state='uploading'`으로 기록 (신규는 `version = 0`)
+2. 작업 ID 폴더에 본문(markdown/pages/transcript)과 원본 업로드
 3. 업로드한 본문을 다시 내려받아 **콘텐츠 해시로 검증**
-4. 검증 성공 시 `upload_state='ready'`로 전환 (실패 시 `failed` + `upload_error`)
+4. 검증 성공 시 `version`/경로/해시를 활성으로 전환하고 `upload_state='ready'` (실패 시 pending만 `failed`)
 
 - **진행 중 업로드 분리**: 활성 버전과 진행 중 업로드를 `pending_*` 컬럼으로 분리합니다. 업로드가
   실패해도 활성 버전·본문·원본 PDF 경로는 그대로 유지됩니다.
-- **재시도/중복 방지**: 로컬 자료 ID를 그대로 사용하고 경로가 `<id>/v<version>`로 고정됩니다.
-  아직 `ready`가 아닌 pending 업로드는 같은 버전·작업 ID로 재개하며 새 버전을 만들지 않습니다.
-- **수정**: pending 버전에 업로드·본문 재조회·해시 검증을 마친 뒤 `pending_job_id` 조건으로 활성
-  버전을 전환합니다(늦게 도착한 이전 작업은 무시). 새 원본을 주지 않으면 기존 원본 경로를 유지합니다.
+- **작업 소유권**: 활성화는 `user_id`·자료 ID·`pending_job_id`·기준 `version`을 함께 검증합니다.
+  경합에서 진 작업은 명시적 충돌 결과를 반환하고 자기 작업 폴더만 정리합니다.
+- **재시도/중복 방지**: 같은 작업 ID로 재시도하면 같은 pending 버전·폴더를 재사용합니다. 다른 작업 ID는
+  이전 pending을 재사용하지 않고 자기 폴더에 씁니다.
+- **수정**: pending에 업로드·본문 재조회·해시 검증을 마친 뒤 활성 버전을 원자적으로 전환합니다. 새 원본을
+  주지 않으면 기존 원본 경로를 유지합니다.
 - **삭제**: Storage 목록 조회 실패는 삭제 실패로 처리하고 DB 행을 지우지 않습니다. 파일 삭제 후 DB
   삭제가 실패하면 `upload_state='deleting'`으로 남겨 재시도할 수 있게 합니다(정상 자료로 표시하지 않음).
 
@@ -90,8 +100,12 @@ supabase db push
 ## 5. 로컬 → 클라우드 이전
 
 - **서버 캐시와 이전 원본 분리**: 첫 클라우드 로드 전에 계정별 로컬 과목·자료(메타데이터 + IndexedDB
-  본문)를 `redcall_user_<id>__origin_*` 영역과 별도 IndexedDB 스코프에 스냅샷합니다. 이후 클라우드
+  본문)를 `redcall_user_<id>__origin_*` 영역과 별도 IndexedDB 스코프로 **병합 보존**합니다. 클라우드
   캐시가 일반 사용자 영역을 덮어써도 이전 원본은 보존됩니다.
+- **가져오기와 연결**: 기존 공용 기록 가져오기(레거시 import)가 성공하면, 클라우드 캐시를 갱신하기 전에
+  가져온 메타데이터·본문을 이전 원본에 병합·검증합니다. 보존에 실패하면 캐시 덮어쓰기를 중단합니다.
+- **병합 정책**: 같은 ID는 **이미 보존된 원본이 우선**하며(가져온 기록으로 덮어쓰지 않음) 충돌로 보고,
+  새 ID만 추가합니다. 빈 스냅샷 이후의 가져오기도 이전 대상으로 유지됩니다.
 - 대상: **현재 로그인 계정에 귀속된 로컬 과목·자료만**. 미귀속 공용 기록은 자동 업로드하지 않습니다.
 - 사용자가 대시보드에서 "클라우드로 이전"을 명시적으로 선택해야 시작합니다.
 - 작업 레코드(`redcall_user_<id>__cloud_migration_job_v1`)와 진행 상태를 기록하고,

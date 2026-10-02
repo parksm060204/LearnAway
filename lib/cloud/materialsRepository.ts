@@ -191,13 +191,18 @@ export interface MaterialWriteResult {
 /**
  * Creates or updates a material using the local id as the idempotency key.
  *
- * The active version and the in-progress upload are kept separate:
- *  1. write the new version's paths/hash into pending_* (active row untouched)
- *  2. upload original + bodies to deterministic versioned paths
- *  3. download bodies back and verify their content hash
- *  4. switch the active version, guarded by pending_job_id, then clear pending
- * A failure only marks the pending upload failed, so the active version, body
- * and original stay accessible. Retrying reuses the pending version/job.
+ * Ownership + versioning:
+ *  - Each call owns a unique job id; Storage paths include the job id, so two
+ *    jobs never write the same object.
+ *  - `pending_*` holds the in-progress upload; the active version is untouched
+ *    until the switch.
+ *  - A caller-provided job id is a retry of THAT job only. An unrelated pending
+ *    job is never adopted.
+ *  - The switch verifies user + material + job id + base version, so a late job
+ *    cannot overwrite a newer successful one. A losing/failed job cleans up only
+ *    its own objects (never the active ones).
+ *  - `version = 0` means "no active version yet"; the first successful upload
+ *    activates version 1.
  */
 export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResult<MaterialWriteResult>> {
   try {
@@ -217,13 +222,17 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
     const existing = (existingResult.data as MaterialRow | null) ?? null;
     const activeVersion = existing?.version ?? 0;
 
-    // Resume an in-progress/failed pending upload rather than adding a version.
-    const reusePending = Boolean(existing?.pending_version && existing.pending_version > activeVersion);
-    const version = reusePending ? (existing!.pending_version as number) : activeVersion + 1;
-    const jobId =
-      input.jobId ?? (reusePending ? existing!.pending_job_id ?? generateJobId() : generateJobId());
+    // A provided job id is only a retry when it matches the current pending job.
+    const sameJobRetry = Boolean(
+      input.jobId &&
+        existing?.pending_job_id === input.jobId &&
+        existing.pending_version &&
+        existing.pending_version > activeVersion
+    );
+    const jobId = input.jobId ?? generateJobId();
+    const version = sameJobRetry ? (existing!.pending_version as number) : activeVersion + 1;
 
-    const paths = materialObjectPaths(userId, material.id, version, kind);
+    const paths = materialObjectPaths(userId, material.id, jobId, kind);
     const contentHash = materialContentHash(content);
     const pagesProvided = content.pages !== undefined;
     // Never lose an existing original when no replacement file is provided.
@@ -266,14 +275,15 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
         .single();
       if (inserted.error) return repoError(inserted.error.message);
     } else {
-      // Only touch pending columns; the active version stays intact.
-      const updated = await supabase
+      // Claim the pending slot for this job. Last claim wins; the switch below
+      // decides the winner atomically.
+      const claimed = await supabase
         .from('materials')
         .update(pending)
         .eq('id', material.id)
         .select('*')
         .single();
-      if (updated.error) return repoError(updated.error.message);
+      if (claimed.error) return repoError(claimed.error.message);
     }
 
     const fail = async (message: string): Promise<RepoResult<MaterialWriteResult>> => {
@@ -285,11 +295,13 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
         patch.upload_state = 'failed';
         patch.upload_error = message;
       }
+      // Guarded by job id so a late failure cannot change another job's state.
       await supabase
         .from('materials')
         .update(patch)
         .eq('id', material.id)
         .eq('pending_job_id', jobId);
+      await cleanupJobObjects(supabase, userId, material.id, jobId);
       return repoError(message);
     };
 
@@ -333,8 +345,8 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
       return fail('저장된 본문이 원본과 일치하지 않습니다.');
     }
 
-    // Switch the active version, guarded by the job id so a late older attempt
-    // cannot overwrite a newer one.
+    // Activate only if this job still owns the pending slot AND the active
+    // version is still the base version this job started from.
     const switched = await supabase
       .from('materials')
       .update({
@@ -362,15 +374,34 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
       })
       .eq('id', material.id)
       .eq('pending_job_id', jobId)
+      .eq('version', activeVersion)
       .select('*')
       .single();
     if (switched.error) {
+      // Lost the race to another job: discard only this job's own objects.
+      await cleanupJobObjects(supabase, userId, material.id, jobId);
       return repoError('다른 작업이 먼저 완료되어 이번 업로드 결과를 반영하지 않았습니다. 다시 시도해 주세요.');
     }
 
     return repoOk({ row: switched.data as MaterialRow, version, jobId });
   } catch (error) {
     return repoError(toMessage(error, '자료를 저장하지 못했습니다.'));
+  }
+}
+
+/** Removes only the objects created by one upload job (never active objects). */
+async function cleanupJobObjects(
+  supabase: SupabaseClient,
+  userId: string,
+  materialId: string,
+  jobId: string
+): Promise<void> {
+  const listed = await listAllPaths(supabase, `${userId}/${materialId}/${jobId}`);
+  if (!listed.ok || listed.paths.length === 0) return;
+  try {
+    await supabase.storage.from(MATERIALS_BUCKET).remove(listed.paths);
+  } catch {
+    // best effort; the failed job's objects are not referenced by the active row
   }
 }
 

@@ -118,14 +118,20 @@ export function rowToMaterial(row: MaterialRow, content?: CloudMaterialContent):
   };
 }
 
-/** Deterministic Storage paths: <uid>/<materialId>/v<version>/<file>. */
+/**
+ * Job-scoped Storage paths: <uid>/<materialId>/<jobId>/<file>.
+ *
+ * Each upload job owns its own folder, so two concurrent jobs (or a late
+ * retry) can never write over each other's objects. The active row points at
+ * the winning job's paths; the DB stores the version number separately.
+ */
 export function materialObjectPaths(
   userId: string,
   materialId: string,
-  version: number,
+  jobId: string,
   kind: MaterialKind
 ) {
-  const base = `${userId}/${materialId}/v${version}`;
+  const base = `${userId}/${materialId}/${jobId}`;
   const originalExt = kind === 'pdf' ? 'pdf' : 'txt';
   return {
     base,
