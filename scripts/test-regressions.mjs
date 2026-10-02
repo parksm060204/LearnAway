@@ -1169,6 +1169,361 @@ async function run() {
     assert.equal(legacy.status, 'completed_unknown_owner');
   });
 
+  // ---- Stage 19: approval candidate isolation, evaluation signature criteria, core record verification, reservation UI outcome ----
+  check('일괄 승인 A 실패·B 성공 시 실제 저장 상태와 결과 일치', () => {
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-leak-A'), mkDraft('draft-leak-B')]);
+    const originalSet = localStorage.setItem;
+    const PROB_KEY = 'redcall_problems_v1';
+    localStorage.setItem = (key, value) => {
+      // Fail only when attempting to save draft-leak-A
+      if (key === PROB_KEY && String(value).includes('draft-leak-A')) {
+        throw new Error('storage failure for draft A');
+      }
+      return originalSet(key, value);
+    };
+
+    let batchResult;
+    try {
+      batchResult = storage.batchApproveProblemDrafts(['draft-leak-A', 'draft-leak-B']);
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+
+    assert.equal(batchResult.results.find((r) => r.draftId === 'draft-leak-A').status, 'failed');
+    assert.equal(batchResult.results.find((r) => r.draftId === 'draft-leak-B').status, 'approved');
+
+    // Crucial check: Draft A candidate must NOT be present in stored problems!
+    const storedProbs = storage.loadStoredProblems();
+    assert.equal(storedProbs.some((p) => p.draftId === 'draft-leak-A'), false, 'failed candidate A must not be saved');
+    assert.equal(storedProbs.some((p) => p.draftId === 'draft-leak-B'), true, 'successful candidate B must be saved');
+
+    // Draft statuses in storage
+    const drafts = storage.loadStoredProblemDrafts();
+    assert.equal(drafts.find((d) => d.id === 'draft-leak-A').isApproved, false, 'draft A remains unapproved');
+    assert.equal(drafts.find((d) => d.id === 'draft-leak-B').isApproved, true, 'draft B is approved');
+
+    // Retry approving A succeeds cleanly without duplicates or unexpected versions
+    const retryA = storage.approveProblemDraft('draft-leak-A');
+    assert.equal(retryA.success, true);
+    const probsAfterRetry = storage.loadStoredProblems();
+    assert.equal(probsAfterRetry.filter((p) => p.draftId === 'draft-leak-A').length, 1);
+    assert.equal(probsAfterRetry.find((p) => p.draftId === 'draft-leak-A').version, 1);
+  });
+
+  check('일괄 승인 A 성공·B 실패 및 초안 상태 저장 실패', () => {
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-succ-A'), mkDraft('draft-fail-B')]);
+    const originalSet = localStorage.setItem;
+    const PROB_KEY = 'redcall_problems_v1';
+    const DRAFT_KEY = 'redcall_problem_drafts_v1';
+
+    // 1) A succeeds, B fails
+    localStorage.setItem = (key, value) => {
+      if (key === PROB_KEY && String(value).includes('draft-fail-B')) {
+        throw new Error('storage failure for B');
+      }
+      return originalSet(key, value);
+    };
+    let batch1;
+    try {
+      batch1 = storage.batchApproveProblemDrafts(['draft-succ-A', 'draft-fail-B']);
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+    assert.equal(batch1.results.find((r) => r.draftId === 'draft-succ-A').status, 'approved');
+    assert.equal(batch1.results.find((r) => r.draftId === 'draft-fail-B').status, 'failed');
+    assert.equal(storage.loadStoredProblems().some((p) => p.draftId === 'draft-succ-A'), true);
+    assert.equal(storage.loadStoredProblems().some((p) => p.draftId === 'draft-fail-B'), false);
+
+    // 2) Draft state save failure during batch approval
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-draft-fail')]);
+    localStorage.setItem = (key, value) => {
+      if (key === DRAFT_KEY) throw new Error('draft storage down');
+      return originalSet(key, value);
+    };
+    let batch2;
+    try {
+      batch2 = storage.batchApproveProblemDrafts(['draft-draft-fail']);
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+    const itemRes = batch2.results.find((r) => r.draftId === 'draft-draft-fail');
+    assert.equal(itemRes.status, 'partial_draft_failed');
+    assert.equal(itemRes.problemPersisted, true);
+    assert.equal(itemRes.draftPersisted, false);
+    assert.equal(storage.loadStoredProblems().some((p) => p.draftId === 'draft-draft-fail'), true);
+    assert.equal(storage.loadStoredProblemDrafts().find((d) => d.id === 'draft-draft-fail').isApproved, false);
+
+    // Retry repairs draft without duplicate problem
+    const retry = storage.batchApproveProblemDrafts(['draft-draft-fail']);
+    assert.equal(retry.results[0].status, 'approved');
+    assert.equal(storage.loadStoredProblems().filter((p) => p.draftId === 'draft-draft-fail').length, 1);
+    assert.equal(storage.loadStoredProblemDrafts().find((d) => d.id === 'draft-draft-fail').isApproved, true);
+  });
+
+  check('유형·개념만 변경한 재승인의 버전 증가', () => {
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-type-concept', {
+      type: 'essay_descriptive',
+      conceptIds: ['c1'],
+    })]);
+
+    const first = storage.approveProblemDraft('draft-type-concept');
+    assert.equal(first.success, true);
+    assert.equal(first.approvedProblem.version, 1);
+    assert.equal(first.approvedProblem.type, 'essay_descriptive');
+    assert.deepEqual(first.approvedProblem.conceptIds, ['c1']);
+
+    // Change ONLY type and conceptIds (no promptText or title change)
+    storage.saveStoredProblemDrafts([mkDraft('draft-type-concept', {
+      type: 'proof_argument',
+      conceptIds: ['c1', 'c2'],
+      appliedConditionNote: 'updated condition',
+      updatedAt: 't2',
+    })]);
+
+    const second = storage.approveProblemDraft('draft-type-concept');
+    assert.equal(second.success, true);
+    assert.equal(second.approvedProblem.version, 2, 'version bumped when type and concepts changed');
+    assert.equal(second.approvedProblem.type, 'proof_argument');
+    assert.deepEqual(second.approvedProblem.conceptIds, ['c1', 'c2']);
+    assert.equal(second.approvedProblem.versionHistory.length, 1);
+    assert.equal(second.approvedProblem.versionHistory[0].version, 1);
+    assert.equal(second.approvedProblem.versionHistory[0].type, 'essay_descriptive');
+    assert.deepEqual(second.approvedProblem.versionHistory[0].conceptIds, ['c1']);
+
+    // Identical re-approval keeps version 2 without unnecessary bump
+    const third = storage.approveProblemDraft('draft-type-concept');
+    assert.equal(third.success, true);
+    assert.equal(third.approvedProblem.version, 2, 'identical re-approval preserves version');
+    assert.equal(third.approvedProblem.versionHistory.length, 1);
+  });
+
+  check('유형·개념·전이 연결 정보 저장 실패 감지', () => {
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-transfer-verify', {
+      type: 'essay_descriptive',
+      conceptIds: ['c1'],
+    })]);
+    const first = storage.approveProblemDraft('draft-transfer-verify');
+    assert.equal(first.success, true);
+    assert.equal(first.approvedProblem.version, 1);
+
+    // Update with type, concept, and transfer linkage changes
+    storage.saveStoredProblemDrafts([mkDraft('draft-transfer-verify', {
+      type: 'proof_argument',
+      conceptIds: ['c1', 'c2'],
+      isTransfer: true,
+      sourceProblemId: 'p-orig',
+      logicSessionId: 'ls-orig',
+      transferChanges: 'precondition changed',
+      understandingFocus: 'domain boundary',
+      transferKind: 'precondition_change',
+      originalCondition: 'cond1',
+      newCondition: 'cond2',
+      updatedAt: 't2',
+    })]);
+
+    const originalSet = localStorage.setItem;
+    const PROB_KEY = 'redcall_problems_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === PROB_KEY) throw new Error('problem storage down');
+      return originalSet(key, value);
+    };
+
+    let result;
+    try {
+      result = storage.approveProblemDraft('draft-transfer-verify');
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+
+    assert.equal(result.success, false, 'content mismatch detected on failed save');
+    assert.equal(result.status, 'failed');
+    assert.equal(result.approvedProblem, null, 'candidate problem must not be returned on failed save');
+    // Ensure storage was not corrupted and draft is not approved
+    const stored = storage.loadStoredProblems().find((p) => p.draftId === 'draft-transfer-verify');
+    assert.equal(stored.version, 1);
+    assert.equal(stored.type, 'essay_descriptive');
+    assert.deepEqual(stored.conceptIds, ['c1']);
+    assert.equal(stored.isTransfer, false);
+    assert.equal(stored.sourceProblemId, undefined);
+    assert.equal(storage.loadStoredProblemDrafts().find((d) => d.id === 'draft-transfer-verify').isApproved, false);
+  });
+
+  await checkAsync('이벤트 저장 실패 시 계획·예약 미완료 유지', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredAttempts([]);
+    storage.saveStoredStudyPlanItems([{
+      id: 'spi-core-fail', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'p-core',
+      kind: 'recommended_review', round: 1, assignedDate: '2026-10-01', estimatedMinutes: 15,
+      isEstimatedTime: false, priorityScore: 1, priorityReason: 'r', status: 'pending',
+      snapshotTitle: 't', snapshotDetail: 'd',
+    }]);
+    logicSession.saveRechallengeReservation({
+      id: 'rr-core-fail', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'p-core',
+      problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: 't', status: 'scheduled',
+    });
+
+    const originalSet = localStorage.setItem;
+    const CONCEPT_KEY = 'redcall_concepts_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === CONCEPT_KEY) throw new Error('concept review event storage down');
+      return originalSet(key, value);
+    };
+
+    const attempt = {
+      id: 'att-core-fail', problemId: 'p-core', conceptId: c.id, subjectId: c.subjectId,
+      at: '2026-10-01T08:00:00+09:00', answer: 'ans', confidence: 3, errorType: 'none',
+      hintCount: 0, reasoningNotes: '', calculatedScore: 85, rubricResults: [],
+      evaluatorFeedback: '', planItemId: 'spi-core-fail', rechallengeReservationId: 'rr-core-fail',
+    };
+
+    let result;
+    try {
+      result = storage.recordAttemptAndUpdateConcept(attempt, undefined, {
+        planItemId: 'spi-core-fail',
+        rechallengeReservationId: 'rr-core-fail',
+      });
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+
+    assert.equal(result.status, 'retryable_failure');
+    assert.equal(result.partial, true);
+    assert.equal(result.attemptPersisted, true, 'attempt persisted in storage');
+    assert.equal(result.eventPersisted, false, 'concept review event failed to persist');
+
+    // CRITICAL: plan item must NOT be completed!
+    const planItem = storage.loadStoredStudyPlanItems().find((i) => i.id === 'spi-core-fail');
+    assert.equal(planItem.status, 'pending', 'plan item must remain pending when event fails');
+    assert.equal(planItem.completedAttemptId, undefined);
+
+    // CRITICAL: reservation must NOT be completed!
+    const res = logicSession.getRechallengeReservation('rr-core-fail');
+    assert.equal(res.status, 'scheduled', 'reservation must remain scheduled when event fails');
+    assert.equal(res.completedAttemptId, undefined);
+  });
+
+  await checkAsync('재시도 후 핵심 기록과 연결이 한 번만 완성됨', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredAttempts([]);
+    storage.saveStoredStudyPlanItems([{
+      id: 'spi-retry-once', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'p-retry',
+      kind: 'recommended_review', round: 1, assignedDate: '2026-10-01', estimatedMinutes: 15,
+      isEstimatedTime: false, priorityScore: 1, priorityReason: 'r', status: 'pending',
+      snapshotTitle: 't', snapshotDetail: 'd',
+    }]);
+    logicSession.saveRechallengeReservation({
+      id: 'rr-retry-once', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'p-retry',
+      problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: 't', status: 'scheduled',
+    });
+
+    const attempt = {
+      id: 'att-retry-once', problemId: 'p-retry', conceptId: c.id, subjectId: c.subjectId,
+      at: '2026-10-01T08:00:00+09:00', answer: 'ans', confidence: 3, errorType: 'none',
+      hintCount: 0, reasoningNotes: '', calculatedScore: 90, rubricResults: [],
+      evaluatorFeedback: '', planItemId: 'spi-retry-once', rechallengeReservationId: 'rr-retry-once',
+    };
+
+    // First attempt fails at concept level
+    const originalSet = localStorage.setItem;
+    const CONCEPT_KEY = 'redcall_concepts_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === CONCEPT_KEY) throw new Error('temporary concept failure');
+      return originalSet(key, value);
+    };
+    try {
+      storage.recordAttemptAndUpdateConcept(attempt, undefined, {
+        planItemId: 'spi-retry-once',
+        rechallengeReservationId: 'rr-retry-once',
+      });
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+
+    // Now retry after failure is resolved
+    const retryResult = storage.recordAttemptAndUpdateConcept(attempt, undefined, {
+      planItemId: 'spi-retry-once',
+      rechallengeReservationId: 'rr-retry-once',
+    });
+    assert.equal(retryResult.status, 'complete');
+
+    // Run recovery to link core records and complete reservations
+    const recovery = storage.recoverMissingAttemptEvents();
+    assert.equal(recovery.unresolved.length, 0);
+
+    // Verify storage consistency: exactly 1 attempt, 1 event, 1 exerciseCount
+    const attempts = storage.loadStoredAttempts().filter((a) => a.id === 'att-retry-once');
+    assert.equal(attempts.length, 1, 'attempt not duplicated');
+
+    const updatedConcept = storage.loadStoredConcepts().find((x) => x.id === c.id);
+    const events = updatedConcept.events.filter((e) => e.attemptId === 'att-retry-once');
+    assert.equal(events.length, 1, 'review event not duplicated');
+    assert.equal(updatedConcept.exerciseCount, 1, 'exercise count incremented only once');
+
+    // Plan item and reservation completed
+    const planItem = storage.loadStoredStudyPlanItems().find((i) => i.id === 'spi-retry-once');
+    assert.equal(planItem.status, 'completed');
+    assert.equal(planItem.completedAttemptId, 'att-retry-once');
+
+    const reservation = logicSession.getRechallengeReservation('rr-retry-once');
+    assert.equal(reservation.status, 'completed');
+    assert.equal(reservation.completedAttemptId, 'att-retry-once');
+
+    // Idempotent recovery leaves no unresolved items
+    const secondRecovery = storage.recoverMissingAttemptEvents();
+    assert.equal(secondRecovery.unresolved.length, 0);
+  });
+
+  check('소유자 불명 예약에서 성공 알림이 나오지 않음', () => {
+    // 1) Test handleReservationCompletionOutcome logic for completed_unknown_owner
+    const unknownOwnerResult = logicSession.handleReservationCompletionOutcome({
+      status: 'completed_unknown_owner',
+      message: '완료 소유자 불명',
+    });
+    assert.equal(unknownOwnerResult.isSuccess, false, 'must not be marked success');
+    assert.equal(unknownOwnerResult.toastMessage, undefined, 'no success toast message');
+    assert.equal(unknownOwnerResult.partialOutcome?.status, 'link_conflict');
+    assert.equal(unknownOwnerResult.partialOutcome?.partial, true);
+    assert.equal(unknownOwnerResult.partialOutcome?.attemptPersisted, true);
+    assert.equal(unknownOwnerResult.partialOutcome?.eventPersisted, true);
+
+    // 2) Verify regular completed returns success
+    const completedResult = logicSession.handleReservationCompletionOutcome({
+      status: 'completed',
+    });
+    assert.equal(completedResult.isSuccess, true);
+    assert.ok(completedResult.toastMessage?.includes('재도전 완료'));
+
+    // 3) Verify already_completed returns success
+    const alreadyResult = logicSession.handleReservationCompletionOutcome({
+      status: 'already_completed',
+    });
+    assert.equal(alreadyResult.isSuccess, true);
+    assert.ok(alreadyResult.toastMessage?.includes('이미 완료'));
+
+    // 4) Verify completed_by_other returns link_conflict without success
+    const byOtherResult = logicSession.handleReservationCompletionOutcome({
+      status: 'completed_by_other',
+      message: '다른 풀이로 이미 완료됨',
+    });
+    assert.equal(byOtherResult.isSuccess, false);
+    assert.equal(byOtherResult.partialOutcome?.status, 'link_conflict');
+
+    // 5) Verify save_failed returns retryable_failure without success
+    const saveFailResult = logicSession.handleReservationCompletionOutcome({
+      status: 'save_failed',
+      message: '저장 실패',
+    });
+    assert.equal(saveFailResult.isSuccess, false);
+    assert.equal(saveFailResult.partialOutcome?.status, 'retryable_failure');
+  });
+
   console.log(`${passed} regression checks passed`);
 }
 

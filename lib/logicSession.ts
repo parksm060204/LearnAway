@@ -4,7 +4,7 @@
  * to the caller instead of being silently swallowed.
  */
 
-import { LogicStrengthenSession, RechallengeReservation } from './types';
+import { LogicStrengthenSession, RechallengeReservation, AttemptSaveStatus } from './types';
 
 const LOGIC_KEY = 'redcall_logic_sessions_v1';
 const RESERVATION_KEY = 'redcall_rechallenge_reservations_v1';
@@ -160,7 +160,7 @@ export function validateReservationForAttempt(
         return {
           ok: false,
           reason: 'completed_unknown_owner',
-          message: '완료된 예약이지만 연결된 풀이 기록을 확인할 수 없습니다.',
+          message: '완료된 예약이지만 연결된 풀이 기록을 확인할 수 없습니다. 풀이 기록은 보존되었으며 예약 충돌 해결이 필요합니다.',
         };
       }
       if (reservation.completedAttemptId !== attempt.attemptId) {
@@ -174,6 +174,88 @@ export function validateReservationForAttempt(
     return { ok: false, reason: 'already_completed', message: '이미 완료된 예약입니다.' };
   }
   return { ok: true };
+}
+
+/**
+ * Stage 19: Exhaustive handler for all reservation completion statuses.
+ * Guarantees compile-time safety so that newly added statuses cannot be
+ * accidentally treated as normal success.
+ *
+ * Normal success is restricted to 'completed' and 'already_completed'.
+ * 'completed_unknown_owner' is treated as link_conflict requiring verification.
+ */
+export function handleReservationCompletionOutcome(
+  completion: ReservationCompletionResult
+): {
+  isSuccess: boolean;
+  toastMessage?: string;
+  partialOutcome?: {
+    partial: true;
+    status: AttemptSaveStatus;
+    attemptPersisted: true;
+    eventPersisted: true;
+    message: string;
+  };
+} {
+  switch (completion.status) {
+    case 'completed':
+      return {
+        isSuccess: true,
+        toastMessage: '지연 재도전 완료! 독립 풀이로 기록되었습니다.',
+      };
+
+    case 'already_completed':
+      return {
+        isSuccess: true,
+        toastMessage: '이미 완료된 재도전 예약입니다. 풀이 기록은 저장되었습니다.',
+      };
+
+    case 'completed_unknown_owner':
+      return {
+        isSuccess: false,
+        partialOutcome: {
+          partial: true,
+          status: 'link_conflict',
+          attemptPersisted: true,
+          eventPersisted: true,
+          message:
+            completion.message ||
+            '완료된 예약이지만 연결된 풀이 기록을 확인할 수 없습니다. 풀이 기록은 안전하게 보존되었으며 예약 충돌 해결이 필요합니다.',
+        },
+      };
+
+    case 'completed_by_other':
+    case 'cancelled':
+    case 'mismatch':
+      return {
+        isSuccess: false,
+        partialOutcome: {
+          partial: true,
+          status: 'link_conflict',
+          attemptPersisted: true,
+          eventPersisted: true,
+          message: completion.message,
+        },
+      };
+
+    case 'save_failed':
+    case 'not_found':
+      return {
+        isSuccess: false,
+        partialOutcome: {
+          partial: true,
+          status: 'retryable_failure',
+          attemptPersisted: true,
+          eventPersisted: true,
+          message: completion.message,
+        },
+      };
+
+    default: {
+      const _exhaustiveCheck: never = completion.status;
+      throw new Error(`Unhandled reservation completion status: ${_exhaustiveCheck}`);
+    }
+  }
 }
 
 export function completeRechallengeReservation(

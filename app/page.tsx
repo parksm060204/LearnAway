@@ -77,6 +77,7 @@ import {
   completeRechallengeReservation,
   cancelRechallengeReservation,
   getRechallengeReservation,
+  handleReservationCompletionOutcome,
 } from '../lib/logicSession';
 import { LearningAnalyticsModal } from '../components/LearningAnalyticsModal';
 import { LogicStrengthenModal } from '../components/LogicStrengthenModal';
@@ -777,29 +778,14 @@ export default function RedcallDashboardPage() {
         problemVersion: attempt.problemVersion,
       });
       setRechallengeReservations(completion.reservations);
-      if (completion.status === 'save_failed' || completion.status === 'not_found') {
-        return {
-          partial: true,
-          status: 'retryable_failure',
-          attemptPersisted: true,
-          eventPersisted: true,
-          message: completion.message,
-        };
+
+      const reservationOutcome = handleReservationCompletionOutcome(completion);
+      if (!reservationOutcome.isSuccess && reservationOutcome.partialOutcome) {
+        return reservationOutcome.partialOutcome;
       }
-      if (completion.status === 'completed_by_other' || completion.status === 'cancelled' || completion.status === 'mismatch') {
-        return {
-          partial: true,
-          status: 'link_conflict',
-          attemptPersisted: true,
-          eventPersisted: true,
-          message: completion.message,
-        };
+      if (reservationOutcome.toastMessage) {
+        showToast(reservationOutcome.toastMessage);
       }
-      showToast(
-        completion.status === 'already_completed'
-          ? '이미 완료된 재도전 예약입니다. 풀이 기록은 저장되었습니다.'
-          : '지연 재도전 완료! 독립 풀이로 기록되었습니다.'
-      );
     } else if (result.status === 'already_completed') {
       showToast('이미 기록된 풀이입니다.');
     } else {

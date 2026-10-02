@@ -376,6 +376,9 @@ export interface ProblemVersionSnapshot {
   version: number;
   title: string;
   promptText: string;
+  type?: ProblemType;
+  conceptIds?: string[];
+  appliedConditionNote?: string;
   mathFormula?: string;
   codeSnippet?: string;
   timeStandardMinutes?: number;
@@ -385,6 +388,13 @@ export interface ProblemVersionSnapshot {
   editedAt: string;
   editReason?: string;
 }
+
+export type AttemptSaveStatus =
+  | 'complete'           // 저장 및 모든 링크 정상 반영
+  | 'retryable_failure'  // Attempt/ReviewEvent/Plan 반영 실패 -> 동일 payload 재시도 권장
+  | 'link_conflict'      // 계획이 이미 다른 Attempt로 완료됨 / 불일치 -> 사용자 확인 필요
+  | 'target_missing'     // 대상 계획을 찾을 수 없거나 건너뜀 -> 계획 없이 저장 가능
+  | 'already_completed'; // 동일 Attempt의 재시도 (이미 완료)
 
 export function isProblemAvailableForPractice(problem: Problem): boolean {
   const status = problem.qualityStatus || 'normal';

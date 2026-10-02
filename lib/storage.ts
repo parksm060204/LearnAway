@@ -19,7 +19,12 @@ import {
   PersonalizationSettings,
   PersonalizationCorrectionState,
   DEFAULT_PERSONALIZATION_SETTINGS,
+  AttemptSaveStatus,
+  ProblemType,
+  RubricCriterion,
 } from './types';
+
+export type { AttemptSaveStatus } from './types';
 import {
   INITIAL_SUBJECTS,
   INITIAL_MATERIALS,
@@ -480,6 +485,66 @@ export function deleteProblemDraft(draftId: string): ProblemDraft[] {
  * that every approval route preserves the SAME fields, including transfer linkage
  * (isTransfer / sourceProblemId / logicSessionId / structured condition change).
  */
+/**
+ * Canonical evaluation-affecting content representation shared between
+ * version bump detection in `buildProblemFromDraft` and persistence verification in `problemContentMatches`.
+ * Covers:
+ * - 문제 유형 (type)
+ * - 개념 범위 (conceptIds)
+ * - 제목 (title)
+ * - 지문 (promptText)
+ * - 적용 조건 (appliedConditionNote)
+ * - 수식 (mathFormula)
+ * - 코드 (codeSnippet)
+ * - 모범답안 (modelAnswer)
+ * - 힌트 (hints)
+ * - 루브릭 (rubric)
+ * - 기준 시간 (timeStandardMinutes)
+ * - 출제 의도 (designIntent)
+ */
+export function getProblemEvaluationSignature(p: {
+  type: ProblemType;
+  conceptIds: string[];
+  title: string;
+  promptText: string;
+  appliedConditionNote?: string;
+  mathFormula?: string;
+  codeSnippet?: string;
+  modelAnswer: string;
+  hints: string[];
+  rubric: RubricCriterion[];
+  timeStandardMinutes: number;
+  designIntent?: string;
+}): string {
+  const sortedConcepts = [...(p.conceptIds || [])].sort();
+  const normalizedRubric = (p.rubric || []).map((r) => ({
+    id: r.id,
+    label: r.label,
+    maxScore: r.maxScore,
+    weight: r.weight,
+    description: r.description,
+  }));
+  return JSON.stringify([
+    p.type,
+    sortedConcepts,
+    p.title,
+    p.promptText,
+    p.appliedConditionNote || '',
+    p.mathFormula || '',
+    p.codeSnippet || '',
+    p.modelAnswer,
+    p.hints || [],
+    normalizedRubric,
+    p.timeStandardMinutes,
+    p.designIntent || '',
+  ]);
+}
+
+/**
+ * Single conversion path from an approved draft to a stored Problem. Guarantees
+ * that every approval route preserves the SAME fields, including transfer linkage
+ * (isTransfer / sourceProblemId / logicSessionId / structured condition change).
+ */
 export function buildProblemFromDraft(
   draft: ProblemDraft,
   existing: Problem | undefined,
@@ -512,7 +577,7 @@ export function buildProblemFromDraft(
     sourceMarkdownHash: draft.sourceMarkdownHash,
     sourceMaterials: draft.sourceMaterials,
     // Transfer linkage (explicitly assigned so stale values never linger).
-    isTransfer: draft.isTransfer,
+    isTransfer: draft.isTransfer ? true : false,
     sourceProblemId: draft.sourceProblemId,
     logicSessionId: draft.logicSessionId,
     transferChanges: draft.transferChanges,
@@ -525,32 +590,8 @@ export function buildProblemFromDraft(
   if (existing) {
     // A re-approval that changes evaluation-affecting content is a NEW version
     // with an archived snapshot; an identical re-approval keeps the version.
-    const signature = (p: {
-      title: string;
-      promptText: string;
-      mathFormula?: string;
-      codeSnippet?: string;
-      hints: string[];
-      modelAnswer: string;
-      rubric: Problem['rubric'];
-      timeStandardMinutes: number;
-      appliedConditionNote?: string;
-      designIntent?: string;
-    }) =>
-      JSON.stringify([
-        p.title,
-        p.promptText,
-        p.mathFormula || '',
-        p.codeSnippet || '',
-        p.hints || [],
-        p.modelAnswer,
-        p.rubric || [],
-        p.timeStandardMinutes,
-        p.appliedConditionNote || '',
-        p.designIntent || '',
-      ]);
-
-    const contentChanged = signature(existing) !== signature(derived);
+    const contentChanged =
+      getProblemEvaluationSignature(existing) !== getProblemEvaluationSignature(derived);
 
     if (contentChanged) {
       const currentVersion = existing.version || 1;
@@ -558,6 +599,9 @@ export function buildProblemFromDraft(
         version: currentVersion,
         title: existing.title,
         promptText: existing.promptText,
+        type: existing.type,
+        conceptIds: [...(existing.conceptIds || [])],
+        appliedConditionNote: existing.appliedConditionNote,
         mathFormula: existing.mathFormula,
         codeSnippet: existing.codeSnippet,
         timeStandardMinutes: existing.timeStandardMinutes,
@@ -602,27 +646,42 @@ export function buildProblemFromDraft(
 }
 
 /**
- * Approves a draft, but only marks the draft approved AFTER verifying the Problem
- * actually persisted. A failed problem save returns success=false and leaves the
- * draft unapproved so it can be retried (idempotently, via the stable problem id).
- */
-/**
- * Compares the evaluation-affecting content and version of two problems so that
- * a failed save of a CHANGED re-approval is never mistaken for success just
- * because an older problem with the same id/draftId is still stored.
+ * Compares the evaluation-affecting content, transfer linkage, version and metadata
+ * of two problems so that a failed save of a CHANGED re-approval is never mistaken
+ * for success just because an older problem with the same id/draftId is still stored.
  */
 export function problemContentMatches(a: Problem, b: Problem): boolean {
-  return (
-    a.version === b.version &&
-    a.title === b.title &&
-    a.promptText === b.promptText &&
-    (a.mathFormula || '') === (b.mathFormula || '') &&
-    (a.codeSnippet || '') === (b.codeSnippet || '') &&
-    a.modelAnswer === b.modelAnswer &&
-    a.timeStandardMinutes === b.timeStandardMinutes &&
-    JSON.stringify(a.hints || []) === JSON.stringify(b.hints || []) &&
-    JSON.stringify(a.rubric || []) === JSON.stringify(b.rubric || [])
-  );
+  if (a.version !== b.version) return false;
+  if (getProblemEvaluationSignature(a) !== getProblemEvaluationSignature(b)) {
+    return false;
+  }
+  // Transition / transfer connection info verification
+  const isTransferA = Boolean(a.isTransfer);
+  const isTransferB = Boolean(b.isTransfer);
+  if (isTransferA !== isTransferB) return false;
+  if (isTransferA) {
+    if (
+      (a.sourceProblemId || '') !== (b.sourceProblemId || '') ||
+      (a.logicSessionId || '') !== (b.logicSessionId || '') ||
+      (a.transferChanges || '') !== (b.transferChanges || '') ||
+      (a.understandingFocus || '') !== (b.understandingFocus || '') ||
+      (a.transferKind || '') !== (b.transferKind || '') ||
+      (a.originalCondition || '') !== (b.originalCondition || '') ||
+      (a.newCondition || '') !== (b.newCondition || '')
+    ) {
+      return false;
+    }
+  }
+  // Required metadata verification
+  if (
+    a.subjectId !== b.subjectId ||
+    (a.difficulty || '') !== (b.difficulty || '') ||
+    (a.sourceRefs || '') !== (b.sourceRefs || '') ||
+    (a.draftId || '') !== (b.draftId || '')
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export type ApprovalStatus = 'complete' | 'failed' | 'partial_draft_failed';
@@ -675,8 +734,8 @@ export function approveProblemDraft(draftId: string): {
       status: 'failed',
       problemPersisted: false,
       draftPersisted: false,
-      updatedDrafts: drafts,
-      updatedProblems: problems,
+      updatedDrafts: loadStoredProblemDrafts(),
+      updatedProblems: loadStoredProblems(),
       approvedProblem: null,
       error: '문제 저장에 실패했습니다. 초안은 승인되지 않았으며 다시 시도할 수 있습니다.',
     };
@@ -701,8 +760,8 @@ export function approveProblemDraft(draftId: string): {
       status: 'partial_draft_failed',
       problemPersisted: true,
       draftPersisted: false,
-      updatedDrafts: drafts,
-      updatedProblems: nextProblems,
+      updatedDrafts: loadStoredProblemDrafts(),
+      updatedProblems: loadStoredProblems(),
       approvedProblem: persisted,
       error: '문제는 저장되었지만 초안 승인 상태 저장에 실패했습니다. 다시 시도하면 초안 상태만 복구됩니다.',
     };
@@ -713,8 +772,8 @@ export function approveProblemDraft(draftId: string): {
     status: 'complete',
     problemPersisted: true,
     draftPersisted: true,
-    updatedDrafts,
-    updatedProblems: nextProblems,
+    updatedDrafts: loadStoredProblemDrafts(),
+    updatedProblems: loadStoredProblems(),
     approvedProblem: persisted,
   };
 }
@@ -722,6 +781,8 @@ export function approveProblemDraft(draftId: string): {
 export interface BatchApproveItemResult {
   draftId: string;
   status: 'approved' | 'failed' | 'partial_draft_failed' | 'skipped';
+  problemPersisted?: boolean;
+  draftPersisted?: boolean;
   error?: string;
 }
 
@@ -731,64 +792,46 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
   approvedCount: number;
   results: BatchApproveItemResult[];
 } {
-  const drafts = loadStoredProblemDrafts();
-  let problems = loadStoredProblems();
-  const now = new Date().toISOString();
   const results: BatchApproveItemResult[] = [];
-  const problemPersistedIds = new Set<string>();
+  let approvedCount = 0;
 
   for (const draftId of draftIds) {
-    const draft = drafts.find((d) => d.id === draftId);
-    if (!draft) {
-      results.push({ draftId, status: 'skipped', error: '초안을 찾을 수 없습니다.' });
-      continue;
+    const res = approveProblemDraft(draftId);
+    if (res.status === 'complete') {
+      approvedCount += 1;
+      results.push({
+        draftId,
+        status: 'approved',
+        problemPersisted: res.problemPersisted,
+        draftPersisted: res.draftPersisted,
+      });
+    } else if (res.status === 'partial_draft_failed') {
+      results.push({
+        draftId,
+        status: 'partial_draft_failed',
+        problemPersisted: res.problemPersisted,
+        draftPersisted: res.draftPersisted,
+        error: res.error,
+      });
+    } else if (res.error === '초안을 찾을 수 없습니다.') {
+      results.push({ draftId, status: 'skipped', error: res.error });
+    } else {
+      results.push({
+        draftId,
+        status: 'failed',
+        problemPersisted: res.problemPersisted,
+        draftPersisted: res.draftPersisted,
+        error: res.error || '문제 저장에 실패했습니다.',
+      });
     }
-    const existingIndex = problems.findIndex((p) => p.draftId === draftId);
-    const existing = existingIndex >= 0 ? problems[existingIndex] : undefined;
-    const approvedProblem = buildProblemFromDraft(draft, existing, now);
-    problems = existingIndex >= 0
-      ? problems.map((p, i) => (i === existingIndex ? approvedProblem : p))
-      : [...problems, approvedProblem];
-
-    saveStoredProblems(problems);
-
-    // Verify content/version, not just id/draftId.
-    const persisted = loadStoredProblems().some(
-      (p) => p.id === approvedProblem.id && p.draftId === draftId && problemContentMatches(p, approvedProblem)
-    );
-    if (!persisted) {
-      results.push({ draftId, status: 'failed', error: '문제 저장에 실패했습니다.' });
-      continue;
-    }
-    problemPersistedIds.add(draftId);
-    results.push({ draftId, status: 'approved' });
   }
 
-  const updatedDrafts = drafts.map((d) =>
-    problemPersistedIds.has(d.id)
-      ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now }
-      : d
-  );
-  saveStoredProblemDrafts(updatedDrafts);
-
-  // Downgrade items whose draft approval did not actually persist.
-  const storedDrafts = loadStoredProblemDrafts();
-  let approvedCount = 0;
-  const finalResults = results.map((r) => {
-    if (r.status !== 'approved') return r;
-    const stored = storedDrafts.find((d) => d.id === r.draftId);
-    if (stored?.isApproved === true && stored?.updatedAt === now) {
-      approvedCount += 1;
-      return r;
-    }
-    return {
-      ...r,
-      status: 'partial_draft_failed' as const,
-      error: '문제는 저장되었지만 초안 승인 상태 저장에 실패했습니다.',
-    };
-  });
-
-  return { updatedDrafts, updatedProblems: problems, approvedCount, results: finalResults };
+  return {
+    updatedDrafts: loadStoredProblemDrafts(),
+    updatedProblems: loadStoredProblems(),
+    approvedCount,
+    results,
+  };
 }
 
 // Stage 6: Problem Quality, Reporting, Versioning & Review Operations
@@ -1277,17 +1320,11 @@ export interface PlanLinkageResult {
     | 'PLAN_ITEM_MISMATCH'
     | 'PLAN_ITEM_SKIPPED'
     | 'PLAN_ITEM_COMPLETED_BY_OTHER'
-    | 'NO_MATCHING_ITEM';
+    | 'NO_MATCHING_ITEM'
+    | 'CORE_RECORD_NOT_PERSISTED';
   /** 완료 충돌 시 기존 완료 기록의 Attempt ID */
   conflictWithAttemptId?: string;
 }
-
-export type AttemptSaveStatus =
-  | 'complete'           // 전체 완료
-  | 'retryable_failure'  // 저장 실패: 같은 Attempt로 재시도 가능
-  | 'link_conflict'      // 계획·예약 연결 충돌 (대상이 다른 기록으로 완료됨/불일치)
-  | 'target_missing'     // 대상 삭제·취소·없음
-  | 'already_completed'; // 동일 Attempt의 재시도 (이미 완료)
 
 export interface AttemptSaveResult {
   updatedConcepts: Concept[];
@@ -1338,16 +1375,102 @@ export function recordAttemptAndUpdateConcept(
 
   const alreadyEventStored = targetConcept.events.some((e) => e.attemptId === effectiveAttempt.id);
 
-  // Persist the Attempt if it is missing (idempotent).
+  // 1. Persist the Attempt if it is missing (idempotent).
   const newAttempts = alreadyAttemptStored ? currentAttempts : [effectiveAttempt, ...currentAttempts];
   if (!alreadyAttemptStored) {
     saveStoredAttempts(newAttempts);
   }
 
-  // Stage 9: link the StudyPlanItem for THIS review round only.
-  // The attempt round is derived from the concept's own review history so that a
-  // retry (event already stored) still resolves the correct round instead of
-  // skipping ahead to a future round.
+  // 2. Persist the Concept ReviewEvent.
+  const updatedConcepts = currentConcepts.map((c) => {
+    // Only update the primary concept connected to this attempt
+    if (c.id !== effectiveAttempt.conceptId || c.subjectId !== effectiveAttempt.subjectId) return c;
+    // Never append a duplicate event for the same Attempt.
+    if (alreadyEventStored) return c;
+
+    const newEvent: ReviewEvent = {
+      id: `ev-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+      conceptId: c.id,
+      at: effectiveAttempt.at,
+      dayOffset: 0, // Recorded today
+      kind: 'attempt',
+      title: `풀이 제출 (${effectiveAttempt.calculatedScore}점)`,
+      resultScore: effectiveAttempt.calculatedScore,
+      confidence: effectiveAttempt.confidence,
+      errorType: effectiveAttempt.errorType,
+      hintCount: effectiveAttempt.hintCount,
+      notes: effectiveAttempt.reasoningNotes,
+      sourceRef: c.chapterRef,
+      evaluationSummary: effectiveAttempt.evaluatorFeedback,
+      rubricScores: effectiveAttempt.rubricResults,
+      attemptId: effectiveAttempt.id,
+      strengths: effectiveAttempt.strengths,
+      criticalImprovements: effectiveAttempt.criticalImprovements,
+      needsReview: effectiveAttempt.needsReview,
+    };
+
+    const updatedEvents = [...c.events, newEvent];
+    const newCurrentScore = calculateCurrentConceptScore(updatedEvents, settings, new Date(effectiveAttempt.at));
+    const newStatus = getConceptStatusFromScore(newCurrentScore);
+
+    return {
+      ...c,
+      events: updatedEvents,
+      lastAttemptAt: effectiveAttempt.at,
+      lastAttemptDayOffset: 0,
+      firstLearnedAt: c.firstLearnedAt || effectiveAttempt.at,
+      firstLearnedDayOffset: c.firstLearnedDayOffset ?? 0,
+      isLearned: true,
+      baseScore: c.baseScore > 0 ? c.baseScore : effectiveAttempt.calculatedScore,
+      currentScore: newCurrentScore,
+      status: newStatus,
+      exerciseCount: c.exerciseCount + 1,
+      postponeDays: 0, // Reset postponement upon active confirmed review
+      postponedUntil: undefined,
+    };
+  });
+
+  saveStoredConcepts(updatedConcepts);
+
+  // 3. Verify core records (Attempt + ReviewEvent) persisted.
+  const attemptPersisted = loadStoredAttempts().some((a) => a.id === effectiveAttempt.id);
+  const eventPersisted =
+    loadStoredConcepts()
+      .find((c) => c.id === effectiveAttempt.conceptId && c.subjectId === effectiveAttempt.subjectId)
+      ?.events.some((e) => e.attemptId === effectiveAttempt.id) === true;
+
+  // 4. CRITICAL INVARIANT: If core records failed to persist, DO NOT complete any plan items or reservations!
+  if (!attemptPersisted || !eventPersisted) {
+    const currentPlanItems = loadStoredStudyPlanItems();
+    const conflictItems = currentPlanItems.filter(
+      (i) => i.status === 'completed' && i.completedAttemptId === effectiveAttempt.id
+    );
+    if (conflictItems.length > 0) {
+      const sanitized = currentPlanItems.map((i) =>
+        i.status === 'completed' && i.completedAttemptId === effectiveAttempt.id
+          ? { ...i, status: 'pending' as const, completedAt: undefined, completedAttemptId: undefined }
+          : i
+      );
+      saveStoredStudyPlanItems(sanitized);
+    }
+    return {
+      updatedConcepts: loadStoredConcepts(),
+      updatedAttempts: loadStoredAttempts(),
+      partial: true,
+      status: 'retryable_failure',
+      attemptPersisted,
+      eventPersisted,
+      message: '풀이 기록 저장이 일부만 완료되었습니다. 같은 기록으로 다시 시도하면 누락분이 복구됩니다.',
+      planLinkage: {
+        attempted: Boolean(linkage?.planItemId),
+        linkedItemId: null,
+        persisted: false,
+        skippedReason: 'CORE_RECORD_NOT_PERSISTED',
+      },
+    };
+  }
+
+  // 5. Core records verified. Now proceed to link the StudyPlanItem for THIS review round only.
   const conceptRounds = targetConcept.events
     .filter((e) => e.kind === 'attempt' || e.kind === 'review')
     .slice()
@@ -1441,71 +1564,11 @@ export function recordAttemptAndUpdateConcept(
       persistedItem?.completedAttemptId === effectiveAttempt.id;
   }
 
-  const updatedConcepts = currentConcepts.map((c) => {
-    // Only update the primary concept connected to this attempt
-    if (c.id !== effectiveAttempt.conceptId || c.subjectId !== effectiveAttempt.subjectId) return c;
-    // Never append a duplicate event for the same Attempt.
-    if (alreadyEventStored) return c;
-
-    const newEvent: ReviewEvent = {
-      id: `ev-${Date.now()}-${Math.random().toString(36).substring(7)}`,
-      conceptId: c.id,
-      at: effectiveAttempt.at,
-      dayOffset: 0, // Recorded today
-      kind: 'attempt',
-      title: `풀이 제출 (${effectiveAttempt.calculatedScore}점)`,
-      resultScore: effectiveAttempt.calculatedScore,
-      confidence: effectiveAttempt.confidence,
-      errorType: effectiveAttempt.errorType,
-      hintCount: effectiveAttempt.hintCount,
-      notes: effectiveAttempt.reasoningNotes,
-      sourceRef: c.chapterRef,
-      evaluationSummary: effectiveAttempt.evaluatorFeedback,
-      rubricScores: effectiveAttempt.rubricResults,
-      attemptId: effectiveAttempt.id,
-      strengths: effectiveAttempt.strengths,
-      criticalImprovements: effectiveAttempt.criticalImprovements,
-      needsReview: effectiveAttempt.needsReview,
-    };
-
-    const updatedEvents = [...c.events, newEvent];
-    const newCurrentScore = calculateCurrentConceptScore(updatedEvents, settings, new Date(effectiveAttempt.at));
-    const newStatus = getConceptStatusFromScore(newCurrentScore);
-
-    return {
-      ...c,
-      events: updatedEvents,
-      lastAttemptAt: effectiveAttempt.at,
-      lastAttemptDayOffset: 0,
-      firstLearnedAt: c.firstLearnedAt || effectiveAttempt.at,
-      firstLearnedDayOffset: c.firstLearnedDayOffset ?? 0,
-      isLearned: true,
-      baseScore: c.baseScore > 0 ? c.baseScore : effectiveAttempt.calculatedScore,
-      currentScore: newCurrentScore,
-      status: newStatus,
-      exerciseCount: c.exerciseCount + 1,
-      postponeDays: 0, // Reset postponement upon active confirmed review
-      postponedUntil: undefined,
-    };
-  });
-
-  saveStoredConcepts(updatedConcepts);
-
-  // Read-back verification: report partial persistence instead of a false success.
-  const attemptPersisted = loadStoredAttempts().some((a) => a.id === effectiveAttempt.id);
-  const eventPersisted =
-    loadStoredConcepts()
-      .find((c) => c.id === effectiveAttempt.conceptId && c.subjectId === effectiveAttempt.subjectId)
-      ?.events.some((e) => e.attemptId === effectiveAttempt.id) === true;
-
   // Classify the outcome so callers can react precisely (retry vs resolve vs keep).
   let status: AttemptSaveStatus;
   let message: string | undefined;
 
-  if (!attemptPersisted || !eventPersisted) {
-    status = 'retryable_failure';
-    message = '풀이 기록 저장이 일부만 완료되었습니다. 같은 기록으로 다시 시도하면 누락분이 복구됩니다.';
-  } else if (planLinkage.skippedReason === 'PLAN_ITEM_COMPLETED_BY_OTHER') {
+  if (planLinkage.skippedReason === 'PLAN_ITEM_COMPLETED_BY_OTHER') {
     status = 'link_conflict';
     message = '이 계획은 이미 다른 풀이 기록으로 완료되었습니다. 기존 완료 기록을 유지하고 이 풀이는 계획 연결 없이 보존할 수 있습니다.';
   } else if (planLinkage.skippedReason === 'PLAN_ITEM_MISMATCH') {
@@ -1637,9 +1700,20 @@ export function recoverMissingAttemptEvents(
   const concepts = loadStoredConcepts();
   const attempts = loadStoredAttempts();
   const conceptById = new Map(concepts.map((c) => [c.id, c]));
+  const currentPlanItems = loadStoredStudyPlanItems();
+  const attemptIds = new Set(attempts.map((a) => a.id));
 
   let recoveredCount = 0;
   const unresolved: { attemptId: string; reason: string }[] = [];
+
+  // Identify completed plan items whose connecting attempt record is completely missing
+  for (const item of currentPlanItems) {
+    if (item.status === 'completed' && item.completedAttemptId) {
+      if (!attemptIds.has(item.completedAttemptId)) {
+        unresolved.push({ attemptId: item.completedAttemptId, reason: 'PLAN_COMPLETED_EVENT_MISSING' });
+      }
+    }
+  }
 
   for (const attempt of attempts) {
     const concept = conceptById.get(attempt.conceptId);
@@ -1649,11 +1723,11 @@ export function recoverMissingAttemptEvents(
       // Assisted revisions must NEVER be recovered as independent attempts:
       // that would create an `attempt` event and inflate the review count.
       if (attempt.attemptOrigin === 'assisted_revision') {
-        const hadAssisted = concept.events.some((e) => e.attemptId === attempt.id);
+        const hadAssisted = concept.events.some((e: ReviewEvent) => e.attemptId === attempt.id);
         recordAssistedRevisionAttempt(attempt);
         const assistedNow = loadStoredConcepts()
           .find((c) => c.id === attempt.conceptId)
-          ?.events.some((e) => e.attemptId === attempt.id) === true;
+          ?.events.some((e: ReviewEvent) => e.attemptId === attempt.id) === true;
         if (!assistedNow) {
           unresolved.push({ attemptId: attempt.id, reason: 'EVENT_NOT_PERSISTED' });
         } else if (!hadAssisted) {
@@ -1663,9 +1737,16 @@ export function recoverMissingAttemptEvents(
       }
 
       // Independent / rechallenge attempts.
-      const hadEvent = concept.events.some((e) => e.attemptId === attempt.id);
+      const hadEvent = concept.events.some((e: ReviewEvent) => e.attemptId === attempt.id);
+      const matchingPlanItem = currentPlanItems.find(
+        (i) => (attempt.planItemId && i.id === attempt.planItemId) || i.completedAttemptId === attempt.id
+      );
+      const planItemId = attempt.planItemId || matchingPlanItem?.id;
+      const hadPlanCompleted =
+        matchingPlanItem?.status === 'completed' && matchingPlanItem.completedAttemptId === attempt.id;
+
       const result = recordAttemptAndUpdateConcept(attempt, settings, {
-        planItemId: attempt.planItemId,
+        planItemId,
       });
 
       // Verify each dimension independently. The core record (Attempt + event)
@@ -1673,7 +1754,7 @@ export function recoverMissingAttemptEvents(
       const corePersisted = result.attemptPersisted && result.eventPersisted;
       const repairedEvent = !hadEvent && result.eventPersisted;
       const planOk =
-        !attempt.planItemId ||
+        !planItemId ||
         (result.planLinkage.linkedItemId !== null && result.planLinkage.persisted);
 
       if (!result.attemptPersisted) unresolved.push({ attemptId: attempt.id, reason: 'ATTEMPT_NOT_PERSISTED' });
@@ -1705,7 +1786,7 @@ export function recoverMissingAttemptEvents(
 
       // Count as recovered ONLY when the core record is persisted AND something
       // was actually repaired (a plan-only success with a failed event is not).
-      if (corePersisted && (repairedEvent || (attempt.planItemId && planOk) || reservationCompleted)) {
+      if (corePersisted && (repairedEvent || (planItemId && planOk && !hadPlanCompleted) || reservationCompleted)) {
         recoveredCount += 1;
       }
     } catch (cause) {
