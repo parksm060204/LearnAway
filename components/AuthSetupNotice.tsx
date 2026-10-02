@@ -1,4 +1,5 @@
 import { AppReadySignal } from './AppReadySignal';
+import { RetryReloadButton } from './RetryReloadButton';
 
 interface AuthSetupNoticeProps {
   message: string;
@@ -32,6 +33,10 @@ export function AuthSetupNotice({ message, variant = 'setup' }: AuthSetupNoticeP
         <p className="text-[11px] text-[#827d73]">
           Google 공급자 활성화와 콜백 주소 등 외부 설정은 <code>docs/auth-setup.md</code>를 참고하세요.
         </p>
+
+        <div className="pt-1">
+          <RetryReloadButton />
+        </div>
       </div>
     </div>
   );
