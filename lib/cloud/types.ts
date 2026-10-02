@@ -24,7 +24,7 @@ export interface SubjectRow {
 /** Payloads omit user_id: the DB default (auth.uid()) and RLS own it. */
 export type SubjectUpsert = Omit<SubjectRow, 'user_id' | 'created_at' | 'updated_at'>;
 
-export type MaterialUploadState = 'uploading' | 'ready' | 'failed';
+export type MaterialUploadState = 'uploading' | 'ready' | 'failed' | 'deleting';
 
 /** Row shape of `public.materials`. Heavy content lives in Storage. */
 export interface MaterialRow {
@@ -54,6 +54,16 @@ export interface MaterialRow {
   is_demo: boolean;
   uploaded_at: string;
   last_edited_at: string | null;
+  // In-progress upload (separate from the active version).
+  pending_job_id: string | null;
+  pending_version: number | null;
+  pending_upload_state: MaterialUploadState | null;
+  pending_upload_error: string | null;
+  pending_content_hash: string | null;
+  pending_original_path: string | null;
+  pending_markdown_path: string | null;
+  pending_pages_path: string | null;
+  pending_transcript_path: string | null;
   created_at: string;
   updated_at: string;
 }

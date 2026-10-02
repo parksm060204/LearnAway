@@ -11,6 +11,18 @@ interface AddSubjectModalProps {
   onAddSubject: (subject: Subject) => void;
 }
 
+/** New subject ids are UUIDs; legacy string ids remain valid in the schema. */
+function createSubjectId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch {
+    // fall through
+  }
+  return `subj-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectModalProps) {
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
@@ -38,7 +50,7 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
     const cleanCode = code.trim() || `§${new Date().getFullYear()}-${domain === 'math_stats' ? 'MATH' : 'CS'}-${Math.floor(Math.random() * 90 + 10)}`;
 
     const newSubject: Subject = {
-      id: `subj-${Date.now()}`,
+      id: createSubjectId(),
       ownerId: 'local-user',
       name: name.trim(),
       code: cleanCode.startsWith('§') ? cleanCode : `§${cleanCode}`,

@@ -24,6 +24,8 @@ export async function loadCloudLibrary(): Promise<RepoResult<CloudLibrary>> {
   const materials: Material[] = [];
   const originalPathByMaterialId: Record<string, string> = {};
   for (const row of rows.data) {
+    // A half-deleted material must not appear as a normal item.
+    if (row.upload_state === 'deleting') continue;
     if (row.original_path) originalPathByMaterialId[row.id] = row.original_path;
     if (row.upload_state !== 'ready') {
       materials.push(rowToMaterial(row));

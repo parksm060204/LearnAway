@@ -17,6 +17,8 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
   'lib/storageScope.ts', 'lib/auth/redirects.ts', 'lib/legacyImport.ts', 'lib/appReadiness.ts',
   'lib/cloud/hash.ts', 'lib/cloud/mappers.ts', 'lib/cloud/plan.ts',
+  'lib/cloud/subjectsRepository.ts', 'lib/cloud/materialsRepository.ts', 'lib/cloud/library.ts',
+  'lib/cloud/migrationOriginals.ts', 'lib/cloud/localMigration.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -63,6 +65,21 @@ exports.requireApiUser = async () => {
   const cloudHash = load(path.join(output, 'lib/cloud/hash.js'));
   const cloudMappers = load(path.join(output, 'lib/cloud/mappers.js'));
   const cloudPlan = load(path.join(output, 'lib/cloud/plan.js'));
+
+  // Replace only the external boundary (the Supabase client) with a controllable
+  // fake. The real repository/service code under test is executed unchanged.
+  const supabaseClientPath = path.join(output, 'lib', 'supabase', 'client.js');
+  fs.mkdirSync(path.dirname(supabaseClientPath), { recursive: true });
+  fs.writeFileSync(
+    supabaseClientPath,
+    `exports.createClient = () => globalThis.__fakeSupabaseClient;`
+  );
+  delete load.cache[supabaseClientPath];
+
+  const cloudSubjects = load(path.join(output, 'lib/cloud/subjectsRepository.js'));
+  const cloudMaterials = load(path.join(output, 'lib/cloud/materialsRepository.js'));
+  const cloudOriginals = load(path.join(output, 'lib/cloud/migrationOriginals.js'));
+  const cloudMigration = load(path.join(output, 'lib/cloud/localMigration.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
@@ -331,6 +348,165 @@ exports.requireApiUser = async () => {
     } finally {
       storageScope.setStorageScope({ kind: 'legacy' });
       delete window.indexedDB;
+    }
+  };
+
+  // A controllable fake Supabase client used to exercise the real repository
+  // code with injected failures at the external boundary.
+  function createFakeSupabase(options = {}) {
+    const state = {
+      user: options.user === undefined ? { id: 'user-a' } : options.user,
+      subjects: options.subjects ? [...options.subjects] : [],
+      materials: options.materials ? [...options.materials] : [],
+      objects: new Map(options.objects ? Object.entries(options.objects) : []),
+      fail: options.fail || {},
+    };
+    const clone = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
+    const nowIso = () => new Date().toISOString();
+    const matchFilters = (rows, filters) =>
+      rows.filter((row) => filters.every(([col, val]) => row[col] === val));
+
+    function tableBuilder(table) {
+      const ctx = { op: 'select', payload: null, onConflict: null, filters: [], order: null };
+      const builder = {
+        select() { return builder; },
+        order(col, opts) { ctx.order = { col, opts }; return builder; },
+        eq(col, val) { ctx.filters.push([col, val]); return builder; },
+        update(payload) { ctx.op = 'update'; ctx.payload = payload; return builder; },
+        upsert(payload, opts) { ctx.op = 'upsert'; ctx.payload = payload; ctx.onConflict = opts && opts.onConflict; return builder; },
+        delete() { ctx.op = 'delete'; return builder; },
+        maybeSingle() { return exec(true); },
+        single() { return exec(false); },
+        then(resolve, reject) { return exec(null).then(resolve, reject); },
+      };
+
+      async function exec(maybe) {
+        const rows = state[table];
+        try {
+          if (ctx.op === 'select') {
+            let result = matchFilters(rows, ctx.filters);
+            if (ctx.order) {
+              const { col, opts } = ctx.order;
+              const dir = opts && opts.ascending ? 1 : -1;
+              result = [...result].sort((a, b) => (a[col] < b[col] ? -1 : a[col] > b[col] ? 1 : 0) * dir);
+            }
+            if (maybe === true) return { data: result[0] ? clone(result[0]) : null, error: null };
+            if (maybe === false) {
+              if (result.length === 0) return { data: null, error: { message: 'no rows', code: 'PGRST116' } };
+              return { data: clone(result[0]), error: null };
+            }
+            return { data: result.map(clone), error: null };
+          }
+          if (ctx.op === 'upsert') {
+            if (state.fail.upsert) return { data: null, error: { message: 'injected upsert failure' } };
+            const keys = (ctx.onConflict || 'id').split(',').map((s) => s.trim());
+            const payload = { ...ctx.payload };
+            if (payload.user_id === undefined) payload.user_id = state.user ? state.user.id : null;
+            const idx = rows.findIndex((row) => keys.every((k) => row[k] === payload[k]));
+            let saved;
+            if (idx >= 0) {
+              saved = { ...rows[idx], ...payload, updated_at: nowIso() };
+              rows[idx] = saved;
+            } else {
+              saved = { created_at: nowIso(), updated_at: nowIso(), ...payload };
+              rows.push(saved);
+            }
+            return { data: clone(saved), error: null };
+          }
+          if (ctx.op === 'update') {
+            if (state.fail.update) return { data: null, error: { message: 'injected update failure' } };
+            let matched = matchFilters(rows, ctx.filters);
+            if (state.fail.switch && ctx.filters.some(([col]) => col === 'pending_job_id')) matched = [];
+            if (matched.length === 0) return { data: null, error: { message: 'no rows updated', code: 'PGRST116' } };
+            for (const row of matched) Object.assign(row, ctx.payload, { updated_at: nowIso() });
+            if (maybe === false) return { data: clone(matched[0]), error: null };
+            return { data: matched.map(clone), error: null };
+          }
+          if (ctx.op === 'delete') {
+            if (state.fail.deleteRow) return { data: null, error: { message: 'injected delete failure' } };
+            state[table] = rows.filter((row) => matchFilters([row], ctx.filters).length === 0);
+            return { data: null, error: null };
+          }
+          return { data: null, error: { message: 'unsupported op' } };
+        } catch (error) {
+          return { data: null, error: { message: error.message } };
+        }
+      }
+      return builder;
+    }
+
+    const storage = {
+      from() {
+        return {
+          async upload(path, blob, opts) {
+            if (state.fail.upload) return { data: null, error: { message: 'injected upload failure' } };
+            if (state.fail.uploadPath && path.includes(state.fail.uploadPath)) {
+              return { data: null, error: { message: 'injected upload failure' } };
+            }
+            state.objects.set(path, { blob, contentType: opts && opts.contentType });
+            return { data: { path }, error: null };
+          },
+          async download(path) {
+            if (state.fail.download) return { data: null, error: { message: 'injected download failure' } };
+            const entry = state.objects.get(path);
+            if (!entry) return { data: null, error: { message: 'not found' } };
+            let blob = entry.blob ?? entry;
+            if (state.fail.corruptDownload) {
+              const text = await blob.text();
+              blob = new Blob([`${text} corrupted`]);
+            }
+            return { data: blob, error: null };
+          },
+          async list(prefix, opts) {
+            if (state.fail.list) return { data: null, error: { message: 'injected list failure' } };
+            const limit = (opts && opts.limit) || 100;
+            const offset = (opts && opts.offset) || 0;
+            const children = new Map();
+            for (const key of state.objects.keys()) {
+              if (prefix && !key.startsWith(`${prefix}/`)) continue;
+              const rest = prefix ? key.slice(prefix.length + 1) : key;
+              const seg = rest.split('/')[0];
+              children.set(seg, rest.includes('/'));
+            }
+            const entries = Array.from(children.entries()).map(([name, isFolder]) => ({
+              name,
+              id: isFolder ? null : 'obj',
+            }));
+            return { data: entries.slice(offset, offset + limit), error: null };
+          },
+          async remove(paths) {
+            if (state.fail.remove) return { data: null, error: { message: 'injected remove failure' } };
+            for (const p of paths) state.objects.delete(p);
+            return { data: paths, error: null };
+          },
+          async createSignedUrl(path) {
+            return { data: { signedUrl: `https://signed.example/${path}` }, error: null };
+          },
+        };
+      },
+    };
+
+    return {
+      __state: state,
+      auth: {
+        async getUser() {
+          if (state.fail.authUser) return { data: { user: null }, error: null };
+          return { data: { user: state.user }, error: null };
+        },
+      },
+      from(table) { return tableBuilder(table); },
+      storage,
+    };
+  }
+
+  const withFakeSupabase = async (options, fn) => {
+    const client = createFakeSupabase(options);
+    globalThis.__fakeSupabaseClient = client;
+    try {
+      return await fn(client);
+    } finally {
+      globalThis.__fakeSupabaseClient = undefined;
+      storageScope.setStorageScope({ kind: 'legacy' });
     }
   };
 
@@ -708,6 +884,290 @@ exports.requireApiUser = async () => {
     });
     assert.equal(retry.conflicts.some((c) => c.id === 'm3'), false);
     assert.ok(retry.materials.some((m) => m.id === 'm3'), 'failed upload is retried');
+  });
+
+  // ---- Cloud repository / service (real code, fake Supabase boundary) ----
+  const readyMaterialRow = (overrides = {}) => ({
+    id: 'm',
+    user_id: 'u1',
+    subject_id: 's1',
+    kind: 'pdf',
+    title: 'T',
+    source_refs: '',
+    status: 'ready',
+    status_message: null,
+    is_converted: true,
+    upload_state: 'ready',
+    upload_error: null,
+    version: 1,
+    content_hash: null,
+    original_path: null,
+    markdown_path: null,
+    pages_path: null,
+    transcript_path: null,
+    page_count: null,
+    duration_minutes: null,
+    speaker_count: null,
+    speakers: [],
+    has_ai_concepts: false,
+    has_ai_problems: false,
+    is_demo: false,
+    uploaded_at: '2026-01-01T00:00:00.000Z',
+    last_edited_at: null,
+    pending_job_id: null,
+    pending_version: null,
+    pending_upload_state: null,
+    pending_upload_error: null,
+    pending_content_hash: null,
+    pending_original_path: null,
+    pending_markdown_path: null,
+    pending_pages_path: null,
+    pending_transcript_path: null,
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  });
+
+  await checkAsync('material edit upload failure keeps the active version and original', async () => {
+    const material = {
+      id: 'm-edit', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# v2',
+    };
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      materials: [readyMaterialRow({
+        id: 'm-edit', version: 1, content_hash: 'old',
+        original_path: 'u1/m-edit/v1/original.pdf', markdown_path: 'u1/m-edit/v1/markdown.md',
+      })],
+      objects: { 'u1/m-edit/v1/markdown.md': new Blob(['# v1']) },
+      fail: { uploadPath: 'v2/markdown.md' },
+    }, async (client) => {
+      const result = await cloudMaterials.writeMaterial({ material, content: { markdown: '# v2' } });
+      assert.equal(result.ok, false);
+      const row = client.__state.materials[0];
+      assert.equal(row.version, 1, 'active version unchanged');
+      assert.equal(row.upload_state, 'ready', 'active stays ready');
+      assert.equal(row.original_path, 'u1/m-edit/v1/original.pdf', 'original preserved');
+      assert.equal(row.pending_upload_state, 'failed');
+    });
+  });
+
+  await checkAsync('material edit without a new original keeps the original path', async () => {
+    const material = {
+      id: 'm-noorig', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# v2',
+    };
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      materials: [readyMaterialRow({
+        id: 'm-noorig', version: 1, original_path: 'u1/m-noorig/v1/original.pdf',
+        markdown_path: 'u1/m-noorig/v1/markdown.md',
+      })],
+      objects: { 'u1/m-noorig/v1/markdown.md': new Blob(['# v1']) },
+    }, async (client) => {
+      const result = await cloudMaterials.writeMaterial({ material, content: { markdown: '# v2' } });
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      const row = client.__state.materials[0];
+      assert.equal(row.version, 2);
+      assert.equal(row.original_path, 'u1/m-noorig/v1/original.pdf', 'original path preserved across edit');
+    });
+  });
+
+  await checkAsync('a stale upload result cannot overwrite a newer active version', async () => {
+    const material = {
+      id: 'm-race', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# new',
+    };
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      materials: [readyMaterialRow({
+        id: 'm-race', version: 1, original_path: 'u1/m-race/v1/original.pdf',
+        markdown_path: 'u1/m-race/v1/markdown.md',
+      })],
+      objects: { 'u1/m-race/v1/markdown.md': new Blob(['# old']) },
+      fail: { switch: true },
+    }, async (client) => {
+      const result = await cloudMaterials.writeMaterial({ material, content: { markdown: '# new' } });
+      assert.equal(result.ok, false);
+      assert.match(result.error, /다른 작업/);
+      const row = client.__state.materials[0];
+      assert.equal(row.version, 1, 'active version not switched');
+      assert.equal(row.upload_state, 'ready');
+    });
+  });
+
+  await checkAsync('an empty pages array is stored and verified consistently', async () => {
+    const material = {
+      id: 'm-pages', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const result = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x', pages: [] } });
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      const row = client.__state.materials[0];
+      assert.equal(row.upload_state, 'ready');
+      assert.equal(row.pages_path, 'u1/m-pages/v1/pages.json');
+    });
+  });
+
+  await checkAsync('delete does not remove the DB row when file listing fails', async () => {
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      materials: [readyMaterialRow({ id: 'm-del' })],
+      objects: { 'u1/m-del/v1/markdown.md': new Blob(['# x']) },
+      fail: { list: true },
+    }, async (client) => {
+      const result = await cloudMaterials.deleteMaterial('m-del');
+      assert.equal(result.ok, false);
+      assert.equal(client.__state.materials.length, 1, 'row kept on listing failure');
+    });
+  });
+
+  await checkAsync('delete marks a retryable state when the DB delete fails after files are removed', async () => {
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      materials: [readyMaterialRow({ id: 'm-del2' })],
+      objects: { 'u1/m-del2/v1/markdown.md': new Blob(['# x']) },
+      fail: { deleteRow: true },
+    }, async (client) => {
+      const result = await cloudMaterials.deleteMaterial('m-del2');
+      assert.equal(result.ok, false);
+      assert.equal(client.__state.objects.size, 0, 'files removed');
+      assert.equal(client.__state.materials[0].upload_state, 'deleting', 'retryable deleting state');
+    });
+  });
+
+  await checkAsync('subjects repository preserves legacy string ids', async () => {
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const saved = await cloudSubjects.upsertSubject({ id: 'subj-legacy-1', name: 'A', code: '', timezone: 'Asia/Seoul' });
+      assert.equal(saved.ok, true, saved.ok ? '' : saved.error);
+      assert.equal(saved.data.id, 'subj-legacy-1');
+      assert.equal(client.__state.subjects[0].user_id, 'u1');
+    });
+  });
+
+  await checkAsync('two accounts can store the same legacy string id', async () => {
+    const subject = { id: 'subj-shared', name: 'A', code: '', timezone: 'Asia/Seoul' };
+    await withFakeSupabase({ user: { id: 'u1' } }, async (c1) => {
+      const r1 = await cloudSubjects.upsertSubject(subject);
+      assert.equal(r1.ok, true, r1.ok ? '' : r1.error);
+      assert.equal(c1.__state.subjects[0].user_id, 'u1');
+      await withFakeSupabase({ user: { id: 'u2' } }, async (c2) => {
+        const r2 = await cloudSubjects.upsertSubject(subject);
+        assert.equal(r2.ok, true, r2.ok ? '' : r2.error);
+        assert.equal(c2.__state.subjects.length, 1);
+        assert.equal(c2.__state.subjects[0].user_id, 'u2');
+      });
+      assert.equal(c1.__state.subjects.length, 1);
+    });
+  });
+
+  await checkAsync('retry after a failed upload reuses the same pending version', async () => {
+    const material = {
+      id: 'm-retry', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      fail: { uploadPath: 'v1/markdown.md' },
+    }, async (client) => {
+      const first = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' } });
+      assert.equal(first.ok, false);
+      assert.equal(client.__state.materials[0].pending_version, 1);
+
+      client.__state.fail.uploadPath = null;
+      const retry = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' } });
+      assert.equal(retry.ok, true, retry.ok ? '' : retry.error);
+      assert.equal(client.__state.materials.length, 1, 'no duplicate material row');
+      assert.equal(client.__state.materials[0].version, 1, 'same version reused');
+    });
+  });
+
+  await checkAsync('empty server keeps migration originals intact', async () => {
+    const userId = 'cloud-user-p0';
+    const subjKey = 'redcall_user_' + userId + '__subjects_v1';
+    for (const base of ['__subjects_v1', '__origin_snapshot_v1', '__origin_subjects_v1', '__origin_materials_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+    const original = JSON.stringify([{ id: 'subj-keep', name: 'Keep', code: '', timezone: 'Asia/Seoul' }]);
+    localStorage.setItem(subjKey, original);
+
+    const snapshot = await cloudOriginals.ensureMigrationOriginals(userId);
+    assert.equal(snapshot.ok, true, snapshot.ok ? '' : snapshot.error);
+    assert.equal(localStorage.getItem('redcall_user_' + userId + '__origin_subjects_v1'), original);
+
+    // Simulate the cloud mirror overwriting the live key with an empty list.
+    localStorage.setItem(subjKey, JSON.stringify([]));
+    const loaded = cloudOriginals.loadMigrationOriginals(userId);
+    assert.equal(loaded.ok, true);
+    assert.equal(loaded.subjects.length, 1, 'original preserved in the origin area');
+    assert.equal(loaded.source, 'origin');
+  });
+
+  await checkAsync('same id with different body is a conflict and preserves originals', async () => {
+    const userId = 'cloud-user-conflict';
+    const subjKey = 'redcall_user_' + userId + '__subjects_v1';
+    const matKey = 'redcall_user_' + userId + '__materials_v1';
+    for (const base of ['__subjects_v1', '__materials_v1', '__origin_snapshot_v1', '__origin_subjects_v1', '__origin_materials_v1', '__cloud_migration_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+    const localSubjects = JSON.stringify([{ id: 'subj-1', name: 'A', code: '', timezone: 'Asia/Seoul' }]);
+    const localMaterials = JSON.stringify([{ id: 'mat-1', subjectId: 'subj-1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready', isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# local' }]);
+    localStorage.setItem(subjKey, localSubjects);
+    localStorage.setItem(matKey, localMaterials);
+    await cloudOriginals.ensureMigrationOriginals(userId);
+
+    await withFakeSupabase({
+      user: { id: userId },
+      subjects: [{ id: 'subj-1', user_id: userId, name: 'A', code: '', semester: null, exam_at: null, exam_end_time: null, location: null, timezone: 'Asia/Seoul', scope: null, chapters: [], domain: null, engine_name: null, last_evaluated_at: null, is_demo: false, created_at: '', updated_at: '' }],
+      materials: [readyMaterialRow({
+        id: 'mat-1', user_id: userId, subject_id: 'subj-1', content_hash: 'different',
+        markdown_path: userId + '/mat-1/v1/markdown.md',
+      })],
+      objects: { [userId + '/mat-1/v1/markdown.md']: new Blob(['# server']) },
+    }, async (client) => {
+      const result = await cloudMigration.migrateLocalLibraryToCloud(userId);
+      assert.equal(result.conflict, true);
+      assert.equal(result.ok, false);
+      assert.equal(client.__state.materials.length, 1, 'server material not overwritten');
+      assert.equal(localStorage.getItem(matKey), localMaterials, 'local original preserved');
+    });
+  });
+
+  await checkAsync('cloud migration marker failure is retryable without duplicates', async () => {
+    const userId = 'cloud-user-marker';
+    const subjKey = 'redcall_user_' + userId + '__subjects_v1';
+    const matKey = 'redcall_user_' + userId + '__materials_v1';
+    const markerKey = 'redcall_user_' + userId + '__cloud_migration_v1';
+    for (const base of ['__subjects_v1', '__materials_v1', '__origin_snapshot_v1', '__origin_subjects_v1', '__origin_materials_v1', '__cloud_migration_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+    localStorage.setItem(subjKey, JSON.stringify([{ id: 'subj-1', name: 'A', code: '', timezone: 'Asia/Seoul' }]));
+    localStorage.setItem(matKey, JSON.stringify([{ id: 'mat-1', subjectId: 'subj-1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready', isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# body' }]));
+    await cloudOriginals.ensureMigrationOriginals(userId);
+
+    await withFakeSupabase({ user: { id: userId } }, async (client) => {
+      const realSet = localStorage.setItem.bind(localStorage);
+      localStorage.setItem = (key, value) => {
+        if (key === markerKey) throw new Error('simulated marker failure');
+        realSet(key, value);
+      };
+      let first;
+      try {
+        first = await cloudMigration.migrateLocalLibraryToCloud(userId);
+      } finally {
+        localStorage.setItem = realSet;
+      }
+      assert.equal(first.ok, false, 'marker failure must not report success');
+      assert.equal(localStorage.getItem(markerKey), null);
+      assert.equal(client.__state.materials.length, 1);
+
+      const retry = await cloudMigration.migrateLocalLibraryToCloud(userId);
+      assert.equal(retry.ok, true, retry.message);
+      assert.ok(localStorage.getItem(markerKey) !== null, 'completion marker written on retry');
+      assert.equal(client.__state.materials.length, 1, 'no duplicate material');
+      assert.equal(client.__state.subjects.length, 1, 'no duplicate subject');
+    });
   });
 
   check('material import is never verified when a copy write failed', () => {

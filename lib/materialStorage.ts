@@ -536,6 +536,55 @@ export async function loadMaterialContent(materialId: string): Promise<MaterialC
   return result.status === 'found' ? result.content : null;
 }
 
+/**
+ * Reads a body from an explicitly named scope (e.g. the migration-originals
+ * backup) without switching the active scope. Used so cloud caching cannot
+ * overwrite the local originals kept for migration.
+ */
+export async function loadMaterialContentFromScope(
+  scopeId: string,
+  materialId: string
+): Promise<MaterialLoadResult> {
+  const key = `${scopeId}::${materialId}`;
+  const cached = memoryCache.get(key);
+  if (cached) {
+    return { status: 'found', storage: 'memory', content: cached };
+  }
+
+  if (!isIndexedDBAvailable()) {
+    return { status: 'missing' };
+  }
+
+  const db = await openDBByName(scopeIdToDbName(scopeId));
+  if (!db) {
+    return { status: 'error', error: 'IndexedDB를 열 수 없습니다.' };
+  }
+
+  return new Promise<MaterialLoadResult>((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const req = tx.objectStore(STORE_NAME).get(materialId);
+      req.onsuccess = () => {
+        const result = req.result as MaterialContent | undefined;
+        if (result) {
+          memoryCache.set(key, result);
+          resolve({ status: 'found', storage: 'indexeddb', content: result });
+        } else {
+          resolve({ status: 'missing' });
+        }
+      };
+      req.onerror = () => {
+        resolve({ status: 'error', error: req.error?.message || 'IndexedDB 읽기에 실패했습니다.' });
+      };
+    } catch (err) {
+      resolve({
+        status: 'error',
+        error: err instanceof Error ? err.message : 'IndexedDB 읽기 중 오류가 발생했습니다.',
+      });
+    }
+  });
+}
+
 export async function deleteMaterialContent(materialId: string): Promise<MaterialDeleteResult> {
   const hadMemory = memoryCache.delete(cacheKey(materialId));
 

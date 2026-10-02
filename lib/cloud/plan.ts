@@ -61,7 +61,7 @@ export function planLocalMigration(input: {
   localContentHashes: Map<string, string>;
   cloudContentHashes: Map<string, string>;
   /** Upload lifecycle of cloud rows: non-'ready' rows are retried, not conflicts. */
-  cloudMaterialUploadStates?: Map<string, 'uploading' | 'ready' | 'failed'>;
+  cloudMaterialUploadStates?: Map<string, 'uploading' | 'ready' | 'failed' | 'deleting'>;
 }): MigrationPlan {
   const cloudSubjectById = new Map(input.cloudSubjects.map((s) => [s.id, s]));
   const cloudMaterialById = new Map(input.cloudMaterials.map((m) => [m.id, m]));

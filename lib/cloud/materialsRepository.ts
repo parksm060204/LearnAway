@@ -69,21 +69,52 @@ async function downloadText(supabase: SupabaseClient, path: string): Promise<Rep
   }
 }
 
-async function listAllPaths(supabase: SupabaseClient, prefix: string): Promise<string[]> {
-  const { data, error } = await supabase.storage
-    .from(MATERIALS_BUCKET)
-    .list(prefix, { limit: 1000 });
-  if (error || !data) return [];
+type ListResult = { ok: true; paths: string[] } | { ok: false; error: string };
+
+/**
+ * Recursively lists every object under a prefix. Distinguishes "no files" from
+ * "listing failed", propagates sub-folder failures, and pages through results
+ * so the per-request limit never silently drops objects.
+ */
+async function listAllPaths(supabase: SupabaseClient, prefix: string): Promise<ListResult> {
   const paths: string[] = [];
-  for (const item of data) {
-    const full = prefix ? `${prefix}/${item.name}` : item.name;
-    if (item.id === null) {
-      paths.push(...(await listAllPaths(supabase, full)));
-    } else {
-      paths.push(full);
+  const pageSize = 100;
+  let offset = 0;
+
+  for (;;) {
+    const { data, error } = await supabase.storage
+      .from(MATERIALS_BUCKET)
+      .list(prefix, { limit: pageSize, offset });
+    if (error) return { ok: false, error: error.message };
+    if (!data) return { ok: false, error: '파일 목록을 불러오지 못했습니다.' };
+
+    for (const item of data) {
+      const full = prefix ? `${prefix}/${item.name}` : item.name;
+      if (item.id === null) {
+        const sub = await listAllPaths(supabase, full);
+        if (!sub.ok) return sub;
+        paths.push(...sub.paths);
+      } else {
+        paths.push(full);
+      }
     }
+
+    if (data.length < pageSize) break;
+    offset += pageSize;
   }
-  return paths;
+
+  return { ok: true, paths };
+}
+
+function generateJobId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch {
+    // fall through
+  }
+  return `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,24 +179,25 @@ export interface MaterialWriteInput {
   material: Material;
   content: CloudMaterialContent;
   original?: { blob: Blob; contentType: string } | null;
+  jobId?: string;
 }
 
 export interface MaterialWriteResult {
   row: MaterialRow;
   version: number;
+  jobId: string;
 }
 
 /**
  * Creates or updates a material using the local id as the idempotency key.
  *
- * Sequence (not transactional — a DB row + Storage objects):
- *  1. write metadata with upload_state='uploading'
+ * The active version and the in-progress upload are kept separate:
+ *  1. write the new version's paths/hash into pending_* (active row untouched)
  *  2. upload original + bodies to deterministic versioned paths
  *  3. download bodies back and verify their content hash
- *  4. switch the row to upload_state='ready'
- * A failed attempt leaves upload_state='failed' and reuses the same version, so
- * a retry overwrites the same paths instead of creating duplicates. Editing an
- * already-ready material writes a NEW version, then switches the pointer.
+ *  4. switch the active version, guarded by pending_job_id, then clear pending
+ * A failure only marks the pending upload failed, so the active version, body
+ * and original stay accessible. Retrying reuses the pending version/job.
  */
 export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResult<MaterialWriteResult>> {
   try {
@@ -178,58 +210,101 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
 
     const existingResult = await supabase
       .from('materials')
-      .select('id, version, upload_state')
+      .select('*')
       .eq('id', material.id)
       .maybeSingle();
     if (existingResult.error) return repoError(existingResult.error.message);
-    const existing = existingResult.data as { version: number; upload_state: string } | null;
+    const existing = (existingResult.data as MaterialRow | null) ?? null;
+    const activeVersion = existing?.version ?? 0;
 
-    const version =
-      existing && existing.upload_state === 'ready' ? existing.version + 1 : existing?.version ?? 1;
+    // Resume an in-progress/failed pending upload rather than adding a version.
+    const reusePending = Boolean(existing?.pending_version && existing.pending_version > activeVersion);
+    const version = reusePending ? (existing!.pending_version as number) : activeVersion + 1;
+    const jobId =
+      input.jobId ?? (reusePending ? existing!.pending_job_id ?? generateJobId() : generateJobId());
+
     const paths = materialObjectPaths(userId, material.id, version, kind);
     const contentHash = materialContentHash(content);
+    const pagesProvided = content.pages !== undefined;
+    // Never lose an existing original when no replacement file is provided.
+    const pendingOriginalPath = input.original
+      ? paths.original
+      : existing?.original_path ?? existing?.pending_original_path ?? null;
 
-    const base = materialBaseUpsert(material);
-    const uploadingRow = {
-      ...base,
-      version,
-      upload_state: 'uploading' as const,
-      upload_error: null,
-      content_hash: null,
-      original_path: paths.original,
-      markdown_path: paths.markdown,
-      pages_path: content.pages && content.pages.length > 0 ? paths.pages : null,
-      transcript_path: content.rawText ? paths.transcript : null,
+    const pending = {
+      pending_job_id: jobId,
+      pending_version: version,
+      pending_upload_state: 'uploading' as const,
+      pending_upload_error: null,
+      pending_content_hash: null,
+      pending_original_path: pendingOriginalPath,
+      pending_markdown_path: paths.markdown,
+      pending_pages_path: pagesProvided ? paths.pages : null,
+      pending_transcript_path: content.rawText ? paths.transcript : null,
     };
 
-    const upserted = await supabase
-      .from('materials')
-      .upsert(uploadingRow, { onConflict: 'id' })
-      .select('*')
-      .single();
-    if (upserted.error) return repoError(upserted.error.message);
+    if (!existing) {
+      const base = materialBaseUpsert(material);
+      const inserted = await supabase
+        .from('materials')
+        .upsert(
+          {
+            ...base,
+            version: 0,
+            upload_state: 'uploading',
+            upload_error: null,
+            content_hash: null,
+            original_path: null,
+            markdown_path: null,
+            pages_path: null,
+            transcript_path: null,
+            ...pending,
+          },
+          { onConflict: 'id,user_id' }
+        )
+        .select('*')
+        .single();
+      if (inserted.error) return repoError(inserted.error.message);
+    } else {
+      // Only touch pending columns; the active version stays intact.
+      const updated = await supabase
+        .from('materials')
+        .update(pending)
+        .eq('id', material.id)
+        .select('*')
+        .single();
+      if (updated.error) return repoError(updated.error.message);
+    }
 
     const fail = async (message: string): Promise<RepoResult<MaterialWriteResult>> => {
+      const patch: Record<string, unknown> = {
+        pending_upload_state: 'failed',
+        pending_upload_error: message,
+      };
+      if (activeVersion === 0) {
+        patch.upload_state = 'failed';
+        patch.upload_error = message;
+      }
       await supabase
         .from('materials')
-        .update({ upload_state: 'failed', upload_error: message })
-        .eq('id', material.id);
+        .update(patch)
+        .eq('id', material.id)
+        .eq('pending_job_id', jobId);
       return repoError(message);
     };
 
-    // Upload bodies first, then the original (so a failed body never looks ready).
     const mdUpload = await uploadText(supabase, paths.markdown, content.markdown ?? '', 'text/markdown');
     if (!mdUpload.ok) return fail(mdUpload.error);
-
     if (content.rawText) {
       const trUpload = await uploadText(supabase, paths.transcript, content.rawText, 'text/plain');
       if (!trUpload.ok) return fail(trUpload.error);
     }
-    if (content.pages && content.pages.length > 0) {
+    if (pagesProvided) {
+      // An empty array is stored (not dropped) so read-back and hash agree.
       const pgUpload = await uploadText(
         supabase,
         paths.pages,
-        JSON.stringify(content.pages),
+        JSON.stringify(content.pages ?? []),
         'application/json'
       );
       if (!pgUpload.ok) return fail(pgUpload.error);
@@ -245,48 +320,66 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
     }
 
     // Verify bodies by downloading them back and recomputing the hash.
-    const verify = await downloadMaterialContent({
-      ...(upserted.data as MaterialRow),
+    const verifyRow = {
+      ...(existing ?? {}),
+      id: material.id,
       markdown_path: paths.markdown,
-      pages_path: content.pages && content.pages.length > 0 ? paths.pages : null,
+      pages_path: pagesProvided ? paths.pages : null,
       transcript_path: content.rawText ? paths.transcript : null,
-    });
+    } as MaterialRow;
+    const verify = await downloadMaterialContent(verifyRow);
     if (!verify.ok) return fail(`본문 검증 실패: ${verify.error}`);
-    const verifiedHash = materialContentHash(verify.data);
-    if (verifiedHash !== contentHash) {
+    if (materialContentHash(verify.data) !== contentHash) {
       return fail('저장된 본문이 원본과 일치하지 않습니다.');
     }
 
-    const ready = await supabase
+    // Switch the active version, guarded by the job id so a late older attempt
+    // cannot overwrite a newer one.
+    const switched = await supabase
       .from('materials')
       .update({
+        version,
         upload_state: 'ready',
         upload_error: null,
         content_hash: contentHash,
-        version,
-        original_path: input.original ? paths.original : null,
+        original_path: pendingOriginalPath,
         markdown_path: paths.markdown,
-        pages_path: content.pages && content.pages.length > 0 ? paths.pages : null,
+        pages_path: pagesProvided ? paths.pages : null,
         transcript_path: content.rawText ? paths.transcript : null,
-        is_converted: true,
-        status: 'ready',
+        // Cloud upload completion is separate from conversion status.
+        status: material.status,
+        is_converted: material.isConverted ?? material.status === 'ready',
         last_edited_at: new Date().toISOString(),
+        pending_job_id: null,
+        pending_version: null,
+        pending_upload_state: null,
+        pending_upload_error: null,
+        pending_content_hash: null,
+        pending_original_path: null,
+        pending_markdown_path: null,
+        pending_pages_path: null,
+        pending_transcript_path: null,
       })
       .eq('id', material.id)
+      .eq('pending_job_id', jobId)
       .select('*')
       .single();
-    if (ready.error) return fail(ready.error.message);
+    if (switched.error) {
+      return repoError('다른 작업이 먼저 완료되어 이번 업로드 결과를 반영하지 않았습니다. 다시 시도해 주세요.');
+    }
 
-    return repoOk({ row: ready.data as MaterialRow, version });
+    return repoOk({ row: switched.data as MaterialRow, version, jobId });
   } catch (error) {
     return repoError(toMessage(error, '자료를 저장하지 못했습니다.'));
   }
 }
 
 /**
- * Deletes a material's Storage objects first, then its DB row. A Storage
- * failure is reported and the row is kept so deletion is never falsely
- * reported as successful.
+ * Deletes a material's Storage objects first, then its DB row.
+ *
+ * A listing failure or a partial removal is reported and the DB row is kept.
+ * If files are gone but the DB delete fails, the row is marked 'deleting' so a
+ * retry can finish the job and the material is not shown as a normal ready one.
  */
 export async function deleteMaterial(id: string): Promise<RepoResult<{ id: string }>> {
   try {
@@ -294,14 +387,29 @@ export async function deleteMaterial(id: string): Promise<RepoResult<{ id: strin
     const userId = await getCurrentUserId(supabase);
     if (!userId) return repoError('로그인이 필요합니다.');
 
-    const paths = await listAllPaths(supabase, `${userId}/${id}`);
-    if (paths.length > 0) {
-      const { error } = await supabase.storage.from(MATERIALS_BUCKET).remove(paths);
+    const listed = await listAllPaths(supabase, `${userId}/${id}`);
+    if (!listed.ok) return repoError(`파일 목록 조회 실패: ${listed.error}`);
+
+    if (listed.paths.length > 0) {
+      const { error } = await supabase.storage.from(MATERIALS_BUCKET).remove(listed.paths);
       if (error) return repoError(`파일 삭제 실패: ${error.message}`);
+      const after = await listAllPaths(supabase, `${userId}/${id}`);
+      if (!after.ok) return repoError(`파일 삭제 확인 실패: ${after.error}`);
+      if (after.paths.length > 0) {
+        return repoError('일부 파일이 삭제되지 않았습니다. 다시 시도해 주세요.');
+      }
     }
 
     const { error } = await supabase.from('materials').delete().eq('id', id);
-    if (error) return repoError(error.message);
+    if (error) {
+      await supabase
+        .from('materials')
+        .update({ upload_state: 'deleting', upload_error: `DB 행 삭제 실패: ${error.message}` })
+        .eq('id', id);
+      return repoError(
+        `파일은 삭제됐지만 DB 행 삭제에 실패했습니다. 다시 시도해 주세요. (${error.message})`
+      );
+    }
     return repoOk({ id });
   } catch (error) {
     return repoError(toMessage(error, '자료를 삭제하지 못했습니다.'));

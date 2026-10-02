@@ -122,6 +122,7 @@ import {
   declineCloudMigration,
   CloudMigrationState,
 } from '../lib/cloud/localMigration';
+import { ensureMigrationOriginals } from '../lib/cloud/migrationOriginals';
 import { applyMaterialEditToProblems } from '../lib/problemFreshness';
 import { setStorageScope } from '../lib/storageScope';
 import {
@@ -266,6 +267,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         if (!result.ok) {
           setCloudStatus('error');
           setCloudError(result.error);
+          return;
+        }
+
+        // Preserve this account's pre-cloud local records (metadata + bodies)
+        // in a dedicated area BEFORE the cloud mirror can overwrite them.
+        const snapshot = await ensureMigrationOriginals(currentUser.id);
+        if (cancelled) return;
+        if (!snapshot.ok) {
+          setCloudStatus('error');
+          setCloudError(snapshot.error);
           return;
         }
 
@@ -833,7 +844,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   };
 
   // Material Add Handler — uploads original + body to Storage and metadata to DB.
-  const handleAddMaterial = async (newMat: Material, originalFile?: File) => {
+  // Returns true only after the server confirms, so the upload modal can keep
+  // the form open on failure.
+  const handleAddMaterial = async (newMat: Material, originalFile?: File): Promise<boolean> => {
     const content = {
       markdown: newMat.parsedMarkdown ?? '',
       rawText: newMat.rawText,
@@ -847,13 +860,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         : null,
     });
     if (!result.ok) {
-      showToast(`자료 저장 실패: ${result.error}`);
-      return;
+      showToast(`자료 서버 저장 실패: ${result.error}`);
+      return false;
     }
     const updated = [newMat, ...materials];
     setMaterials(updated);
     saveStoredMaterials(updated);
-    showToast(`자료 [${newMat.title}]가 등록되었습니다.`);
+    showToast(`자료 [${newMat.title}]가 서버에 등록되었습니다.`);
+    return true;
   };
 
   // Stage 2: AI Concept Analysis Handler

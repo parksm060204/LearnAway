@@ -22,8 +22,21 @@ interface MaterialUploadModalProps {
   onClose: () => void;
   subjects: Subject[];
   activeSubject: Subject;
-  onAddMaterial: (material: Material, originalFile?: File) => void;
+  /** Resolves true only after the server confirmed the save. */
+  onAddMaterial: (material: Material, originalFile?: File) => Promise<boolean>;
   onOpenEditor?: (material: Material) => void;
+}
+
+/** New material ids are UUIDs; legacy string ids remain valid in the schema. */
+function createMaterialId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch {
+    // fall through
+  }
+  return `mat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export function MaterialUploadModal({
@@ -60,6 +73,9 @@ export function MaterialUploadModal({
 
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  // Stable id reused across retries so a failed attempt never creates a duplicate.
+  const materialIdRef = useRef<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -178,6 +194,8 @@ export function MaterialUploadModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    // Prevent duplicate submissions while a save is in flight.
+    if (isSubmitting) return;
     if (!title.trim()) {
       alert('자료 제목을 입력해 주세요.');
       return;
@@ -215,8 +233,11 @@ export function MaterialUploadModal({
       status = 'ready';
     }
 
+    if (!materialIdRef.current) {
+      materialIdRef.current = createMaterialId();
+    }
     const newMaterial: Material = {
-      id: `mat-${Date.now()}`,
+      id: materialIdRef.current,
       subjectId: selectedSubjectId,
       kind,
       title: title.trim(),
@@ -236,28 +257,46 @@ export function MaterialUploadModal({
       hasAiProblems: false,
     };
 
-    // 1. Save heavy content to decoupled storage
-    const saveResult = await saveMaterialContent(newMaterial.id, {
-      markdown: finalMarkdown,
-      rawText: finalRawText,
-      pages: kind === 'pdf' ? pdfPages : undefined,
-    });
+    setIsSubmitting(true);
+    try {
+      // 1. Save heavy content to the local cache (kept even if the server fails).
+      const saveResult = await saveMaterialContent(newMaterial.id, {
+        markdown: finalMarkdown,
+        rawText: finalRawText,
+        pages: kind === 'pdf' ? pdfPages : undefined,
+      });
 
-    // 2. Add material metadata (and the original PDF for private cloud storage)
-    onAddMaterial(newMaterial, kind === 'pdf' ? pdfFile ?? undefined : undefined);
-
-    if (!saveResult.persisted) {
-      // Surface the limitation instead of pretending the save was durable.
-      alert(
-        `자료 본문이 브라우저 저장소에 기록되지 않고 메모리에만 보관되었습니다. 새로고침하면 사라질 수 있습니다.\n사유: ${saveResult.error}`
+      // 2. Persist metadata + original + body to the server and wait for it.
+      const serverOk = await onAddMaterial(
+        newMaterial,
+        kind === 'pdf' ? pdfFile ?? undefined : undefined
       );
-    }
 
-    onClose();
+      if (!serverOk) {
+        // Keep the form open and preserve inputs; the same id is reused on retry.
+        alert(
+          '서버에 자료를 저장하지 못했습니다. 입력 내용은 그대로 유지됩니다. 다시 시도해 주세요.'
+        );
+        return;
+      }
 
-    // 3. Option to immediately open editor
-    if (onOpenEditor) {
-      onOpenEditor(newMaterial);
+      if (!saveResult.persisted) {
+        // Distinguish the local cache result from the server result.
+        alert(
+          `서버 저장은 완료됐지만 브라우저 캐시에는 메모리로만 보관되었습니다.\n사유: ${saveResult.error}`
+        );
+      }
+
+      // Success: reset the id so the next upload is a new material.
+      materialIdRef.current = null;
+      onClose();
+
+      // 3. Option to immediately open editor
+      if (onOpenEditor) {
+        onOpenEditor(newMaterial);
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -545,10 +584,10 @@ export function MaterialUploadModal({
             </button>
             <button
               type="submit"
-              disabled={isConvertingPdf}
+              disabled={isConvertingPdf || isSubmitting}
               className="px-4 py-2 text-xs bg-[#191817] hover:bg-[#33302b] text-white font-bold rounded-xs shadow-xs disabled:opacity-50 flex items-center gap-1.5"
             >
-              <span>자료 등록 완료</span>
+              <span>{isSubmitting ? '서버 저장 중...' : '자료 등록 완료'}</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>

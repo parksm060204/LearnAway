@@ -42,7 +42,7 @@ export async function upsertSubject(subject: Subject): Promise<RepoResult<Subjec
     const supabase = createClient();
     const { data, error } = await supabase
       .from('subjects')
-      .upsert(subjectToUpsert(subject), { onConflict: 'id' })
+      .upsert(subjectToUpsert(subject), { onConflict: 'id,user_id' })
       .select('*')
       .single();
     if (error) return repoError(error.message);
