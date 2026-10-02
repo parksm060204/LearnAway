@@ -1,5 +1,5 @@
 /**
- * REDCALL Academic Study Suite - Transcript Parser
+ * Learn my way Academic Study Suite - Transcript Parser
  * 
  * Accurately parses lecture recordings and transcripts into structured Markdown.
  * Preserves raw wording, speaker identification, and timestamps.

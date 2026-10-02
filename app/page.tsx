@@ -110,7 +110,7 @@ import { CheckCircle2 } from 'lucide-react';
 // Stable no-op subscription used only to detect client hydration.
 const hydrationSubscribe = () => () => {};
 
-export default function RedcallDashboardPage() {
+export default function LearnMyWayDashboardPage() {
   // Hydration safety flag
   const [isLoaded, setIsLoaded] = useState(false);
 
@@ -1114,7 +1114,7 @@ export default function RedcallDashboardPage() {
   if (!isLoaded || !activeSubject) {
     return (
       <div className="min-h-screen bg-[#faf8f4] flex items-center justify-center p-6 text-sm font-academic-mono text-[#827d73]">
-        REDCALL Academic Suite 초기화 중...
+        Learn my way Academic Suite 초기화 중...
       </div>
     );
   }
@@ -1287,7 +1287,7 @@ export default function RedcallDashboardPage() {
         <div className="max-w-[1440px] mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-3 font-academic-mono text-[11px]">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 bg-[#c52828] inline-block" />
-            <span className="font-bold text-[#191817]">REDCALL ACADEMIC SYSTEM</span>
+            <span className="font-bold text-[#191817]">Learn my way ACADEMIC SYSTEM</span>
             <span className="text-[#c8c2b5]">|</span>
             <span>수리통계 및 알고리즘 서술·증명 복습 플랫폼 (데모)</span>
           </div>

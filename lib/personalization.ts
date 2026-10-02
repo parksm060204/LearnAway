@@ -1,5 +1,5 @@
 /**
- * REDCALL Academic Suite - Personal Review Interval Adjustment Layer (Stage 10)
+ * Learn my way Academic Suite - Personal Review Interval Adjustment Layer (Stage 10)
  *
  * Adds a personalization layer ON TOP of the existing power-law retention model.
  * The base formula and its coefficients (tau, alpha, threshold) are unchanged.

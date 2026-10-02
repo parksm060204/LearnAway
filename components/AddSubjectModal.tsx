@@ -50,7 +50,7 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
       scope: scope.trim() || '출제 범위 미설정',
       chapters: scope.trim() ? [scope.trim()] : [],
       lastEvaluatedAt: new Date().toISOString(),
-      engineName: 'REDCALL-EBBINGHAUS-DECAY-v4',
+      engineName: 'LEARN-MY-WAY-EBBINGHAUS-DECAY-v4',
       domain,
       isDemo: false,
     };

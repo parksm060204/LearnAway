@@ -337,7 +337,7 @@ export function MaterialsListModal({
 
         {/* Footer */}
         <div className="bg-[#f5f2eb] px-5 py-3 border-t border-[#ded6c8] flex items-center justify-between text-xs font-academic-mono text-[#57544e]">
-          <span>REDCALL 과목별 자료 저장소 • PyMuPDF4LLM 파이프라인 연계</span>
+          <span>Learn my way 과목별 자료 저장소 • PyMuPDF4LLM 파이프라인 연계</span>
           <button
             onClick={onClose}
             className="px-3.5 py-1.5 bg-white hover:bg-[#e8e4dc] border border-[#ded6c8] rounded text-xs text-[#191817]"

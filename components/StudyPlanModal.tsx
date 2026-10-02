@@ -189,7 +189,7 @@ export function StudyPlanModal({
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="font-academic-serif text-base sm:text-lg font-bold tracking-tight">
-                  시험일까지의 학습 계획 (REDCALL STUDY PLAN)
+                  시험일까지의 학습 계획 (Learn my way STUDY PLAN)
                 </h2>
                 <span className="text-[10px] font-academic-mono bg-[#2a2825] text-[#ded6c8] px-2 py-0.5 rounded-xs border border-[#45423d]">
                   STAGE 9 DETERMINISTIC ENGINE

@@ -1,5 +1,5 @@
 /**
- * REDCALL Academic AI Service Configuration
+ * Learn my way Academic AI Service Configuration
  * Provides unified access to Gemini, OpenAI, and DeepSeek model credentials.
  */
 

@@ -1,5 +1,5 @@
 /**
- * REDCALL Academic Study Suite - Markdown & Citation Utilities
+ * Learn my way Academic Study Suite - Markdown & Citation Utilities
  * 
  * Provides:
  * 1. Deterministic hashing to track if source material has changed after extraction

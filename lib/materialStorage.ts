@@ -1,5 +1,5 @@
 /**
- * REDCALL Academic Study Suite - Decoupled Material Content Storage
+ * Learn my way Academic Study Suite - Decoupled Material Content Storage
  *
  * Separates heavy document content (full markdown, raw text, and page arrays)
  * from lightweight metadata stored in localStorage.

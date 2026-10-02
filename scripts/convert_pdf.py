@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REDCALL Academic Study Suite - PyMuPDF4LLM PDF Conversion Worker
+Learn my way Academic Study Suite - PyMuPDF4LLM PDF Conversion Worker
 Extracts page-by-page markdown and metadata from PDF files using pymupdf4llm.
 """
 

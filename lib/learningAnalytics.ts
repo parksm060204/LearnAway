@@ -1,5 +1,5 @@
 /**
- * REDCALL Academic Suite - Learning Analytics Engine (Stage 10)
+ * Learn my way Academic Suite - Learning Analytics Engine (Stage 10)
  *
  * Pure, deterministic analytics over a user's real saved learning records.
  * The engine computes observed performance only. It NEVER mutates attempts,

@@ -1,5 +1,5 @@
 /**
- * REDCALL Academic Suite - Study Plan Engine (Stage 9)
+ * Learn my way Academic Suite - Study Plan Engine (Stage 9)
  * Pure deterministic rule-based planning engine.
  * Connects exam schedule, exam scope, retention priorities, and daily time budget.
  *

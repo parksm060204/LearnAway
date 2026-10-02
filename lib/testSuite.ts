@@ -95,7 +95,7 @@ import {
 } from './storage';
 
 function runTests() {
-  console.log('=== STARTING REDCALL AUTOMATED VERIFICATION SUITE ===\n');
+  console.log('=== STARTING LEARN MY WAY AUTOMATED VERIFICATION SUITE ===\n');
 
   let passed = 0;
   let failed = 0;

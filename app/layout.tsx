@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "REDCALL ACADEMIC | 대학 논술·서술형 스페이스드 리피티션 학습 도구",
+  title: "Learn my way ACADEMIC | 대학 논술·서술형 스페이스드 리피티션 학습 도구",
   description:
     "수리통계 및 알고리즘 대학 논술·서술형 시험 대비 동적 망각곡선 및 루브릭 정밀 첨삭 학습 도구",
 };

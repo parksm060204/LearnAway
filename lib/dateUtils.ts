@@ -1,5 +1,5 @@
 /**
- * Date and Timezone utilities for REDCALL Academic Suite.
+ * Date and Timezone utilities for Learn my way Academic Suite.
  * Target Timezone: Asia/Seoul (UTC+09:00)
  */
 

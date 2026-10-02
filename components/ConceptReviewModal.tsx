@@ -747,7 +747,7 @@ export function ConceptReviewModal({
         {/* Bottom Footer */}
         <div className="bg-[#f5f2eb] px-5 py-3 border-t border-[#ded6c8] flex items-center justify-between text-xs font-academic-mono text-[#57544e]">
           <span>
-            REDCALL AI 개념 추출 파이프라인 • 총 {subjectDrafts.length}개 초안 중 {approvedCount}개 승인됨
+            Learn my way AI 개념 추출 파이프라인 • 총 {subjectDrafts.length}개 초안 중 {approvedCount}개 승인됨
           </span>
           <button
             onClick={onClose}
