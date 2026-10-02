@@ -5,14 +5,16 @@
  */
 
 import { LogicStrengthenSession, RechallengeReservation, AttemptSaveStatus } from './types';
+import { scopedStorageKey } from './storageScope';
 
-const LOGIC_KEY = 'redcall_logic_sessions_v1';
-const RESERVATION_KEY = 'redcall_rechallenge_reservations_v1';
-const ACTIVE_SESSION_KEY = 'redcall_logic_active_sessions_v1';
+const LOGIC_KEY = 'logic_sessions_v1';
+const RESERVATION_KEY = 'rechallenge_reservations_v1';
+const ACTIVE_SESSION_KEY = 'logic_active_sessions_v1';
 
 const inMemory: Record<string, string> = {};
 
-function safeGet<T>(key: string, fallback: T): T {
+function safeGet<T>(baseKey: string, fallback: T): T {
+  const key = scopedStorageKey(baseKey);
   try {
     const raw =
       typeof window !== 'undefined' && window.localStorage
@@ -25,7 +27,8 @@ function safeGet<T>(key: string, fallback: T): T {
   }
 }
 
-function safeSet<T>(key: string, value: T): boolean {
+function safeSet<T>(baseKey: string, value: T): boolean {
+  const key = scopedStorageKey(baseKey);
   try {
     const serialized = JSON.stringify(value);
     if (typeof window !== 'undefined' && window.localStorage) {

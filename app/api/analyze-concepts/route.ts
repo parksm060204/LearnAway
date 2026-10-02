@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { AI_CONFIG, isAiConfigured } from '@/lib/aiConfig';
 import { ConceptDraft, ConceptEvidence } from '@/lib/types';
 import {
@@ -22,6 +23,9 @@ function asStringArray(value: unknown): string[] {
 }
 
 export async function POST(req: NextRequest) {
+  const auth = await requireApiUser();
+  if (!auth.ok) return auth.response;
+
   try {
     let body: unknown;
     try {

@@ -10,6 +10,8 @@
     "test:regressions": "node scripts/test-regressions.mjs"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.117.2",
     "@types/katex": "^0.16.8",
     "katex": "^0.18.9",
     "lucide-react": "^1.48.0",

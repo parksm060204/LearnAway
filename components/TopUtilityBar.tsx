@@ -18,6 +18,7 @@ import {
   FileQuestion,
   ShieldAlert,
   BarChart3,
+  LogOut,
 } from 'lucide-react';
 
 interface TopUtilityBarProps {
@@ -39,6 +40,9 @@ interface TopUtilityBarProps {
   onOpenMockExam: () => void;
   onOpenSettings: () => void;
   onScrollToTodayReview: () => void;
+  userEmail?: string | null;
+  onLogout?: () => void;
+  isLoggingOut?: boolean;
 }
 
 export function TopUtilityBar({
@@ -60,6 +64,9 @@ export function TopUtilityBar({
   onOpenMockExam,
   onOpenSettings,
   onScrollToTodayReview,
+  userEmail,
+  onLogout,
+  isLoggingOut = false,
 }: TopUtilityBarProps) {
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
@@ -297,6 +304,28 @@ export function TopUtilityBar({
           >
             <Settings className="w-4 h-4" />
           </button>
+
+          {onLogout && (
+            <div className="flex items-center gap-2 ml-1 pl-2 border-l border-[#e2ded6]">
+              {userEmail && (
+                <span
+                  className="hidden xl:inline max-w-[160px] truncate text-[11px] font-academic-mono text-[#827d73]"
+                  title={userEmail}
+                >
+                  {userEmail}
+                </span>
+              )}
+              <button
+                onClick={onLogout}
+                disabled={isLoggingOut}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xs text-[#57544e] hover:text-[#c52828] hover:bg-[#fef2f2] border border-transparent hover:border-[#fecaca] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                title="로그아웃"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>{isLoggingOut ? '로그아웃 중...' : '로그아웃'}</span>
+              </button>
+            </div>
+          )}
         </nav>
 
         {/* Mobile menu toggle */}
@@ -463,6 +492,20 @@ export function TopUtilityBar({
             <Settings className="w-4 h-4 text-[#827d73]" />
             <span>시연 파라미터 및 모델 설정</span>
           </button>
+
+          {onLogout && (
+            <button
+              onClick={() => {
+                setIsMobileMenuOpen(false);
+                onLogout();
+              }}
+              disabled={isLoggingOut}
+              className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#c52828] hover:bg-[#fef2f2] rounded-xs disabled:opacity-60"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>{isLoggingOut ? '로그아웃 중...' : '로그아웃'}</span>
+            </button>
+          )}
         </div>
       )}
     </header>

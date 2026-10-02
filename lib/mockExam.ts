@@ -1,12 +1,14 @@
 import { Concept, MockExamSession, Problem, ProblemType, Subject, isProblemAvailableForPractice } from './types';
+import { scopedStorageKey } from './storageScope';
 
-const STORAGE_KEY = 'redcall_mock_exam_sessions_v1';
+const STORAGE_KEY = 'mock_exam_sessions_v1';
 let inMemoryMockStore: MockExamSession[] = [];
 
 export function loadMockExams(): MockExamSession[] {
+  const key = scopedStorageKey(STORAGE_KEY);
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      const parsed: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+      const parsed: unknown = JSON.parse(localStorage.getItem(key) || '[]');
       return Array.isArray(parsed) ? (parsed as MockExamSession[]) : [];
     }
     return inMemoryMockStore;
@@ -16,20 +18,22 @@ export function loadMockExams(): MockExamSession[] {
 }
 
 export function saveMockExam(session: MockExamSession): void {
+  const key = scopedStorageKey(STORAGE_KEY);
   const existing = loadMockExams();
   const updated = [session, ...existing.filter((item) => item.id !== session.id)];
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+      localStorage.setItem(key, JSON.stringify(updated));
     }
   } catch {}
   inMemoryMockStore = updated;
 }
 
 export function clearMockExams(): void {
+  const key = scopedStorageKey(STORAGE_KEY);
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(key);
     }
   } catch {}
   inMemoryMockStore = [];

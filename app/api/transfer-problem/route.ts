@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { AI_CONFIG, isAiConfigured } from '../../../lib/aiConfig';
 import { ProblemDifficulty, ProblemType, RubricCriterion } from '../../../lib/types';
 import { validateTransferProblemOutput } from '../../../lib/transferValidation';
@@ -23,6 +24,9 @@ function asString(value: unknown): string {
 }
 
 export async function POST(req: NextRequest) {
+  const auth = await requireApiUser();
+  if (!auth.ok) return auth.response;
+
   try {
     let body: unknown;
     try {

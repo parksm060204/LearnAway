@@ -39,26 +39,34 @@ import {
 import { addDaysToDate } from './dateUtils';
 import { computeMarkdownHash } from './markdownUtils';
 import { completeRechallengeReservation } from './logicSession';
+import { scopedStorageKey } from './storageScope';
 
+// Base key names. The `redcall_` prefix and user namespace are applied by
+// scopedStorageKey() so legacy (pre-login) data keeps its exact historical keys.
 const STORAGE_KEYS = {
-  CURRENT_SUBJECT_ID: 'redcall_active_subject_id',
-  SUBJECTS: 'redcall_subjects_v1',
-  MATERIALS: 'redcall_materials_v1',
-  CONCEPTS: 'redcall_concepts_v1',
-  CONCEPT_DRAFTS: 'redcall_concept_drafts_v1',
-  PROBLEMS: 'redcall_problems_v1',
-  PROBLEM_DRAFTS: 'redcall_problem_drafts_v1',
-  ATTEMPTS: 'redcall_attempts_v1',
-  SETTINGS: 'redcall_retention_settings_v1',
-  STUDY_PLAN_SETTINGS: 'redcall_study_plan_settings_v1',
-  STUDY_PLAN_ITEMS: 'redcall_study_plan_items_v1',
-  PERSONALIZATION_SETTINGS: 'redcall_personalization_settings_v1',
-  PERSONALIZATION_STATE: 'redcall_personalization_state_v1',
-};
+  CURRENT_SUBJECT_ID: 'active_subject_id',
+  SUBJECTS: 'subjects_v1',
+  MATERIALS: 'materials_v1',
+  CONCEPTS: 'concepts_v1',
+  CONCEPT_DRAFTS: 'concept_drafts_v1',
+  PROBLEMS: 'problems_v1',
+  PROBLEM_DRAFTS: 'problem_drafts_v1',
+  ATTEMPTS: 'attempts_v1',
+  SETTINGS: 'retention_settings_v1',
+  STUDY_PLAN_SETTINGS: 'study_plan_settings_v1',
+  STUDY_PLAN_ITEMS: 'study_plan_items_v1',
+  PERSONALIZATION_SETTINGS: 'personalization_settings_v1',
+  PERSONALIZATION_STATE: 'personalization_state_v1',
+} as const;
+
+const MOCK_EXAM_KEY = 'mock_exam_sessions_v1';
+const LOGIC_SESSIONS_KEY = 'logic_sessions_v1';
+const REC_HALLENGE_KEY = 'rechallenge_reservations_v1';
 
 const inMemoryStore: Record<string, string> = {};
 
-function safeGetItem<T>(key: string, fallback: T): T {
+function safeGetItem<T>(baseKey: string, fallback: T): T {
+  const key = scopedStorageKey(baseKey);
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       const raw = localStorage.getItem(key);
@@ -75,7 +83,8 @@ function safeGetItem<T>(key: string, fallback: T): T {
   }
 }
 
-function safeSetItem<T>(key: string, val: T): void {
+function safeSetItem<T>(baseKey: string, val: T): void {
+  const key = scopedStorageKey(baseKey);
   try {
     const serialized = JSON.stringify(val);
     if (typeof window !== 'undefined' && window.localStorage) {
@@ -85,6 +94,19 @@ function safeSetItem<T>(key: string, val: T): void {
     }
   } catch (e) {
     console.error(`Failed to write localStorage key ${key}`, e);
+  }
+}
+
+function safeRemoveItem(baseKey: string): void {
+  const key = scopedStorageKey(baseKey);
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.removeItem(key);
+    } else {
+      delete inMemoryStore[key];
+    }
+  } catch (e) {
+    console.error(`Failed to remove localStorage key ${key}`, e);
   }
 }
 
@@ -1196,22 +1218,22 @@ export function saveStoredSettings(settings: RetentionModelSettings): void {
  */
 export function resetToInitialDemoData(): void {
   if (typeof window === 'undefined') return;
-  localStorage.removeItem(STORAGE_KEYS.CURRENT_SUBJECT_ID);
-  localStorage.removeItem(STORAGE_KEYS.SUBJECTS);
-  localStorage.removeItem(STORAGE_KEYS.MATERIALS);
-  localStorage.removeItem(STORAGE_KEYS.CONCEPTS);
-  localStorage.removeItem(STORAGE_KEYS.CONCEPT_DRAFTS);
-  localStorage.removeItem(STORAGE_KEYS.PROBLEMS);
-  localStorage.removeItem(STORAGE_KEYS.PROBLEM_DRAFTS);
-  localStorage.removeItem(STORAGE_KEYS.ATTEMPTS);
-  localStorage.removeItem('redcall_mock_exam_sessions_v1');
-  localStorage.removeItem(STORAGE_KEYS.SETTINGS);
-  localStorage.removeItem(STORAGE_KEYS.STUDY_PLAN_SETTINGS);
-  localStorage.removeItem(STORAGE_KEYS.STUDY_PLAN_ITEMS);
-  localStorage.removeItem(STORAGE_KEYS.PERSONALIZATION_SETTINGS);
-  localStorage.removeItem(STORAGE_KEYS.PERSONALIZATION_STATE);
-  localStorage.removeItem('redcall_logic_sessions_v1');
-  localStorage.removeItem('redcall_rechallenge_reservations_v1');
+  safeRemoveItem(STORAGE_KEYS.CURRENT_SUBJECT_ID);
+  safeRemoveItem(STORAGE_KEYS.SUBJECTS);
+  safeRemoveItem(STORAGE_KEYS.MATERIALS);
+  safeRemoveItem(STORAGE_KEYS.CONCEPTS);
+  safeRemoveItem(STORAGE_KEYS.CONCEPT_DRAFTS);
+  safeRemoveItem(STORAGE_KEYS.PROBLEMS);
+  safeRemoveItem(STORAGE_KEYS.PROBLEM_DRAFTS);
+  safeRemoveItem(STORAGE_KEYS.ATTEMPTS);
+  safeRemoveItem(MOCK_EXAM_KEY);
+  safeRemoveItem(STORAGE_KEYS.SETTINGS);
+  safeRemoveItem(STORAGE_KEYS.STUDY_PLAN_SETTINGS);
+  safeRemoveItem(STORAGE_KEYS.STUDY_PLAN_ITEMS);
+  safeRemoveItem(STORAGE_KEYS.PERSONALIZATION_SETTINGS);
+  safeRemoveItem(STORAGE_KEYS.PERSONALIZATION_STATE);
+  safeRemoveItem(LOGIC_SESSIONS_KEY);
+  safeRemoveItem(REC_HALLENGE_KEY);
   // Demo data is now loaded only through this explicit reset action.
   saveStoredSubjects(INITIAL_SUBJECTS);
   saveStoredMaterials(INITIAL_MATERIALS);

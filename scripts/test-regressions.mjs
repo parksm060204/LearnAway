@@ -15,6 +15,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
   'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
+  'lib/storageScope.ts', 'lib/auth/redirects.ts', 'lib/legacyImport.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -25,9 +26,38 @@ async function run() {
   fs.symlinkSync(path.join(root, 'node_modules'), path.join(output, 'node_modules'), 'junction');
   const data = new Map();
   global.window = { localStorage: {} };
-  global.localStorage = { getItem: (key) => data.get(key) ?? null,
-    setItem: (key, value) => data.set(key, value), removeItem: (key) => data.delete(key) };
+  global.localStorage = {
+    getItem: (key) => (data.has(key) ? data.get(key) : null),
+    setItem: (key, value) => { data.set(key, String(value)); },
+    removeItem: (key) => { data.delete(key); },
+    clear: () => { data.clear(); },
+    key: (index) => Array.from(data.keys())[index] ?? null,
+    get length() { return data.size; },
+  };
   window.localStorage = localStorage;
+
+  // --- Auth gate mock ------------------------------------------------------
+  // Production route handlers verify the user on the server with no bypass.
+  // Tests replace only the compiled auth gate module with a controllable stub.
+  const apiAuthPath = path.join(output, 'lib', 'auth', 'apiAuth.js');
+  fs.mkdirSync(path.dirname(apiAuthPath), { recursive: true });
+  // Keep the real compiled module for testing the pure failure-response mapper.
+  const realApiAuthPath = path.join(output, 'lib', 'auth', 'apiAuth.real.js');
+  fs.copyFileSync(apiAuthPath, realApiAuthPath);
+  fs.writeFileSync(apiAuthPath, `const { NextResponse } = require('next/server');
+let mode = 'authenticated';
+exports.__setMode = (m) => { mode = m; };
+exports.requireApiUser = async () => {
+  if (mode === 'authenticated') return { ok: true, user: { id: 'test-user', email: 'test@example.com' } };
+  return { ok: false, response: NextResponse.json({ success: false, authError: true, code: 'UNAUTHENTICATED', error: 'login required' }, { status: 401 }) };
+};
+`);
+  delete load.cache[apiAuthPath];
+  const auth = load(apiAuthPath);
+  const realApiAuth = load(realApiAuthPath);
+  const redirects = load(path.join(output, 'lib/auth/redirects.js'));
+  const legacyImport = load(path.join(output, 'lib/legacyImport.js'));
+
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
   const validation = load(path.join(output, 'lib/evaluationValidation.js'));
@@ -144,6 +174,36 @@ async function run() {
     assert.equal(valid.status, 200); assert.equal(response.evaluation.calculatedScore, 80.5);
   });
 
+  // ---- Authentication gate ----
+  const callsBeforeAnonymous = calls;
+  auth.__setMode('anonymous');
+  const unauthenticated = await POST(request(body));
+  check('unauthenticated AI evaluation is blocked with 401 before any AI call', () => {
+    assert.equal(unauthenticated.status, 401);
+    assert.equal(calls, callsBeforeAnonymous);
+  });
+  auth.__setMode('authenticated');
+
+  check('auth failures map consistently to 401/503 with authError flag', async () => {
+    const unauth = realApiAuth.authFailureResponse({ status: 'unauthenticated' });
+    const errored = realApiAuth.authFailureResponse({ status: 'error', message: 'x' });
+    const unconfigured = realApiAuth.authFailureResponse({ status: 'unconfigured', message: 'x' });
+    assert.equal(unauth.status, 401);
+    assert.equal(errored.status, 401);
+    assert.equal(unconfigured.status, 503);
+    assert.equal((await unauth.json()).authError, true);
+  });
+
+  check('redirect targets are restricted to internal non-auth paths', () => {
+    assert.equal(redirects.safeInternalPath('/subjects?x=1'), '/subjects?x=1');
+    assert.equal(redirects.safeInternalPath('//evil.com'), '/');
+    assert.equal(redirects.safeInternalPath('https://evil.com'), '/');
+    assert.equal(redirects.safeInternalPath('/\\evil.com'), '/');
+    assert.equal(redirects.safeInternalPath('/login'), '/');
+    assert.equal(redirects.safeInternalPath('/auth/callback'), '/');
+    assert.equal(redirects.safeInternalPath(null), '/');
+  });
+
   // ---- Stage 11: material storage reliability ----
   const checkAsync = async (name, fn) => { await fn(); passed++; console.log(`PASS ${name}`); };
 
@@ -165,6 +225,36 @@ async function run() {
     await matStorage.saveMaterialContent('mat-y', { markdown: '# y' });
     await matStorage.clearAllMaterialContent();
     assert.equal(matStorage.getCachedMaterialContent('mat-y'), null);
+  });
+
+  await checkAsync('legacy import is explicit, idempotent and never clobbers user data', async () => {
+    localStorage.setItem('redcall_subjects_v1', JSON.stringify([{ id: 'legacy-s' }]));
+    localStorage.setItem('redcall_attempts_v1', JSON.stringify([{ id: 'legacy-a' }]));
+
+    const first = await legacyImport.importLegacyData('user-1');
+    assert.equal(first.verified, true);
+    assert.ok(first.localStorageCopied >= 2, 'both seeded legacy keys are imported');
+    assert.equal(localStorage.getItem('redcall_user_user-1__subjects_v1'), JSON.stringify([{ id: 'legacy-s' }]));
+
+    // Re-running must skip existing keys (no duplicates) and stay verified.
+    const second = await legacyImport.importLegacyData('user-1');
+    assert.equal(second.localStorageCopied, 0);
+    assert.equal(second.localStorageSkipped, first.localStorageCopied + first.localStorageSkipped);
+    assert.equal(second.verified, true);
+
+    // The original legacy source is preserved untouched.
+    assert.equal(localStorage.getItem('redcall_subjects_v1'), JSON.stringify([{ id: 'legacy-s' }]));
+
+    // Another account sees its own (empty) namespace, not user-1's records.
+    const other = await legacyImport.getLegacyImportState('user-2');
+    assert.equal(other.imported, false);
+    assert.equal(localStorage.getItem('redcall_user_user-1__subjects_v1'), JSON.stringify([{ id: 'legacy-s' }]));
+
+    // Pre-existing account data is never overwritten.
+    localStorage.setItem('redcall_user_user-3__subjects_v1', JSON.stringify([{ id: 'own' }]));
+    const third = await legacyImport.importLegacyData('user-3');
+    assert.equal(third.verified, false);
+    assert.equal(localStorage.getItem('redcall_user_user-3__subjects_v1'), JSON.stringify([{ id: 'own' }]));
   });
 
   // ---- Stage 11: problem source collection ----
