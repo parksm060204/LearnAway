@@ -2,7 +2,7 @@
  * Learn my way Academic Math & Logic Proofing Engine
  * 
  * Provides:
- * 1. Proofreading and transformation of Lean 4 formal logic/proof syntax into mathematical notation
+ * 1. Literal code display, including Lean 4 declarations and proofs
  * 2. Automatic detection and KaTeX wrapping of bare/unescaped LaTeX macros
  * 3. Normalization of double backslash serialization artifacts (\\frac -> \frac)
  * 4. Academic math typesetting and HTML rendering via KaTeX
@@ -128,34 +128,24 @@ export function parseLeanDeclaration(leanCode: string): ParsedLeanBlock | null {
 
 /**
  * Proofreads and normalizes raw text containing Lean code, bare LaTeX,
- * or Markdown into clean Markdown with proper KaTeX math delimiters ($...$ and $$...$$).
+ * or Markdown into clean Markdown with math delimiters, preserving code and explicit formulas.
  */
 export function proofreadAcademicText(text: string): string {
   if (!text) return '';
+  // Transform prose only. Code and explicitly delimited mathematics are literal.
+  const protectedPattern = /```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$[^\$\n]+\$/g;
+  let cursor = 0;
+  let output = '';
+  for (const match of text.matchAll(protectedPattern)) {
+    output += proofreadAcademicSegment(text.slice(cursor, match.index));
+    output += match[0];
+    cursor = match.index! + match[0].length;
+  }
+  return output + proofreadAcademicSegment(text.slice(cursor));
+}
+
+function proofreadAcademicSegment(text: string): string {
   let res = normalizeDoubleEscapes(text);
-
-  // 1. Process Lean code blocks: ```lean ... ```
-  res = res.replace(/```(?:lean|lean4)\s*([\s\S]*?)```/g, (_, code) => {
-    const parsed = parseLeanDeclaration(code);
-    if (parsed) {
-      const nameStr = parsed.name ? ` **${parsed.name}**` : '';
-      const proofStr = parsed.proof ? `\n> *증명*: ${parsed.proof}` : '';
-      return `\n\n> 📜 **${parsed.kind}**${nameStr}\n$$\n${parsed.fullFormula}\n$$\n${proofStr}\n\n`;
-    }
-    return `\n\`\`\`lean\n${code}\n\`\`\`\n`;
-  });
-
-  // 2. Process standalone single-line Lean theorems:
-  // e.g. "theorem foo (x : Real) : ... := by sorry"
-  res = res.replace(/^(theorem|lemma|def|example)\s+([a-zA-Z0-9_']+)?\s*\(.*?\)\s*:.*$/gm, (match) => {
-    const parsed = parseLeanDeclaration(match);
-    if (parsed) {
-      const nameStr = parsed.name ? ` **${parsed.name}**` : '';
-      return `> 📜 **${parsed.kind}**${nameStr}\n$$\n${parsed.fullFormula}\n$$`;
-    }
-    return match;
-  });
-
   // 3. Protect existing display and inline math
   const preservedMath: string[] = [];
   res = res.replace(/(\$\$[\s\S]*?\$\$|\$[^\$\n]+?\$)/g, (m) => {
@@ -212,10 +202,16 @@ export function proofreadAcademicText(text: string): string {
   return res;
 }
 
+export function escapeAcademicHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 export interface RenderAcademicMathOptions {
   inline?: boolean;
   displayMode?: boolean;
   throwOnError?: boolean;
+  sourceAnchors?: boolean;
 }
 
 /**
@@ -223,7 +219,7 @@ export interface RenderAcademicMathOptions {
  */
 export function safeRenderKaTeX(math: string, displayMode: boolean = false): string {
   try {
-    const clean = normalizeDoubleEscapes(math.trim());
+    const clean = math.trim();
     return katex.renderToString(clean, {
       displayMode,
       throwOnError: false,
@@ -231,7 +227,7 @@ export function safeRenderKaTeX(math: string, displayMode: boolean = false): str
     });
   } catch (e) {
     console.warn('KaTeX render error:', e);
-    return `<span class="font-academic-mono text-xs bg-amber-50 text-amber-900 px-1 py-0.5 rounded border border-amber-200">${math}</span>`;
+    return `<span class="font-academic-mono text-xs bg-amber-50 text-amber-900 px-1 py-0.5 rounded border border-amber-200">${escapeAcademicHtml(math)}</span>`;
   }
 }
 
@@ -255,27 +251,47 @@ export function renderAcademicMathHtml(
   // 1. Proofread and normalize syntax
   let text = proofreadAcademicText(content);
 
+  const fragments: string[] = [];
+  let marker = 'ACADEMICFRAGMENT';
+  while (text.includes(marker)) marker += 'X';
+  const preserve = (html: string) => {
+    fragments.push(html);
+    return `${marker}${fragments.length - 1}END`;
+  };
+  const restore = (value: string) => value.replace(new RegExp(`${marker}(\\d+)END`, 'g'), (_, idx) => fragments[Number(idx)]);
+  text = text.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, language, code) =>
+    preserve(`<pre class="my-2 overflow-x-auto"><code data-language="${escapeAcademicHtml(language.trim())}">${escapeAcademicHtml(code)}</code></pre>`));
+  text = text.replace(/`([^`\n]+)`/g, (_, code) => preserve(`<code>${escapeAcademicHtml(code)}</code>`));
+  if (options.sourceAnchors) {
+    text = text.replace(/<!--\s*\[PAGE\s+(\d+)\]\s*-->/gi, (_, page) =>
+      preserve(`<div class="my-3"><button type="button" class="text-xs text-[#c52828]" data-page="${page}">§ 원본 PDF 제${page}페이지</button></div>`));
+    text = text.replace(/<!--\s*\[발화\s+#?(\d+)\]\s*-->/gi, (_, block) =>
+      preserve(`<div class="my-3"><button type="button" class="text-xs text-indigo-700" data-block="${block}">§ 발화 #${block}</button></div>`));
+  }
+
   // 2. Process Display Math: $$...$$
   text = text.replace(/\$\$([\s\S]*?)\$\$/g, (_, equation) => {
-    return `<div class="my-3 py-2 px-3 bg-[#faf8f5] border border-[#e8e4dc] rounded text-center overflow-x-auto select-text">${safeRenderKaTeX(
+    return preserve(`<div class="my-3 py-2 px-3 bg-[#faf8f5] border border-[#e8e4dc] rounded text-center overflow-x-auto select-text">${safeRenderKaTeX(
       equation,
       true
-    )}</div>`;
+    )}</div>`);
   });
 
   // 3. Process Inline Math: $...$
   text = text.replace(/\$([^\$\n]+?)\$/g, (_, equation) => {
-    return safeRenderKaTeX(equation, false);
+    return preserve(safeRenderKaTeX(equation, false));
   });
+
+  text = escapeAcademicHtml(text);
 
   // If inline rendering is requested, strip headings, lists, blockquotes and only keep bold/italic
   if (inline) {
     text = text.replace(/^#+\s+/gm, '');
-    text = text.replace(/^>\s*/gm, '');
+    text = text.replace(/^&gt;\s*/gm, '');
     text = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
     text = text.replace(/\*(.*?)\*/g, '<em>$1</em>');
     text = text.replace(/\n+/g, ' ');
-    return text.trim();
+    return restore(text.trim());
   }
 
   // 4. Headings
@@ -284,7 +300,7 @@ export function renderAcademicMathHtml(
   text = text.replace(/^# (.*$)/gim, '<h1 class="text-lg font-bold font-serif text-[#191817] mt-2 mb-3 pb-1 border-b-2 border-[#191817]">$1</h1>');
 
   // 5. Blockquotes
-  text = text.replace(/^>\s?(.*$)/gim, '<blockquote class="border-l-3 border-[#c52828] pl-3 py-1 my-2 bg-[#fdfcfb] text-[#33302b] italic text-xs leading-relaxed">$1</blockquote>');
+  text = text.replace(/^&gt;\s?(.*$)/gim, '<blockquote class="border-l-3 border-[#c52828] pl-3 py-1 my-2 bg-[#fdfcfb] text-[#33302b] italic text-xs leading-relaxed">$1</blockquote>');
 
   // 6. Bold and Italic
   text = text.replace(/\*\*(.*?)\*\*/g, '<strong class="font-semibold text-[#191817]">$1</strong>');
@@ -318,7 +334,7 @@ export function renderAcademicMathHtml(
     })
     .join('\n');
 
-  return text;
+  return restore(text);
 }
 
 /**
@@ -333,3 +349,4 @@ export function cleanDisplayTitle(title: string): string {
     .replace(/`([^`]+)`/g, '$1')
     .trim();
 }
+

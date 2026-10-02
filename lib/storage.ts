@@ -89,7 +89,7 @@ function safeSetItem<T>(key: string, val: T): void {
 }
 
 export function loadStoredSubjects(): Subject[] {
-  return safeGetItem<Subject[]>(STORAGE_KEYS.SUBJECTS, INITIAL_SUBJECTS);
+  return safeGetItem<Subject[]>(STORAGE_KEYS.SUBJECTS, []);
 }
 
 export function saveStoredSubjects(subjects: Subject[]): void {
@@ -97,7 +97,9 @@ export function saveStoredSubjects(subjects: Subject[]): void {
 }
 
 export function loadActiveSubjectId(): string {
-  return safeGetItem<string>(STORAGE_KEYS.CURRENT_SUBJECT_ID, INITIAL_SUBJECTS[0].id);
+  const subjects = loadStoredSubjects();
+  const stored = safeGetItem<string>(STORAGE_KEYS.CURRENT_SUBJECT_ID, '');
+  return subjects.some((subject) => subject.id === stored) ? stored : subjects[0]?.id || '';
 }
 
 export function saveActiveSubjectId(id: string): void {
@@ -105,7 +107,7 @@ export function saveActiveSubjectId(id: string): void {
 }
 
 export function loadStoredMaterials(): Material[] {
-  const loaded = safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, INITIAL_MATERIALS);
+  const loaded = safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, []);
   return loaded.map((m) => ({
     ...m,
     status: m.status || (m.isConverted ? 'ready' : 'converting'),
@@ -127,7 +129,7 @@ export function saveStoredMaterials(materials: Material[]): void {
 }
 
 export function loadStoredConcepts(referenceDate: Date = new Date()): Concept[] {
-  const loaded = safeGetItem<Concept[]>(STORAGE_KEYS.CONCEPTS, INITIAL_CONCEPTS);
+  const loaded = safeGetItem<Concept[]>(STORAGE_KEYS.CONCEPTS, []);
   const settings = safeGetItem<RetentionModelSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_RETENTION_SETTINGS);
 
   return loaded.map((c) => {
@@ -419,7 +421,7 @@ export function markConceptAsLearned(
 }
 
 export function loadStoredProblems(): Problem[] {
-  const raw = safeGetItem<Problem[]>(STORAGE_KEYS.PROBLEMS, INITIAL_PROBLEMS);
+  const raw = safeGetItem<Problem[]>(STORAGE_KEYS.PROBLEMS, []);
   // Legacy migration: recover transfer linkage ONLY when the original draft can
   // still be resolved by draftId. Never infer a source/session.
   const drafts = loadStoredProblemDrafts();
@@ -1210,6 +1212,12 @@ export function resetToInitialDemoData(): void {
   localStorage.removeItem(STORAGE_KEYS.PERSONALIZATION_STATE);
   localStorage.removeItem('redcall_logic_sessions_v1');
   localStorage.removeItem('redcall_rechallenge_reservations_v1');
+  // Demo data is now loaded only through this explicit reset action.
+  saveStoredSubjects(INITIAL_SUBJECTS);
+  saveStoredMaterials(INITIAL_MATERIALS);
+  saveStoredConcepts(INITIAL_CONCEPTS);
+  saveStoredProblems(INITIAL_PROBLEMS);
+  saveActiveSubjectId(INITIAL_SUBJECTS[0].id);
 }
 
 // Stage 10: Personal review recommendation settings & correction state
@@ -1867,3 +1875,4 @@ export function getAttemptById(attemptId: string): Attempt | null {
   const attempts = loadStoredAttempts();
   return attempts.find((a) => a.id === attemptId) || null;
 }
+

@@ -14,7 +14,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
-  'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
+  'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -1524,8 +1524,69 @@ async function run() {
     assert.equal(saveFailResult.partialOutcome?.status, 'retryable_failure');
   });
 
+  const academic = load(path.join(output, 'lib/academicProofing.js'));
+  const aiConfig = load(path.join(output, 'lib/aiConfig.js'));
+  check('academic renderer escapes untrusted HTML in block and inline views', () => {
+    for (const options of [{}, { inline: true }]) {
+      const html = academic.renderAcademicMathHtml('<img src=x onerror=alert(1)><script>alert(2)</script>', options);
+      assert.ok(!html.includes('<img'));
+      assert.ok(!html.includes('<script'));
+      assert.ok(html.includes('&lt;img'));
+    }
+  });
+  check('math HTML is preserved through Markdown emphasis and code stays literal', () => {
+    assert.ok(!academic.renderAcademicMathHtml('$a*b*c$').includes('<em'));
+    const code = String.raw`\\frac{x}{y}`;
+    assert.equal(academic.proofreadAcademicText('`' + code + '`'), '`' + code + '`');
+    const html = academic.renderAcademicMathHtml('```lean\ntheorem foo (h : P) : P := by exact h\n```');
+    assert.ok(html.includes('theorem foo (h : P)'));
+    assert.ok(!html.includes('katex'));
+    const matrix = String.raw`\begin{matrix}a\\b\end{matrix}`;
+    assert.equal(academic.proofreadAcademicText('$' + matrix + '$'), '$' + matrix + '$');
+    assert.ok(!academic.safeRenderKaTeX(matrix).includes('katex-error'));
+  });
+  check('source anchors work and user HTML cannot forge source links', () => {
+    const html = academic.renderAcademicMathHtml('<!-- [PAGE 3] -->\n<!-- [발화 #2] -->\n<span data-page="9">forged</span>', { sourceAnchors: true });
+    assert.ok(html.includes('data-page="3"'));
+    assert.ok(html.includes('data-block="2"'));
+    assert.ok(!html.includes('<span data-page="9"'));
+  });
+  check('provider credentials, model and endpoint resolve as one configuration', () => {
+    const configs = [
+      [{ DEEPSEEK_API_KEY: ' key ' }, 'deepseek', 'https://api.deepseek.com', 'deepseek-v4-flash'],
+      [{ OPENAI_API_KEY: 'key', DEEPSEEK_MODEL: 'wrong' }, 'openai', 'https://api.openai.com/v1', 'gpt-4o-mini'],
+      [{ GEMINI_API_KEY: 'key', OPENAI_MODEL: 'wrong', OPENAI_BASE_URL: 'https://wrong' }, 'gemini', 'https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-3.5-flash'],
+      [{ AI_API_KEY: 'key', AI_MODEL: 'custom', AI_API_BASE: 'https://custom/v1/' }, 'gemini', 'https://custom/v1', 'custom'],
+    ];
+    for (const [env, provider, base, model] of configs) {
+      const config = aiConfig.resolveAiConfig(env);
+      assert.equal(config.provider, provider);
+      assert.equal(config.apiBase, base);
+      assert.equal(config.model, model);
+      assert.equal(config.apiKey, 'key');
+    }
+  });
+  check('new users start empty and existing stored data survives reload', () => {
+    const backup = new Map(data);
+    try {
+      data.clear();
+      assert.deepEqual(storage.loadStoredSubjects(), []);
+      assert.deepEqual(storage.loadStoredMaterials(), []);
+      assert.deepEqual(storage.loadStoredConcepts(), []);
+      assert.deepEqual(storage.loadStoredProblems(), []);
+      assert.equal(storage.loadActiveSubjectId(), '');
+      storage.saveStoredSubjects([subject]);
+      storage.saveStoredMaterials([{ id: 'real', subjectId: subject.id, status: 'ready', isDemo: false }]);
+      storage.saveStoredAttempts([attempt]);
+      assert.equal(storage.loadActiveSubjectId(), subject.id);
+      assert.equal(storage.loadStoredMaterials()[0].id, 'real');
+      assert.equal(storage.loadStoredAttempts()[0].id, attempt.id);
+    } finally { data.clear(); for (const [key, value] of backup) data.set(key, value); }
+  });
+
   console.log(`${passed} regression checks passed`);
 }
 
 run().catch((error) => { console.error(error); process.exitCode = 1; })
   .finally(() => fs.rmSync(output, { recursive: true, force: true }));
+

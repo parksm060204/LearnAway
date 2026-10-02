@@ -14,7 +14,7 @@ interface AcademicMathViewProps {
 /**
  * AcademicMathView
  * 
- * Automatically proofreads and formats Lean, Markdown, and LaTeX syntax
+ * Formats Markdown and LaTeX while preserving literal Lean and other code
  * into typeset KaTeX formulas and clean academic typography.
  */
 export function AcademicMathView({
@@ -51,3 +51,4 @@ export function AcademicMathView({
 }
 
 export default AcademicMathView;
+

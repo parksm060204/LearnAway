@@ -13,9 +13,9 @@ export function MathFormula({ math, displayMode = false, className = '' }: MathF
   if (!math) return null;
 
   const leanParsed = parseLeanDeclaration(math);
-  const targetMath = leanParsed
-    ? leanParsed.fullFormula
-    : proofreadAcademicText(math.trim().replace(/^\$\$([\s\S]*)\$\$$/, '$1').replace(/^\$([^\$]+)\$$/, '$1')).replace(/^\$\$([\s\S]*)\$\$$/, '$1').replace(/^\$([^\$]+)\$$/, '$1');
+  // A heuristic translation cannot preserve Lean hypotheses or proof semantics.
+  if (leanParsed) return <code className={`whitespace-pre-wrap ${className}`}>{math}</code>;
+  const targetMath = proofreadAcademicText(math.trim().replace(/^\$\$([\s\S]*)\$\$$/, '$1').replace(/^\$([^\$]+)\$$/, '$1')).replace(/^\$\$([\s\S]*)\$\$$/, '$1').replace(/^\$([^\$]+)\$$/, '$1');
   const html = safeRenderKaTeX(targetMath, displayMode);
 
   return (
@@ -25,3 +25,4 @@ export function MathFormula({ math, displayMode = false, className = '' }: MathF
     />
   );
 }
+

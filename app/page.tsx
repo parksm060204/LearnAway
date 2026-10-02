@@ -1111,10 +1111,21 @@ export default function LearnMyWayDashboardPage() {
     window.location.reload();
   };
 
-  if (!isLoaded || !activeSubject) {
+  if (!isLoaded) {
     return (
       <div className="min-h-screen bg-[#faf8f4] flex items-center justify-center p-6 text-sm font-academic-mono text-[#827d73]">
         Learn my way Academic Suite 초기화 중...
+      </div>
+    );
+  }
+
+  if (!activeSubject) {
+    return (
+      <div className="min-h-screen bg-[#faf8f4] flex flex-col items-center justify-center gap-4 p-6 text-[#191817]">
+        <h1 className="text-2xl font-bold">Learn my way</h1>
+        <p>첫 과목을 만들고 PDF 또는 전사본을 등록해 학습을 시작하세요.</p>
+        <button className="rounded-full bg-[#191817] px-5 py-3 text-white" onClick={() => setIsAddSubjectModalOpen(true)}>과목 만들기</button>
+        <AddSubjectModal isOpen={isAddSubjectModalOpen} onClose={() => setIsAddSubjectModalOpen(false)} onAddSubject={handleAddSubject} />
       </div>
     );
   }
@@ -1644,3 +1655,4 @@ export default function LearnMyWayDashboardPage() {
     </div>
   );
 }
+

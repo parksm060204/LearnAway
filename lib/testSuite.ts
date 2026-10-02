@@ -420,6 +420,8 @@ function runTests() {
       updatedAt: '2026-09-29T00:00:00+09:00',
     };
 
+    // Seed demo fixtures explicitly; new users no longer receive demo data.
+    saveStoredProblems(INITIAL_PROBLEMS);
     saveStoredProblemDrafts([testDraft]);
     const loadedDrafts = loadStoredProblemDrafts();
     assert(loadedDrafts.some((d) => d.id === testDraftId), 'Draft saved and loaded from storage');
@@ -2303,5 +2305,6 @@ function runTests() {
 }
 
 runTests();
+
 
 
