@@ -13,8 +13,8 @@ const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
-  'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/learningAnalytics.ts',
-  'lib/transferValidation.ts',
+  'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
+  'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -38,6 +38,7 @@ async function run() {
   const logicSession = load(path.join(output, 'lib/logicSession.js'));
   const logicValidation = load(path.join(output, 'lib/logicValidation.js'));
   const transferValidation = load(path.join(output, 'lib/transferValidation.js'));
+  const logicAsync = load(path.join(output, 'lib/logicAsync.js'));
   const learningAnalytics = load(path.join(output, 'lib/learningAnalytics.js'));
   const markdownUtils = load(path.join(output, 'lib/markdownUtils.js'));
   const personalization = load(path.join(output, 'lib/personalization.js'));
@@ -724,18 +725,133 @@ async function run() {
   });
 
   check('transfer validation rejects same-prompt and invalid rubric, accepts valid transfer', () => {
-    const ctx = { allowedConceptIds: ['ls-c'], allowedTypes: ['essay_descriptive'], originalPrompt: '원문 지문', originalAnswer: '원답안' };
+    const ctx = { allowedConceptIds: ['ls-c'], requiredType: 'essay_descriptive', requiredDifficulty: 'advanced_college', originalPrompt: '원문 지문', originalAnswer: '원답안' };
     const transferRubric = [
       { id: 't1', label: '전제', maxScore: 30, weight: 0.3, description: 'd' },
       { id: 't2', label: '전개', maxScore: 40, weight: 0.4, description: 'd' },
       { id: 't3', label: '결론', maxScore: 30, weight: 0.3, description: 'd' },
     ];
-    const valid = { title: '전이', promptText: '조건을 바꾼 새 지문', type: 'essay_descriptive', difficulty: 'advanced_college', conceptIds: ['ls-c'], transferChanges: '적용 조건을 음수에서 양수로 변경', understandingFocus: '전제조건 이해', timeStandardMinutes: 20, modelAnswer: '모범', rubric: transferRubric, hints: ['hint'], designIntent: 'd', sourceRefs: 's' };
+    const valid = { title: '전이', promptText: '조건을 바꾼 새 지문', type: 'essay_descriptive', difficulty: 'advanced_college', conceptIds: ['ls-c'], transferKind: 'precondition_change', originalCondition: '조건 A', newCondition: '조건 B', transferChanges: '적용 조건을 음수에서 양수로 변경', understandingFocus: '전제조건 이해', timeStandardMinutes: 20, modelAnswer: '모범', rubric: transferRubric, hints: ['hint'], designIntent: 'd', sourceRefs: 's' };
     const out = transferValidation.validateTransferProblemOutput(valid, ctx);
     assert.equal(out.conceptIds[0], 'ls-c');
+    assert.equal(out.transferKind, 'precondition_change');
+    assert.equal(out.materialEvidenceVerified, false, 'material evidence not claimed');
     assert.throws(() => transferValidation.validateTransferProblemOutput({ ...valid, promptText: '원문 지문' }, ctx));
     assert.throws(() => transferValidation.validateTransferProblemOutput({ ...valid, rubric: [{ id: 'r', label: 'r', maxScore: 50, weight: 0.5, description: 'd' }] }, ctx));
   });
+
+  // ---- Stage 15: integrity + transfer linkage ----
+  check('transfer validation rejects duplicate rubric ids, zero score, out-of-scope concept and wrong type', () => {
+    const ctx = { allowedConceptIds: ['ls-c'], requiredType: 'essay_descriptive', requiredDifficulty: 'advanced_college', originalPrompt: '원문 지문', originalAnswer: '원답안' };
+    const transferRubric = [
+      { id: 't1', label: '전제', maxScore: 30, weight: 0.3, description: 'd' },
+      { id: 't2', label: '전개', maxScore: 40, weight: 0.4, description: 'd' },
+      { id: 't3', label: '결론', maxScore: 30, weight: 0.3, description: 'd' },
+    ];
+    const base = { title: '전이', promptText: '조건을 바꾼 새 지문', type: 'essay_descriptive', difficulty: 'advanced_college', conceptIds: ['ls-c'], transferKind: 'precondition_change', originalCondition: 'A', newCondition: 'B', transferChanges: '조건을 바꿈', understandingFocus: '이해', timeStandardMinutes: 20, modelAnswer: '모범', rubric: transferRubric, hints: ['hint'], designIntent: 'd', sourceRefs: 's' };
+    // duplicate rubric ids (sum still 100)
+    assert.throws(() => transferValidation.validateTransferProblemOutput({ ...base, rubric: [
+      { id: 'dup', label: 'a', maxScore: 50, weight: 0.5, description: 'd' },
+      { id: 'dup', label: 'b', maxScore: 50, weight: 0.5, description: 'd' },
+    ] }, ctx));
+    // zero maxScore (sum adjusted to 100 with another item)
+    assert.throws(() => transferValidation.validateTransferProblemOutput({ ...base, rubric: [
+      { id: 'z', label: 'a', maxScore: 0, weight: 0, description: 'd' },
+      { id: 'b', label: 'b', maxScore: 100, weight: 1, description: 'd' },
+      { id: 'c', label: 'c', maxScore: 0, weight: 0, description: 'd' },
+    ] }, ctx));
+    // out-of-scope concept rejected (not silently dropped)
+    assert.throws(() => transferValidation.validateTransferProblemOutput({ ...base, conceptIds: ['ls-c', 'other-c'] }, ctx));
+    // wrong type
+    assert.throws(() => transferValidation.validateTransferProblemOutput({ ...base, type: 'calc_derivation' }, ctx));
+    // invalid time
+    assert.throws(() => transferValidation.validateTransferProblemOutput({ ...base, timeStandardMinutes: 500 }, ctx));
+  });
+
+  check('single and batch approval preserve transfer linkage fields', () => {
+    storage.saveStoredProblems([]);
+    const draftBase = {
+      id: 'draft-transfer-x', subjectId: 'ls-subj', conceptIds: ['ls-c'], conceptTitles: ['c'], title: '전이', type: 'essay_descriptive',
+      difficulty: 'advanced_college', categoryLabel: '전이', categoryNumber: 0, promptText: 'p', designIntent: 'd', appliedConditionNote: 'change',
+      sourceRefs: 's', timeStandardMinutes: 20, timeBreakdownDesc: '20', coreEvaluationHighlight: 'e', itemCountDesc: '1',
+      hints: ['h'], modelAnswer: 'm', rubric: [{ id: 'r', label: 'r', maxScore: 100, weight: 1, description: 'd' }],
+      status: 'draft', isApproved: false, isDemo: false,
+      verificationStatus: { hasRequiredFields: true, isScore100: true, scoreSum: 100, hasConceptLink: true, isSourceVerified: false },
+      createdAt: 't', updatedAt: 't', isTransfer: true, sourceProblemId: 'ls-prob', logicSessionId: 'logic-ls-orig',
+      transferChanges: 'change', understandingFocus: 'focus', transferKind: 'precondition_change', originalCondition: 'A', newCondition: 'B',
+    };
+    storage.saveStoredProblemDrafts([draftBase]);
+    const single = storage.approveProblemDraft('draft-transfer-x');
+    assert.equal(single.approvedProblem.isTransfer, true);
+    assert.equal(single.approvedProblem.sourceProblemId, 'ls-prob');
+    assert.equal(single.approvedProblem.logicSessionId, 'logic-ls-orig');
+    assert.equal(single.approvedProblem.transferKind, 'precondition_change');
+
+    const draftB = { ...draftBase, id: 'draft-transfer-y', logicSessionId: 'logic-ls-orig-r2', title: '전이2' };
+    storage.saveStoredProblemDrafts([draftB]);
+    const batch = storage.batchApproveProblemDrafts(['draft-transfer-y']);
+    const approvedB = batch.updatedProblems.find((p) => p.draftId === 'draft-transfer-y');
+    assert.equal(approvedB.isTransfer, true);
+    assert.equal(approvedB.logicSessionId, 'logic-ls-orig-r2');
+  });
+
+  check('reservation completion blocks missing, cancelled and mismatched reservations', () => {
+    const mkRes = (id, status) => ({ id, subjectId: 'ls-subj', subjectName: 'n', conceptId: 'ls-c', problemId: 'ls-prob', problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: 't', status });
+    logicSession.saveRechallengeReservation(mkRes('rr-cancelled', 'cancelled'));
+    logicSession.saveRechallengeReservation(mkRes('rr-mismatch', 'scheduled'));
+    const identity = { subjectId: 'ls-subj', conceptId: 'ls-c', problemId: 'ls-prob', problemVersion: 1 };
+    assert.equal(logicSession.completeRechallengeReservation('rr-missing', identity).status, 'not_found');
+    assert.equal(logicSession.completeRechallengeReservation('rr-cancelled', identity).status, 'cancelled');
+    assert.equal(logicSession.completeRechallengeReservation('rr-mismatch', { ...identity, problemId: 'other' }).status, 'mismatch');
+    assert.equal(logicSession.completeRechallengeReservation('rr-mismatch', identity).status, 'completed');
+    assert.equal(logicSession.completeRechallengeReservation('rr-mismatch', identity).status, 'already_completed');
+  });
+
+  await checkAsync('recovery does not complete a cancelled reservation', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    logicSession.saveRechallengeReservation({ id: 'rr-rec', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'rec-prob', problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: 't', status: 'cancelled' });
+    storage.saveStoredAttempts([{ id: 'rec-rechallenge', problemId: 'rec-prob', conceptId: c.id, subjectId: c.subjectId, at: '2026-10-01T08:00:00+09:00', answer: 'a', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '', attemptOrigin: 'rechallenge', rechallengeReservationId: 'rr-rec' }]);
+    const outcome = storage.recoverMissingAttemptEvents();
+    assert.ok(outcome.unresolved.some((u) => u.attemptId === 'rec-rechallenge' && u.reason === 'RESERVATION_cancelled'), 'cancelled reservation reported unresolved');
+    const reservation = logicSession.getRechallengeReservation('rr-rec');
+    assert.equal(reservation.status, 'cancelled', 'cancelled reservation not completed by recovery');
+  });
+
+  check('session rounds are independent from question-set versions and are listed per attempt', () => {
+    const base = { subjectId: 'ls-subj', conceptId: 'ls-c', problemId: 'ls-prob', problemVersion: 1, sourceAttemptId: 'ls-orig', createdAt: 't', updatedAt: 't', status: 'draft', problemTitleSnapshot: 't', problemPromptSnapshot: 'p', modelAnswerSnapshot: 'm', rubricSnapshot: [{ id: 'r', label: 'r', maxScore: 100, weight: 1, description: 'd' }], originalAnswer: 'a', originalScore: 60, originalRubricResults: [], questions: [], questionSetVersion: 3, questionSets: [], questionAnswers: {}, revisedAnswer: '' };
+    logicSession.saveLogicSession({ ...base, id: 'logic-ls-orig', sessionRound: 1 });
+    logicSession.saveLogicSession({ ...base, id: 'logic-ls-orig-r2', sessionRound: 2, questionSetVersion: 1 });
+    const list = logicSession.loadLogicSessionsForAttempt('ls-orig');
+    assert.equal(list.length, 2);
+    assert.equal(list.find((s) => s.id === 'logic-ls-orig').questionSetVersion, 3);
+    assert.equal(list.find((s) => s.id === 'logic-ls-orig-r2').sessionRound, 2);
+    logicSession.setActiveLogicSessionId('ls-orig', 'logic-ls-orig-r2');
+    assert.equal(logicSession.getActiveLogicSessionId('ls-orig'), 'logic-ls-orig-r2');
+  });
+
+  await checkAsync('a delayed stale response is ignored when the input changed (component guard + mock API)', async () => {
+    const { POST } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    // Delayed mock response so the request is genuinely in flight.
+    global.fetch = async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      return Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'A', linkedCriterionId: 'r' }, { id: 'q2', question: 'B', linkedCriterionId: 'r' }] }) } }] });
+    };
+    const reqBody = { subjectId: 'ls-subj', domain: 'math_stats', problemTitle: 't', problemPrompt: 'p', modelAnswer: 'm', rubric: lsRubric, originalAnswer: '조건부 기댓값', solvingReason: '' };
+    const request = (value) => new NextRequest('http://localhost/api/logic-questions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+    const pending = POST(request(reqBody));
+    // The user changes input while the request is in flight -> snapshot no longer matches.
+    const guard = logicAsync.shouldApplyResponse({ mounted: true, requestId: 1, latestRequestId: 2, requestSessionId: 's1', activeSessionId: 's1', snapshotHash: 'old', currentHash: 'new' });
+    assert.equal(guard, false, 'stale response rejected');
+    const res = await pending;
+    assert.equal(res.status, 200);
+    // Same request id/session/hash would be applied.
+    assert.equal(logicAsync.shouldApplyResponse({ mounted: true, requestId: 2, latestRequestId: 2, requestSessionId: 's1', activeSessionId: 's1', snapshotHash: 'new', currentHash: 'new' }), true);
+    assert.equal(logicAsync.shouldApplyResponse({ mounted: false, requestId: 2, latestRequestId: 2, requestSessionId: 's1', activeSessionId: 's1', snapshotHash: 'new', currentHash: 'new' }), false, 'unmounted rejected');
+    assert.equal(logicAsync.shouldApplyResponse({ mounted: true, requestId: 2, latestRequestId: 2, requestSessionId: 's1', activeSessionId: 's2', snapshotHash: 'new', currentHash: 'new' }), false, 'round changed rejected');
+  });
+
+  console.log(`${passed} regression checks passed`);
 
   check('transfer problem is not assigned before approval', () => {
     const concept = { ...structuredClone(lsConcept) };

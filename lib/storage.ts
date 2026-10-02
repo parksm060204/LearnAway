@@ -415,15 +415,36 @@ export function markConceptAsLearned(
 
 export function loadStoredProblems(): Problem[] {
   const raw = safeGetItem<Problem[]>(STORAGE_KEYS.PROBLEMS, INITIAL_PROBLEMS);
-  return raw.map((p) => ({
-    ...p,
-    isDemo: p.isDemo ?? true,
-    isApproved: p.isApproved ?? true,
-    qualityStatus: p.qualityStatus ?? 'normal',
-    version: p.version ?? 1,
-    reports: p.reports ?? [],
-    versionHistory: p.versionHistory ?? [],
-  }));
+  // Legacy migration: recover transfer linkage ONLY when the original draft can
+  // still be resolved by draftId. Never infer a source/session.
+  const drafts = loadStoredProblemDrafts();
+  const draftById = new Map(drafts.map((d) => [d.id, d]));
+
+  return raw.map((p) => {
+    const base: Problem = {
+      ...p,
+      isDemo: p.isDemo ?? true,
+      isApproved: p.isApproved ?? true,
+      qualityStatus: p.qualityStatus ?? 'normal',
+      version: p.version ?? 1,
+      reports: p.reports ?? [],
+      versionHistory: p.versionHistory ?? [],
+    };
+    if (base.isTransfer === undefined && base.draftId) {
+      const draft = draftById.get(base.draftId);
+      if (draft?.isTransfer === true) {
+        base.isTransfer = true;
+        base.sourceProblemId = draft.sourceProblemId;
+        base.logicSessionId = draft.logicSessionId;
+        base.transferChanges = draft.transferChanges;
+        base.understandingFocus = draft.understandingFocus;
+        base.transferKind = draft.transferKind;
+        base.originalCondition = draft.originalCondition;
+        base.newCondition = draft.newCondition;
+      }
+    }
+    return base;
+  });
 }
 
 export function saveStoredProblems(problems: Problem[]): void {
@@ -454,6 +475,75 @@ export function deleteProblemDraft(draftId: string): ProblemDraft[] {
   return updated;
 }
 
+/**
+ * Single conversion path from an approved draft to a stored Problem. Guarantees
+ * that every approval route preserves the SAME fields, including transfer linkage
+ * (isTransfer / sourceProblemId / logicSessionId / structured condition change).
+ */
+export function buildProblemFromDraft(
+  draft: ProblemDraft,
+  existing: Problem | undefined,
+  now: string
+): Problem {
+  const derived: Omit<Problem, 'id' | 'createdAt' | 'version' | 'qualityStatus' | 'reports' | 'versionHistory'> = {
+    conceptIds: draft.conceptIds,
+    subjectId: draft.subjectId,
+    title: draft.title,
+    type: draft.type,
+    categoryLabel: draft.categoryLabel,
+    categoryNumber: draft.categoryNumber,
+    promptText: draft.promptText,
+    mathFormula: draft.mathFormula,
+    codeSnippet: draft.codeSnippet,
+    timeStandardMinutes: draft.timeStandardMinutes,
+    timeBreakdownDesc: draft.timeBreakdownDesc,
+    coreEvaluationHighlight: draft.coreEvaluationHighlight,
+    itemCountDesc: draft.itemCountDesc,
+    sourceRefs: draft.sourceRefs,
+    hints: draft.hints,
+    modelAnswer: draft.modelAnswer,
+    rubric: draft.rubric,
+    isDemo: false,
+    isApproved: true,
+    draftId: draft.id,
+    difficulty: draft.difficulty,
+    designIntent: draft.designIntent,
+    appliedConditionNote: draft.appliedConditionNote,
+    sourceMarkdownHash: draft.sourceMarkdownHash,
+    sourceMaterials: draft.sourceMaterials,
+    // Transfer linkage (explicitly assigned so stale values never linger).
+    isTransfer: draft.isTransfer,
+    sourceProblemId: draft.sourceProblemId,
+    logicSessionId: draft.logicSessionId,
+    transferChanges: draft.transferChanges,
+    understandingFocus: draft.understandingFocus,
+    transferKind: draft.transferKind,
+    originalCondition: draft.originalCondition,
+    newCondition: draft.newCondition,
+  };
+
+  if (existing) {
+    return {
+      ...existing,
+      ...derived,
+      qualityStatus: existing.qualityStatus || 'normal',
+      version: existing.version || 1,
+      reports: existing.reports || [],
+      versionHistory: existing.versionHistory || [],
+    };
+  }
+
+  return {
+    ...derived,
+    id: `prob-ai-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+    createdAt: now,
+    version: 1,
+    qualityStatus: 'normal',
+    reports: [],
+    versionHistory: [],
+  };
+}
+
 export function approveProblemDraft(draftId: string): {
   updatedDrafts: ProblemDraft[];
   updatedProblems: Problem[];
@@ -476,71 +566,12 @@ export function approveProblemDraft(draftId: string): {
   saveStoredProblemDrafts(updatedDrafts);
 
   const existingIndex = problems.findIndex((p) => p.draftId === draftId);
-  let approvedProblem: Problem;
+  const existing = existingIndex >= 0 ? problems[existingIndex] : undefined;
+  const approvedProblem = buildProblemFromDraft(targetDraft, existing, now);
 
   if (existingIndex >= 0) {
-    approvedProblem = {
-      ...problems[existingIndex],
-      title: targetDraft.title,
-      type: targetDraft.type,
-      difficulty: targetDraft.difficulty,
-      promptText: targetDraft.promptText,
-      mathFormula: targetDraft.mathFormula,
-      codeSnippet: targetDraft.codeSnippet,
-      designIntent: targetDraft.designIntent,
-      appliedConditionNote: targetDraft.appliedConditionNote,
-      timeStandardMinutes: targetDraft.timeStandardMinutes,
-      timeBreakdownDesc: targetDraft.timeBreakdownDesc,
-      coreEvaluationHighlight: targetDraft.coreEvaluationHighlight,
-      itemCountDesc: targetDraft.itemCountDesc,
-      hints: targetDraft.hints,
-      modelAnswer: targetDraft.modelAnswer,
-      rubric: targetDraft.rubric,
-      sourceRefs: targetDraft.sourceRefs,
-      sourceMarkdownHash: targetDraft.sourceMarkdownHash,
-      sourceMaterials: targetDraft.sourceMaterials,
-      isApproved: true,
-      isDemo: false,
-      qualityStatus: problems[existingIndex].qualityStatus || 'normal',
-      version: problems[existingIndex].version || 1,
-      reports: problems[existingIndex].reports || [],
-      versionHistory: problems[existingIndex].versionHistory || [],
-    };
     problems[existingIndex] = approvedProblem;
   } else {
-    approvedProblem = {
-      id: `prob-ai-${Date.now()}-${Math.random().toString(36).substring(7)}`,
-      conceptIds: targetDraft.conceptIds,
-      subjectId: targetDraft.subjectId,
-      title: targetDraft.title,
-      type: targetDraft.type,
-      categoryLabel: targetDraft.categoryLabel,
-      categoryNumber: targetDraft.categoryNumber,
-      promptText: targetDraft.promptText,
-      mathFormula: targetDraft.mathFormula,
-      codeSnippet: targetDraft.codeSnippet,
-      timeStandardMinutes: targetDraft.timeStandardMinutes,
-      timeBreakdownDesc: targetDraft.timeBreakdownDesc,
-      coreEvaluationHighlight: targetDraft.coreEvaluationHighlight,
-      itemCountDesc: targetDraft.itemCountDesc,
-      sourceRefs: targetDraft.sourceRefs,
-      hints: targetDraft.hints,
-      modelAnswer: targetDraft.modelAnswer,
-      rubric: targetDraft.rubric,
-      isDemo: false,
-      isApproved: true,
-      draftId: targetDraft.id,
-      difficulty: targetDraft.difficulty,
-      designIntent: targetDraft.designIntent,
-      appliedConditionNote: targetDraft.appliedConditionNote,
-      sourceMarkdownHash: targetDraft.sourceMarkdownHash,
-      sourceMaterials: targetDraft.sourceMaterials,
-      createdAt: now,
-      version: 1,
-      qualityStatus: 'normal',
-      reports: [],
-      versionHistory: [],
-    };
     problems.push(approvedProblem);
   }
 
@@ -571,68 +602,12 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
     if (!draft) continue;
 
     const existingIndex = problems.findIndex((p) => p.draftId === draftId);
+    const existing = existingIndex >= 0 ? problems[existingIndex] : undefined;
+    const approvedProblem = buildProblemFromDraft(draft, existing, now);
     if (existingIndex >= 0) {
-      problems[existingIndex] = {
-        ...problems[existingIndex],
-        title: draft.title,
-        type: draft.type,
-        difficulty: draft.difficulty,
-        promptText: draft.promptText,
-        mathFormula: draft.mathFormula,
-        codeSnippet: draft.codeSnippet,
-        designIntent: draft.designIntent,
-        appliedConditionNote: draft.appliedConditionNote,
-        timeStandardMinutes: draft.timeStandardMinutes,
-        timeBreakdownDesc: draft.timeBreakdownDesc,
-        coreEvaluationHighlight: draft.coreEvaluationHighlight,
-        itemCountDesc: draft.itemCountDesc,
-        hints: draft.hints,
-        modelAnswer: draft.modelAnswer,
-        rubric: draft.rubric,
-        sourceRefs: draft.sourceRefs,
-        sourceMarkdownHash: draft.sourceMarkdownHash,
-        sourceMaterials: draft.sourceMaterials,
-        isApproved: true,
-        isDemo: false,
-        qualityStatus: problems[existingIndex].qualityStatus || 'normal',
-        version: problems[existingIndex].version || 1,
-        reports: problems[existingIndex].reports || [],
-        versionHistory: problems[existingIndex].versionHistory || [],
-      };
+      problems[existingIndex] = approvedProblem;
     } else {
-      problems.push({
-        id: `prob-ai-${Date.now()}-${Math.random().toString(36).substring(7)}`,
-        conceptIds: draft.conceptIds,
-        subjectId: draft.subjectId,
-        title: draft.title,
-        type: draft.type,
-        categoryLabel: draft.categoryLabel,
-        categoryNumber: draft.categoryNumber,
-        promptText: draft.promptText,
-        mathFormula: draft.mathFormula,
-        codeSnippet: draft.codeSnippet,
-        timeStandardMinutes: draft.timeStandardMinutes,
-        timeBreakdownDesc: draft.timeBreakdownDesc,
-        coreEvaluationHighlight: draft.coreEvaluationHighlight,
-        itemCountDesc: draft.itemCountDesc,
-        sourceRefs: draft.sourceRefs,
-        hints: draft.hints,
-        modelAnswer: draft.modelAnswer,
-        rubric: draft.rubric,
-        isDemo: false,
-        isApproved: true,
-        draftId: draft.id,
-        difficulty: draft.difficulty,
-        designIntent: draft.designIntent,
-        appliedConditionNote: draft.appliedConditionNote,
-        sourceMarkdownHash: draft.sourceMarkdownHash,
-        sourceMaterials: draft.sourceMaterials,
-        createdAt: now,
-        version: 1,
-        qualityStatus: 'normal',
-        reports: [],
-        versionHistory: [],
-      });
+      problems.push(approvedProblem);
     }
     approvedCount++;
   }
@@ -1410,14 +1385,23 @@ export function recordAssistedRevisionAttempt(
  * Scans stored Attempts and rebuilds any missing review events on their concepts.
  * Used to recover after a partial save (Attempt persisted, event missing).
  */
+export interface RecoveryOutcome {
+  recoveredCount: number;
+  updatedConcepts: Concept[];
+  /** Attempts whose event/plan/reservation could not be repaired this pass. */
+  unresolved: { attemptId: string; reason: string }[];
+}
+
 export function recoverMissingAttemptEvents(
   settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS
-): { recoveredCount: number; updatedConcepts: Concept[] } {
+): RecoveryOutcome {
   const concepts = loadStoredConcepts();
   const attempts = loadStoredAttempts();
   const conceptById = new Map(concepts.map((c) => [c.id, c]));
 
   let recoveredCount = 0;
+  const unresolved: { attemptId: string; reason: string }[] = [];
+
   for (const attempt of attempts) {
     const concept = conceptById.get(attempt.conceptId);
     if (!concept || concept.subjectId !== attempt.subjectId) continue;
@@ -1438,9 +1422,21 @@ export function recoverMissingAttemptEvents(
 
       // Independent / rechallenge attempts: append the review event AND repair
       // the plan linkage, then complete the rechallenge reservation if linked.
-      const result = recordAttemptAndUpdateConcept(attempt, settings);
+      const result = recordAttemptAndUpdateConcept(attempt, settings, {
+        planItemId: attempt.planItemId,
+      });
       if (attempt.rechallengeReservationId) {
-        completeRechallengeReservation(attempt.rechallengeReservationId);
+        const completion = completeRechallengeReservation(attempt.rechallengeReservationId, {
+          subjectId: attempt.subjectId,
+          conceptId: attempt.conceptId,
+          problemId: attempt.problemId,
+          problemVersion: attempt.problemVersion,
+        });
+        // Retryable and terminal-blocked states are both reported as unresolved
+        // so a failure is never silently reported as a normal completion.
+        if (completion.status !== 'completed' && completion.status !== 'already_completed') {
+          unresolved.push({ attemptId: attempt.id, reason: `RESERVATION_${completion.status}` });
+        }
       }
       const eventNow =
         loadStoredConcepts()
@@ -1450,12 +1446,15 @@ export function recoverMissingAttemptEvents(
       const repairedPlan =
         result.planLinkage.linkedItemId !== null && result.planLinkage.persisted;
       if (repairedEvent || repairedPlan) recoveredCount += 1;
-    } catch {
-      // Leave unresolved; the next retry can try again.
+      if (result.partial && !repairedPlan) {
+        unresolved.push({ attemptId: attempt.id, reason: 'PLAN_LINKAGE_FAILED' });
+      }
+    } catch (cause) {
+      unresolved.push({ attemptId: attempt.id, reason: cause instanceof Error ? cause.message : 'UNKNOWN' });
     }
   }
 
-  return { recoveredCount, updatedConcepts: loadStoredConcepts() };
+  return { recoveredCount, updatedConcepts: loadStoredConcepts(), unresolved };
 }
 
 /**

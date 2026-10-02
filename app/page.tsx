@@ -76,6 +76,7 @@ import {
   completeRechallengeReservation,
   cancelRechallengeReservation,
   getRechallengeReservation,
+  validateReservationForAttempt,
 } from '../lib/logicSession';
 import { LearningAnalyticsModal } from '../components/LearningAnalyticsModal';
 import { LogicStrengthenModal } from '../components/LogicStrengthenModal';
@@ -726,18 +727,18 @@ export default function RedcallDashboardPage() {
     // Verify the reservation matches this attempt before completing it.
     if (attempt.rechallengeReservationId) {
       const reservation = getRechallengeReservation(attempt.rechallengeReservationId);
-      if (
-        !reservation ||
-        reservation.subjectId !== attempt.subjectId ||
-        reservation.conceptId !== attempt.conceptId ||
-        reservation.problemId !== attempt.problemId ||
-        reservation.problemVersion !== (attempt.problemVersion ?? 1)
-      ) {
-        return { partial: true, message: '재도전 예약 정보(과목·개념·문제·버전)가 현재 풀이와 일치하지 않습니다. 예약을 다시 확인해 주세요.' };
+      const check = validateReservationForAttempt(reservation, {
+        subjectId: attempt.subjectId,
+        conceptId: attempt.conceptId,
+        problemId: attempt.problemId,
+        problemVersion: attempt.problemVersion,
+      });
+      if (!check.ok && check.reason !== 'already_completed') {
+        return { partial: true, message: check.message || '재도전 예약을 완료할 수 없습니다.' };
       }
     }
 
-    const result = recordAttemptAndUpdateConcept(attempt, settings);
+    const result = recordAttemptAndUpdateConcept(attempt, settings, { planItemId: attempt.planItemId });
 
     const { updatedConcepts, updatedAttempts } = result;
     setAllConcepts(updatedConcepts);
@@ -757,16 +758,22 @@ export default function RedcallDashboardPage() {
 
     if (attempt.rechallengeReservationId) {
       // Attempt is saved; a failed reservation completion is a retryable link failure.
-      const completion = completeRechallengeReservation(attempt.rechallengeReservationId);
-      if (!completion.saved) {
+      const completion = completeRechallengeReservation(attempt.rechallengeReservationId, {
+        subjectId: attempt.subjectId,
+        conceptId: attempt.conceptId,
+        problemId: attempt.problemId,
+        problemVersion: attempt.problemVersion,
+      });
+      if (completion.status === 'save_failed' || completion.status === 'not_found') {
         setRechallengeReservations(loadRechallengeReservations());
-        return {
-          partial: true,
-          message: '풀이 기록은 저장됐지만 재도전 예약 완료 반영은 실패했습니다. 재시도해 주세요.',
-        };
+        return { partial: true, message: completion.message };
       }
-      setRechallengeReservations(loadRechallengeReservations());
-      showToast('지연 재도전 완료! 독립 풀이로 기록되었습니다.');
+      setRechallengeReservations(completion.reservations);
+      showToast(
+        completion.status === 'already_completed'
+          ? '이미 완료된 재도전 예약입니다. 풀이 기록은 저장되었습니다.'
+          : '지연 재도전 완료! 독립 풀이로 기록되었습니다.'
+      );
     } else {
       showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
     }
@@ -833,8 +840,16 @@ export default function RedcallDashboardPage() {
     try {
       const updated = [draft, ...problemDrafts.filter((d) => d.id !== draft.id)];
       saveStoredProblemDrafts(updated);
-      const persisted = loadStoredProblemDrafts().some((d) => d.id === draft.id);
-      if (!persisted) return false;
+      // Verify the exact content/version we tried to save (not just the id).
+      const persisted = loadStoredProblemDrafts().find((d) => d.id === draft.id);
+      if (
+        !persisted ||
+        persisted.updatedAt !== draft.updatedAt ||
+        persisted.promptText !== draft.promptText ||
+        persisted.logicSessionId !== draft.logicSessionId
+      ) {
+        return false;
+      }
       setProblemDrafts(updated);
       showToast('전이 문제 초안이 저장되었습니다. 문제 검토·승인 화면에서 검토해 주세요.');
       return true;
@@ -1592,15 +1607,13 @@ export default function RedcallDashboardPage() {
           sourceAttempt={logicTarget.attempt}
           recommendationDate={logicRecommendationDate || undefined}
           reservations={rechallengeReservations}
-          approvedTransferProblem={
-            allProblems.find(
-              (p) =>
-                p.isTransfer === true &&
-                p.sourceProblemId === logicTarget.problem.id &&
-                p.subjectId === logicTarget.attempt.subjectId &&
-                isProblemAvailableForPractice(p)
-            ) || null
-          }
+          approvedTransferProblems={allProblems.filter(
+            (p) =>
+              p.isTransfer === true &&
+              p.sourceProblemId === logicTarget.problem.id &&
+              p.subjectId === logicTarget.attempt.subjectId &&
+              isProblemAvailableForPractice(p)
+          )}
           onRecordAssistedAttempt={handleRecordAssistedAttempt}
           onReserveRechallenge={handleReserveRechallenge}
           onUpdateReservation={handleUpdateReservation}

@@ -265,12 +265,15 @@ export interface ProblemDraft {
   sourceEvidenceQuote?: string;    // 원문 인용 근거
   sourceMarkdownHash?: string;     // 분석/생성에 참조된 자료 버전 해시 (하위 호환)
   sourceMaterials?: ProblemSourceRef[]; // 자료별 출처 ID·제목·생성 당시 본문 해시
-  // Stage 14: 조건 변형·전이 문제
+  // Stage 14/15: 조건 변형·전이 문제 (구조화된 변형 정보)
   isTransfer?: boolean;
   sourceProblemId?: string;
   logicSessionId?: string;
-  transferChanges?: string;   // 원문에서 바뀐 조건 설명
+  transferChanges?: string;   // 원문에서 바뀐 조건 설명(요약)
   understandingFocus?: string; // 확인하려는 이해 요소
+  transferKind?: string;      // 변형 유형 (예: precondition_change, counterexample, cross_concept, complexity_change ...)
+  originalCondition?: string; // 원래 조건
+  newCondition?: string;      // 바뀐 조건
   timeStandardMinutes: number;
   timeBreakdownDesc: string;
   coreEvaluationHighlight: string;
@@ -435,12 +438,15 @@ export interface Problem {
   appliedConditionNote?: string; // AI 설계 응용 조건
   sourceMarkdownHash?: string;   // 생성 당시 원문 해시 (하위 호환)
   sourceMaterials?: ProblemSourceRef[]; // 자료별 출처 ID·제목·생성 당시 본문 해시
-  // Stage 14: 조건 변형·전이 문제
+  // Stage 14/15: 조건 변형·전이 문제 (구조화된 변형 정보)
   isTransfer?: boolean;
   sourceProblemId?: string;
   logicSessionId?: string;
   transferChanges?: string;
   understandingFocus?: string;
+  transferKind?: string;
+  originalCondition?: string;
+  newCondition?: string;
   isOutdated?: boolean;          // 원문 Markdown 사후 수정 시 구버전 플래그
   needsSourceReview?: boolean;   // 출처 불명확(자료별 해시 없음)으로 사용자 확인 필요
   createdAt?: string;
@@ -626,9 +632,14 @@ export interface LogicStrengthenSession {
   problemTitleSnapshot: string;
   problemPromptSnapshot: string;
   modelAnswerSnapshot: string;
+  // 문제 조건/수식/코드 스냅샷 (현재 문제와 섞지 않기 위해 세션에 고정)
+  problemFormulaSnapshot?: string;
+  problemCodeSnapshot?: string;
+  problemConditionNoteSnapshot?: string;
   rubricSnapshot: RubricCriterion[];
   sourceMarkdownHash?: string;
   sourceMaterials?: ProblemSourceRef[];
+  sessionRound: number;             // 보완 회차 (질문 세트 버전과 분리)
 
   originalAnswer: string;
   originalScore: number;
@@ -654,8 +665,10 @@ export interface LogicStrengthenSession {
   revisedEvaluationInputHash?: string;   // 평가 시점 입력 해시
   revisedAttemptId?: string; // 확정 시 생성된 별도 Attempt
 
-  // Stage 14: 전이 문제 초안 연결
+  // Stage 14/15: 전이 문제 초안 연결
   transferDraftId?: string;
+  transferDraftVersion?: number;    // 전이 초안 버전 (재생성 구분)
+  transferInputHash?: string;       // 동일 입력 재사용 판단용
 }
 
 export type RechallengeReservationStatus = 'scheduled' | 'completed' | 'cancelled';
