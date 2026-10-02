@@ -234,14 +234,16 @@ exports.requireApiUser = async () => {
 
     const first = await legacyImport.importLegacyData('user-1');
     assert.equal(first.verified, true);
+    assert.equal(first.conflict, false);
     assert.ok(first.localStorageCopied >= 2, 'both seeded legacy keys are imported');
     assert.equal(localStorage.getItem('redcall_user_user-1__subjects_v1'), JSON.stringify([{ id: 'legacy-s' }]));
 
-    // Re-running must skip existing keys (no duplicates) and stay verified.
+    // Re-running after completion is a verified no-op (no duplicates, no conflict).
     const second = await legacyImport.importLegacyData('user-1');
-    assert.equal(second.localStorageCopied, 0);
-    assert.equal(second.localStorageSkipped, first.localStorageCopied + first.localStorageSkipped);
     assert.equal(second.verified, true);
+    assert.equal(second.conflict, false);
+    assert.equal(second.localStorageCopied, 0);
+    assert.equal(second.localStorageSkipped, 0);
 
     // The original legacy source is preserved untouched.
     assert.equal(localStorage.getItem('redcall_subjects_v1'), JSON.stringify([{ id: 'legacy-s' }]));
@@ -250,12 +252,68 @@ exports.requireApiUser = async () => {
     const other = await legacyImport.getLegacyImportState('user-2');
     assert.equal(other.imported, false);
     assert.equal(localStorage.getItem('redcall_user_user-1__subjects_v1'), JSON.stringify([{ id: 'legacy-s' }]));
+  });
 
-    // Pre-existing account data is never overwritten.
+  await checkAsync('import into an account with existing records is refused without partial merge', async () => {
     localStorage.setItem('redcall_user_user-3__subjects_v1', JSON.stringify([{ id: 'own' }]));
-    const third = await legacyImport.importLegacyData('user-3');
-    assert.equal(third.verified, false);
-    assert.equal(localStorage.getItem('redcall_user_user-3__subjects_v1'), JSON.stringify([{ id: 'own' }]));
+    const state = await legacyImport.getLegacyImportState('user-3');
+    assert.equal(state.conflict, true);
+
+    const before = localStorage.getItem('redcall_user_user-3__subjects_v1');
+    const result = await legacyImport.importLegacyData('user-3');
+    assert.equal(result.conflict, true);
+    assert.equal(result.verified, false);
+    assert.equal(result.localStorageCopied, 0);
+    // Target records are untouched and no legacy-only key was copied in.
+    assert.equal(localStorage.getItem('redcall_user_user-3__subjects_v1'), before);
+    assert.equal(localStorage.getItem('redcall_user_user-3__attempts_v1'), null);
+    assert.equal(legacyImport.isLegacyImportCompleted('user-3'), false);
+  });
+
+  await checkAsync('failed import rolls back its writes so a retry is not blocked', async () => {
+    const userId = 'user-rollback';
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    let shouldFail = true;
+    localStorage.setItem = (key, value) => {
+      if (shouldFail && key.endsWith('__attempts_v1')) {
+        shouldFail = false;
+        throw new Error('simulated quota failure');
+      }
+      realSetItem(key, value);
+    };
+
+    let result;
+    try {
+      result = await legacyImport.importLegacyData(userId);
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+
+    assert.equal(result.verified, false);
+    // The failed attempt must not leave owned records behind.
+    assert.equal(localStorage.getItem('redcall_user_' + userId + '__subjects_v1'), null);
+    assert.equal(localStorage.getItem('redcall_user_' + userId + '__attempts_v1'), null);
+
+    // Retry now succeeds and is not rejected as a conflict.
+    const retry = await legacyImport.importLegacyData(userId);
+    assert.equal(retry.conflict, false);
+    assert.equal(retry.verified, true);
+    assert.ok(localStorage.getItem('redcall_user_' + userId + '__subjects_v1') !== null);
+  });
+
+  check('material import is never verified when a copy write failed', () => {
+    assert.equal(
+      matStorage.isMaterialImportVerified({ available: true, copied: 1, skipped: 0, failed: 1, verified: true }),
+      false
+    );
+    assert.equal(
+      matStorage.isMaterialImportVerified({ available: true, copied: 0, skipped: 0, failed: 0, verified: false }),
+      false
+    );
+    assert.equal(
+      matStorage.isMaterialImportVerified({ available: true, copied: 2, skipped: 0, failed: 0, verified: true }),
+      true
+    );
   });
 
   check('corrupt local records are detected instead of treated as an empty account', () => {
@@ -267,6 +325,27 @@ exports.requireApiUser = async () => {
     if (previous === null) localStorage.removeItem('redcall_concepts_v1');
     else localStorage.setItem('redcall_concepts_v1', previous);
     assert.equal(storage.checkStoredDataIntegrity().ok, true);
+  });
+
+  check('integrity check rejects wrong top-level types and missing id fields', () => {
+    const key = 'redcall_subjects_v1';
+    const previous = localStorage.getItem(key);
+
+    localStorage.setItem(key, 'null');
+    let result = storage.checkStoredDataIntegrity();
+    assert.equal(result.ok, false);
+    assert.ok(result.failedKeys.includes(key));
+
+    localStorage.setItem(key, JSON.stringify([{ name: 'missing id' }]));
+    result = storage.checkStoredDataIntegrity();
+    assert.equal(result.ok, false);
+    assert.ok(result.failedKeys.includes(key));
+
+    localStorage.setItem(key, JSON.stringify([{ id: 's1', name: 'ok' }]));
+    assert.equal(storage.checkStoredDataIntegrity().ok, true);
+
+    if (previous === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, previous);
   });
 
   check('app readiness exposes a stable snapshot for useSyncExternalStore', () => {

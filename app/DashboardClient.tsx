@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useSyncExternalStore } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import {
   Subject,
   Material,
@@ -115,6 +115,7 @@ import {
 } from '../lib/legacyImport';
 import { createClient as createBrowserSupabaseClient } from '../lib/supabase/client';
 import type { AppUser } from '../lib/auth/types';
+import type { AuthChangeEvent, Session } from '@supabase/supabase-js';
 import { reportAppReady, reportAppError } from '../lib/appReadiness';
 import { CheckCircle2 } from 'lucide-react';
 
@@ -210,8 +211,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
   // Session / account switching
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
   const [legacyImportState, setLegacyImportState] = useState<LegacyImportState | null>(null);
   const [isImportingLegacy, setIsImportingLegacy] = useState(false);
+  // Ensures a single full-page handoff when the session changes (this tab or another).
+  const authRedirectStarted = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -227,18 +231,107 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     };
   }, [currentUser.id]);
 
+  // Detect sign-out / account changes in other tabs and reset to the correct
+  // user context. A full navigation discards in-memory state and in-flight
+  // requests, and re-runs the server-side auth guard for the new session.
+  useEffect(() => {
+    let subscription: { unsubscribe: () => void } | null = null;
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const { data } = supabase.auth.onAuthStateChange(
+        (event: AuthChangeEvent, session: Session | null) => {
+          if (authRedirectStarted.current) return;
+          const nextUserId = session?.user?.id ?? null;
+          if (event === 'SIGNED_OUT' || !nextUserId) {
+            authRedirectStarted.current = true;
+            window.location.replace('/login');
+            return;
+          }
+          if (nextUserId !== currentUser.id) {
+            authRedirectStarted.current = true;
+            window.location.replace('/');
+          }
+        }
+      );
+      subscription = data.subscription;
+    } catch {
+      // Without client configuration the server guard already controls access.
+    }
+    return () => {
+      subscription?.unsubscribe();
+    };
+  }, [currentUser.id]);
+
+  // With cookie-based sessions, a sign-out or account switch in another tab
+  // updates the shared cookies. Re-verify against the Auth server when this tab
+  // becomes active; only a definitive "no session" or a different user triggers
+  // a handoff (transient network errors are ignored).
+  useEffect(() => {
+    const verify = async () => {
+      if (authRedirectStarted.current) return;
+      try {
+        const supabase = createBrowserSupabaseClient();
+        const { data, error } = await supabase.auth.getUser();
+        if (authRedirectStarted.current) return;
+        const id = data?.user?.id ?? null;
+        if (!error && id) {
+          if (id !== currentUser.id) {
+            authRedirectStarted.current = true;
+            window.location.replace('/');
+          }
+          return;
+        }
+        if ((error as { name?: string } | null)?.name === 'AuthSessionMissingError' || (!error && !id)) {
+          authRedirectStarted.current = true;
+          window.location.replace('/login');
+        }
+      } catch {
+        // Ignore transient failures; data access stays gated on the server.
+      }
+    };
+    const onActive = () => {
+      if (document.visibilityState === 'visible') void verify();
+    };
+    document.addEventListener('visibilitychange', onActive);
+    window.addEventListener('focus', onActive);
+    return () => {
+      document.removeEventListener('visibilitychange', onActive);
+      window.removeEventListener('focus', onActive);
+    };
+  }, [currentUser.id]);
+
   const handleLogout = async () => {
     if (isLoggingOut) return;
     setIsLoggingOut(true);
+    setLogoutError(null);
+
     try {
       const supabase = createBrowserSupabaseClient();
-      await supabase.auth.signOut();
-    } catch {
-      // Even if sign-out fails, leave the protected screen below.
+      const { error } = await supabase.auth.signOut();
+      if (error) {
+        // Some sign-out errors still clear the local session. Only stay on the
+        // protected screen when a session actually remains.
+        const { data } = await supabase.auth.getSession();
+        if (data.session) {
+          setLogoutError('로그아웃에 실패했습니다. 세션이 남아 있어 다시 시도해야 합니다.');
+          setIsLoggingOut(false);
+          return;
+        }
+      }
+    } catch (err) {
+      setLogoutError(
+        err instanceof Error
+          ? err.message
+          : '로그아웃 중 오류가 발생했습니다. 다시 시도해 주세요.'
+      );
+      setIsLoggingOut(false);
+      return;
     }
+
     // A full navigation discards all in-memory learning state and aborts any
     // in-flight requests so the next account starts clean. `replace` also keeps
     // the protected screen out of the back/forward history.
+    authRedirectStarted.current = true;
     window.location.replace('/login');
   };
 
@@ -248,6 +341,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     try {
       const result = await importLegacyData(currentUser.id);
       showToast(result.message);
+      if (result.conflict) {
+        setLegacyImportState((prev) => (prev ? { ...prev, conflict: true } : prev));
+        return;
+      }
       if (result.verified) {
         // Reload so the freshly imported records populate the scoped state.
         window.location.reload();
@@ -1271,6 +1368,32 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         </div>
       )}
 
+      {/* Logout failure */}
+      {logoutError && (
+        <div
+          role="alert"
+          className="fixed top-16 left-1/2 -translate-x-1/2 z-[70] flex items-center gap-3 px-4 py-2.5 bg-[#8a1f1f] text-white border border-[#6f1717] rounded-xs shadow-lg text-xs max-w-[90vw]"
+        >
+          <span>{logoutError}</span>
+          <button
+            type="button"
+            onClick={handleLogout}
+            disabled={isLoggingOut}
+            className="shrink-0 underline font-semibold disabled:opacity-60"
+          >
+            다시 시도
+          </button>
+          <button
+            type="button"
+            onClick={() => setLogoutError(null)}
+            className="shrink-0 text-white/80 hover:text-white"
+            aria-label="로그아웃 오류 닫기"
+          >
+            닫기
+          </button>
+        </div>
+      )}
+
       {/* Top Utility Bar */}
       <TopUtilityBar
         subjects={subjects}
@@ -1332,7 +1455,25 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       {legacyImportState &&
         legacyImportState.hasLegacyData &&
         !legacyImportState.imported &&
-        !legacyImportState.declined && (
+        !legacyImportState.declined &&
+        (legacyImportState.conflict ? (
+          <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
+            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+              <div className="text-xs text-[#57544e] leading-relaxed">
+                <span className="font-bold text-[#191817]">기존 공용 학습 기록이 있습니다.</span>{' '}
+                이미 이 계정에 학습 기록이 있어 자동으로 가져오지 않습니다. 두 기록을 섞으면
+                과목·자료 연결이 깨질 수 있어 현재 계정 기록을 그대로 유지합니다.
+              </div>
+              <button
+                type="button"
+                onClick={handleDeclineLegacy}
+                className="shrink-0 text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors"
+              >
+                확인
+              </button>
+            </div>
+          </div>
+        ) : (
           <div className="w-full bg-[#fef2f2] border-b border-[#f3c6c6]">
             <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
               <div className="text-xs text-[#57544e] leading-relaxed">
@@ -1362,7 +1503,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               </div>
             </div>
           </div>
-        )}
+        ))}
 
       {/* Main Workspace Container */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-3 sm:px-6 py-4 sm:py-6 space-y-4">

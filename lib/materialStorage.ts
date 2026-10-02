@@ -95,73 +95,167 @@ function openDB(): Promise<IDBDatabase | null> {
   return openDBByName(getDbName());
 }
 
+export interface MaterialImportResult {
+  available: boolean;
+  copied: number;
+  skipped: number;
+  failed: number;
+  verified: boolean;
+  error?: string;
+}
+
+function readAllContents(db: IDBDatabase): Promise<MaterialContent[] | null> {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const req = tx.objectStore(STORE_NAME).getAll();
+      req.onsuccess = () => resolve((req.result as MaterialContent[]) || []);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function readAllKeys(db: IDBDatabase): Promise<Set<string> | null> {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const req = tx.objectStore(STORE_NAME).getAllKeys();
+      req.onsuccess = () => resolve(new Set((req.result as IDBValidKey[]).map(String)));
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function hasContent(db: IDBDatabase, materialId: string): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const req = tx.objectStore(STORE_NAME).get(materialId);
+      req.onsuccess = () => resolve(Boolean(req.result));
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function putContent(db: IDBDatabase, content: MaterialContent): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+      tx.objectStore(STORE_NAME).put(content);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 /**
  * Copies every stored material body from a source scope's IndexedDB into the
  * current scope's IndexedDB. Existing target bodies are never overwritten, so
  * re-running the import cannot duplicate or clobber records.
+ *
+ * The result reports write failures and re-reads the target store to verify
+ * that every source body is actually present before callers may mark the
+ * import complete.
  */
 export async function importMaterialContentsFromScope(
   sourceScopeId: string
-): Promise<{ available: boolean; copied: number; skipped: number; error?: string }> {
+): Promise<MaterialImportResult> {
   const sourceName = sourceScopeId === 'shared' ? LEGACY_DB_NAME : `${LEGACY_DB_NAME}_${sourceScopeId}`;
   const targetName = getDbName();
 
   if (sourceName === targetName) {
-    return { available: true, copied: 0, skipped: 0 };
+    return { available: true, copied: 0, skipped: 0, failed: 0, verified: true };
   }
   if (!isIndexedDBAvailable()) {
-    return { available: false, copied: 0, skipped: 0 };
+    // Without IndexedDB there are no durable material bodies to move.
+    return { available: false, copied: 0, skipped: 0, failed: 0, verified: true };
   }
 
   const source = await openDBByName(sourceName);
   if (!source) {
-    return { available: false, copied: 0, skipped: 0 };
+    return {
+      available: false,
+      copied: 0,
+      skipped: 0,
+      failed: 0,
+      verified: false,
+      error: '원본 자료 저장소를 열 수 없습니다.',
+    };
   }
   const target = await openDBByName(targetName);
   if (!target) {
-    return { available: false, copied: 0, skipped: 0, error: '대상 IndexedDB를 열 수 없습니다.' };
+    try {
+      source.close();
+    } catch {
+      // ignore close failures
+    }
+    return {
+      available: false,
+      copied: 0,
+      skipped: 0,
+      failed: 0,
+      verified: false,
+      error: '대상 자료 저장소를 열 수 없습니다.',
+    };
   }
 
-  const contents = await new Promise<MaterialContent[]>((resolve) => {
+  const contents = await readAllContents(source);
+  if (!contents) {
     try {
-      const tx = source.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).getAll();
-      req.onsuccess = () => resolve((req.result as MaterialContent[]) || []);
-      req.onerror = () => resolve([]);
+      source.close();
+      target.close();
     } catch {
-      resolve([]);
+      // ignore close failures
     }
-  });
+    return {
+      available: true,
+      copied: 0,
+      skipped: 0,
+      failed: 0,
+      verified: false,
+      error: '원본 자료를 읽지 못했습니다.',
+    };
+  }
 
   let copied = 0;
   let skipped = 0;
+  let failed = 0;
   for (const content of contents) {
     if (!content || typeof content.materialId !== 'string') continue;
-    const exists = await new Promise<boolean>((resolve) => {
-      try {
-        const tx = target.transaction(STORE_NAME, 'readonly');
-        const req = tx.objectStore(STORE_NAME).get(content.materialId);
-        req.onsuccess = () => resolve(Boolean(req.result));
-        req.onerror = () => resolve(false);
-      } catch {
-        resolve(false);
-      }
-    });
+    const exists = await hasContent(target, content.materialId);
+    if (exists === null) {
+      failed += 1;
+      continue;
+    }
     if (exists) {
       skipped += 1;
       continue;
     }
-    const written = await new Promise<boolean>((resolve) => {
-      try {
-        const tx = target.transaction(STORE_NAME, 'readwrite');
-        tx.oncomplete = () => resolve(true);
-        tx.onerror = () => resolve(false);
-        tx.objectStore(STORE_NAME).put(content);
-      } catch {
-        resolve(false);
-      }
-    });
+    const written = await putContent(target, content);
     if (written) copied += 1;
+    else failed += 1;
+  }
+
+  // Verify by reading the target store back: every source body must be present.
+  const targetIds = await readAllKeys(target);
+  let verified = failed === 0 && targetIds !== null;
+  if (targetIds) {
+    for (const content of contents) {
+      if (!content || typeof content.materialId !== 'string') continue;
+      if (!targetIds.has(content.materialId)) {
+        verified = false;
+        break;
+      }
+    }
   }
 
   try {
@@ -171,7 +265,26 @@ export async function importMaterialContentsFromScope(
     // ignore close failures
   }
 
-  return { available: true, copied, skipped };
+  return {
+    available: true,
+    copied,
+    skipped,
+    failed,
+    verified,
+    error: verified
+      ? undefined
+      : failed > 0
+        ? '일부 자료 본문을 복사하지 못했습니다.'
+        : '복사한 자료 본문을 검증하지 못했습니다.',
+  };
+}
+
+/**
+ * A material import is complete only when every body was copied/re-verified and
+ * no write failed. Callers must gate their "import completed" marker on this.
+ */
+export function isMaterialImportVerified(result: MaterialImportResult): boolean {
+  return result.verified && result.failed === 0 && !result.error;
 }
 
 /** Raw list of material ids in a scope, used to verify an import. */

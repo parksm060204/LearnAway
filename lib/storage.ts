@@ -39,7 +39,13 @@ import {
 import { addDaysToDate } from './dateUtils';
 import { computeMarkdownHash } from './markdownUtils';
 import { completeRechallengeReservation } from './logicSession';
-import { scopedStorageKey, isKeyInActiveScope } from './storageScope';
+import {
+  scopedStorageKey,
+  isKeyInActiveScope,
+  getStorageScope,
+  getScopedStoragePrefix,
+  LEGACY_KEY_PREFIX,
+} from './storageScope';
 
 // Base key names. The `redcall_` prefix and user namespace are applied by
 // scopedStorageKey() so legacy (pre-login) data keeps its exact historical keys.
@@ -115,12 +121,72 @@ export interface StoredDataIntegrity {
   failedKeys: string[];
 }
 
+type StoredValueShape =
+  | { kind: 'string' }
+  | { kind: 'object' }
+  | { kind: 'arrayRecords'; requiredStringFields: string[] };
+
+/**
+ * Expected top-level shape for each known record. Unknown keys only need valid
+ * JSON. This catches structural corruption (e.g. `null` where an array is
+ * expected) that would crash later `.map()`/`.some()` calls.
+ */
+const STORED_VALUE_SHAPES: Record<string, StoredValueShape> = {
+  active_subject_id: { kind: 'string' },
+  subjects_v1: { kind: 'arrayRecords', requiredStringFields: ['id'] },
+  materials_v1: { kind: 'arrayRecords', requiredStringFields: ['id', 'subjectId'] },
+  concepts_v1: { kind: 'arrayRecords', requiredStringFields: ['id', 'subjectId'] },
+  concept_drafts_v1: { kind: 'arrayRecords', requiredStringFields: ['id', 'subjectId'] },
+  problems_v1: { kind: 'arrayRecords', requiredStringFields: ['id', 'subjectId'] },
+  problem_drafts_v1: { kind: 'arrayRecords', requiredStringFields: ['id', 'subjectId'] },
+  attempts_v1: { kind: 'arrayRecords', requiredStringFields: ['id'] },
+  mock_exam_sessions_v1: { kind: 'arrayRecords', requiredStringFields: ['id'] },
+  logic_sessions_v1: { kind: 'arrayRecords', requiredStringFields: ['id'] },
+  rechallenge_reservations_v1: { kind: 'arrayRecords', requiredStringFields: ['id'] },
+  study_plan_items_v1: { kind: 'arrayRecords', requiredStringFields: ['id'] },
+  retention_settings_v1: { kind: 'object' },
+  study_plan_settings_v1: { kind: 'object' },
+  personalization_settings_v1: { kind: 'object' },
+  personalization_state_v1: { kind: 'object' },
+};
+
+function baseKeyForActiveScope(rawKey: string): string | null {
+  if (!isKeyInActiveScope(rawKey)) return null;
+  if (getStorageScope().kind === 'user') {
+    return rawKey.slice(getScopedStoragePrefix().length);
+  }
+  return rawKey.slice(LEGACY_KEY_PREFIX.length);
+}
+
+function matchesStoredShape(baseKey: string, parsed: unknown): boolean {
+  const shape = STORED_VALUE_SHAPES[baseKey];
+  if (!shape) return true;
+
+  if (shape.kind === 'string') {
+    return typeof parsed === 'string';
+  }
+  if (shape.kind === 'object') {
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
+  }
+  if (!Array.isArray(parsed)) return false;
+  return parsed.every(
+    (item) =>
+      item !== null &&
+      typeof item === 'object' &&
+      !Array.isArray(item) &&
+      shape.requiredStringFields.every(
+        (field) => typeof (item as Record<string, unknown>)[field] === 'string'
+      )
+  );
+}
+
 /**
  * Detects corrupt local records for the active scope.
  *
- * A missing key is a valid empty account; only unparsable JSON is reported as a
- * failure so callers can show an error + retry instead of silently presenting an
- * empty account or substituting demo data.
+ * A missing key is a valid empty account. Invalid JSON, a wrong top-level type,
+ * or records missing required string fields are reported so callers can show an
+ * error + retry instead of silently presenting an empty account or substituting
+ * demo data.
  */
 export function checkStoredDataIntegrity(): StoredDataIntegrity {
   if (typeof window === 'undefined' || !window.localStorage) {
@@ -131,12 +197,19 @@ export function checkStoredDataIntegrity(): StoredDataIntegrity {
   try {
     for (let i = 0; i < localStorage.length; i += 1) {
       const key = localStorage.key(i);
-      if (!key || !isKeyInActiveScope(key)) continue;
+      if (!key) continue;
+      const baseKey = baseKeyForActiveScope(key);
+      if (baseKey === null) continue;
       const raw = localStorage.getItem(key);
       if (raw === null || raw === '') continue;
+      let parsed: unknown;
       try {
-        JSON.parse(raw);
+        parsed = JSON.parse(raw);
       } catch {
+        failedKeys.push(key);
+        continue;
+      }
+      if (!matchesStoredShape(baseKey, parsed)) {
         failedKeys.push(key);
       }
     }
