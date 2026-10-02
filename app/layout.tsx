@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { AppSplash } from "../components/AppSplash";
 
 export const metadata: Metadata = {
   title: "Learn my way ACADEMIC | 대학 논술·서술형 스페이스드 리피티션 학습 도구",
@@ -20,7 +21,10 @@ export default function RootLayout({
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
         {/* Font stylesheets are imported in globals.css to avoid per-page font links. */}
       </head>
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        {children}
+        <AppSplash />
+      </body>
     </html>
   );
 }

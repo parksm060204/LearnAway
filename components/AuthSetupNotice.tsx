@@ -1,3 +1,5 @@
+import { AppReadySignal } from './AppReadySignal';
+
 interface AuthSetupNoticeProps {
   message: string;
   variant?: 'setup' | 'error';
@@ -6,6 +8,7 @@ interface AuthSetupNoticeProps {
 export function AuthSetupNotice({ message, variant = 'setup' }: AuthSetupNoticeProps) {
   return (
     <div className="min-h-screen bg-[#faf8f4] flex items-center justify-center p-6">
+      <AppReadySignal />
       <div className="max-w-xl w-full bg-white border border-[#c8c2b5] rounded-xs shadow-sm p-6 space-y-4">
         <div className="flex items-center gap-2">
           <span className="w-3 h-3 bg-[#c52828] inline-block" aria-hidden="true" />

@@ -61,6 +61,7 @@ import {
   loadStoredPersonalizationSettings,
   saveStoredPersonalizationSettings,
   saveStoredPersonalizationState,
+  checkStoredDataIntegrity,
   AttemptSaveStatus,
 } from '../lib/storage';
 import {
@@ -114,6 +115,7 @@ import {
 } from '../lib/legacyImport';
 import { createClient as createBrowserSupabaseClient } from '../lib/supabase/client';
 import type { AppUser } from '../lib/auth/types';
+import { reportAppReady, reportAppError } from '../lib/appReadiness';
 import { CheckCircle2 } from 'lucide-react';
 
 // Stable no-op subscription used only to detect client hydration.
@@ -131,6 +133,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
   // Hydration safety flag
   const [isLoaded, setIsLoaded] = useState(false);
+  // Corrupt stored records (not an empty account). Surfaces an error + retry.
+  const [loadError, setLoadError] = useState<string[] | null>(null);
 
   // Core Data State
   const [subjects, setSubjects] = useState<Subject[]>([]);
@@ -268,6 +272,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   if (isHydrated && !isLoaded) {
     setIsLoaded(true);
 
+    const integrity = checkStoredDataIntegrity();
+    if (!integrity.ok) {
+      // Do not fall back to an empty account or demo data; surface an error.
+      setLoadError(integrity.failedKeys);
+    } else {
     const loadedSubjects = loadStoredSubjects();
     const loadedSubjectId = loadActiveSubjectId();
     const loadedMaterials = loadStoredMaterials();
@@ -318,7 +327,20 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         setSelectedEventId(lastEvent.id);
       }
     }
+    }
   }
+
+  // Report initialization to the splash once the first data load settles.
+  useEffect(() => {
+    if (!isLoaded) return;
+    if (loadError) {
+      reportAppError(
+        '저장된 학습 데이터를 불러오지 못했습니다. 기록이 손상되었을 수 있습니다. 데이터는 삭제되지 않았으니 다시 시도해 주세요.'
+      );
+    } else {
+      reportAppReady();
+    }
+  }, [isLoaded, loadError]);
 
   // Re-check plan storage and KST date sync on window focus
   useEffect(() => {
@@ -1184,6 +1206,27 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     window.location.reload();
   };
 
+  if (loadError) {
+    return (
+      <div className="min-h-screen bg-[#faf8f4] flex flex-col items-center justify-center gap-4 p-6 text-center text-[#191817]">
+        <h1 className="text-xl font-bold">학습 데이터를 불러오지 못했습니다</h1>
+        <p role="alert" className="max-w-md text-sm text-[#57544e] leading-relaxed">
+          저장된 학습 기록 일부를 읽을 수 없습니다. 기록은 삭제되지 않았으니 다시 시도해 주세요.
+        </p>
+        <p className="text-[11px] font-academic-mono text-[#827d73]">
+          영향받은 항목: {loadError.length}개
+        </p>
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="rounded-xs bg-[#191817] px-5 py-3 text-sm font-semibold text-white hover:bg-[#33302b] transition-colors"
+        >
+          다시 시도
+        </button>
+      </div>
+    );
+  }
+
   if (!isLoaded) {
     return (
       <div className="min-h-screen bg-[#faf8f4] flex items-center justify-center p-6 text-sm font-academic-mono text-[#827d73]">
@@ -1194,10 +1237,25 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
   if (!activeSubject) {
     return (
-      <div className="min-h-screen bg-[#faf8f4] flex flex-col items-center justify-center gap-4 p-6 text-[#191817]">
-        <h1 className="text-2xl font-bold">Learn my way</h1>
-        <p>첫 과목을 만들고 PDF 또는 전사본을 등록해 학습을 시작하세요.</p>
-        <button className="rounded-full bg-[#191817] px-5 py-3 text-white" onClick={() => setIsAddSubjectModalOpen(true)}>과목 만들기</button>
+      <div className="min-h-screen bg-[#faf8f4] flex flex-col items-center justify-center gap-5 p-6 text-center text-[#191817]">
+        <span className="w-3 h-3 bg-[#c52828] inline-block" aria-hidden="true" />
+        <h1 className="text-2xl font-bold">첫 과목을 만들어 시작하세요</h1>
+        <p className="max-w-md text-sm text-[#57544e] leading-relaxed">
+          과목을 만들고 PDF 또는 강의 전사본을 등록하면, 자료를 바탕으로 개념 분석과 문제 생성이
+          시작됩니다.
+        </p>
+        <ol className="text-xs text-[#827d73] space-y-1 text-left">
+          <li>1. 과목 생성 (시험 일정 설정)</li>
+          <li>2. 학습 자료 등록 (PDF / 전사본)</li>
+          <li>3. 개념 검토 후 문제 풀기</li>
+        </ol>
+        <button
+          type="button"
+          className="rounded-xs bg-[#191817] px-5 py-3 text-sm font-semibold text-white hover:bg-[#33302b] transition-colors"
+          onClick={() => setIsAddSubjectModalOpen(true)}
+        >
+          과목 만들기
+        </button>
         <AddSubjectModal isOpen={isAddSubjectModalOpen} onClose={() => setIsAddSubjectModalOpen(false)} onAddSubject={handleAddSubject} />
       </div>
     );
@@ -1252,6 +1310,24 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         onLogout={handleLogout}
         isLoggingOut={isLoggingOut}
       />
+
+      {materials.filter((m) => m.subjectId === activeSubject.id).length === 0 && (
+        <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
+          <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+            <p className="text-xs text-[#57544e] leading-relaxed">
+              이 과목에는 아직 학습 자료가 없습니다. PDF 또는 강의 전사본을 등록하면 자료 분석과
+              문제 생성이 시작됩니다.
+            </p>
+            <button
+              type="button"
+              onClick={() => setIsUploadModalOpen(true)}
+              className="shrink-0 text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors"
+            >
+              자료 등록
+            </button>
+          </div>
+        </div>
+      )}
 
       {legacyImportState &&
         legacyImportState.hasLegacyData &&

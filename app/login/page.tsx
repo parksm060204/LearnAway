@@ -2,7 +2,7 @@ import { redirect } from 'next/navigation';
 import { getAuthState } from '@/lib/auth/session';
 import { safeInternalPath } from '@/lib/auth/redirects';
 import { AuthSetupNotice } from '@/components/AuthSetupNotice';
-import { LoginPanel } from '@/components/LoginPanel';
+import { GatewayPage } from '@/components/GatewayPage';
 
 export const dynamic = 'force-dynamic';
 
@@ -40,5 +40,5 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
     ? ERROR_MESSAGES[rawError] || ERROR_MESSAGES.oauth_failed
     : null;
 
-  return <LoginPanel nextPath={nextPath} initialError={initialError} />;
+  return <GatewayPage nextPath={nextPath} initialError={initialError} />;
 }

@@ -77,7 +77,21 @@ h1, h2, h3, .subject-title, .font-academic-serif {
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+a:focus-visible {
   outline: 2px solid #c52828;
   outline-offset: 1px;
+  border-radius: 2px;
+}
+
+/* Respect reduced-motion preferences without ever delaying content. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }

@@ -15,7 +15,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
   'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
-  'lib/storageScope.ts', 'lib/auth/redirects.ts', 'lib/legacyImport.ts',
+  'lib/storageScope.ts', 'lib/auth/redirects.ts', 'lib/legacyImport.ts', 'lib/appReadiness.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -57,6 +57,7 @@ exports.requireApiUser = async () => {
   const realApiAuth = load(realApiAuthPath);
   const redirects = load(path.join(output, 'lib/auth/redirects.js'));
   const legacyImport = load(path.join(output, 'lib/legacyImport.js'));
+  const appReadiness = load(path.join(output, 'lib/appReadiness.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
@@ -255,6 +256,30 @@ exports.requireApiUser = async () => {
     const third = await legacyImport.importLegacyData('user-3');
     assert.equal(third.verified, false);
     assert.equal(localStorage.getItem('redcall_user_user-3__subjects_v1'), JSON.stringify([{ id: 'own' }]));
+  });
+
+  check('corrupt local records are detected instead of treated as an empty account', () => {
+    const previous = localStorage.getItem('redcall_concepts_v1');
+    localStorage.setItem('redcall_concepts_v1', '{not valid json');
+    const corrupt = storage.checkStoredDataIntegrity();
+    assert.equal(corrupt.ok, false);
+    assert.ok(corrupt.failedKeys.includes('redcall_concepts_v1'));
+    if (previous === null) localStorage.removeItem('redcall_concepts_v1');
+    else localStorage.setItem('redcall_concepts_v1', previous);
+    assert.equal(storage.checkStoredDataIntegrity().ok, true);
+  });
+
+  check('app readiness exposes a stable snapshot for useSyncExternalStore', () => {
+    appReadiness.resetAppReadiness();
+    assert.equal(appReadiness.getAppReadiness().status, 'loading');
+    appReadiness.reportAppReady();
+    assert.equal(appReadiness.getAppReadiness().status, 'ready');
+    const readySnapshot = appReadiness.getAppReadiness();
+    appReadiness.reportAppReady();
+    assert.equal(appReadiness.getAppReadiness(), readySnapshot, 'unchanged ready keeps reference');
+    appReadiness.reportAppError('boom');
+    assert.equal(appReadiness.getAppReadiness().status, 'error');
+    assert.equal(appReadiness.getAppReadiness().message, 'boom');
   });
 
   // ---- Stage 11: problem source collection ----

@@ -39,7 +39,7 @@ import {
 import { addDaysToDate } from './dateUtils';
 import { computeMarkdownHash } from './markdownUtils';
 import { completeRechallengeReservation } from './logicSession';
-import { scopedStorageKey } from './storageScope';
+import { scopedStorageKey, isKeyInActiveScope } from './storageScope';
 
 // Base key names. The `redcall_` prefix and user namespace are applied by
 // scopedStorageKey() so legacy (pre-login) data keeps its exact historical keys.
@@ -108,6 +108,43 @@ function safeRemoveItem(baseKey: string): void {
   } catch (e) {
     console.error(`Failed to remove localStorage key ${key}`, e);
   }
+}
+
+export interface StoredDataIntegrity {
+  ok: boolean;
+  failedKeys: string[];
+}
+
+/**
+ * Detects corrupt local records for the active scope.
+ *
+ * A missing key is a valid empty account; only unparsable JSON is reported as a
+ * failure so callers can show an error + retry instead of silently presenting an
+ * empty account or substituting demo data.
+ */
+export function checkStoredDataIntegrity(): StoredDataIntegrity {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return { ok: true, failedKeys: [] };
+  }
+
+  const failedKeys: string[] = [];
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key || !isKeyInActiveScope(key)) continue;
+      const raw = localStorage.getItem(key);
+      if (raw === null || raw === '') continue;
+      try {
+        JSON.parse(raw);
+      } catch {
+        failedKeys.push(key);
+      }
+    }
+  } catch {
+    return { ok: false, failedKeys: ['localStorage'] };
+  }
+
+  return { ok: failedKeys.length === 0, failedKeys };
 }
 
 export function loadStoredSubjects(): Subject[] {
