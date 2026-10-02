@@ -26,6 +26,10 @@ interface MaterialsListModalProps {
   onOpenUpload: () => void;
   onSelectMaterial: (material: Material) => void;
   onDeleteMaterial?: (materialId: string) => void;
+  /** True when a private original file exists for the material. */
+  hasOriginal?: (materialId: string) => boolean;
+  /** Opens the original via a short-lived signed URL. */
+  onOpenOriginal?: (materialId: string) => void;
   onOpenConceptReview?: (material: Material) => void;
   onTriggerAnalysis?: (material: Material) => void;
   isAnalyzing?: boolean;
@@ -40,6 +44,8 @@ export function MaterialsListModal({
   onOpenUpload,
   onSelectMaterial,
   onDeleteMaterial,
+  hasOriginal,
+  onOpenOriginal,
   onOpenConceptReview,
   onTriggerAnalysis,
   isAnalyzing = false,
@@ -313,6 +319,17 @@ export function MaterialsListModal({
                         <ExternalLink className="w-3.5 h-3.5" />
                         <span>원문 대조 및 편집</span>
                       </button>
+
+                      {onOpenOriginal && hasOriginal?.(mat.id) && (
+                        <button
+                          onClick={() => onOpenOriginal(mat.id)}
+                          className="px-3 py-1.5 bg-white hover:bg-[#faf8f4] border border-[#c8c2b5] text-[#191817] text-xs font-semibold rounded-xs flex items-center gap-1 transition-colors"
+                          title="인증된 원본 파일 보기 (signed URL)"
+                        >
+                          <FileText className="w-3.5 h-3.5 text-[#827d73]" />
+                          <span>원본 보기</span>
+                        </button>
+                      )}
 
                       {!mat.isDemo && onDeleteMaterial && (
                         <button

@@ -16,6 +16,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
   'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
   'lib/storageScope.ts', 'lib/auth/redirects.ts', 'lib/legacyImport.ts', 'lib/appReadiness.ts',
+  'lib/cloud/hash.ts', 'lib/cloud/mappers.ts', 'lib/cloud/plan.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -59,6 +60,9 @@ exports.requireApiUser = async () => {
   const legacyImport = load(path.join(output, 'lib/legacyImport.js'));
   const appReadiness = load(path.join(output, 'lib/appReadiness.js'));
   const storageScope = load(path.join(output, 'lib/storageScope.js'));
+  const cloudHash = load(path.join(output, 'lib/cloud/hash.js'));
+  const cloudMappers = load(path.join(output, 'lib/cloud/mappers.js'));
+  const cloudPlan = load(path.join(output, 'lib/cloud/plan.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
@@ -615,6 +619,95 @@ exports.requireApiUser = async () => {
       matStorage.materialContentFingerprint({ markdown: '# a', pages: [] }),
       'absent pages differ from an empty page array'
     );
+  });
+
+  check('cloud content hash ignores updatedAt and detects different bodies', () => {
+    assert.equal(
+      cloudHash.materialContentHash({ markdown: '# a', updatedAt: '2020-01-01' }),
+      cloudHash.materialContentHash({ markdown: '# a' })
+    );
+    assert.notEqual(
+      cloudHash.materialContentHash({ markdown: '# a' }),
+      cloudHash.materialContentHash({ markdown: '# b' })
+    );
+  });
+
+  check('subject mapper round-trips and never sends user_id', () => {
+    const subject = {
+      id: 's-1',
+      name: '미적분',
+      code: 'MATH101',
+      timezone: 'Asia/Seoul',
+      examAt: '2026-06-01T00:00:00.000Z',
+      chapters: ['1', '2'],
+      domain: 'math_stats',
+    };
+    const payload = cloudMappers.subjectToUpsert(subject);
+    assert.equal(payload.id, 's-1');
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, 'user_id'), false);
+    const mapped = cloudMappers.rowToSubject({
+      ...payload,
+      user_id: 'user-x',
+      created_at: '',
+      updated_at: '',
+    });
+    assert.equal(mapped.id, 's-1');
+    assert.equal(mapped.name, '미적분');
+    assert.equal(mapped.ownerId, 'user-x');
+    assert.equal(mapped.examAt, '2026-06-01T00:00:00.000Z');
+    assert.deepEqual(mapped.chapters, ['1', '2']);
+  });
+
+  check('material object paths are deterministic and owner/version scoped', () => {
+    const paths = cloudMappers.materialObjectPaths('u1', 'm1', 2, 'pdf');
+    assert.equal(paths.markdown, 'u1/m1/v2/markdown.md');
+    assert.equal(paths.original, 'u1/m1/v2/original.pdf');
+    assert.equal(paths.pages, 'u1/m1/v2/pages.json');
+    assert.equal(paths.transcript, 'u1/m1/v2/transcript.txt');
+  });
+
+  check('migration plan skips identical, conflicts on different, retries failed uploads', () => {
+    const localSubjects = [{ id: 's1', name: 'A', code: '', timezone: 'Asia/Seoul' }];
+    const localMaterials = [
+      { id: 'm1', subjectId: 's1', kind: 'pdf', title: 'T1', sourceRefs: '' },
+      { id: 'm2', subjectId: 's1', kind: 'pdf', title: 'T2', sourceRefs: '' },
+      { id: 'm3', subjectId: 's1', kind: 'pdf', title: 'T3', sourceRefs: '' },
+      { id: 'm4', subjectId: 'sX', kind: 'pdf', title: 'T4', sourceRefs: '' },
+    ];
+    const cloudMaterials = [
+      { id: 'm2', subjectId: 's1', kind: 'pdf', title: 'T2', sourceRefs: '' },
+      { id: 'm3', subjectId: 's1', kind: 'pdf', title: 'T3', sourceRefs: '' },
+    ];
+    const localHashes = new Map([['m1', 'h1'], ['m2', 'h2'], ['m3', 'h3'], ['m4', 'h4']]);
+    const cloudHashes = new Map([['m2', 'h2'], ['m3', 'different']]);
+
+    const plan = cloudPlan.planLocalMigration({
+      localSubjects,
+      localMaterials,
+      cloudSubjects: [],
+      cloudMaterials,
+      localContentHashes: localHashes,
+      cloudContentHashes: cloudHashes,
+      cloudMaterialUploadStates: new Map([['m3', 'ready']]),
+    });
+    assert.deepEqual(plan.subjects.map((s) => s.id), ['s1']);
+    assert.deepEqual(plan.materials.map((m) => m.id).sort(), ['m1']);
+    assert.equal(plan.skippedMaterials, 1);
+    assert.ok(plan.conflicts.some((c) => c.id === 'm3'), 'different content conflicts');
+    assert.ok(plan.conflicts.some((c) => c.id === 'm4'), 'dangling subject conflicts');
+
+    // A same-id row whose upload failed is resumed, not treated as a conflict.
+    const retry = cloudPlan.planLocalMigration({
+      localSubjects,
+      localMaterials,
+      cloudSubjects: [],
+      cloudMaterials,
+      localContentHashes: localHashes,
+      cloudContentHashes: cloudHashes,
+      cloudMaterialUploadStates: new Map([['m3', 'failed']]),
+    });
+    assert.equal(retry.conflicts.some((c) => c.id === 'm3'), false);
+    assert.ok(retry.materials.some((m) => m.id === 'm3'), 'failed upload is retried');
   });
 
   check('material import is never verified when a copy write failed', () => {

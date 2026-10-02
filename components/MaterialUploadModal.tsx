@@ -22,7 +22,7 @@ interface MaterialUploadModalProps {
   onClose: () => void;
   subjects: Subject[];
   activeSubject: Subject;
-  onAddMaterial: (material: Material) => void;
+  onAddMaterial: (material: Material, originalFile?: File) => void;
   onOpenEditor?: (material: Material) => void;
 }
 
@@ -243,8 +243,8 @@ export function MaterialUploadModal({
       pages: kind === 'pdf' ? pdfPages : undefined,
     });
 
-    // 2. Add material metadata
-    onAddMaterial(newMaterial);
+    // 2. Add material metadata (and the original PDF for private cloud storage)
+    onAddMaterial(newMaterial, kind === 'pdf' ? pdfFile ?? undefined : undefined);
 
     if (!saveResult.persisted) {
       // Surface the limitation instead of pretending the save was durable.

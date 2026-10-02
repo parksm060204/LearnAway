@@ -104,7 +104,24 @@ import { MockExamModal, MockExamInitialConfig } from '../components/MockExamModa
 import { AddSubjectModal } from '../components/AddSubjectModal';
 import { StudyPlanModal } from '../components/StudyPlanModal';
 import { calculateDDay, toSeoulDateString, addDaysToDate } from '../lib/dateUtils';
-import { clearAllMaterialContent, deleteMaterialContent } from '../lib/materialStorage';
+import {
+  clearAllMaterialContent,
+  deleteMaterialContent,
+  saveMaterialContent,
+} from '../lib/materialStorage';
+import { loadCloudLibrary } from '../lib/cloud/library';
+import { upsertSubject } from '../lib/cloud/subjectsRepository';
+import {
+  createMaterialSignedUrl,
+  deleteMaterial,
+  writeMaterial,
+} from '../lib/cloud/materialsRepository';
+import {
+  getCloudMigrationState,
+  migrateLocalLibraryToCloud,
+  declineCloudMigration,
+  CloudMigrationState,
+} from '../lib/cloud/localMigration';
 import { applyMaterialEditToProblems } from '../lib/problemFreshness';
 import { setStorageScope } from '../lib/storageScope';
 import {
@@ -214,6 +231,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [logoutError, setLogoutError] = useState<string | null>(null);
   const [legacyImportState, setLegacyImportState] = useState<LegacyImportState | null>(null);
   const [isImportingLegacy, setIsImportingLegacy] = useState(false);
+  // Cloud library (subjects + materials) is the source of truth for this stage.
+  const [cloudStatus, setCloudStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [cloudError, setCloudError] = useState<string | null>(null);
+  const [cloudReloadToken, setCloudReloadToken] = useState(0);
+  const [cloudMigrationState, setCloudMigrationState] = useState<CloudMigrationState | null>(null);
+  const [isMigratingCloud, setIsMigratingCloud] = useState(false);
+  const [cloudOriginalPaths, setCloudOriginalPaths] = useState<Record<string, string>>({});
   // Ensures a single full-page handoff when the session changes (this tab or another).
   const authRedirectStarted = useRef(false);
 
@@ -230,6 +254,68 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       cancelled = true;
     };
   }, [currentUser.id]);
+
+  // Load subjects + materials from Supabase. A failed read shows an error screen
+  // and is never silently replaced by an empty list or local cache.
+  useEffect(() => {
+    let cancelled = false;
+
+    loadCloudLibrary()
+      .then(async (result) => {
+        if (cancelled) return;
+        if (!result.ok) {
+          setCloudStatus('error');
+          setCloudError(result.error);
+          return;
+        }
+
+        // Mirror the server library into the local cache for offline reads.
+        saveStoredSubjects(result.data.subjects);
+        saveStoredMaterials(result.data.materials);
+        for (const material of result.data.materials) {
+          if (
+            material.parsedMarkdown !== undefined ||
+            material.rawText !== undefined ||
+            material.pages !== undefined
+          ) {
+            await saveMaterialContent(material.id, {
+              markdown: material.parsedMarkdown ?? '',
+              rawText: material.rawText,
+              pages: material.pages,
+            });
+          }
+        }
+        if (cancelled) return;
+
+        setSubjects(result.data.subjects);
+        setMaterials(result.data.materials);
+        setCloudOriginalPaths(result.data.originalPathByMaterialId);
+        setActiveSubjectId((prev) =>
+          result.data.subjects.some((s) => s.id === prev)
+            ? prev
+            : result.data.subjects[0]?.id ?? ''
+        );
+        setCloudMigrationState(getCloudMigrationState(currentUser.id));
+        setCloudStatus('ready');
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setCloudStatus('error');
+        setCloudError(
+          error instanceof Error ? error.message : '서버 학습 데이터를 불러오지 못했습니다.'
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser.id, cloudReloadToken]);
+
+  const reloadCloudLibrary = () => {
+    setCloudStatus('loading');
+    setCloudError(null);
+    setCloudReloadToken((token) => token + 1);
+  };
 
   // Detect sign-out / account changes in other tabs and reset to the correct
   // user context. A full navigation discards in-memory state and in-flight
@@ -368,6 +454,47 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     setLegacyImportState((prev) => (prev ? { ...prev, declined: true } : prev));
   };
 
+  // Explicit, resumable migration of this account's local subjects/materials.
+  const handleMigrateCloud = async () => {
+    if (isMigratingCloud) return;
+    setIsMigratingCloud(true);
+    try {
+      const result = await migrateLocalLibraryToCloud(currentUser.id);
+      showToast(result.message);
+      setCloudMigrationState((prev) =>
+        prev
+          ? { ...prev, imported: result.ok ? true : prev.imported, resume: !result.ok && prev.resume }
+          : prev
+      );
+      if (result.ok) {
+        // Reload the cloud library so migrated records become the source of truth.
+        reloadCloudLibrary();
+      }
+    } finally {
+      setIsMigratingCloud(false);
+    }
+  };
+
+  const handleDeclineCloudMigration = () => {
+    declineCloudMigration(currentUser.id);
+    setCloudMigrationState((prev) => (prev ? { ...prev, declined: true } : prev));
+  };
+
+  // Original files are private: open them through a short-lived signed URL.
+  const handleOpenOriginal = async (materialId: string) => {
+    const path = cloudOriginalPaths[materialId];
+    if (!path) {
+      showToast('이 자료에는 저장된 원본 파일이 없습니다.');
+      return;
+    }
+    const result = await createMaterialSignedUrl(path);
+    if (!result.ok) {
+      showToast(`원본 보기 실패: ${result.error}`);
+      return;
+    }
+    window.open(result.data, '_blank', 'noopener,noreferrer');
+  };
+
   // Hydration-safe flag: false during SSR/first hydration commit, true after.
   const isHydrated = useSyncExternalStore(hydrationSubscribe, () => true, () => false);
 
@@ -442,10 +569,15 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       reportAppError(
         '저장된 학습 데이터를 불러오지 못했습니다. 기록이 손상되었을 수 있습니다. 데이터는 삭제되지 않았으니 다시 시도해 주세요.'
       );
-    } else {
-      reportAppReady();
+      return;
     }
-  }, [isLoaded, loadError]);
+    if (cloudStatus === 'loading') return;
+    if (cloudStatus === 'error') {
+      reportAppError(cloudError ?? '서버 학습 데이터를 불러오지 못했습니다.');
+      return;
+    }
+    reportAppReady();
+  }, [isLoaded, loadError, cloudStatus, cloudError]);
 
   // Re-check plan storage and KST date sync on window focus
   useEffect(() => {
@@ -647,13 +779,18 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     showToast(`과목이 [${targetSubject?.name || '새 과목'}]으로 전환되었습니다.`);
   };
 
-  // Add Subject Handler (Stage 0)
-  const handleAddSubject = (newSubject: Subject) => {
-    const updated = [...subjects, newSubject];
+  // Add Subject Handler (Stage 0) — persists to Supabase first.
+  const handleAddSubject = async (newSubject: Subject) => {
+    const result = await upsertSubject(newSubject);
+    if (!result.ok) {
+      showToast(`과목 저장 실패: ${result.error}`);
+      return;
+    }
+    const updated = [...subjects, result.data];
     setSubjects(updated);
     saveStoredSubjects(updated);
-    handleSelectSubject(newSubject.id);
-    showToast(`새 과목 폴더 [${newSubject.name}]이 생성되었습니다.`);
+    handleSelectSubject(result.data.id);
+    showToast(`새 과목 폴더 [${result.data.name}]이 생성되었습니다.`);
   };
 
   // Concept Selection Handler
@@ -682,16 +819,37 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     }
   };
 
-  // Subject Update Handler (Schedule, Scope, etc.)
-  const handleUpdateSubject = (updated: Subject) => {
-    const newSubjects = subjects.map((s) => (s.id === updated.id ? updated : s));
+  // Subject Update Handler (Schedule, Scope, etc.) — persists to Supabase first.
+  const handleUpdateSubject = async (updated: Subject) => {
+    const result = await upsertSubject(updated);
+    if (!result.ok) {
+      showToast(`과목 정보 저장 실패: ${result.error}`);
+      return;
+    }
+    const newSubjects = subjects.map((s) => (s.id === result.data.id ? result.data : s));
     setSubjects(newSubjects);
     saveStoredSubjects(newSubjects);
     showToast('과목 시험 정보가 성공적으로 갱신되었습니다.');
   };
 
-  // Material Add Handler
-  const handleAddMaterial = (newMat: Material) => {
+  // Material Add Handler — uploads original + body to Storage and metadata to DB.
+  const handleAddMaterial = async (newMat: Material, originalFile?: File) => {
+    const content = {
+      markdown: newMat.parsedMarkdown ?? '',
+      rawText: newMat.rawText,
+      pages: newMat.pages,
+    };
+    const result = await writeMaterial({
+      material: newMat,
+      content,
+      original: originalFile
+        ? { blob: originalFile, contentType: originalFile.type || 'application/pdf' }
+        : null,
+    });
+    if (!result.ok) {
+      showToast(`자료 저장 실패: ${result.error}`);
+      return;
+    }
     const updated = [newMat, ...materials];
     setMaterials(updated);
     saveStoredMaterials(updated);
@@ -1340,6 +1498,35 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     );
   }
 
+  if (cloudStatus === 'loading') {
+    return (
+      <div className="min-h-screen bg-[#faf8f4] flex items-center justify-center p-6 text-sm font-academic-mono text-[#827d73]">
+        클라우드 학습 데이터를 불러오는 중...
+      </div>
+    );
+  }
+
+  if (cloudStatus === 'error') {
+    return (
+      <div className="min-h-screen bg-[#faf8f4] flex flex-col items-center justify-center gap-4 p-6 text-center text-[#191817]">
+        <h1 className="text-xl font-bold">서버 학습 데이터를 불러오지 못했습니다</h1>
+        <p role="alert" className="max-w-md text-sm text-[#57544e] leading-relaxed">
+          {cloudError ?? '네트워크 또는 서버 오류가 발생했습니다.'}
+        </p>
+        <p className="text-xs text-[#827d73]">
+          서버 읽기 실패를 빈 목록이나 로컬 데이터로 대체하지 않습니다. 다시 시도해 주세요.
+        </p>
+        <button
+          type="button"
+          onClick={reloadCloudLibrary}
+          className="rounded-xs bg-[#191817] px-5 py-3 text-sm font-semibold text-white hover:bg-[#33302b] transition-colors"
+        >
+          다시 시도
+        </button>
+      </div>
+    );
+  }
+
   if (!activeSubject) {
     return (
       <div className="min-h-screen bg-[#faf8f4] flex flex-col items-center justify-center gap-5 p-6 text-center text-[#191817]">
@@ -1361,6 +1548,37 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         >
           과목 만들기
         </button>
+
+        {cloudMigrationState &&
+          cloudMigrationState.hasLocalData &&
+          !cloudMigrationState.imported &&
+          !cloudMigrationState.declined && (
+            <div className="max-w-md w-full border border-[#e2ded6] bg-white p-4 rounded-xs text-left space-y-2">
+              <p className="text-xs text-[#57544e] leading-relaxed">
+                이 브라우저에 저장된 과목·자료가 있습니다. 클라우드로 이전하면 다른 기기에서도
+                사용할 수 있습니다. 로컬 원본은 그대로 보존됩니다.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={handleMigrateCloud}
+                  disabled={isMigratingCloud}
+                  className="text-xs font-semibold bg-[#c52828] text-white px-3 py-1.5 rounded-xs hover:bg-[#a81f1f] transition-colors disabled:opacity-60"
+                >
+                  {isMigratingCloud ? '이전 중...' : '클라우드로 이전'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeclineCloudMigration}
+                  disabled={isMigratingCloud}
+                  className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
+                >
+                  나중에
+                </button>
+              </div>
+            </div>
+          )}
+
         <AddSubjectModal isOpen={isAddSubjectModalOpen} onClose={() => setIsAddSubjectModalOpen(false)} onAddSubject={handleAddSubject} />
       </div>
     );
@@ -1519,6 +1737,40 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             </div>
           </div>
         ))}
+
+      {cloudMigrationState &&
+        cloudMigrationState.hasLocalData &&
+        !cloudMigrationState.imported &&
+        !cloudMigrationState.declined && (
+          <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
+            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+              <div className="text-xs text-[#57544e] leading-relaxed">
+                <span className="font-bold text-[#191817]">이 계정의 로컬 과목·자료를 클라우드로 이전할 수 있습니다.</span>{' '}
+                이전하면 다른 기기에서도 같은 과목·자료를 사용할 수 있습니다. 로컬 원본은 그대로
+                보존되며, 같은 ID의 다른 내용은 자동으로 덮어쓰지 않습니다. (문제·답안·복습 이력은
+                아직 로컬에 남습니다.)
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleMigrateCloud}
+                  disabled={isMigratingCloud}
+                  className="text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {isMigratingCloud ? '이전 중...' : '클라우드로 이전'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeclineCloudMigration}
+                  disabled={isMigratingCloud}
+                  className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
+                >
+                  나중에
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
       {/* Main Workspace Container */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-3 sm:px-6 py-4 sm:py-6 space-y-4">
@@ -1728,15 +1980,23 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           setEditingMaterial(mat);
           setIsMaterialEditorOpen(true);
         }}
+        hasOriginal={(materialId) => Boolean(cloudOriginalPaths[materialId])}
+        onOpenOriginal={handleOpenOriginal}
         onDeleteMaterial={async (materialId) => {
+          // Delete on the server first; never report success on failure.
+          const result = await deleteMaterial(materialId);
+          if (!result.ok) {
+            showToast(`자료 삭제 실패: ${result.error}`);
+            return;
+          }
           const updated = materials.filter((m) => m.id !== materialId);
           setMaterials(updated);
           saveStoredMaterials(updated);
-          const result = await deleteMaterialContent(materialId);
+          const localCleanup = await deleteMaterialContent(materialId);
           showToast(
-            result.deleted
+            localCleanup.deleted
               ? '자료와 저장된 본문이 삭제되었습니다.'
-              : `자료 목록에서는 제거했지만 본문 저장소 정리에 실패했습니다. (${result.error || '알 수 없는 오류'})`
+              : `서버에서는 삭제됐지만 브라우저 캐시 정리에 실패했습니다. (${localCleanup.error || '알 수 없는 오류'})`
           );
         }}
         onOpenConceptReview={(mat) => {
@@ -1760,7 +2020,21 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         material={editingMaterial}
         subject={activeSubject}
         draftCount={editingMaterial ? conceptDrafts.filter((d) => d.materialId === editingMaterial.id).length : 0}
-        onSave={(updatedMat) => {
+        onSave={async (updatedMat, updatedContent) => {
+          // Persist a new version to the server before updating local state.
+          const writeResult = await writeMaterial({
+            material: updatedMat,
+            content: {
+              markdown: updatedContent.markdown,
+              rawText: updatedMat.rawText,
+              pages: updatedContent.pages,
+            },
+          });
+          if (!writeResult.ok) {
+            showToast(`자료 수정 저장 실패: ${writeResult.error}`);
+            return false;
+          }
+
           const updated = materials.map((m) =>
             m.id === updatedMat.id ? updatedMat : m
           );
@@ -1788,8 +2062,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               `[${updatedMat.title}] 수정과 연관된 문제 ${reviewIds.length}건을 확인 필요 상태로 표시했습니다.`
             );
           } else {
-            showToast(`[${updatedMat.title}] 수정 내용이 저장되었습니다.`);
+            showToast(`[${updatedMat.title}] 수정 내용이 서버에 저장되었습니다.`);
           }
+          return true;
         }}
         onOpenConceptReview={(mat) => {
           setConceptReviewMaterial(mat || null);

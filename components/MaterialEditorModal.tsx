@@ -30,10 +30,11 @@ interface MaterialEditorModalProps {
   isAnalyzing?: boolean;
   onTriggerAnalysis?: (material: Material) => void;
   onOpenConceptReview?: (material: Material) => void;
+  /** Returns true only when the update was confirmed by the server. */
   onSave: (
     updatedMaterial: Material,
     updatedContent: { markdown: string; pages?: MaterialPage[] }
-  ) => void;
+  ) => Promise<boolean>;
 }
 
 export function MaterialEditorModal({
@@ -142,15 +143,18 @@ export function MaterialEditorModal({
         status: material.status === 'failed' ? 'needs_review' : material.status,
       };
 
-      onSave(updatedMaterial, { markdown, pages });
+      const savedToServer = await onSave(updatedMaterial, { markdown, pages });
 
       const now = new Date().toLocaleTimeString('ko-KR', { hour12: false });
-      if (result.persisted) {
+      if (!savedToServer) {
+        // Do not claim success when the server did not confirm the save.
+        setSaveWarning('서버에 저장하지 못했습니다. 다시 시도해 주세요. (로컬 캐시는 갱신되었습니다.)');
+      } else if (result.persisted) {
         setSaveSuccessMsg(`저장 완료 (${now})`);
       } else {
         // Do not claim a durable save when only the in-memory cache holds the content.
         setSaveWarning(
-          `메모리에만 보관되었습니다. 새로고침하면 사라질 수 있습니다. (${result.error})`
+          `서버 저장은 완료됐지만 브라우저 캐시에는 메모리로만 보관되었습니다. (${result.error})`
         );
       }
     } catch (e) {
