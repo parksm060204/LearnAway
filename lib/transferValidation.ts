@@ -7,8 +7,28 @@
  * Unverifiable or invalid output is rejected, never saved as success.
  */
 
-import { ProblemDifficulty, ProblemType, RubricCriterion } from './types';
+import { Problem, ProblemDifficulty, ProblemType, RubricCriterion } from './types';
 import { validateEvaluationRubric } from './evaluationValidation';
+
+/**
+ * Selects the approved transfer problem for the CURRENT draft only. An earlier
+ * approved generation (different draftId) must never be treated as this draft's
+ * approval, even if it shares the same logic session.
+ */
+export function selectApprovedTransferProblem(
+  problems: Problem[],
+  draftId: string | undefined
+): Problem | null {
+  if (!draftId) return null;
+  return problems.find((p) => p.isTransfer === true && p.draftId === draftId) || null;
+}
+
+export function previousApprovedTransfers(
+  problems: Problem[],
+  draftId: string | undefined
+): Problem[] {
+  return problems.filter((p) => p.isTransfer === true && p.draftId !== draftId);
+}
 
 export type TransferKind =
   | 'precondition_change'

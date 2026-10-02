@@ -131,12 +131,8 @@ export function validateReservationForAttempt(
   attempt: ReservationAttemptIdentity
 ): { ok: boolean; reason?: ReservationCompletionStatus; message?: string } {
   if (!reservation) return { ok: false, reason: 'not_found', message: '재도전 예약을 찾을 수 없습니다.' };
-  if (reservation.status === 'cancelled') {
-    return { ok: false, reason: 'cancelled', message: '취소된 예약은 완료 처리할 수 없습니다.' };
-  }
-  if (reservation.status === 'completed') {
-    return { ok: false, reason: 'already_completed', message: '이미 완료된 예약입니다.' };
-  }
+  // Identity is validated FIRST: a completed reservation for a DIFFERENT problem
+  // must not be reported as "already completed".
   if (
     reservation.subjectId !== attempt.subjectId ||
     reservation.conceptId !== attempt.conceptId ||
@@ -148,6 +144,13 @@ export function validateReservationForAttempt(
       reason: 'mismatch',
       message: '재도전 예약 정보(과목·개념·문제·버전)가 현재 풀이와 일치하지 않습니다.',
     };
+  }
+  if (reservation.status === 'cancelled') {
+    return { ok: false, reason: 'cancelled', message: '취소된 예약은 완료 처리할 수 없습니다.' };
+  }
+  if (reservation.status === 'completed') {
+    // Same record retried: allowed as idempotent completion.
+    return { ok: false, reason: 'already_completed', message: '이미 완료된 예약입니다.' };
   }
   return { ok: true };
 }

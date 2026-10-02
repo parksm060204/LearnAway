@@ -21,6 +21,17 @@ import {
   setActiveLogicSessionId,
 } from '../lib/logicSession';
 import { shouldApplyResponse } from '../lib/logicAsync';
+import {
+  AsyncTracker,
+  beginAsyncRequest,
+  createAsyncTracker,
+  invalidateAsyncRequests,
+  settleAsyncRequest,
+} from '../lib/asyncRequestTracker';
+import {
+  previousApprovedTransfers,
+  selectApprovedTransferProblem,
+} from '../lib/transferValidation';
 import { X, Sparkles, BrainCircuit, CheckCircle2, AlertTriangle, CalendarClock, Loader2, ShieldCheck, GitBranch, Trash2 } from 'lucide-react';
 
 interface LogicStrengthenModalProps {
@@ -154,9 +165,9 @@ export function LogicStrengthenModal({
   const mountedRef = useRef(true);
   const [activeSessionId, setActiveSessionId] = useState(session.id);
   const activeSessionIdRef = useRef(session.id);
-  const questionsReqRef = useRef(0);
-  const evalReqRef = useRef(0);
-  const transferReqRef = useRef(0);
+  const questionsTrackerRef = useRef<AsyncTracker>(createAsyncTracker());
+  const evalTrackerRef = useRef<AsyncTracker>(createAsyncTracker());
+  const transferTrackerRef = useRef<AsyncTracker>(createAsyncTracker());
 
   const [sessionList, setSessionList] = useState<LogicStrengthenSession[]>(() =>
     loadLogicSessionsForAttempt(sourceAttempt.id)
@@ -176,12 +187,15 @@ export function LogicStrengthenModal({
 
   useEffect(() => {
     mountedRef.current = true;
+    const questionsTracker = questionsTrackerRef.current;
+    const evalTracker = evalTrackerRef.current;
+    const transferTracker = transferTrackerRef.current;
     return () => {
       mountedRef.current = false;
       // Invalidate any in-flight responses once the modal closes.
-      questionsReqRef.current += 1;
-      evalReqRef.current += 1;
-      transferReqRef.current += 1;
+      invalidateAsyncRequests(questionsTracker);
+      invalidateAsyncRequests(evalTracker);
+      invalidateAsyncRequests(transferTracker);
     };
   }, []);
 
@@ -192,8 +206,16 @@ export function LogicStrengthenModal({
   const sessionReservations = reservations.filter(
     (r) => r.sourceLogicSessionId === session.id || r.sourceAttemptId === sourceAttempt.id
   );
-  const approvedTransferProblem =
-    approvedTransferProblems.find((p) => p.isTransfer === true && p.logicSessionId === session.id) || null;
+  // Exact draft match only: a previously approved transfer from an earlier
+  // generation must never be shown as the current draft's approval.
+  const approvedTransferProblem = selectApprovedTransferProblem(
+    approvedTransferProblems,
+    session.transferDraftId
+  );
+  const previousApprovedTransferList = previousApprovedTransfers(
+    approvedTransferProblems,
+    session.transferDraftId
+  );
 
   const persist = (next: LogicStrengthenSession) => {
     setSessionState(next);
@@ -222,9 +244,9 @@ export function LogicStrengthenModal({
     );
 
   const switchSession = (target: LogicStrengthenSession) => {
-    questionsReqRef.current += 1;
-    evalReqRef.current += 1;
-    transferReqRef.current += 1;
+    invalidateAsyncRequests(questionsTrackerRef.current);
+    invalidateAsyncRequests(evalTrackerRef.current);
+    invalidateAsyncRequests(transferTrackerRef.current);
     setActiveLogicSessionId(sourceAttempt.id, target.id);
     activeSessionIdRef.current = target.id;
     setActiveSessionId(target.id);
@@ -247,8 +269,7 @@ export function LogicStrengthenModal({
       setNotice('동일한 입력의 질문이 이미 생성되어 재사용했습니다. 다시 만들려면 "질문 다시 생성"을 누르세요.');
       return;
     }
-    const requestId = questionsReqRef.current + 1;
-    questionsReqRef.current = requestId;
+    const requestId = beginAsyncRequest(questionsTrackerRef.current);
     const requestSessionId = base.id;
     setIsGenerating(true);
     setError(null);
@@ -275,7 +296,7 @@ export function LogicStrengthenModal({
         !shouldApplyResponse({
           mounted: mountedRef.current,
           requestId,
-          latestRequestId: questionsReqRef.current,
+          latestRequestId: questionsTrackerRef.current.generation,
           requestSessionId,
           activeSessionId: activeSessionIdRef.current,
           snapshotHash: inputHash,
@@ -319,19 +340,24 @@ export function LogicStrengthenModal({
       });
       setNotice(`질문 세트 v${newVersion}이 생성되었습니다. 이전 질문과 응답은 이력으로 보존됩니다.`);
     } catch (cause) {
-      if (mountedRef.current && requestId === questionsReqRef.current) {
+      if (mountedRef.current && requestId === questionsTrackerRef.current.generation) {
         setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
       }
     } finally {
-      if (mountedRef.current && requestId === questionsReqRef.current) setIsGenerating(false);
+      const { loading } = settleAsyncRequest(questionsTrackerRef.current, requestId);
+      if (mountedRef.current) setIsGenerating(loading);
     }
   };
 
   // ---- Revised answer ----
   const changeRevisedAnswer = (value: string) => {
     if (isLocked) return;
-    // Invalidate any in-flight evaluation immediately.
-    evalReqRef.current += 1;
+    // Invalidate any in-flight evaluation/transfer immediately AND release the
+    // loading state, so the button never stays disabled after an edit.
+    invalidateAsyncRequests(evalTrackerRef.current);
+    invalidateAsyncRequests(transferTrackerRef.current);
+    setIsEvaluating(false);
+    setIsGeneratingTransfer(false);
     const base = sessionRef.current;
     const patch: Partial<LogicStrengthenSession> = { revisedAnswer: value };
     if (base.revisedEvaluation && value.trim() !== (base.revisedEvaluatedAnswer || '').trim()) {
@@ -358,8 +384,7 @@ export function LogicStrengthenModal({
       inputHash: simpleHash(`${answer}|${base.problemVersion}|${rubricHash(base.rubricSnapshot)}`),
       sessionId: base.id,
     };
-    const requestId = evalReqRef.current + 1;
-    evalReqRef.current = requestId;
+    const requestId = beginAsyncRequest(evalTrackerRef.current);
     setIsEvaluating(true);
     setError(null);
     try {
@@ -390,7 +415,7 @@ export function LogicStrengthenModal({
         !shouldApplyResponse({
           mounted: mountedRef.current,
           requestId,
-          latestRequestId: evalReqRef.current,
+          latestRequestId: evalTrackerRef.current.generation,
           requestSessionId: snapshot.sessionId,
           activeSessionId: activeSessionIdRef.current,
           snapshotHash: snapshot.inputHash,
@@ -411,11 +436,12 @@ export function LogicStrengthenModal({
         status: 'revised_evaluated',
       });
     } catch (cause) {
-      if (mountedRef.current && requestId === evalReqRef.current) {
+      if (mountedRef.current && requestId === evalTrackerRef.current.generation) {
         setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
       }
     } finally {
-      if (mountedRef.current && requestId === evalReqRef.current) setIsEvaluating(false);
+      const { loading } = settleAsyncRequest(evalTrackerRef.current, requestId);
+      if (mountedRef.current) setIsEvaluating(loading);
     }
   };
 
@@ -539,8 +565,7 @@ export function LogicStrengthenModal({
       setNotice('동일한 입력의 전이 초안이 이미 생성되어 재사용했습니다. 다시 만들려면 "전이 문제 다시 생성"을 누르세요.');
       return;
     }
-    const requestId = transferReqRef.current + 1;
-    transferReqRef.current = requestId;
+    const requestId = beginAsyncRequest(transferTrackerRef.current);
     const requestSessionId = base.id;
     setIsGeneratingTransfer(true);
     setError(null);
@@ -573,7 +598,7 @@ export function LogicStrengthenModal({
         !shouldApplyResponse({
           mounted: mountedRef.current,
           requestId,
-          latestRequestId: transferReqRef.current,
+          latestRequestId: transferTrackerRef.current.generation,
           requestSessionId,
           activeSessionId: activeSessionIdRef.current,
           snapshotHash: inputHash,
@@ -657,11 +682,12 @@ export function LogicStrengthenModal({
       });
       setNotice('전이 문제 초안이 생성되었습니다. 검토·승인 전에는 학습 계획에 배정되지 않습니다.');
     } catch (cause) {
-      if (mountedRef.current && requestId === transferReqRef.current) {
+      if (mountedRef.current && requestId === transferTrackerRef.current.generation) {
         setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
       }
     } finally {
-      if (mountedRef.current && requestId === transferReqRef.current) setIsGeneratingTransfer(false);
+      const { loading } = settleAsyncRequest(transferTrackerRef.current, requestId);
+      if (mountedRef.current) setIsGeneratingTransfer(loading);
     }
   };
 
@@ -998,6 +1024,17 @@ export function LogicStrengthenModal({
                 ) : (
                   <p className="text-indigo-900">아직 이 회차의 전이 문제가 승인되지 않았습니다. 문제 검토·승인 화면에서 승인하면 즉시 풀거나 예약할 수 있습니다.</p>
                 )}
+              </div>
+            )}
+            {previousApprovedTransferList.length > 0 && (
+              <div className="border border-[#e2ded6] rounded-xs p-2 text-[11px] space-y-1">
+                <div className="font-semibold text-[#57544e]">이전 생성 결과(참고용, 현재 초안과 무관)</div>
+                {previousApprovedTransferList.map((p) => (
+                  <div key={p.id} className="flex items-center justify-between gap-2 text-[#827d73]">
+                    <span className="line-clamp-1">v{p.version ?? 1} · {p.title}</span>
+                    <span>승인됨</span>
+                  </div>
+                ))}
               </div>
             )}
           </section>

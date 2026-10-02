@@ -14,7 +14,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
-  'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
+  'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -39,6 +39,7 @@ async function run() {
   const logicValidation = load(path.join(output, 'lib/logicValidation.js'));
   const transferValidation = load(path.join(output, 'lib/transferValidation.js'));
   const logicAsync = load(path.join(output, 'lib/logicAsync.js'));
+  const asyncTracker = load(path.join(output, 'lib/asyncRequestTracker.js'));
   const learningAnalytics = load(path.join(output, 'lib/learningAnalytics.js'));
   const markdownUtils = load(path.join(output, 'lib/markdownUtils.js'));
   const personalization = load(path.join(output, 'lib/personalization.js'));
@@ -851,8 +852,6 @@ async function run() {
     assert.equal(logicAsync.shouldApplyResponse({ mounted: true, requestId: 2, latestRequestId: 2, requestSessionId: 's1', activeSessionId: 's2', snapshotHash: 'new', currentHash: 'new' }), false, 'round changed rejected');
   });
 
-  console.log(`${passed} regression checks passed`);
-
   check('transfer problem is not assigned before approval', () => {
     const concept = { ...structuredClone(lsConcept) };
     const draftTransfer = { ...structuredClone(lsProblem), id: 'ls-transfer', isTransfer: true, sourceProblemId: 'ls-prob', isApproved: false };
@@ -873,6 +872,67 @@ async function run() {
     assert.equal(collection.transferCount, 1);
     const rec = collection.records.find((r) => r.attemptId === 'att-transfer');
     assert.ok(rec && rec.isTransfer === true, 'transfer flagged in analytics');
+  });
+
+  // ---- Stage 16: async loading, linkage failure, versioning, reservation identity ----
+  check('changing input during evaluation releases loading and rejects the stale response', () => {
+    const tracker = asyncTracker.createAsyncTracker();
+    const requestId = asyncTracker.beginAsyncRequest(tracker);
+    assert.equal(tracker.inFlight, 1);
+    // User edits the answer while the request is in flight.
+    asyncTracker.invalidateAsyncRequests(tracker);
+    const settled = asyncTracker.settleAsyncRequest(tracker, requestId);
+    assert.equal(settled.apply, false, 'stale response not applied');
+    assert.equal(settled.loading, false, 'loading released after invalidation');
+    // A newer request started after invalidation keeps loading until it settles.
+    const requestId2 = asyncTracker.beginAsyncRequest(tracker);
+    assert.equal(asyncTracker.settleAsyncRequest(tracker, requestId2).loading, false);
+    assert.equal(asyncTracker.settleAsyncRequest(tracker, requestId2).apply, true);
+  });
+
+  check('an explicit plan-item mismatch is reported as a partial failure', () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredAttempts([]);
+    storage.saveStoredStudyPlanItems([{ id: 'spi-other', subjectId: c.subjectId, subjectName: 'n', conceptId: 'other-concept', problemId: 'other-prob', kind: 'recommended_review', assignedDate: '2026-10-01', estimatedMinutes: 15, isEstimatedTime: false, priorityScore: 1, priorityReason: 'r', status: 'pending', snapshotTitle: 't', snapshotDetail: 'd' }]);
+    const attempt = { id: 'att-explicit-link', problemId: 'explicit-prob', conceptId: c.id, subjectId: c.subjectId, at: '2026-10-01T08:00:00+09:00', answer: 'a', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '', planItemId: 'spi-other' };
+    const result = storage.recordAttemptAndUpdateConcept(attempt, undefined, { planItemId: 'spi-other' });
+    assert.equal(result.partial, true, 'explicit mismatch is partial');
+    assert.ok(['PLAN_ITEM_MISMATCH', 'PLAN_ITEM_NOT_FOUND'].includes(result.planLinkage.skippedReason), 'skipped reason preserved');
+  });
+
+  check('re-approving changed content bumps the version and archives history', () => {
+    storage.saveStoredProblems([]);
+    const draft = { id: 'draft-ver', subjectId: 'ls-subj', conceptIds: ['ls-c'], conceptTitles: ['c'], title: 'v1', type: 'essay_descriptive', difficulty: 'advanced_college', categoryLabel: 'c', categoryNumber: 1, promptText: 'prompt v1', designIntent: 'd', appliedConditionNote: 'n', sourceRefs: 's', timeStandardMinutes: 20, timeBreakdownDesc: '20', coreEvaluationHighlight: 'e', itemCountDesc: '1', hints: ['h'], modelAnswer: 'answer v1', rubric: [{ id: 'r', label: 'r', maxScore: 100, weight: 1, description: 'd' }], status: 'draft', isApproved: false, isDemo: false, verificationStatus: { hasRequiredFields: true, isScore100: true, scoreSum: 100, hasConceptLink: true, isSourceVerified: false }, createdAt: 't', updatedAt: 't' };
+    storage.saveStoredProblemDrafts([draft]);
+    const first = storage.approveProblemDraft('draft-ver');
+    assert.equal(first.approvedProblem.version, 1);
+    // Identical re-approval keeps the version.
+    const same = storage.approveProblemDraft('draft-ver');
+    assert.equal(same.approvedProblem.version, 1, 'identical re-approval keeps version');
+    // Changed content bumps the version and archives the prior snapshot.
+    storage.saveStoredProblemDrafts([{ ...draft, promptText: 'prompt v2', updatedAt: 't2' }]);
+    const changed = storage.approveProblemDraft('draft-ver');
+    assert.equal(changed.approvedProblem.version, 2, 'changed content bumps version');
+    assert.equal(changed.approvedProblem.versionHistory.length, 1, 'prior version archived');
+    assert.equal(changed.approvedProblem.versionHistory[0].promptText, 'prompt v1');
+  });
+
+  check('a completed reservation with mismatched identity reports mismatch, not already_completed', () => {
+    logicSession.saveRechallengeReservation({ id: 'rr-done', subjectId: 'ls-subj', subjectName: 'n', conceptId: 'ls-c', problemId: 'ls-prob', problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: 't', status: 'completed' });
+    const identity = { subjectId: 'ls-subj', conceptId: 'ls-c', problemId: 'ls-prob', problemVersion: 1 };
+    assert.equal(logicSession.completeRechallengeReservation('rr-done', { ...identity, problemId: 'other' }).status, 'mismatch');
+    assert.equal(logicSession.completeRechallengeReservation('rr-done', identity).status, 'already_completed');
+  });
+
+  check('approved transfer selection matches the exact current draft only', () => {
+    const approvedV1 = { id: 'tp-v1', draftId: 'draft-transfer-s1-v1', isTransfer: true, logicSessionId: 's1', title: 'v1' };
+    const approvedV2 = { id: 'tp-v2', draftId: 'draft-transfer-s1-v2', isTransfer: true, logicSessionId: 's1', title: 'v2' };
+    assert.equal(transferValidation.selectApprovedTransferProblem([approvedV1, approvedV2], 'draft-transfer-s1-v2').id, 'tp-v2');
+    assert.equal(transferValidation.selectApprovedTransferProblem([approvedV1, approvedV2], 'draft-transfer-s1-v3'), null);
+    const previous = transferValidation.previousApprovedTransfers([approvedV1, approvedV2], 'draft-transfer-s1-v2');
+    assert.equal(previous.length, 1);
+    assert.equal(previous[0].id, 'tp-v1');
   });
 
   console.log(`${passed} regression checks passed`);

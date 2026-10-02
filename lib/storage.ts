@@ -523,6 +523,61 @@ export function buildProblemFromDraft(
   };
 
   if (existing) {
+    // A re-approval that changes evaluation-affecting content is a NEW version
+    // with an archived snapshot; an identical re-approval keeps the version.
+    const signature = (p: {
+      title: string;
+      promptText: string;
+      mathFormula?: string;
+      codeSnippet?: string;
+      hints: string[];
+      modelAnswer: string;
+      rubric: Problem['rubric'];
+      timeStandardMinutes: number;
+      appliedConditionNote?: string;
+      designIntent?: string;
+    }) =>
+      JSON.stringify([
+        p.title,
+        p.promptText,
+        p.mathFormula || '',
+        p.codeSnippet || '',
+        p.hints || [],
+        p.modelAnswer,
+        p.rubric || [],
+        p.timeStandardMinutes,
+        p.appliedConditionNote || '',
+        p.designIntent || '',
+      ]);
+
+    const contentChanged = signature(existing) !== signature(derived);
+
+    if (contentChanged) {
+      const currentVersion = existing.version || 1;
+      const snapshot: ProblemVersionSnapshot = {
+        version: currentVersion,
+        title: existing.title,
+        promptText: existing.promptText,
+        mathFormula: existing.mathFormula,
+        codeSnippet: existing.codeSnippet,
+        timeStandardMinutes: existing.timeStandardMinutes,
+        hints: [...(existing.hints || [])],
+        modelAnswer: existing.modelAnswer,
+        rubric: [...(existing.rubric || [])],
+        editedAt: now,
+        editReason: '재승인 시 내용 변경',
+      };
+      return {
+        ...existing,
+        ...derived,
+        qualityStatus: 'reapproved',
+        version: currentVersion + 1,
+        reports: existing.reports || [],
+        versionHistory: [snapshot, ...(existing.versionHistory || [])],
+        lastReviewedAt: now,
+      };
+    }
+
     return {
       ...existing,
       ...derived,
@@ -1301,7 +1356,11 @@ export function recordAttemptAndUpdateConcept(
 
   // Plan linkage is a secondary record. Its failure must not be swallowed: report it
   // via `partial` so the caller can retry without re-incrementing Attempt/event counts.
-  const partial = matchingPlanItem !== undefined && !planLinkage.persisted;
+  // When a plan item was EXPLICITLY requested, a missing/mismatched/skipped target is
+  // also a linkage failure (otherwise the UI would show a false success).
+  const explicitLinkFailed = Boolean(linkage?.planItemId) && planLinkage.linkedItemId === null;
+  const partial =
+    explicitLinkFailed || (matchingPlanItem !== undefined && !planLinkage.persisted);
 
   return { updatedConcepts, updatedAttempts: newAttempts, partial, planLinkage };
 }
