@@ -1,5 +1,5 @@
 /**
- * Stage 13: Persistence for answer-logic strengthening sessions and delayed
+ * Stage 13/14: Persistence for answer-logic strengthening sessions and delayed
  * rechallenge reservations. Drafts survive a refresh; save failures are reported
  * to the caller instead of being silently swallowed.
  */
@@ -52,8 +52,8 @@ export function saveLogicSession(session: LogicStrengthenSession): boolean {
   return safeSet(LOGIC_KEY, [session, ...others]);
 }
 
-export function deleteLogicSession(sessionId: string): void {
-  safeSet(LOGIC_KEY, loadLogicSessions().filter((s) => s.id !== sessionId));
+export function deleteLogicSession(sessionId: string): boolean {
+  return safeSet(LOGIC_KEY, loadLogicSessions().filter((s) => s.id !== sessionId));
 }
 
 export function loadRechallengeReservations(): RechallengeReservation[] {
@@ -61,20 +61,39 @@ export function loadRechallengeReservations(): RechallengeReservation[] {
   return Array.isArray(loaded) ? loaded : [];
 }
 
+export function getRechallengeReservation(reservationId: string): RechallengeReservation | null {
+  return loadRechallengeReservations().find((r) => r.id === reservationId) || null;
+}
+
 export function saveRechallengeReservation(reservation: RechallengeReservation): boolean {
   const others = loadRechallengeReservations().filter((r) => r.id !== reservation.id);
   return safeSet(RESERVATION_KEY, [reservation, ...others]);
 }
 
+/** Returns the updated list plus whether the write actually persisted. */
 export function updateRechallengeReservation(
   reservationId: string,
   patch: Partial<RechallengeReservation>
-): RechallengeReservation[] {
+): { reservations: RechallengeReservation[]; saved: boolean } {
   const updated = loadRechallengeReservations().map((r) =>
     r.id === reservationId ? { ...r, ...patch } : r
   );
-  safeSet(RESERVATION_KEY, updated);
-  return updated;
+  const saved = safeSet(RESERVATION_KEY, updated);
+  return { reservations: updated, saved };
+}
+
+export function completeRechallengeReservation(reservationId: string): {
+  reservations: RechallengeReservation[];
+  saved: boolean;
+} {
+  return updateRechallengeReservation(reservationId, { status: 'completed' });
+}
+
+export function cancelRechallengeReservation(reservationId: string): {
+  reservations: RechallengeReservation[];
+  saved: boolean;
+} {
+  return updateRechallengeReservation(reservationId, { status: 'cancelled' });
 }
 
 export function clearLogicData(): void {

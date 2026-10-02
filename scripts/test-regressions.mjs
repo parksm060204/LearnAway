@@ -14,7 +14,8 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/learningAnalytics.ts',
-  'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts',
+  'lib/transferValidation.ts',
+  'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -36,6 +37,7 @@ async function run() {
   const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
   const logicSession = load(path.join(output, 'lib/logicSession.js'));
   const logicValidation = load(path.join(output, 'lib/logicValidation.js'));
+  const transferValidation = load(path.join(output, 'lib/transferValidation.js'));
   const learningAnalytics = load(path.join(output, 'lib/learningAnalytics.js'));
   const markdownUtils = load(path.join(output, 'lib/markdownUtils.js'));
   const personalization = load(path.join(output, 'lib/personalization.js'));
@@ -596,13 +598,51 @@ async function run() {
 
   check('AI-only question validation never creates learning history', () => {
     const attemptsBefore = storage.loadStoredAttempts().length;
+    const answer = '조건부 기댓값 정의를 사용하였다';
     const qs = logicValidation.validateLogicQuestionsOutput(
-      { questions: [{ id: 'q1', question: 'a', linkedCriterionId: 'r' }, { id: 'q2', question: 'b' }] },
-      lsRubric
+      {
+        questions: [
+          { id: 'q1', question: '적용 조건은 무엇인가?', linkedCriterionId: 'r' },
+          { id: 'q2', question: '반례는 무엇인가?', linkedQuote: '조건부 기댓값' },
+        ],
+      },
+      lsRubric,
+      answer
     );
     assert.equal(qs.length, 2);
-    assert.throws(() => logicValidation.validateLogicQuestionsOutput({ questions: [{ id: 'q1', question: 'a' }] }, lsRubric));
     assert.equal(storage.loadStoredAttempts().length, attemptsBefore, 'no history from AI-only validation');
+  });
+
+  check('question validation rejects duplicate ids, fabricated quotes and ungrounded questions', () => {
+    const answer = '조건부 기댓값 정의를 사용하였다';
+    assert.throws(() =>
+      logicValidation.validateLogicQuestionsOutput(
+        { questions: [{ id: 'q1', question: 'A', linkedCriterionId: 'r' }, { id: 'q1', question: 'B', linkedCriterionId: 'r' }] },
+        lsRubric,
+        answer
+      )
+    );
+    assert.throws(() =>
+      logicValidation.validateLogicQuestionsOutput(
+        { questions: [{ id: 'q1', question: 'A', linkedQuote: '존재하지 않는 문장' }, { id: 'q2', question: 'B', linkedCriterionId: 'r' }] },
+        lsRubric,
+        answer
+      )
+    );
+    assert.throws(() =>
+      logicValidation.validateLogicQuestionsOutput(
+        { questions: [{ id: 'q1', question: 'A' }, { id: 'q2', question: 'B' }] },
+        lsRubric,
+        answer
+      )
+    );
+    assert.throws(() =>
+      logicValidation.validateLogicQuestionsOutput(
+        { questions: [{ id: 'q1', question: 'A', linkedCriterionId: 'r' }, { id: 'q2', question: 'A', linkedCriterionId: 'r' }] },
+        lsRubric,
+        answer
+      )
+    );
   });
 
   check('rechallenge reservation adds a plan item without changing score or round', () => {
@@ -618,20 +658,105 @@ async function run() {
     assert.equal(storage.loadStoredConcepts().find((c) => c.id === 'ls-c').events.length, eventsBefore, 'reservation adds no review event');
   });
 
-  await checkAsync('logic-questions API rejects malformed output and accepts valid questions', async () => {
+  await checkAsync('logic-questions API rejects malformed output and accepts grounded questions', async () => {
     const { POST } = load(path.join(output, 'app/api/logic-questions/route.js'));
-    const reqBody = { subjectId: 'ls-subj', domain: 'math_stats', problemTitle: 't', problemPrompt: 'p', modelAnswer: 'm', rubric: lsRubric, originalAnswer: 'orig', solvingReason: '' };
+    const reqBody = { subjectId: 'ls-subj', domain: 'math_stats', problemTitle: 't', problemPrompt: 'p', modelAnswer: 'm', rubric: lsRubric, originalAnswer: '조건부 기댓값', solvingReason: '' };
     const request = (value) => new NextRequest('http://localhost/api/logic-questions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
-    global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'a' }, { id: 'q2', question: 'b' }] }) } }] });
+    global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'A', linkedCriterionId: 'r' }, { id: 'q2', question: 'B', linkedCriterionId: 'r' }] }) } }] });
     const ok = await POST(request(reqBody));
     assert.equal(ok.status, 200);
     const okJson = await ok.json();
     assert.equal(okJson.questions.length, 2);
-    global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'a' }] }) } }] });
+    global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'A', linkedCriterionId: 'r' }] }) } }] });
     const bad = await POST(request(reqBody));
     assert.equal(bad.status, 502, 'insufficient questions rejected');
+    global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'A' }, { id: 'q2', question: 'B' }] }) } }] });
+    const ungrounded = await POST(request(reqBody));
+    assert.equal(ungrounded.status, 502, 'ungrounded questions rejected');
+    const oversize = await POST(request({ ...reqBody, originalAnswer: 'x'.repeat(7000) }));
+    assert.equal(oversize.status, 400, 'oversized input rejected instead of truncated');
     const badReq = await POST(request({ ...reqBody, originalAnswer: '' }));
     assert.equal(badReq.status, 400, 'missing original answer rejected before AI call');
+  });
+
+  // ---- Stage 14: integrity + transfer problems ----
+  await checkAsync('assisted revision recovery never creates an independent attempt event', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    const assisted = { id: 'rec-assisted', problemId: 'p', conceptId: c.id, subjectId: c.subjectId, at: '2026-10-01T08:00:00+09:00', answer: 'a', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 90, rubricResults: [], evaluatorFeedback: '', isAiEvaluated: true, attemptOrigin: 'assisted_revision' };
+    storage.saveStoredAttempts([assisted]);
+    const { recoveredCount } = storage.recoverMissingAttemptEvents();
+    assert.equal(recoveredCount, 1);
+    const after = storage.loadStoredConcepts()[0];
+    const ev = after.events.find((e) => e.attemptId === 'rec-assisted');
+    assert.equal(ev.kind, 'assisted_revision');
+    assert.equal(after.exerciseCount, 0, 'assisted recovery does not increase exercise count');
+    assert.equal(after.currentScore, 0, 'assisted recovery does not change score');
+    storage.recoverMissingAttemptEvents();
+    assert.equal(storage.loadStoredConcepts()[0].events.filter((e) => e.attemptId === 'rec-assisted').length, 1, 'idempotent');
+    assert.equal(storage.verifyAttemptEventOrigins().mismatches.length, 0, 'no origin mismatches');
+  });
+
+  check('reservation save failure is reported instead of a false success', () => {
+    const originalSet = localStorage.setItem;
+    localStorage.setItem = (key) => {
+      if (String(key).includes('rechallenge')) throw new Error('reservation storage down');
+    };
+    try {
+      const ok = logicSession.saveRechallengeReservation({ id: 'rr-fail', subjectId: 's', subjectName: 'n', conceptId: 'c', problemId: 'p', problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: '2026-10-01T09:00:00+09:00', status: 'scheduled' });
+      assert.equal(ok, false, 'save failure surfaced');
+      const upd = logicSession.updateRechallengeReservation('rr-fail', { scheduledDate: '2026-10-06' });
+      assert.equal(upd.saved, false, 'update failure surfaced');
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+  });
+
+  check('question set history preserves old answers and detaches them from new questions', () => {
+    const base = { id: 'logic-qh', subjectId: 's', conceptId: 'c', problemId: 'p', problemVersion: 1, sourceAttemptId: 'a', createdAt: 't', updatedAt: 't', status: 'draft', problemTitleSnapshot: 't', problemPromptSnapshot: 'p', modelAnswerSnapshot: 'm', rubricSnapshot: lsRubric, originalAnswer: 'orig', originalScore: 60, originalRubricResults: [], questions: [{ id: 'v1-q1', question: 'A', linkedCriterionId: 'r' }], questionSetVersion: 1, questionSets: [], questionAnswers: { 'v1-q1': 'my answer' }, revisedAnswer: '' };
+    const archived = [...base.questionSets, { version: 1, questions: base.questions, answers: base.questionAnswers, generatedAt: 't', inputHash: 'h' }];
+    const next = { ...base, questionSets: archived, questionSetVersion: 2, questions: [{ id: 'v2-q1', question: 'B', linkedCriterionId: 'r' }], questionAnswers: {} };
+    assert.equal(logicSession.saveLogicSession(next), true);
+    const loaded = logicSession.getLogicSession('logic-qh');
+    assert.equal(loaded.questionSetVersion, 2);
+    assert.equal(loaded.questionSets[0].answers['v1-q1'], 'my answer', 'old answers preserved');
+    assert.equal(loaded.questionAnswers['v1-q1'], undefined, 'old answers not attached to new set');
+  });
+
+  check('transfer validation rejects same-prompt and invalid rubric, accepts valid transfer', () => {
+    const ctx = { allowedConceptIds: ['ls-c'], allowedTypes: ['essay_descriptive'], originalPrompt: '원문 지문', originalAnswer: '원답안' };
+    const transferRubric = [
+      { id: 't1', label: '전제', maxScore: 30, weight: 0.3, description: 'd' },
+      { id: 't2', label: '전개', maxScore: 40, weight: 0.4, description: 'd' },
+      { id: 't3', label: '결론', maxScore: 30, weight: 0.3, description: 'd' },
+    ];
+    const valid = { title: '전이', promptText: '조건을 바꾼 새 지문', type: 'essay_descriptive', difficulty: 'advanced_college', conceptIds: ['ls-c'], transferChanges: '적용 조건을 음수에서 양수로 변경', understandingFocus: '전제조건 이해', timeStandardMinutes: 20, modelAnswer: '모범', rubric: transferRubric, hints: ['hint'], designIntent: 'd', sourceRefs: 's' };
+    const out = transferValidation.validateTransferProblemOutput(valid, ctx);
+    assert.equal(out.conceptIds[0], 'ls-c');
+    assert.throws(() => transferValidation.validateTransferProblemOutput({ ...valid, promptText: '원문 지문' }, ctx));
+    assert.throws(() => transferValidation.validateTransferProblemOutput({ ...valid, rubric: [{ id: 'r', label: 'r', maxScore: 50, weight: 0.5, description: 'd' }] }, ctx));
+  });
+
+  check('transfer problem is not assigned before approval', () => {
+    const concept = { ...structuredClone(lsConcept) };
+    const draftTransfer = { ...structuredClone(lsProblem), id: 'ls-transfer', isTransfer: true, sourceProblemId: 'ls-prob', isApproved: false };
+    const approvedTransfer = { ...draftTransfer, isApproved: true };
+    const excluded = studyPlan.getEligibleProblemsForPlan(lsSubject, concept, [draftTransfer], ['ls-c'], ['essay_descriptive']);
+    assert.equal(excluded.eligibleProblems.length, 0, 'unapproved transfer excluded');
+    const included = studyPlan.getEligibleProblemsForPlan(lsSubject, concept, [approvedTransfer], ['ls-c'], ['essay_descriptive']);
+    assert.equal(included.eligibleProblems.length, 1, 'approved transfer eligible');
+  });
+
+  await checkAsync('transfer attempt with model-answer help is flagged in analytics', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredAttempts([]);
+    const transferAttempt = { id: 'att-transfer', problemId: 'ls-transfer', conceptId: c.id, subjectId: c.subjectId, at: '2026-10-01T08:00:00+09:00', answer: 'a', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 80, rubricResults: [], evaluatorFeedback: '', isAiEvaluated: true, attemptOrigin: 'independent', isTransfer: true, modelAnswerRevealed: true, helpUsage: 'model_answer' };
+    storage.recordAttemptAndUpdateConcept(transferAttempt);
+    const collection = learningAnalytics.collectValidRecords({ attempts: storage.loadStoredAttempts(), mockExams: [], problems: [{ ...lsProblem, id: 'ls-transfer', isTransfer: true }], subjects: [lsSubject], concepts: storage.loadStoredConcepts() });
+    assert.equal(collection.transferCount, 1);
+    const rec = collection.records.find((r) => r.attemptId === 'att-transfer');
+    assert.ok(rec && rec.isTransfer === true, 'transfer flagged in analytics');
   });
 
   console.log(`${passed} regression checks passed`);

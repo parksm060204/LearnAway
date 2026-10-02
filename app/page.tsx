@@ -69,7 +69,14 @@ import {
 import { generateStudyPlan } from '../lib/studyPlan';
 import { computeCorrectionState, getEffectiveIntervalMultiplier } from '../lib/personalization';
 import { loadMockExams } from '../lib/mockExam';
-import { loadRechallengeReservations, saveRechallengeReservation, updateRechallengeReservation } from '../lib/logicSession';
+import {
+  loadRechallengeReservations,
+  saveRechallengeReservation,
+  updateRechallengeReservation,
+  completeRechallengeReservation,
+  cancelRechallengeReservation,
+  getRechallengeReservation,
+} from '../lib/logicSession';
 import { LearningAnalyticsModal } from '../components/LearningAnalyticsModal';
 import { LogicStrengthenModal } from '../components/LogicStrengthenModal';
 import { TopUtilityBar } from '../components/TopUtilityBar';
@@ -165,6 +172,7 @@ export default function RedcallDashboardPage() {
   const [logicRecommendationDate, setLogicRecommendationDate] = useState<string | null>(null);
   const [rechallengeReservations, setRechallengeReservations] = useState<RechallengeReservation[]>([]);
   const [activeRechallengeReservationId, setActiveRechallengeReservationId] = useState<string | null>(null);
+  const [activePlanItemIdForSession, setActivePlanItemIdForSession] = useState<string | null>(null);
 
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -714,7 +722,21 @@ export default function RedcallDashboardPage() {
 
   // Attempt Submission Handler (Updates ReviewEvent & Retention Score)
   // Returns { partial } so the caller can keep the session open for a retry.
-  const handleSubmitAttempt = (attempt: Attempt): { partial: boolean } => {
+  const handleSubmitAttempt = (attempt: Attempt): { partial: boolean; message?: string } => {
+    // Verify the reservation matches this attempt before completing it.
+    if (attempt.rechallengeReservationId) {
+      const reservation = getRechallengeReservation(attempt.rechallengeReservationId);
+      if (
+        !reservation ||
+        reservation.subjectId !== attempt.subjectId ||
+        reservation.conceptId !== attempt.conceptId ||
+        reservation.problemId !== attempt.problemId ||
+        reservation.problemVersion !== (attempt.problemVersion ?? 1)
+      ) {
+        return { partial: true, message: '재도전 예약 정보(과목·개념·문제·버전)가 현재 풀이와 일치하지 않습니다. 예약을 다시 확인해 주세요.' };
+      }
+    }
+
     const result = recordAttemptAndUpdateConcept(attempt, settings);
 
     const { updatedConcepts, updatedAttempts } = result;
@@ -729,16 +751,26 @@ export default function RedcallDashboardPage() {
       setSelectedEventId(newEvent.id);
     }
 
-    if (!result.partial) {
-      if (attempt.rechallengeReservationId) {
-        updateRechallengeReservation(attempt.rechallengeReservationId, { status: 'completed' });
-        setRechallengeReservations(loadRechallengeReservations());
-        showToast('지연 재도전 완료! 독립 풀이로 기록되었습니다.');
-      } else {
-        showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
-      }
+    if (result.partial) {
+      return { partial: true };
     }
-    return { partial: result.partial };
+
+    if (attempt.rechallengeReservationId) {
+      // Attempt is saved; a failed reservation completion is a retryable link failure.
+      const completion = completeRechallengeReservation(attempt.rechallengeReservationId);
+      if (!completion.saved) {
+        setRechallengeReservations(loadRechallengeReservations());
+        return {
+          partial: true,
+          message: '풀이 기록은 저장됐지만 재도전 예약 완료 반영은 실패했습니다. 재시도해 주세요.',
+        };
+      }
+      setRechallengeReservations(loadRechallengeReservations());
+      showToast('지연 재도전 완료! 독립 풀이로 기록되었습니다.');
+    } else {
+      showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
+    }
+    return { partial: false };
   };
 
   // Stage 13: Answer-logic strengthening handlers
@@ -764,14 +796,66 @@ export default function RedcallDashboardPage() {
     showToast('보완 답안이 원본과 연결된 별도 기록으로 저장되었습니다. (원본 불변, 독립 성과 아님)');
   };
 
-  const handleReserveRechallenge = (reservation: RechallengeReservation) => {
+  const handleReserveRechallenge = (reservation: RechallengeReservation): boolean => {
     const ok = saveRechallengeReservation(reservation);
     if (!ok) {
       showToast('재도전 예약 저장에 실패했습니다. 다시 시도해 주세요.');
-      return;
+      return false;
     }
     setRechallengeReservations(loadRechallengeReservations());
     showToast(`재도전이 ${reservation.scheduledDate}에 예약되었습니다. 점수·복습 회차는 변경되지 않습니다.`);
+    return true;
+  };
+
+  const handleUpdateReservation = (reservationId: string, scheduledDate: string): boolean => {
+    const { saved } = updateRechallengeReservation(reservationId, { scheduledDate });
+    if (!saved) {
+      showToast('예약 날짜 변경 저장에 실패했습니다.');
+      return false;
+    }
+    setRechallengeReservations(loadRechallengeReservations());
+    showToast(`재도전 예약 날짜가 ${scheduledDate}로 변경되었습니다.`);
+    return true;
+  };
+
+  const handleCancelReservation = (reservationId: string): boolean => {
+    const { saved } = cancelRechallengeReservation(reservationId);
+    if (!saved) {
+      showToast('예약 취소 저장에 실패했습니다.');
+      return false;
+    }
+    setRechallengeReservations(loadRechallengeReservations());
+    showToast('재도전 예약이 취소되었습니다. 점수·복습 회차는 변경되지 않았습니다.');
+    return true;
+  };
+
+  const handleSaveTransferDraft = (draft: ProblemDraft): boolean => {
+    try {
+      const updated = [draft, ...problemDrafts.filter((d) => d.id !== draft.id)];
+      saveStoredProblemDrafts(updated);
+      const persisted = loadStoredProblemDrafts().some((d) => d.id === draft.id);
+      if (!persisted) return false;
+      setProblemDrafts(updated);
+      showToast('전이 문제 초안이 저장되었습니다. 문제 검토·승인 화면에서 검토해 주세요.');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const handleStartTransferProblem = (transferProblem: Problem) => {
+    if (transferProblem.subjectId !== activeSubjectId) {
+      setActiveSubjectId(transferProblem.subjectId);
+      saveActiveSubjectId(transferProblem.subjectId);
+    }
+    if (transferProblem.conceptIds[0]) setSelectedConceptId(transferProblem.conceptIds[0]);
+    setSelectedProblemType(transferProblem.type);
+    setActiveProblemIdForSession(transferProblem.id);
+    setActiveRechallengeReservationId(null);
+    setActivePlanItemIdForSession(null);
+    setLogicTarget(null);
+    setIsProblemSessionOpen(true);
+    showToast('전이 문제를 시작합니다. 모범답안은 제출 전까지 표시되지 않습니다.');
   };
 
   // Stage 9: Study Plan Handlers
@@ -827,10 +911,25 @@ export default function RedcallDashboardPage() {
         showToast('재도전 문제를 사용할 수 없습니다. 문제를 재생성하거나 예약을 조정해 주세요.');
         return;
       }
+      // 예약 이후 문제 버전이 바뀌면 알리고 확인을 받는다.
+      if (item.rechallengeId) {
+        const reservation = getRechallengeReservation(item.rechallengeId);
+        const currentVersion = prob.version ?? 1;
+        if (reservation && reservation.problemVersion !== currentVersion) {
+          if (
+            !window.confirm(
+              `예약 당시 문제 버전(v${reservation.problemVersion})과 현재 버전(v${currentVersion})이 다릅니다. 현재 버전으로 풀어도 될까요?`
+            )
+          ) {
+            return;
+          }
+        }
+      }
       if (item.conceptId) setSelectedConceptId(item.conceptId);
       if (item.problemType) setSelectedProblemType(item.problemType);
       setActiveProblemIdForSession(item.problemId || null);
       setActiveRechallengeReservationId(item.rechallengeId || null);
+      setActivePlanItemIdForSession(item.id);
       setIsStudyPlanOpen(false);
       setIsProblemSessionOpen(true);
       showToast('지연 재도전: 원답안·보완 답안을 가리고 새 답안을 먼저 작성하세요.');
@@ -852,6 +951,7 @@ export default function RedcallDashboardPage() {
       }
       setActiveProblemIdForSession(item.problemId);
       setActiveRechallengeReservationId(null);
+      setActivePlanItemIdForSession(item.id);
       setIsStudyPlanOpen(false);
       setIsProblemSessionOpen(true);
       showToast(`[${item.problemTitle || '문제'}] 풀이를 시작합니다.`);
@@ -1018,6 +1118,7 @@ export default function RedcallDashboardPage() {
             return;
           }
           setActiveRechallengeReservationId(null);
+          setActivePlanItemIdForSession(null);
           setIsProblemSessionOpen(true);
         }}
         onOpenMockExam={() => {
@@ -1116,6 +1217,7 @@ export default function RedcallDashboardPage() {
                     setActiveProblemIdForSession(problemId);
                   }
                   setActiveRechallengeReservationId(null);
+                  setActivePlanItemIdForSession(null);
                   setIsProblemSessionOpen(true);
                 }}
                 onPostponeDay={handlePostponeDay}
@@ -1181,12 +1283,14 @@ export default function RedcallDashboardPage() {
             setIsProblemSessionOpen(false);
             setActiveProblemIdForSession(null);
             setActiveRechallengeReservationId(null);
+            setActivePlanItemIdForSession(null);
           }}
           subject={activeSubject}
           concept={sessionConcept}
           problem={activeSessionProblem}
           onSubmitAttempt={handleSubmitAttempt}
           rechallengeReservationId={activeRechallengeReservationId || undefined}
+          planItemId={activePlanItemIdForSession || undefined}
           onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
           onReportProblem={handleReportProblem}
         />
@@ -1487,8 +1591,22 @@ export default function RedcallDashboardPage() {
           problem={logicTarget.problem}
           sourceAttempt={logicTarget.attempt}
           recommendationDate={logicRecommendationDate || undefined}
+          reservations={rechallengeReservations}
+          approvedTransferProblem={
+            allProblems.find(
+              (p) =>
+                p.isTransfer === true &&
+                p.sourceProblemId === logicTarget.problem.id &&
+                p.subjectId === logicTarget.attempt.subjectId &&
+                isProblemAvailableForPractice(p)
+            ) || null
+          }
           onRecordAssistedAttempt={handleRecordAssistedAttempt}
           onReserveRechallenge={handleReserveRechallenge}
+          onUpdateReservation={handleUpdateReservation}
+          onCancelReservation={handleCancelReservation}
+          onSaveTransferDraft={handleSaveTransferDraft}
+          onStartTransferProblem={handleStartTransferProblem}
         />
       )}
     </div>

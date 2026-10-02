@@ -1,19 +1,21 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Attempt,
   Concept,
   EvaluationResult,
+  LogicQuestionSet,
   LogicStrengthenSession,
   Problem,
+  ProblemDraft,
   RechallengeReservation,
   RubricCriterion,
   Subject,
   METHOD_REASON_RATING_LABELS,
 } from '../lib/types';
 import { getLogicSession, saveLogicSession } from '../lib/logicSession';
-import { X, Sparkles, BrainCircuit, CheckCircle2, AlertTriangle, CalendarClock, Loader2, ShieldCheck } from 'lucide-react';
+import { X, Sparkles, BrainCircuit, CheckCircle2, AlertTriangle, CalendarClock, Loader2, ShieldCheck, GitBranch, Trash2 } from 'lucide-react';
 
 interface LogicStrengthenModalProps {
   isOpen: boolean;
@@ -23,23 +25,42 @@ interface LogicStrengthenModalProps {
   problem: Problem;
   sourceAttempt: Attempt;
   recommendationDate?: string;
+  reservations: RechallengeReservation[];
+  approvedTransferProblem?: Problem | null;
   onRecordAssistedAttempt: (attempt: Attempt) => void;
-  onReserveRechallenge: (reservation: RechallengeReservation) => void;
+  onReserveRechallenge: (reservation: RechallengeReservation) => boolean;
+  onUpdateReservation: (reservationId: string, scheduledDate: string) => boolean;
+  onCancelReservation: (reservationId: string) => boolean;
+  onSaveTransferDraft: (draft: ProblemDraft) => boolean;
+  onStartTransferProblem: (problem: Problem) => void;
 }
 
-function sessionIdFor(attemptId: string): string {
-  return `logic-${attemptId}`;
+function simpleHash(value: string): string {
+  let h = 5381;
+  for (let i = 0; i < value.length; i++) {
+    h = (h * 33) ^ value.charCodeAt(i);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function rubricHash(rubric: RubricCriterion[]): string {
+  return rubric.map((c) => `${c.id}:${c.maxScore}`).join(',');
+}
+
+function sessionIdFor(attemptId: string, round = 1): string {
+  return round <= 1 ? `logic-${attemptId}` : `logic-${attemptId}-r${round}`;
 }
 
 function buildNewSession(
   subject: Subject,
   concept: Concept,
   problem: Problem,
-  sourceAttempt: Attempt
+  sourceAttempt: Attempt,
+  round = 1
 ): LogicStrengthenSession {
   const now = new Date().toISOString();
   return {
-    id: sessionIdFor(sourceAttempt.id),
+    id: sessionIdFor(sourceAttempt.id, round),
     subjectId: subject.id,
     conceptId: concept.id,
     problemId: problem.id,
@@ -61,9 +82,29 @@ function buildNewSession(
     originalIsReasonNotApplicable: sourceAttempt.isReasonNotApplicable,
     originalDiagnosisSummary: sourceAttempt.methodSelectionDiagnosis?.summary,
     questions: [],
+    questionSetVersion: 1,
+    questionSets: [],
     questionAnswers: {},
     revisedAnswer: '',
   };
+}
+
+/** Migrate legacy sessions and drop an evaluation whose inputs no longer match. */
+function normalizeLoadedSession(session: LogicStrengthenSession): LogicStrengthenSession {
+  const migrated: LogicStrengthenSession = {
+    ...session,
+    questionSetVersion: session.questionSetVersion ?? 1,
+    questionSets: Array.isArray(session.questionSets) ? session.questionSets : [],
+  };
+  const currentHash = simpleHash(`${session.revisedAnswer.trim()}|${session.problemVersion}|${rubricHash(session.rubricSnapshot)}`);
+  if (migrated.revisedEvaluation && migrated.revisedEvaluationInputHash !== currentHash) {
+    migrated.revisedEvaluation = undefined;
+    migrated.revisedEvaluatedAt = undefined;
+    migrated.revisedEvaluatedAnswer = undefined;
+    migrated.revisedEvaluationInputHash = undefined;
+    if (migrated.status === 'revised_evaluated') migrated.status = 'questions_ready';
+  }
+  return migrated;
 }
 
 export function LogicStrengthenModal({
@@ -74,40 +115,77 @@ export function LogicStrengthenModal({
   problem,
   sourceAttempt,
   recommendationDate,
+  reservations,
+  approvedTransferProblem,
   onRecordAssistedAttempt,
   onReserveRechallenge,
+  onUpdateReservation,
+  onCancelReservation,
+  onSaveTransferDraft,
+  onStartTransferProblem,
 }: LogicStrengthenModalProps) {
   const [session, setSession] = useState<LogicStrengthenSession>(() => {
     const existing = getLogicSession(sessionIdFor(sourceAttempt.id));
     if (existing && existing.problemVersion === (sourceAttempt.problemVersion ?? problem.version ?? 1)) {
-      return existing;
+      return normalizeLoadedSession(existing);
     }
     return buildNewSession(subject, concept, problem, sourceAttempt);
   });
   const [isGenerating, setIsGenerating] = useState(false);
   const [isEvaluating, setIsEvaluating] = useState(false);
+  const [isGeneratingTransfer, setIsGeneratingTransfer] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [saveWarning, setSaveWarning] = useState<string | null>(null);
   const [rechallengeDate, setRechallengeDate] = useState<string>(
     () => recommendationDate || new Date().toISOString().slice(0, 10)
   );
+  const [transferDate, setTransferDate] = useState<string>(
+    () => recommendationDate || new Date().toISOString().slice(0, 10)
+  );
+  const evalRequestRef = useRef(0);
+  const questionsRequestRef = useRef(0);
 
   if (!isOpen) return null;
 
   const rubric: RubricCriterion[] = session.rubricSnapshot;
+  const sessionReservations = reservations.filter(
+    (r) => r.sourceLogicSessionId === session.id || r.sourceAttemptId === sourceAttempt.id
+  );
 
   const persist = (next: LogicStrengthenSession) => {
     setSession(next);
     const ok = saveLogicSession(next);
     setSaveWarning(ok ? null : '세션 초안을 브라우저에 저장하지 못했습니다. 새로고침 시 입력이 사라질 수 있습니다.');
   };
-
   const updateSession = (patch: Partial<LogicStrengthenSession>) =>
     persist({ ...session, ...patch, updatedAt: new Date().toISOString() });
 
-  const handleGenerateQuestions = async () => {
+  const currentEvalHash = () =>
+    simpleHash(`${session.revisedAnswer.trim()}|${session.problemVersion}|${rubricHash(rubric)}`);
+  const currentQuestionsHash = () =>
+    simpleHash(
+      [
+        session.problemTitleSnapshot,
+        session.problemPromptSnapshot,
+        session.modelAnswerSnapshot,
+        rubricHash(rubric),
+        session.originalAnswer,
+        session.originalSolvingReason || '',
+        session.originalDiagnosisSummary || '',
+      ].join('|')
+    );
+
+  // ---- Questions ----
+  const handleGenerateQuestions = async (force: boolean) => {
     if (isGenerating) return;
+    const inputHash = currentQuestionsHash();
+    if (!force && session.questions.length > 0 && session.questionsInputHash === inputHash) {
+      setNotice('동일한 입력의 질문이 이미 생성되어 재사용했습니다. 다시 만들려면 "질문 다시 생성"을 누르세요.');
+      return;
+    }
+    const requestId = questionsRequestRef.current + 1;
+    questionsRequestRef.current = requestId;
     setIsGenerating(true);
     setError(null);
     setNotice(null);
@@ -128,29 +206,81 @@ export function LogicStrengthenModal({
         }),
       });
       const data = await res.json();
+      if (requestId !== questionsRequestRef.current) return; // stale response
       if (!res.ok || !data.success) {
         setError(data.error || '핵심 질문 생성에 실패했습니다.');
         return;
       }
+      const newVersion = session.questionSetVersion + 1;
+      const versioned = (data.questions as LogicStrengthenSession['questions']).map((q) => ({
+        ...q,
+        id: `v${newVersion}-${q.id}`,
+      }));
+      // Archive the previous set (questions + answers) so old responses never
+      // attach to the new questions.
+      const archived: LogicQuestionSet[] =
+        session.questions.length > 0
+          ? [
+              ...session.questionSets,
+              {
+                version: session.questionSetVersion,
+                questions: session.questions,
+                answers: session.questionAnswers,
+                generatedAt: session.questionsGeneratedAt || new Date().toISOString(),
+                model: session.questionsModel,
+                inputHash: session.questionsInputHash || '',
+              },
+            ]
+          : session.questionSets;
+
       updateSession({
-        questions: data.questions,
+        questions: versioned,
+        questionAnswers: {},
+        questionSetVersion: newVersion,
+        questionSets: archived,
         questionsGeneratedAt: new Date().toISOString(),
         questionsModel: data.model,
-        status: 'questions_ready',
+        questionsInputHash: inputHash,
+        status: session.revisedEvaluation ? session.status : 'questions_ready',
       });
+      setNotice(`질문 세트 v${newVersion}이 생성되었습니다. 이전 질문과 응답은 이력으로 보존됩니다.`);
     } catch (cause) {
-      setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+      if (requestId === questionsRequestRef.current) {
+        setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+      }
     } finally {
-      setIsGenerating(false);
+      if (requestId === questionsRequestRef.current) setIsGenerating(false);
     }
   };
 
+  // ---- Revised answer ----
+  const changeRevisedAnswer = (value: string) => {
+    if (session.revisedAttemptId) return; // locked after confirmation
+    const patch: Partial<LogicStrengthenSession> = { revisedAnswer: value };
+    // Any change invalidates a previous evaluation and the confirmable state.
+    if (session.revisedEvaluation && value.trim() !== (session.revisedEvaluatedAnswer || '').trim()) {
+      patch.revisedEvaluation = undefined;
+      patch.revisedEvaluatedAt = undefined;
+      patch.revisedEvaluatedAnswer = undefined;
+      patch.revisedEvaluationInputHash = undefined;
+      if (session.status === 'revised_evaluated') patch.status = 'questions_ready';
+    }
+    updateSession(patch);
+  };
+
   const handleEvaluateRevised = async () => {
-    if (isEvaluating) return;
-    if (!session.revisedAnswer.trim()) {
+    if (isEvaluating || session.revisedAttemptId) return;
+    const answer = session.revisedAnswer.trim();
+    if (!answer) {
       setError('보완 답안을 작성한 뒤 평가를 요청해 주세요.');
       return;
     }
+    const snapshot = {
+      answer,
+      inputHash: simpleHash(`${answer}|${session.problemVersion}|${rubricHash(rubric)}`),
+    };
+    const requestId = evalRequestRef.current + 1;
+    evalRequestRef.current = requestId;
     setIsEvaluating(true);
     setError(null);
     try {
@@ -170,12 +300,15 @@ export function LogicStrengthenModal({
           codeSnippet: problem.codeSnippet,
           modelAnswer: session.modelAnswerSnapshot,
           rubric,
-          userAnswer: session.revisedAnswer.trim(),
+          userAnswer: snapshot.answer,
           revealedHintCount: 0,
           hints: [],
         }),
       });
       const data = await res.json();
+      // Ignore stale responses, and responses whose inputs have since changed.
+      if (requestId !== evalRequestRef.current) return;
+      if (snapshot.inputHash !== currentEvalHash()) return;
       if (!res.ok || !data.success) {
         setError(data.error || '보완 답안 평가에 실패했습니다.');
         return;
@@ -183,24 +316,29 @@ export function LogicStrengthenModal({
       updateSession({
         revisedEvaluation: data.evaluation as EvaluationResult,
         revisedEvaluatedAt: new Date().toISOString(),
+        revisedEvaluatedAnswer: snapshot.answer,
+        revisedEvaluationInputHash: snapshot.inputHash,
         status: 'revised_evaluated',
       });
     } catch (cause) {
-      setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+      if (requestId === evalRequestRef.current) {
+        setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+      }
     } finally {
-      setIsEvaluating(false);
+      if (requestId === evalRequestRef.current) setIsEvaluating(false);
     }
   };
 
   const handleConfirmRevision = () => {
-    if (!session.revisedEvaluation) {
-      setError('보완 답안을 먼저 평가해 주세요.');
-      return;
-    }
     if (session.revisedAttemptId) {
-      setNotice('보완 답안은 이미 별도 기록으로 저장되었습니다.');
+      setNotice('이미 확정된 보완 기록은 수정할 수 없습니다. 다시 보완하려면 새 회차를 시작하세요.');
       return;
     }
+    if (!session.revisedEvaluation || session.revisedEvaluationInputHash !== currentEvalHash()) {
+      setError('보완 답안이 평가 시점과 다릅니다. 다시 평가한 뒤 확정해 주세요.');
+      return;
+    }
+    const evaluatedAnswer = session.revisedEvaluatedAnswer || session.revisedAnswer.trim();
     const attemptId = `att-logic-${session.id}`;
     const revisedAttempt: Attempt = {
       id: attemptId,
@@ -209,7 +347,7 @@ export function LogicStrengthenModal({
       conceptIds: problem.conceptIds || [concept.id],
       subjectId: subject.id,
       at: new Date().toISOString(),
-      answer: session.revisedAnswer.trim(),
+      answer: evaluatedAnswer,
       confidence: sourceAttempt.confidence,
       errorType: session.revisedEvaluation.recommendedErrorType,
       hintCount: 0,
@@ -231,6 +369,7 @@ export function LogicStrengthenModal({
       attemptOrigin: 'assisted_revision',
       logicSessionId: session.id,
       sourceAttemptId: sourceAttempt.id,
+      helpUsage: 'assisted',
     };
     try {
       onRecordAssistedAttempt(revisedAttempt);
@@ -241,16 +380,25 @@ export function LogicStrengthenModal({
     }
   };
 
+  const handleStartNewRound = () => {
+    const nextRound = (session.questionSetVersion || 1) + 1;
+    const fresh = buildNewSession(subject, concept, problem, sourceAttempt, nextRound);
+    if (!saveLogicSession(fresh)) {
+      setError('새 보완 회차를 저장하지 못했습니다. 다시 시도해 주세요.');
+      return;
+    }
+    setSession(fresh);
+    setNotice(`새 보완 회차(${fresh.id})를 시작했습니다. 이전 회차 기록은 그대로 보존됩니다.`);
+  };
+
+  // ---- Reservations ----
   const handleReserve = () => {
     if (!rechallengeDate) {
       setError('재도전 날짜를 선택해 주세요.');
       return;
     }
-    if (subject.examAt) {
-      const examDate = subject.examAt.slice(0, 10);
-      if (rechallengeDate > examDate) {
-        if (!window.confirm('선택한 재도전 날짜가 시험일 이후입니다. 그래도 예약할까요?')) return;
-      }
+    if (subject.examAt && rechallengeDate > subject.examAt.slice(0, 10)) {
+      if (!window.confirm('선택한 재도전 날짜가 시험일 이후입니다. 그래도 예약할까요?')) return;
     }
     const reservation: RechallengeReservation = {
       id: `rr-${session.id}`,
@@ -268,11 +416,138 @@ export function LogicStrengthenModal({
       sourceLogicSessionId: session.id,
       sourceAttemptId: sourceAttempt.id,
     };
-    onReserveRechallenge(reservation);
+    if (!onReserveRechallenge(reservation)) {
+      setError('재도전 예약 저장에 실패했습니다. 다시 시도해 주세요.');
+      return;
+    }
     setNotice('지연 재도전이 예약되었습니다. 점수·복습 회차는 변경되지 않습니다.');
   };
 
+  // ---- Transfer problem ----
+  const handleGenerateTransfer = async () => {
+    if (isGeneratingTransfer) return;
+    setIsGeneratingTransfer(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const vulnerable = session.originalRubricResults
+        .filter((r) => r.isVulnerable || r.score < r.maxScore * 0.6)
+        .map((r) => r.label);
+      const res = await fetch('/api/transfer-problem', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: subject.id,
+          domain: subject.domain || 'math_stats',
+          problemTitle: session.problemTitleSnapshot,
+          problemPrompt: session.problemPromptSnapshot,
+          modelAnswer: session.modelAnswerSnapshot,
+          rubric,
+          originalAnswer: session.originalAnswer,
+          revisedAnswer: session.revisedEvaluatedAnswer || session.revisedAnswer,
+          vulnerableCriteria: vulnerable,
+          concepts: [{ id: concept.id, title: concept.title }],
+          problemType: problem.type,
+          difficulty: problem.difficulty || 'advanced_college',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setError(data.error || '전이 문제 생성에 실패했습니다.');
+        return;
+      }
+      const now = new Date().toISOString();
+      const draft: ProblemDraft = {
+        id: `draft-transfer-${session.id}`,
+        subjectId: subject.id,
+        conceptIds: data.draft.conceptIds,
+        conceptTitles: [concept.title],
+        title: data.draft.title,
+        type: data.draft.type,
+        difficulty: data.draft.difficulty,
+        categoryLabel: '전이 문제 (조건 변형)',
+        categoryNumber: 0,
+        promptText: data.draft.promptText,
+        mathFormula: data.draft.mathFormula,
+        codeSnippet: data.draft.codeSnippet,
+        designIntent: data.draft.designIntent,
+        appliedConditionNote: data.draft.transferChanges,
+        sourceRefs: data.draft.sourceRefs,
+        sourceEvidenceQuote: session.originalAnswer.slice(0, 200),
+        sourceMarkdownHash: session.sourceMarkdownHash,
+        sourceMaterials: session.sourceMaterials,
+        timeStandardMinutes: data.draft.timeStandardMinutes,
+        timeBreakdownDesc: `${data.draft.timeStandardMinutes}분 (조건 분석 및 전이 적용)`,
+        coreEvaluationHighlight: data.draft.understandingFocus,
+        itemCountDesc: '전이 문제 1문항',
+        hints: data.draft.hints,
+        modelAnswer: data.draft.modelAnswer,
+        rubric: data.draft.rubric,
+        status: 'draft',
+        isApproved: false,
+        isDemo: false,
+        verificationStatus: {
+          hasRequiredFields: true,
+          isScore100: true,
+          scoreSum: 100,
+          hasConceptLink: true,
+          isSourceVerified: true,
+          note: `전이 문제: ${data.draft.transferChanges}`,
+        },
+        createdAt: now,
+        updatedAt: now,
+        isTransfer: true,
+        sourceProblemId: problem.id,
+        logicSessionId: session.id,
+        transferChanges: data.draft.transferChanges,
+        understandingFocus: data.draft.understandingFocus,
+      };
+      if (!onSaveTransferDraft(draft)) {
+        setError('전이 문제 초안 저장에 실패했습니다. 다시 시도해 주세요.');
+        return;
+      }
+      updateSession({ transferDraftId: draft.id });
+      setNotice('전이 문제 초안이 생성되었습니다. 검토·승인 전에는 학습 계획에 배정되지 않습니다.');
+    } catch (cause) {
+      setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+    } finally {
+      setIsGeneratingTransfer(false);
+    }
+  };
+
+  const handleReserveTransfer = () => {
+    if (!approvedTransferProblem) {
+      setError('전이 문제를 먼저 승인해 주세요.');
+      return;
+    }
+    const reservation: RechallengeReservation = {
+      id: `rr-transfer-${session.id}`,
+      subjectId: subject.id,
+      subjectName: subject.name,
+      conceptId: concept.id,
+      problemId: approvedTransferProblem.id,
+      problemVersion: approvedTransferProblem.version ?? 1,
+      problemTitle: approvedTransferProblem.title,
+      problemType: approvedTransferProblem.type,
+      scheduledDate: transferDate,
+      estimatedMinutes: approvedTransferProblem.timeStandardMinutes || 20,
+      createdAt: new Date().toISOString(),
+      status: 'scheduled',
+      sourceLogicSessionId: session.id,
+      sourceAttemptId: sourceAttempt.id,
+      isTransfer: true,
+    };
+    if (!onReserveRechallenge(reservation)) {
+      setError('전이 문제 예약 저장에 실패했습니다. 다시 시도해 주세요.');
+      return;
+    }
+    setNotice('전이 문제가 예약되었습니다. 점수·복습 회차는 변경되지 않습니다.');
+  };
+
   const originalDiag = sourceAttempt.methodSelectionDiagnosis;
+  const evaluatedMatches = Boolean(
+    session.revisedEvaluation && session.revisedEvaluationInputHash === currentEvalHash()
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/60 backdrop-blur-xs overflow-y-auto" role="dialog" aria-modal="true" aria-label="답안 논리 강화">
@@ -326,16 +601,28 @@ export function LogicStrengthenModal({
           {/* Step 1: questions */}
           <section className="space-y-2">
             <div className="flex items-center justify-between">
-              <h3 className="font-bold text-[#191817]">1. AI 핵심 질문</h3>
-              <button
-                type="button"
-                onClick={handleGenerateQuestions}
-                disabled={isGenerating}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-[#191817] text-white rounded-xs font-bold disabled:opacity-50"
-              >
-                {isGenerating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5 text-amber-400" />}
-                <span>{session.questions.length ? '질문 다시 생성' : 'AI 핵심 질문 생성'}</span>
-              </button>
+              <h3 className="font-bold text-[#191817]">1. AI 핵심 질문 <span className="text-[11px] text-[#827d73]">(세트 v{session.questionSetVersion})</span></h3>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleGenerateQuestions(false)}
+                  disabled={isGenerating || Boolean(session.revisedAttemptId)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-[#191817] text-white rounded-xs font-bold disabled:opacity-50"
+                >
+                  {isGenerating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5 text-amber-400" />}
+                  <span>{session.questions.length ? '질문 불러오기(재사용)' : 'AI 핵심 질문 생성'}</span>
+                </button>
+                {session.questions.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => handleGenerateQuestions(true)}
+                    disabled={isGenerating || Boolean(session.revisedAttemptId)}
+                    className="px-2.5 py-1.5 text-[11px] border border-[#ded6c8] rounded-xs hover:bg-[#faf8f4] disabled:opacity-50"
+                  >
+                    질문 다시 생성
+                  </button>
+                )}
+              </div>
             </div>
             {session.questions.length === 0 ? (
               <p className="text-xs text-[#827d73]">질문 생성 버튼을 눌러 원답안의 논리를 점검하는 질문을 받아보세요. 정답은 공개되지 않습니다.</p>
@@ -351,6 +638,7 @@ export function LogicStrengthenModal({
                       rows={2}
                       placeholder="이 질문에 대한 내 답변을 적어보세요. (점수에 반영되지 않습니다)"
                       value={session.questionAnswers[q.id] || ''}
+                      disabled={Boolean(session.revisedAttemptId)}
                       onChange={(e) =>
                         updateSession({ questionAnswers: { ...session.questionAnswers, [q.id]: e.target.value } })
                       }
@@ -359,35 +647,43 @@ export function LogicStrengthenModal({
                 ))}
               </ul>
             )}
+            {session.questionSets.length > 0 && (
+              <p className="text-[10.5px] text-[#827d73]">이전 질문 세트 {session.questionSets.length}개(응답 포함)가 이력으로 보존되어 있습니다.</p>
+            )}
           </section>
 
           {/* Step 2: revised answer */}
           <section className="space-y-2">
             <h3 className="font-bold text-[#191817]">2. 보완 답안 작성</h3>
             <textarea
-              className="w-full border border-[#ded6c8] p-3 text-xs rounded-xs min-h-32"
+              className="w-full border border-[#ded6c8] p-3 text-xs rounded-xs min-h-32 disabled:bg-[#f4f1ea]"
               placeholder="원답안에서 보완할 점을 반영해 다시 작성하세요."
               value={session.revisedAnswer}
-              onChange={(e) => updateSession({ revisedAnswer: e.target.value })}
+              disabled={Boolean(session.revisedAttemptId)}
+              onChange={(e) => changeRevisedAnswer(e.target.value)}
             />
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={handleEvaluateRevised}
-                disabled={isEvaluating}
+                disabled={isEvaluating || Boolean(session.revisedAttemptId)}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-[#c52828] text-white rounded-xs font-bold disabled:opacity-50"
               >
                 {isEvaluating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
-                <span>{session.revisedEvaluation ? '보완 답안 재평가' : '보완 답안 평가'}</span>
+                <span>{evaluatedMatches ? '보완 답안 재평가' : '보완 답안 평가'}</span>
               </button>
-              <span className="text-[11px] text-[#827d73]">동일한 문제·루브릭 스냅샷으로 평가합니다.</span>
+              <span className="text-[11px] text-[#827d73]">동일한 문제·루브릭 스냅샷으로 평가합니다. 답안을 수정하면 평가가 무효화됩니다.</span>
             </div>
 
             {session.revisedEvaluation && (
-              <div className="bg-[#faf8f4] border border-[#ded6c8] p-3 rounded-xs text-xs space-y-1">
+              <div className={`border p-3 rounded-xs text-xs space-y-1 ${evaluatedMatches ? 'bg-[#faf8f4] border-[#ded6c8]' : 'bg-amber-50 border-amber-300'}`}>
                 <div className="font-semibold text-[#191817]">보완 답안 평가: {session.revisedEvaluation.calculatedScore}점</div>
                 <p className="text-[#57544e]">{session.revisedEvaluation.feedback}</p>
-                <div className="text-[11px] text-[#827d73]">원본 {session.originalScore}점 → 보완 {session.revisedEvaluation.calculatedScore}점 (참고용, 원본은 변경되지 않음)</div>
+                {evaluatedMatches ? (
+                  <div className="text-[11px] text-[#827d73]">원본 {session.originalScore}점 → 보완 {session.revisedEvaluation.calculatedScore}점 (동일 문제 참고용, 원본은 변경되지 않음)</div>
+                ) : (
+                  <div className="text-[11px] text-amber-900">평가 이후 답안이 변경되어 확정할 수 없습니다. 다시 평가해 주세요.</div>
+                )}
               </div>
             )}
           </section>
@@ -398,12 +694,21 @@ export function LogicStrengthenModal({
               <button
                 type="button"
                 onClick={handleConfirmRevision}
-                disabled={!session.revisedEvaluation || Boolean(session.revisedAttemptId)}
+                disabled={!evaluatedMatches || Boolean(session.revisedAttemptId)}
                 className="flex items-center gap-1.5 px-4 py-2 text-xs bg-[#191817] text-white rounded-xs font-bold disabled:opacity-50"
               >
                 <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
                 <span>{session.revisedAttemptId ? '보완 답안 저장됨' : '보완 답안 확정 저장 (별도 기록)'}</span>
               </button>
+              {session.revisedAttemptId && (
+                <button
+                  type="button"
+                  onClick={handleStartNewRound}
+                  className="px-3 py-2 text-xs border border-[#ded6c8] rounded-xs hover:bg-[#faf8f4] font-semibold"
+                >
+                  새 보완 회차 시작
+                </button>
+              )}
               <span className="text-[11px] text-[#827d73]">확정 전에는 새 학습 기록이 생성되지 않습니다.</span>
             </div>
 
@@ -418,19 +723,99 @@ export function LogicStrengthenModal({
                   className="border border-[#ded6c8] p-1 text-xs rounded-xs"
                 />
               </label>
-              <button
-                type="button"
-                onClick={handleReserve}
-                className="px-3 py-1.5 text-xs border border-[#ded6c8] rounded-xs hover:bg-white font-semibold"
-              >
+              <button type="button" onClick={handleReserve} className="px-3 py-1.5 text-xs border border-[#ded6c8] rounded-xs hover:bg-white font-semibold">
                 재도전 예약
               </button>
-              <span className="text-[11px] text-[#827d73]">예약만으로는 점수·복습 회차가 바뀌지 않습니다.</span>
             </div>
+
+            {sessionReservations.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-[11px] font-semibold text-[#57544e]">이 세션의 예약</div>
+                {sessionReservations.map((r) => (
+                  <div key={r.id} className="flex flex-wrap items-center gap-2 bg-white border border-[#e2ded6] rounded-2xs p-2 text-[11px]">
+                    <span className={`font-semibold ${r.status === 'cancelled' ? 'text-[#827d73] line-through' : 'text-[#191817]'}`}>
+                      {r.scheduledDate} · {r.problemTitle || '문제'} {r.isTransfer ? '(전이)' : '(재도전)'}
+                    </span>
+                    <span className="text-[#827d73]">[{r.status}]</span>
+                    {r.status === 'scheduled' && (
+                      <>
+                        <input
+                          type="date"
+                          defaultValue={r.scheduledDate}
+                          onChange={(e) => {
+                            if (!onUpdateReservation(r.id, e.target.value)) {
+                              setError('예약 날짜 변경 저장에 실패했습니다.');
+                            }
+                          }}
+                          className="border border-[#ded6c8] p-0.5 text-[11px] rounded-2xs"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!onCancelReservation(r.id)) setError('예약 취소 저장에 실패했습니다.');
+                            else setNotice('예약이 취소되었습니다.');
+                          }}
+                          className="flex items-center gap-0.5 text-[#c52828] hover:underline"
+                        >
+                          <Trash2 className="w-3 h-3" /> 취소
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
             {subject.examAt && rechallengeDate > subject.examAt.slice(0, 10) && (
               <p className="text-[11px] text-amber-800 flex items-center gap-1">
                 <AlertTriangle className="w-3.5 h-3.5" /> 선택한 재도전 날짜가 시험일({subject.examAt.slice(0, 10)}) 이후입니다.
               </p>
+            )}
+          </section>
+
+          {/* Step 4: transfer problem */}
+          <section className="border-t border-[#f1ede4] pt-3 space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-[#191817] flex items-center gap-1.5">
+                <GitBranch className="w-4 h-4 text-indigo-600" /> 조건을 바꾼 문제로 확인하기 (전이 문제)
+              </h3>
+              <button
+                type="button"
+                onClick={handleGenerateTransfer}
+                disabled={isGeneratingTransfer}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-indigo-700 text-white rounded-xs font-bold disabled:opacity-50"
+              >
+                {isGeneratingTransfer ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <GitBranch className="w-3.5 h-3.5" />}
+                <span>{session.transferDraftId ? '전이 문제 다시 생성' : '전이 문제 생성'}</span>
+              </button>
+            </div>
+            <p className="text-[11px] text-[#827d73]">
+              단순 숫자 변경이 아니라 조건·제약·반례·복잡도가 달라진 문제로 이해를 확인합니다. 생성된 초안은 승인 전까지 학습 계획에 배정되지 않습니다.
+            </p>
+            {session.transferDraftId && (
+              <div className="bg-indigo-50/60 border border-indigo-200 rounded-xs p-2.5 text-[11px] space-y-1">
+                <div className="font-semibold text-indigo-900">전이 문제 초안: {session.transferDraftId}</div>
+                {approvedTransferProblem ? (
+                  <div className="flex flex-wrap items-end gap-2 pt-1">
+                    <span className="text-emerald-800 font-semibold">승인됨 · v{approvedTransferProblem.version ?? 1}</span>
+                    <button
+                      type="button"
+                      onClick={() => onStartTransferProblem(approvedTransferProblem)}
+                      className="px-3 py-1.5 text-xs bg-[#191817] text-white rounded-xs font-bold"
+                    >
+                      지금 전이 문제 풀기
+                    </button>
+                    <label className="flex items-center gap-1.5">
+                      예약일
+                      <input type="date" value={transferDate} onChange={(e) => setTransferDate(e.target.value)} className="border border-[#ded6c8] p-0.5 text-[11px] rounded-2xs" />
+                    </label>
+                    <button type="button" onClick={handleReserveTransfer} className="px-2.5 py-1.5 text-xs border border-[#ded6c8] rounded-xs hover:bg-white font-semibold">
+                      전이 문제 예약
+                    </button>
+                  </div>
+                ) : (
+                  <p className="text-indigo-900">아직 승인되지 않았습니다. 문제 검토·승인 화면에서 검토 후 승인하면 즉시 풀거나 예약할 수 있습니다.</p>
+                )}
+              </div>
             )}
           </section>
 

@@ -33,6 +33,7 @@ import {
 } from './retentionModel';
 import { addDaysToDate } from './dateUtils';
 import { computeMarkdownHash } from './markdownUtils';
+import { completeRechallengeReservation } from './logicSession';
 
 const STORAGE_KEYS = {
   CURRENT_SUBJECT_ID: 'redcall_active_subject_id',
@@ -1423,9 +1424,24 @@ export function recoverMissingAttemptEvents(
     const hadEvent = concept.events.some((e) => e.attemptId === attempt.id);
 
     try {
-      // Always run the full routine: it appends a missing review event AND repairs
-      // a missing StudyPlanItem link, even when the Attempt/event already exist.
+      // Assisted revisions must NEVER be recovered as independent attempts:
+      // that would create an `attempt` event and inflate the review count.
+      if (attempt.attemptOrigin === 'assisted_revision') {
+        recordAssistedRevisionAttempt(attempt);
+        const eventNow =
+          loadStoredConcepts()
+            .find((c) => c.id === attempt.conceptId)
+            ?.events.some((e) => e.attemptId === attempt.id) === true;
+        if (!hadEvent && eventNow) recoveredCount += 1;
+        continue;
+      }
+
+      // Independent / rechallenge attempts: append the review event AND repair
+      // the plan linkage, then complete the rechallenge reservation if linked.
       const result = recordAttemptAndUpdateConcept(attempt, settings);
+      if (attempt.rechallengeReservationId) {
+        completeRechallengeReservation(attempt.rechallengeReservationId);
+      }
       const eventNow =
         loadStoredConcepts()
           .find((c) => c.id === attempt.conceptId)
@@ -1440,6 +1456,34 @@ export function recoverMissingAttemptEvents(
   }
 
   return { recoveredCount, updatedConcepts: loadStoredConcepts() };
+}
+
+/**
+ * Read-only audit: reports attempts whose review event kind does not match their
+ * provenance (e.g. an assisted revision that was wrongly recorded as an attempt).
+ * The original Attempt is never modified; callers can decide on a correction.
+ */
+export function verifyAttemptEventOrigins(): {
+  mismatches: { attemptId: string; expectedKind: string; actualKinds: string[] }[];
+} {
+  const concepts = loadStoredConcepts();
+  const attempts = loadStoredAttempts();
+  const mismatches: { attemptId: string; expectedKind: string; actualKinds: string[] }[] = [];
+
+  for (const attempt of attempts) {
+    const concept = concepts.find((c) => c.id === attempt.conceptId);
+    if (!concept) continue;
+    const events = concept.events.filter((e) => e.attemptId === attempt.id);
+    if (events.length === 0) continue;
+
+    const expectedKind = attempt.attemptOrigin === 'assisted_revision' ? 'assisted_revision' : 'attempt';
+    const actualKinds = Array.from(new Set(events.map((e) => e.kind)));
+    if (!actualKinds.includes(expectedKind) || actualKinds.some((k) => k !== expectedKind && k !== 'assisted_revision')) {
+      mismatches.push({ attemptId: attempt.id, expectedKind, actualKinds });
+    }
+  }
+
+  return { mismatches };
 }
 
 /**

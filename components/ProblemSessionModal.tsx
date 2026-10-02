@@ -49,9 +49,11 @@ interface ProblemSessionModalProps {
   subject: Subject;
   concept: Concept;
   problem: Problem;
-  onSubmitAttempt: (attempt: Attempt) => { partial: boolean };
+  onSubmitAttempt: (attempt: Attempt) => { partial: boolean; message?: string };
   /** 지연 재도전 예약에서 시작한 경우 전달. 확정 시 예약을 완료 처리하고 독립 풀이로 표시한다. */
   rechallengeReservationId?: string;
+  /** 실행한 학습 계획 항목 ID (추적용). */
+  planItemId?: string;
   onOpenSourceModal: (sourceRef: string) => void;
   onReportProblem?: (
     problemId: string,
@@ -67,6 +69,7 @@ export function ProblemSessionModal({
   problem,
   onSubmitAttempt,
   rechallengeReservationId,
+  planItemId,
   onOpenSourceModal,
   onReportProblem,
 }: ProblemSessionModalProps) {
@@ -90,6 +93,7 @@ export function ProblemSessionModal({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(false);
+  const [wasModelAnswerRevealed, setWasModelAnswerRevealed] = useState(false);
 
   // Stage 6: Report State
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
@@ -279,14 +283,23 @@ export function ProblemSessionModal({
       methodSelectionDiagnosis: evaluationResult.methodSelectionDiagnosis,
       attemptOrigin: rechallengeReservationId ? 'rechallenge' : 'independent',
       rechallengeReservationId,
+      planItemId,
+      modelAnswerRevealed: wasModelAnswerRevealed,
+      helpUsage: wasModelAnswerRevealed
+        ? 'model_answer'
+        : snapshot.hintCount > 0
+        ? 'hints'
+        : 'independent',
     };
 
     try {
       const result = onSubmitAttempt(newAttempt);
       if (result.partial) {
-        // 풀이/이벤트는 저장됐지만 계획 연결이 실패한 부분 저장: 모달을 닫지 않고 재시도를 안내한다.
-        // 재시도는 같은 Attempt ID를 사용하며 AI를 다시 호출하지 않는다.
-        setSubmitNotice('풀이 기록은 저장됐지만 학습 계획 완료 반영은 실패했습니다. 재시도해 주세요.');
+        // 풀이/이벤트는 저장됐지만 계획 연결(또는 예약 완료)이 실패한 부분 저장:
+        // 모달을 닫지 않고 재시도를 안내한다. 재시도는 같은 Attempt ID를 사용하며 AI를 다시 호출하지 않는다.
+        setSubmitNotice(
+          result.message || '풀이 기록은 저장됐지만 학습 계획 완료 반영은 실패했습니다. 재시도해 주세요.'
+        );
         setIsSubmitting(false);
         return;
       }
@@ -494,7 +507,11 @@ export function ProblemSessionModal({
             <div className="border border-[#ded6c8] rounded-xs bg-[#fcfbf9] overflow-hidden">
               <button
                 type="button"
-                onClick={() => setIsModelAnswerVisible(!isModelAnswerVisible)}
+                onClick={() => {
+                  const next = !isModelAnswerVisible;
+                  setIsModelAnswerVisible(next);
+                  if (next) setWasModelAnswerRevealed(true);
+                }}
                 className="w-full px-4 py-2 bg-[#f6f3eb] hover:bg-[#ede8dc] flex items-center justify-between text-xs transition-colors"
               >
                 <div className="flex items-center gap-1.5 font-bold text-[#57544e]">

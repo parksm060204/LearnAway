@@ -119,6 +119,8 @@ export interface AnalyticsRecord {
   methodSelectionDiagnosis?: MethodSelectionDiagnosis;
   // Stage 13: 보완(도움 받은) 풀이와 독립 풀이 구분
   origin: 'independent' | 'assisted_revision' | 'rechallenge';
+  // Stage 14: 조건 변형·전이 문제 여부
+  isTransfer: boolean;
 }
 
 export interface ExcludedRecord {
@@ -143,6 +145,7 @@ export interface RecordCollection {
   // 보완(assisted) 풀이는 독립 성과와 섞지 않고 별도로 집계한다.
   assistedRevisionCount: number;
   rechallengeCount: number;
+  transferCount: number;
 }
 
 function emptyExclusionMap(): Record<AnalyticsExclusionReason, number> {
@@ -202,6 +205,7 @@ export function collectValidRecords({
   const excludedByReason = emptyExclusionMap();
   let assistedRevisionCount = 0;
   let rechallengeCount = 0;
+  let transferCount = 0;
 
   const exclude = (recordId: string, source: AnalyticsRecordSource, reason: AnalyticsExclusionReason, at?: string) => {
     excluded.push({ recordId, source, reason, at });
@@ -271,6 +275,7 @@ export function collectValidRecords({
       continue;
     }
     if (origin === 'rechallenge') rechallengeCount += 1;
+    if (attempt.isTransfer === true) transferCount += 1;
 
     const conceptIds = attempt.conceptIds && attempt.conceptIds.length > 0
       ? attempt.conceptIds
@@ -297,6 +302,7 @@ export function collectValidRecords({
       rubricResults: attempt.rubricResults || [],
       methodSelectionDiagnosis: attempt.methodSelectionDiagnosis,
       origin,
+      isTransfer: attempt.isTransfer === true,
     });
   }
 
@@ -362,6 +368,7 @@ export function collectValidRecords({
         rubricResults: evaluation.rubricResults || [],
         methodSelectionDiagnosis: evaluation.methodSelectionDiagnosis,
         origin: 'independent',
+        isTransfer: false,
       });
     }
   }
@@ -390,7 +397,7 @@ export function collectValidRecords({
     }
   }
 
-  return { records, excluded, excludedByReason, eventStats, assistedRevisionCount, rechallengeCount };
+  return { records, excluded, excludedByReason, eventStats, assistedRevisionCount, rechallengeCount, transferCount };
 }
 
 // =========================================================================

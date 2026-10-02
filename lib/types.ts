@@ -265,6 +265,12 @@ export interface ProblemDraft {
   sourceEvidenceQuote?: string;    // 원문 인용 근거
   sourceMarkdownHash?: string;     // 분석/생성에 참조된 자료 버전 해시 (하위 호환)
   sourceMaterials?: ProblemSourceRef[]; // 자료별 출처 ID·제목·생성 당시 본문 해시
+  // Stage 14: 조건 변형·전이 문제
+  isTransfer?: boolean;
+  sourceProblemId?: string;
+  logicSessionId?: string;
+  transferChanges?: string;   // 원문에서 바뀐 조건 설명
+  understandingFocus?: string; // 확인하려는 이해 요소
   timeStandardMinutes: number;
   timeBreakdownDesc: string;
   coreEvaluationHighlight: string;
@@ -429,6 +435,12 @@ export interface Problem {
   appliedConditionNote?: string; // AI 설계 응용 조건
   sourceMarkdownHash?: string;   // 생성 당시 원문 해시 (하위 호환)
   sourceMaterials?: ProblemSourceRef[]; // 자료별 출처 ID·제목·생성 당시 본문 해시
+  // Stage 14: 조건 변형·전이 문제
+  isTransfer?: boolean;
+  sourceProblemId?: string;
+  logicSessionId?: string;
+  transferChanges?: string;
+  understandingFocus?: string;
   isOutdated?: boolean;          // 원문 Markdown 사후 수정 시 구버전 플래그
   needsSourceReview?: boolean;   // 출처 불명확(자료별 해시 없음)으로 사용자 확인 필요
   createdAt?: string;
@@ -537,6 +549,12 @@ export interface Attempt {
   logicSessionId?: string;                 // 논리 강화 세션에서 생성된 보완 답안
   sourceAttemptId?: string;                // 보완/재도전의 원본 Attempt ID
   rechallengeReservationId?: string;       // 재도전 예약에서 생성된 기록
+  // Stage 14 fields:
+  isTransfer?: boolean;                    // 조건 변형·전이 문제 풀이 여부
+  sourceProblemId?: string;                // 전이 문제의 원본 문제 ID
+  planItemId?: string;                     // 실행한 학습 계획 항목 ID
+  modelAnswerRevealed?: boolean;           // 풀이 중 모범답안을 열람했는지
+  helpUsage?: 'independent' | 'hints' | 'model_answer' | 'assisted'; // 도움 사용 여부
 }
 
 export interface MockExamSession {
@@ -577,6 +595,16 @@ export interface LogicQuestion {
   guidance?: string;          // 답변 시 고려할 방향(정답 아님)
 }
 
+/** 질문 세트 버전 (재생성 시 이력으로 보존, 이전 응답이 새 질문에 붙지 않도록 구분) */
+export interface LogicQuestionSet {
+  version: number;
+  questions: LogicQuestion[];
+  answers: Record<string, string>;
+  generatedAt: string;
+  model?: string;
+  inputHash: string;
+}
+
 export type LogicSessionStatus =
   | 'draft'              // 세션 생성, 질문 미생성
   | 'questions_ready'    // AI 질문 생성 완료
@@ -609,17 +637,25 @@ export interface LogicStrengthenSession {
   originalIsReasonNotApplicable?: boolean;
   originalDiagnosisSummary?: string;
 
-  // AI 생성 질문 (2~3개)
+  // AI 생성 질문 (2~3개) + 세트 버전/이력
   questions: LogicQuestion[];
   questionsGeneratedAt?: string;
   questionsModel?: string;
+  questionsInputHash?: string;      // 재사용 판단용 입력 해시
+  questionSetVersion: number;       // 현재 질문 세트 버전 (1부터)
+  questionSets: LogicQuestionSet[]; // 이전 세트(질문+응답) 이력
 
   // 학생 응답 및 보완 답안
   questionAnswers: Record<string, string>;
   revisedAnswer: string;
   revisedEvaluation?: EvaluationResult;
   revisedEvaluatedAt?: string;
+  revisedEvaluatedAnswer?: string;       // 평가 시점의 답안 스냅샷
+  revisedEvaluationInputHash?: string;   // 평가 시점 입력 해시
   revisedAttemptId?: string; // 확정 시 생성된 별도 Attempt
+
+  // Stage 14: 전이 문제 초안 연결
+  transferDraftId?: string;
 }
 
 export type RechallengeReservationStatus = 'scheduled' | 'completed' | 'cancelled';
@@ -639,6 +675,7 @@ export interface RechallengeReservation {
   status: RechallengeReservationStatus;
   sourceLogicSessionId?: string;
   sourceAttemptId?: string;
+  isTransfer?: boolean; // 전이 문제 예약 여부
   note?: string;
 }
 
