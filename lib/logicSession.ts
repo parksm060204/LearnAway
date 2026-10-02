@@ -104,6 +104,7 @@ export type ReservationCompletionStatus =
   | 'completed'
   | 'already_completed'
   | 'completed_by_other'
+  | 'completed_unknown_owner'
   | 'not_found'
   | 'cancelled'
   | 'mismatch'
@@ -153,16 +154,22 @@ export function validateReservationForAttempt(
   if (reservation.status === 'completed') {
     // Only the SAME attempt's retry is an idempotent success; a different attempt
     // must not overwrite the existing completion history.
-    if (
-      attempt.attemptId &&
-      reservation.completedAttemptId &&
-      reservation.completedAttemptId !== attempt.attemptId
-    ) {
-      return {
-        ok: false,
-        reason: 'completed_by_other',
-        message: '이미 다른 풀이 기록으로 완료된 예약입니다.',
-      };
+    if (attempt.attemptId) {
+      if (!reservation.completedAttemptId) {
+        // Ownership cannot be verified (legacy completion) -> separate state.
+        return {
+          ok: false,
+          reason: 'completed_unknown_owner',
+          message: '완료된 예약이지만 연결된 풀이 기록을 확인할 수 없습니다.',
+        };
+      }
+      if (reservation.completedAttemptId !== attempt.attemptId) {
+        return {
+          ok: false,
+          reason: 'completed_by_other',
+          message: '이미 다른 풀이 기록으로 완료된 예약입니다.',
+        };
+      }
     }
     return { ok: false, reason: 'already_completed', message: '이미 완료된 예약입니다.' };
   }

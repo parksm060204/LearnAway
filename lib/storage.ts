@@ -606,8 +606,32 @@ export function buildProblemFromDraft(
  * actually persisted. A failed problem save returns success=false and leaves the
  * draft unapproved so it can be retried (idempotently, via the stable problem id).
  */
+/**
+ * Compares the evaluation-affecting content and version of two problems so that
+ * a failed save of a CHANGED re-approval is never mistaken for success just
+ * because an older problem with the same id/draftId is still stored.
+ */
+export function problemContentMatches(a: Problem, b: Problem): boolean {
+  return (
+    a.version === b.version &&
+    a.title === b.title &&
+    a.promptText === b.promptText &&
+    (a.mathFormula || '') === (b.mathFormula || '') &&
+    (a.codeSnippet || '') === (b.codeSnippet || '') &&
+    a.modelAnswer === b.modelAnswer &&
+    a.timeStandardMinutes === b.timeStandardMinutes &&
+    JSON.stringify(a.hints || []) === JSON.stringify(b.hints || []) &&
+    JSON.stringify(a.rubric || []) === JSON.stringify(b.rubric || [])
+  );
+}
+
+export type ApprovalStatus = 'complete' | 'failed' | 'partial_draft_failed';
+
 export function approveProblemDraft(draftId: string): {
   success: boolean;
+  status: ApprovalStatus;
+  problemPersisted: boolean;
+  draftPersisted: boolean;
   updatedDrafts: ProblemDraft[];
   updatedProblems: Problem[];
   approvedProblem: Problem | null;
@@ -618,7 +642,16 @@ export function approveProblemDraft(draftId: string): {
 
   const targetDraft = drafts.find((d) => d.id === draftId);
   if (!targetDraft) {
-    return { success: false, updatedDrafts: drafts, updatedProblems: problems, approvedProblem: null, error: '초안을 찾을 수 없습니다.' };
+    return {
+      success: false,
+      status: 'failed',
+      problemPersisted: false,
+      draftPersisted: false,
+      updatedDrafts: drafts,
+      updatedProblems: problems,
+      approvedProblem: null,
+      error: '초안을 찾을 수 없습니다.',
+    };
   }
 
   const now = new Date().toISOString();
@@ -631,13 +664,17 @@ export function approveProblemDraft(draftId: string): {
 
   saveStoredProblems(nextProblems);
 
-  // Verify the problem is really persisted before declaring success.
+  // Verify the problem is really persisted with the EXACT content/version we
+  // intended (not just an older row with the same id/draftId).
   const persisted = loadStoredProblems().find(
-    (p) => p.id === approvedProblem.id && p.draftId === draftId
+    (p) => p.id === approvedProblem.id && p.draftId === draftId && problemContentMatches(p, approvedProblem)
   );
   if (!persisted) {
     return {
       success: false,
+      status: 'failed',
+      problemPersisted: false,
+      draftPersisted: false,
       updatedDrafts: drafts,
       updatedProblems: problems,
       approvedProblem: null,
@@ -651,12 +688,40 @@ export function approveProblemDraft(draftId: string): {
       : d
   );
   saveStoredProblemDrafts(updatedDrafts);
-  return { success: true, updatedDrafts, updatedProblems: nextProblems, approvedProblem: persisted };
+
+  // Verify the draft approval actually persisted; otherwise it is a PARTIAL
+  // approval (problem usable, draft still marked unapproved after refresh).
+  const persistedDraft = loadStoredProblemDrafts().find((d) => d.id === draftId);
+  const draftPersisted =
+    persistedDraft?.isApproved === true && persistedDraft?.updatedAt === now;
+
+  if (!draftPersisted) {
+    return {
+      success: false,
+      status: 'partial_draft_failed',
+      problemPersisted: true,
+      draftPersisted: false,
+      updatedDrafts: drafts,
+      updatedProblems: nextProblems,
+      approvedProblem: persisted,
+      error: '문제는 저장되었지만 초안 승인 상태 저장에 실패했습니다. 다시 시도하면 초안 상태만 복구됩니다.',
+    };
+  }
+
+  return {
+    success: true,
+    status: 'complete',
+    problemPersisted: true,
+    draftPersisted: true,
+    updatedDrafts,
+    updatedProblems: nextProblems,
+    approvedProblem: persisted,
+  };
 }
 
 export interface BatchApproveItemResult {
   draftId: string;
-  status: 'approved' | 'failed' | 'skipped';
+  status: 'approved' | 'failed' | 'partial_draft_failed' | 'skipped';
   error?: string;
 }
 
@@ -670,7 +735,7 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
   let problems = loadStoredProblems();
   const now = new Date().toISOString();
   const results: BatchApproveItemResult[] = [];
-  const approvedIds = new Set<string>();
+  const problemPersistedIds = new Set<string>();
 
   for (const draftId of draftIds) {
     const draft = drafts.find((d) => d.id === draftId);
@@ -687,25 +752,43 @@ export function batchApproveProblemDrafts(draftIds: string[]): {
 
     saveStoredProblems(problems);
 
+    // Verify content/version, not just id/draftId.
     const persisted = loadStoredProblems().some(
-      (p) => p.id === approvedProblem.id && p.draftId === draftId
+      (p) => p.id === approvedProblem.id && p.draftId === draftId && problemContentMatches(p, approvedProblem)
     );
     if (!persisted) {
       results.push({ draftId, status: 'failed', error: '문제 저장에 실패했습니다.' });
       continue;
     }
-    approvedIds.add(draftId);
+    problemPersistedIds.add(draftId);
     results.push({ draftId, status: 'approved' });
   }
 
   const updatedDrafts = drafts.map((d) =>
-    approvedIds.has(d.id)
+    problemPersistedIds.has(d.id)
       ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now }
       : d
   );
   saveStoredProblemDrafts(updatedDrafts);
 
-  return { updatedDrafts, updatedProblems: problems, approvedCount: approvedIds.size, results };
+  // Downgrade items whose draft approval did not actually persist.
+  const storedDrafts = loadStoredProblemDrafts();
+  let approvedCount = 0;
+  const finalResults = results.map((r) => {
+    if (r.status !== 'approved') return r;
+    const stored = storedDrafts.find((d) => d.id === r.draftId);
+    if (stored?.isApproved === true && stored?.updatedAt === now) {
+      approvedCount += 1;
+      return r;
+    }
+    return {
+      ...r,
+      status: 'partial_draft_failed' as const,
+      error: '문제는 저장되었지만 초안 승인 상태 저장에 실패했습니다.',
+    };
+  });
+
+  return { updatedDrafts, updatedProblems: problems, approvedCount, results: finalResults };
 }
 
 // Stage 6: Problem Quality, Reporting, Versioning & Review Operations
@@ -1561,49 +1644,69 @@ export function recoverMissingAttemptEvents(
   for (const attempt of attempts) {
     const concept = conceptById.get(attempt.conceptId);
     if (!concept || concept.subjectId !== attempt.subjectId) continue;
-    const hadEvent = concept.events.some((e) => e.attemptId === attempt.id);
 
     try {
       // Assisted revisions must NEVER be recovered as independent attempts:
       // that would create an `attempt` event and inflate the review count.
       if (attempt.attemptOrigin === 'assisted_revision') {
+        const hadAssisted = concept.events.some((e) => e.attemptId === attempt.id);
         recordAssistedRevisionAttempt(attempt);
-        const eventNow =
-          loadStoredConcepts()
-            .find((c) => c.id === attempt.conceptId)
-            ?.events.some((e) => e.attemptId === attempt.id) === true;
-        if (!hadEvent && eventNow) recoveredCount += 1;
+        const assistedNow = loadStoredConcepts()
+          .find((c) => c.id === attempt.conceptId)
+          ?.events.some((e) => e.attemptId === attempt.id) === true;
+        if (!assistedNow) {
+          unresolved.push({ attemptId: attempt.id, reason: 'EVENT_NOT_PERSISTED' });
+        } else if (!hadAssisted) {
+          recoveredCount += 1;
+        }
         continue;
       }
 
-      // Independent / rechallenge attempts: append the review event AND repair
-      // the plan linkage, then complete the rechallenge reservation if linked.
+      // Independent / rechallenge attempts.
+      const hadEvent = concept.events.some((e) => e.attemptId === attempt.id);
       const result = recordAttemptAndUpdateConcept(attempt, settings, {
         planItemId: attempt.planItemId,
       });
+
+      // Verify each dimension independently. The core record (Attempt + event)
+      // must be complete before the plan/reservation may be considered repaired.
+      const corePersisted = result.attemptPersisted && result.eventPersisted;
+      const repairedEvent = !hadEvent && result.eventPersisted;
+      const planOk =
+        !attempt.planItemId ||
+        (result.planLinkage.linkedItemId !== null && result.planLinkage.persisted);
+
+      if (!result.attemptPersisted) unresolved.push({ attemptId: attempt.id, reason: 'ATTEMPT_NOT_PERSISTED' });
+      if (!result.eventPersisted) unresolved.push({ attemptId: attempt.id, reason: 'EVENT_NOT_PERSISTED' });
+      if (!planOk) {
+        unresolved.push({ attemptId: attempt.id, reason: `PLAN_${result.planLinkage.skippedReason || 'FAILED'}` });
+      }
+
+      // Reservation completion is only allowed once the core record persists, and
+      // it must carry the attempt id so ownership is verifiable later.
+      let reservationCompleted = false;
       if (attempt.rechallengeReservationId) {
-        const completion = completeRechallengeReservation(attempt.rechallengeReservationId, {
-          subjectId: attempt.subjectId,
-          conceptId: attempt.conceptId,
-          problemId: attempt.problemId,
-          problemVersion: attempt.problemVersion,
-        });
-        // Retryable and terminal-blocked states are both reported as unresolved
-        // so a failure is never silently reported as a normal completion.
-        if (completion.status !== 'completed' && completion.status !== 'already_completed') {
-          unresolved.push({ attemptId: attempt.id, reason: `RESERVATION_${completion.status}` });
+        if (!corePersisted) {
+          unresolved.push({ attemptId: attempt.id, reason: 'RESERVATION_SKIPPED_CORE_RECORD_FAILED' });
+        } else {
+          const completion = completeRechallengeReservation(attempt.rechallengeReservationId, {
+            attemptId: attempt.id,
+            subjectId: attempt.subjectId,
+            conceptId: attempt.conceptId,
+            problemId: attempt.problemId,
+            problemVersion: attempt.problemVersion,
+          });
+          if (completion.status === 'completed') reservationCompleted = true;
+          else if (completion.status !== 'already_completed') {
+            unresolved.push({ attemptId: attempt.id, reason: `RESERVATION_${completion.status}` });
+          }
         }
       }
-      const eventNow =
-        loadStoredConcepts()
-          .find((c) => c.id === attempt.conceptId)
-          ?.events.some((e) => e.attemptId === attempt.id) === true;
-      const repairedEvent = !hadEvent && eventNow;
-      const repairedPlan =
-        result.planLinkage.linkedItemId !== null && result.planLinkage.persisted;
-      if (repairedEvent || repairedPlan) recoveredCount += 1;
-      if (result.partial && !repairedPlan) {
-        unresolved.push({ attemptId: attempt.id, reason: 'PLAN_LINKAGE_FAILED' });
+
+      // Count as recovered ONLY when the core record is persisted AND something
+      // was actually repaired (a plan-only success with a failed event is not).
+      if (corePersisted && (repairedEvent || (attempt.planItemId && planOk) || reservationCompleted)) {
+        recoveredCount += 1;
       }
     } catch (cause) {
       unresolved.push({ attemptId: attempt.id, reason: cause instanceof Error ? cause.message : 'UNKNOWN' });

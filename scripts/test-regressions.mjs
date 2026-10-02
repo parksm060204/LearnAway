@@ -1077,6 +1077,98 @@ async function run() {
     assert.equal(logicSession.getRechallengeReservation('rr-flow').completedAttemptId, 'att-flow-transfer');
   });
 
+  // ---- Stage 18: content-verified approval, recovery completeness, ownership ----
+  check('changed re-approval whose save fails is not reported as success', () => {
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-content')]);
+    const first = storage.approveProblemDraft('draft-content');
+    assert.equal(first.success, true);
+    // Change the draft content, then fail the problem save.
+    storage.saveStoredProblemDrafts([mkDraft('draft-content', { promptText: 'changed v2', updatedAt: 't2' })]);
+    const originalSet = localStorage.setItem;
+    const PROB_KEY = 'redcall_problems_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === PROB_KEY) throw new Error('problem storage down');
+      return originalSet(key, value);
+    };
+    let changed;
+    try {
+      changed = storage.approveProblemDraft('draft-content');
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+    assert.equal(changed.success, false, 'stale content is not a success');
+    assert.equal(changed.status, 'failed');
+    assert.equal(storage.loadStoredProblems()[0].promptText, 'prompt draft-content', 'stored content unchanged');
+  });
+
+  check('draft approval state save failure is reported as partial (not success)', () => {
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-partial')]);
+    const originalSet = localStorage.setItem;
+    const DRAFT_KEY = 'redcall_problem_drafts_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === DRAFT_KEY) throw new Error('draft storage down');
+      return originalSet(key, value);
+    };
+    let result;
+    try {
+      result = storage.approveProblemDraft('draft-partial');
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+    assert.equal(result.success, false, 'partial approval is not a full success');
+    assert.equal(result.status, 'partial_draft_failed');
+    assert.equal(result.problemPersisted, true, 'problem persisted');
+    assert.equal(result.draftPersisted, false, 'draft not persisted');
+    assert.equal(storage.loadStoredProblemDrafts().find((d) => d.id === 'draft-partial').isApproved, false);
+    // Retry repairs only the draft state, without duplicating the problem.
+    const retry = storage.approveProblemDraft('draft-partial');
+    assert.equal(retry.success, true);
+    assert.equal(storage.loadStoredProblems().filter((p) => p.draftId === 'draft-partial').length, 1);
+    assert.equal(storage.loadStoredProblems()[0].version, 1, 'no duplicate version bump');
+  });
+
+  await checkAsync('an event-only recovery failure is unresolved and does not complete the reservation', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredStudyPlanItems([{ id: 'spi-ev', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'ev-p', kind: 'recommended_review', round: 1, assignedDate: '2026-10-01', estimatedMinutes: 15, isEstimatedTime: false, priorityScore: 1, priorityReason: 'r', status: 'pending', snapshotTitle: 't', snapshotDetail: 'd' }]);
+    storage.saveStoredAttempts([{ id: 'att-ev', problemId: 'ev-p', conceptId: c.id, subjectId: c.subjectId, at: '2026-10-01T08:00:00+09:00', answer: 'a', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '', planItemId: 'spi-ev', rechallengeReservationId: 'rr-ev' }]);
+    logicSession.saveRechallengeReservation({ id: 'rr-ev', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'ev-p', problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: 't', status: 'scheduled' });
+    const originalSet = localStorage.setItem;
+    const CONCEPT_KEY = 'redcall_concepts_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === CONCEPT_KEY) throw new Error('concept storage down');
+      return originalSet(key, value);
+    };
+    let outcome;
+    try {
+      outcome = storage.recoverMissingAttemptEvents();
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+    assert.ok(outcome.unresolved.some((u) => u.attemptId === 'att-ev' && u.reason === 'EVENT_NOT_PERSISTED'), 'event failure is unresolved');
+    assert.equal(outcome.recoveredCount, 0, 'plan-only success is not counted as recovered');
+    assert.equal(logicSession.getRechallengeReservation('rr-ev').status, 'scheduled', 'reservation not completed when core failed');
+  });
+
+  await checkAsync('recovery passes the attempt id so reservation ownership is verifiable', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredStudyPlanItems([]);
+    storage.saveStoredAttempts([{ id: 'att-owner', problemId: 'own-p', conceptId: c.id, subjectId: c.subjectId, at: '2026-10-01T08:00:00+09:00', answer: 'a', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '', rechallengeReservationId: 'rr-owner' }]);
+    logicSession.saveRechallengeReservation({ id: 'rr-owner', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'own-p', problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: 't', status: 'scheduled' });
+    const outcome = storage.recoverMissingAttemptEvents();
+    assert.equal(outcome.unresolved.length, 0);
+    assert.equal(logicSession.getRechallengeReservation('rr-owner').completedAttemptId, 'att-owner', 'owner recorded');
+    const other = logicSession.completeRechallengeReservation('rr-owner', { attemptId: 'att-different', subjectId: c.subjectId, conceptId: c.id, problemId: 'own-p', problemVersion: 1 });
+    assert.equal(other.status, 'completed_by_other');
+    // Legacy completion without owner is a distinct state.
+    logicSession.saveRechallengeReservation({ id: 'rr-legacy', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'own-p', problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 15, createdAt: 't', status: 'completed' });
+    const legacy = logicSession.completeRechallengeReservation('rr-legacy', { attemptId: 'att-any', subjectId: c.subjectId, conceptId: c.id, problemId: 'own-p', problemVersion: 1 });
+    assert.equal(legacy.status, 'completed_unknown_owner');
+  });
+
   console.log(`${passed} regression checks passed`);
 }
 

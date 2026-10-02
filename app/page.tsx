@@ -585,11 +585,13 @@ export default function RedcallDashboardPage() {
   };
 
   const handleApproveProblemDraft = (draftId: string) => {
-    const { success, approvedProblem, updatedDrafts, updatedProblems, error } = approveProblemDraft(draftId);
+    const { success, status, approvedProblem, updatedDrafts, updatedProblems, error } = approveProblemDraft(draftId);
     setProblemDrafts(updatedDrafts);
     setAllProblems(updatedProblems);
     if (success && approvedProblem) {
       showToast(`문제 [${approvedProblem.title}]이(가) 승인되어 풀이 목록에 등록되었습니다.`);
+    } else if (status === 'partial_draft_failed') {
+      showToast(error || '문제는 저장됐지만 초안 승인 상태 저장에 실패했습니다. 다시 시도해 주세요.');
     } else {
       showToast(`문제 승인 저장에 실패했습니다. 초안은 승인되지 않았습니다. (${error || '다시 시도해 주세요.'})`);
     }
@@ -600,8 +602,9 @@ export default function RedcallDashboardPage() {
     setProblemDrafts(updatedDrafts);
     setAllProblems(updatedProblems);
     const failed = results.filter((r) => r.status === 'failed').length;
-    if (failed > 0) {
-      showToast(`${approvedCount}건 승인 완료, ${failed}건 저장 실패. 실패한 항목만 다시 시도해 주세요.`);
+    const partial = results.filter((r) => r.status === 'partial_draft_failed').length;
+    if (failed > 0 || partial > 0) {
+      showToast(`${approvedCount}건 승인 완료, 실패 ${failed}건·부분 ${partial}건. 해당 항목만 다시 시도해 주세요.`);
     } else {
       showToast(`선택한 문제 ${approvedCount}건이 승인 완료되어 풀이에 등록되었습니다.`);
     }
