@@ -590,7 +590,9 @@ export function buildProblemFromDraft(
 
   return {
     ...derived,
-    id: `prob-ai-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+    // Stable id derived from the draft id: a retry after a partial save never
+    // creates a duplicate problem.
+    id: `prob-ai-${draft.id}`,
     createdAt: now,
     version: 1,
     qualityStatus: 'normal',
@@ -599,76 +601,111 @@ export function buildProblemFromDraft(
   };
 }
 
+/**
+ * Approves a draft, but only marks the draft approved AFTER verifying the Problem
+ * actually persisted. A failed problem save returns success=false and leaves the
+ * draft unapproved so it can be retried (idempotently, via the stable problem id).
+ */
 export function approveProblemDraft(draftId: string): {
+  success: boolean;
   updatedDrafts: ProblemDraft[];
   updatedProblems: Problem[];
   approvedProblem: Problem | null;
+  error?: string;
 } {
   const drafts = loadStoredProblemDrafts();
   const problems = loadStoredProblems();
 
   const targetDraft = drafts.find((d) => d.id === draftId);
   if (!targetDraft) {
-    return { updatedDrafts: drafts, updatedProblems: problems, approvedProblem: null };
+    return { success: false, updatedDrafts: drafts, updatedProblems: problems, approvedProblem: null, error: '초안을 찾을 수 없습니다.' };
   }
 
   const now = new Date().toISOString();
+  const existingIndex = problems.findIndex((p) => p.draftId === draftId);
+  const existing = existingIndex >= 0 ? problems[existingIndex] : undefined;
+  const approvedProblem = buildProblemFromDraft(targetDraft, existing, now);
+  const nextProblems = existingIndex >= 0
+    ? problems.map((p, i) => (i === existingIndex ? approvedProblem : p))
+    : [...problems, approvedProblem];
+
+  saveStoredProblems(nextProblems);
+
+  // Verify the problem is really persisted before declaring success.
+  const persisted = loadStoredProblems().find(
+    (p) => p.id === approvedProblem.id && p.draftId === draftId
+  );
+  if (!persisted) {
+    return {
+      success: false,
+      updatedDrafts: drafts,
+      updatedProblems: problems,
+      approvedProblem: null,
+      error: '문제 저장에 실패했습니다. 초안은 승인되지 않았으며 다시 시도할 수 있습니다.',
+    };
+  }
+
   const updatedDrafts = drafts.map((d) =>
     d.id === draftId
       ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now }
       : d
   );
   saveStoredProblemDrafts(updatedDrafts);
+  return { success: true, updatedDrafts, updatedProblems: nextProblems, approvedProblem: persisted };
+}
 
-  const existingIndex = problems.findIndex((p) => p.draftId === draftId);
-  const existing = existingIndex >= 0 ? problems[existingIndex] : undefined;
-  const approvedProblem = buildProblemFromDraft(targetDraft, existing, now);
-
-  if (existingIndex >= 0) {
-    problems[existingIndex] = approvedProblem;
-  } else {
-    problems.push(approvedProblem);
-  }
-
-  saveStoredProblems(problems);
-  return { updatedDrafts, updatedProblems: problems, approvedProblem };
+export interface BatchApproveItemResult {
+  draftId: string;
+  status: 'approved' | 'failed' | 'skipped';
+  error?: string;
 }
 
 export function batchApproveProblemDrafts(draftIds: string[]): {
   updatedDrafts: ProblemDraft[];
   updatedProblems: Problem[];
   approvedCount: number;
+  results: BatchApproveItemResult[];
 } {
   const drafts = loadStoredProblemDrafts();
-  const problems = loadStoredProblems();
-  const targetIdsSet = new Set(draftIds);
+  let problems = loadStoredProblems();
   const now = new Date().toISOString();
+  const results: BatchApproveItemResult[] = [];
+  const approvedIds = new Set<string>();
+
+  for (const draftId of draftIds) {
+    const draft = drafts.find((d) => d.id === draftId);
+    if (!draft) {
+      results.push({ draftId, status: 'skipped', error: '초안을 찾을 수 없습니다.' });
+      continue;
+    }
+    const existingIndex = problems.findIndex((p) => p.draftId === draftId);
+    const existing = existingIndex >= 0 ? problems[existingIndex] : undefined;
+    const approvedProblem = buildProblemFromDraft(draft, existing, now);
+    problems = existingIndex >= 0
+      ? problems.map((p, i) => (i === existingIndex ? approvedProblem : p))
+      : [...problems, approvedProblem];
+
+    saveStoredProblems(problems);
+
+    const persisted = loadStoredProblems().some(
+      (p) => p.id === approvedProblem.id && p.draftId === draftId
+    );
+    if (!persisted) {
+      results.push({ draftId, status: 'failed', error: '문제 저장에 실패했습니다.' });
+      continue;
+    }
+    approvedIds.add(draftId);
+    results.push({ draftId, status: 'approved' });
+  }
 
   const updatedDrafts = drafts.map((d) =>
-    targetIdsSet.has(d.id)
+    approvedIds.has(d.id)
       ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now }
       : d
   );
   saveStoredProblemDrafts(updatedDrafts);
 
-  let approvedCount = 0;
-  for (const draftId of draftIds) {
-    const draft = drafts.find((d) => d.id === draftId);
-    if (!draft) continue;
-
-    const existingIndex = problems.findIndex((p) => p.draftId === draftId);
-    const existing = existingIndex >= 0 ? problems[existingIndex] : undefined;
-    const approvedProblem = buildProblemFromDraft(draft, existing, now);
-    if (existingIndex >= 0) {
-      problems[existingIndex] = approvedProblem;
-    } else {
-      problems.push(approvedProblem);
-    }
-    approvedCount++;
-  }
-
-  saveStoredProblems(problems);
-  return { updatedDrafts, updatedProblems: problems, approvedCount };
+  return { updatedDrafts, updatedProblems: problems, approvedCount: approvedIds.size, results };
 }
 
 // Stage 6: Problem Quality, Reporting, Versioning & Review Operations
@@ -1152,14 +1189,35 @@ export interface PlanLinkageResult {
   /** 계획 항목 완료가 저장·검증되었는지 여부 */
   persisted: boolean;
   /** 연결을 건너뛴 사유 (없으면 undefined) */
-  skippedReason?: 'PLAN_ITEM_NOT_FOUND' | 'PLAN_ITEM_MISMATCH' | 'PLAN_ITEM_SKIPPED' | 'NO_MATCHING_ITEM';
+  skippedReason?:
+    | 'PLAN_ITEM_NOT_FOUND'
+    | 'PLAN_ITEM_MISMATCH'
+    | 'PLAN_ITEM_SKIPPED'
+    | 'PLAN_ITEM_COMPLETED_BY_OTHER'
+    | 'NO_MATCHING_ITEM';
+  /** 완료 충돌 시 기존 완료 기록의 Attempt ID */
+  conflictWithAttemptId?: string;
 }
+
+export type AttemptSaveStatus =
+  | 'complete'           // 전체 완료
+  | 'retryable_failure'  // 저장 실패: 같은 Attempt로 재시도 가능
+  | 'link_conflict'      // 계획·예약 연결 충돌 (대상이 다른 기록으로 완료됨/불일치)
+  | 'target_missing'     // 대상 삭제·취소·없음
+  | 'already_completed'; // 동일 Attempt의 재시도 (이미 완료)
 
 export interface AttemptSaveResult {
   updatedConcepts: Concept[];
   updatedAttempts: Attempt[];
-  /** Attempt/ReviewEvent/계획 연결 중 하나라도 저장·검증에 실패하면 true */
+  /** 재시도가 필요한(또는 충돌/대상 없음) 경우 true. complete/already_completed는 false. */
   partial: boolean;
+  status: AttemptSaveStatus;
+  /** Attempt가 실제 저장·검증되었는지 */
+  attemptPersisted: boolean;
+  /** ReviewEvent가 실제 저장·검증되었는지 */
+  eventPersisted: boolean;
+  /** 호출부에 표시할 안내 문구 */
+  message?: string;
   planLinkage: PlanLinkageResult;
 }
 
@@ -1233,9 +1291,20 @@ export function recordAttemptAndUpdateConcept(
     } else if (
       byId.subjectId !== effectiveAttempt.subjectId ||
       (byId.conceptId !== undefined && byId.conceptId !== effectiveAttempt.conceptId) ||
-      (byId.problemId !== undefined && byId.problemId !== effectiveAttempt.problemId) ||
-      (byId.round !== undefined && byId.round !== attemptRound)
+      (byId.problemId !== undefined && byId.problemId !== effectiveAttempt.problemId)
     ) {
+      planLinkage.skippedReason = 'PLAN_ITEM_MISMATCH';
+    } else if (byId.status === 'completed') {
+      // Same attempt retry is idempotent success; a different attempt must never
+      // overwrite the existing completion history. (Round is ignored here because
+      // the stored completion already represents this round.)
+      if (byId.completedAttemptId === effectiveAttempt.id) {
+        matchingPlanItem = byId;
+      } else {
+        planLinkage.skippedReason = 'PLAN_ITEM_COMPLETED_BY_OTHER';
+        planLinkage.conflictWithAttemptId = byId.completedAttemptId;
+      }
+    } else if (byId.round !== undefined && byId.round !== attemptRound) {
       planLinkage.skippedReason = 'PLAN_ITEM_MISMATCH';
     } else {
       matchingPlanItem = byId;
@@ -1346,23 +1415,51 @@ export function recordAttemptAndUpdateConcept(
       .find((c) => c.id === effectiveAttempt.conceptId && c.subjectId === effectiveAttempt.subjectId)
       ?.events.some((e) => e.attemptId === effectiveAttempt.id) === true;
 
-  // The Attempt and its review event are the critical records. If either could not
-  // be verified, surface it as a real failure so the caller can retry the recovery.
+  // Classify the outcome so callers can react precisely (retry vs resolve vs keep).
+  let status: AttemptSaveStatus;
+  let message: string | undefined;
+
   if (!attemptPersisted || !eventPersisted) {
-    throw new Error(
-      '풀이 기록 저장이 일부만 완료되었습니다. 다시 시도하면 누락된 기록이 자동으로 복구됩니다.'
-    );
+    status = 'retryable_failure';
+    message = '풀이 기록 저장이 일부만 완료되었습니다. 같은 기록으로 다시 시도하면 누락분이 복구됩니다.';
+  } else if (planLinkage.skippedReason === 'PLAN_ITEM_COMPLETED_BY_OTHER') {
+    status = 'link_conflict';
+    message = '이 계획은 이미 다른 풀이 기록으로 완료되었습니다. 기존 완료 기록을 유지하고 이 풀이는 계획 연결 없이 보존할 수 있습니다.';
+  } else if (planLinkage.skippedReason === 'PLAN_ITEM_MISMATCH') {
+    status = 'link_conflict';
+    message = '계획 항목이 현재 풀이와 일치하지 않습니다. 올바른 계획을 선택하거나 계획 연결 없이 기록을 보존하세요.';
+  } else if (
+    planLinkage.skippedReason === 'PLAN_ITEM_NOT_FOUND' ||
+    planLinkage.skippedReason === 'PLAN_ITEM_SKIPPED'
+  ) {
+    status = 'target_missing';
+    message = '연결하려던 계획 항목을 사용할 수 없습니다(삭제·건너뜀). 계획 연결 없이 기록을 보존할 수 있습니다.';
+  } else if (matchingPlanItem !== undefined && !planLinkage.persisted) {
+    status = 'retryable_failure';
+    message = '계획 완료 반영 저장에 실패했습니다. 같은 기록으로 다시 시도해 주세요.';
+  } else if (
+    alreadyAttemptStored &&
+    alreadyEventStored &&
+    (!linkage?.planItemId || planLinkage.persisted)
+  ) {
+    status = 'already_completed';
+    message = '이미 기록된 풀이입니다.';
+  } else {
+    status = 'complete';
   }
 
-  // Plan linkage is a secondary record. Its failure must not be swallowed: report it
-  // via `partial` so the caller can retry without re-incrementing Attempt/event counts.
-  // When a plan item was EXPLICITLY requested, a missing/mismatched/skipped target is
-  // also a linkage failure (otherwise the UI would show a false success).
-  const explicitLinkFailed = Boolean(linkage?.planItemId) && planLinkage.linkedItemId === null;
-  const partial =
-    explicitLinkFailed || (matchingPlanItem !== undefined && !planLinkage.persisted);
+  const partial = status !== 'complete' && status !== 'already_completed';
 
-  return { updatedConcepts, updatedAttempts: newAttempts, partial, planLinkage };
+  return {
+    updatedConcepts,
+    updatedAttempts: newAttempts,
+    partial,
+    status,
+    attemptPersisted,
+    eventPersisted,
+    message,
+    planLinkage,
+  };
 }
 
 /**

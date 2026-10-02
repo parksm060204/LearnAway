@@ -103,6 +103,7 @@ export function updateRechallengeReservation(
 export type ReservationCompletionStatus =
   | 'completed'
   | 'already_completed'
+  | 'completed_by_other'
   | 'not_found'
   | 'cancelled'
   | 'mismatch'
@@ -116,6 +117,7 @@ export interface ReservationCompletionResult {
 
 /** Attempt identity used to validate a reservation before completion. */
 export interface ReservationAttemptIdentity {
+  attemptId?: string;
   subjectId: string;
   conceptId: string;
   problemId: string;
@@ -149,7 +151,19 @@ export function validateReservationForAttempt(
     return { ok: false, reason: 'cancelled', message: '취소된 예약은 완료 처리할 수 없습니다.' };
   }
   if (reservation.status === 'completed') {
-    // Same record retried: allowed as idempotent completion.
+    // Only the SAME attempt's retry is an idempotent success; a different attempt
+    // must not overwrite the existing completion history.
+    if (
+      attempt.attemptId &&
+      reservation.completedAttemptId &&
+      reservation.completedAttemptId !== attempt.attemptId
+    ) {
+      return {
+        ok: false,
+        reason: 'completed_by_other',
+        message: '이미 다른 풀이 기록으로 완료된 예약입니다.',
+      };
+    }
     return { ok: false, reason: 'already_completed', message: '이미 완료된 예약입니다.' };
   }
   return { ok: true };
@@ -181,6 +195,8 @@ export function completeRechallengeReservation(
 
   const { reservations: updated, saved } = updateRechallengeReservation(reservationId, {
     status: 'completed',
+    completedAttemptId: attempt?.attemptId || reservation.completedAttemptId,
+    completedAt: new Date().toISOString(),
   });
   if (!saved) {
     return { status: 'save_failed', reservations: loadRechallengeReservations(), message: '예약 완료 저장에 실패했습니다.' };

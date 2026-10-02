@@ -875,19 +875,33 @@ async function run() {
   });
 
   // ---- Stage 16: async loading, linkage failure, versioning, reservation identity ----
-  check('changing input during evaluation releases loading and rejects the stale response', () => {
+  check('A/B request: settling an old request never releases the new request loading', () => {
     const tracker = asyncTracker.createAsyncTracker();
-    const requestId = asyncTracker.beginAsyncRequest(tracker);
-    assert.equal(tracker.inFlight, 1);
-    // User edits the answer while the request is in flight.
+    const a = asyncTracker.beginAsyncRequest(tracker);
+    // Input changed -> A invalidated.
     asyncTracker.invalidateAsyncRequests(tracker);
-    const settled = asyncTracker.settleAsyncRequest(tracker, requestId);
-    assert.equal(settled.apply, false, 'stale response not applied');
-    assert.equal(settled.loading, false, 'loading released after invalidation');
-    // A newer request started after invalidation keeps loading until it settles.
-    const requestId2 = asyncTracker.beginAsyncRequest(tracker);
-    assert.equal(asyncTracker.settleAsyncRequest(tracker, requestId2).loading, false);
-    assert.equal(asyncTracker.settleAsyncRequest(tracker, requestId2).apply, true);
+    const b = asyncTracker.beginAsyncRequest(tracker);
+    // A finishes late, while B is still in flight.
+    const settledA = asyncTracker.settleAsyncRequest(tracker, a);
+    assert.equal(settledA.apply, false, 'A not applied');
+    assert.equal(settledA.settled, false, 'A was invalidated, not active');
+    assert.equal(settledA.loading, true, 'B still loading after A settles');
+    const settledB = asyncTracker.settleAsyncRequest(tracker, b);
+    assert.equal(settledB.apply, true, 'B applied');
+    assert.equal(settledB.loading, false, 'loading released when B settles');
+    // Double-settling the same request is a no-op.
+    const again = asyncTracker.settleAsyncRequest(tracker, b);
+    assert.equal(again.settled, false);
+    assert.equal(again.loading, false);
+  });
+
+  check('invalidating aborts the in-flight request controller', () => {
+    const tracker = asyncTracker.createAsyncTracker();
+    const id = asyncTracker.beginAsyncRequest(tracker);
+    const controller = new AbortController();
+    asyncTracker.registerAsyncController(tracker, id, controller);
+    asyncTracker.invalidateAsyncRequests(tracker);
+    assert.equal(controller.signal.aborted, true, 'controller aborted');
   });
 
   check('an explicit plan-item mismatch is reported as a partial failure', () => {
@@ -933,6 +947,134 @@ async function run() {
     const previous = transferValidation.previousApprovedTransfers([approvedV1, approvedV2], 'draft-transfer-s1-v2');
     assert.equal(previous.length, 1);
     assert.equal(previous[0].id, 'tp-v1');
+  });
+
+  // ---- Stage 17: completed-link preservation, approval partial save, full flow ----
+  const mkDraft = (id, extra = {}) => ({
+    id, subjectId: 'ls-subj', conceptIds: ['ls-c'], conceptTitles: ['c'], title: id, type: 'essay_descriptive',
+    difficulty: 'advanced_college', categoryLabel: 'c', categoryNumber: 1, promptText: `prompt ${id}`,
+    designIntent: 'd', appliedConditionNote: 'n', sourceRefs: 's', timeStandardMinutes: 20, timeBreakdownDesc: '20',
+    coreEvaluationHighlight: 'e', itemCountDesc: '1', hints: ['h'], modelAnswer: `answer ${id}`,
+    rubric: [{ id: 'r', label: 'r', maxScore: 100, weight: 1, description: 'd' }], status: 'draft',
+    isApproved: false, isDemo: false,
+    verificationStatus: { hasRequiredFields: true, isScore100: true, scoreSum: 100, hasConceptLink: true, isSourceVerified: false },
+    createdAt: 't', updatedAt: 't', ...extra,
+  });
+
+  check('a completed plan item linked to another attempt is preserved on conflict', () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredAttempts([]);
+    storage.saveStoredStudyPlanItems([{ id: 'spi-done', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'p', kind: 'recommended_review', round: 1, assignedDate: '2026-10-01', estimatedMinutes: 15, isEstimatedTime: false, priorityScore: 1, priorityReason: 'r', status: 'completed', completedAt: '2026-10-01T07:00:00+09:00', completedAttemptId: 'att-original', snapshotTitle: 't', snapshotDetail: 'd' }]);
+    const attempt = { id: 'att-new', problemId: 'p', conceptId: c.id, subjectId: c.subjectId, at: '2026-10-01T08:00:00+09:00', answer: 'a', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '', planItemId: 'spi-done' };
+    const result = storage.recordAttemptAndUpdateConcept(attempt, undefined, { planItemId: 'spi-done' });
+    assert.equal(result.status, 'link_conflict', 'conflict status returned');
+    assert.equal(result.partial, true);
+    assert.equal(result.attemptPersisted, true, 'attempt still saved');
+    const item = storage.loadStoredStudyPlanItems().find((i) => i.id === 'spi-done');
+    assert.equal(item.completedAttemptId, 'att-original', 'original completion preserved');
+    assert.equal(result.planLinkage.conflictWithAttemptId, 'att-original');
+    // Same attempt that owns the completion is an idempotent success.
+    const same = storage.recordAttemptAndUpdateConcept({ ...attempt, id: 'att-original' }, undefined, { planItemId: 'spi-done' });
+    assert.ok(['complete', 'already_completed'].includes(same.status), 'same attempt links cleanly');
+  });
+
+  check('approval does not mark the draft approved when the problem save fails', () => {
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-fail')]);
+    const originalSet = localStorage.setItem;
+    const PROB_KEY = 'redcall_problems_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === PROB_KEY) throw new Error('problem storage down');
+      return originalSet(key, value);
+    };
+    let first;
+    try {
+      first = storage.approveProblemDraft('draft-fail');
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+    assert.equal(first.success, false, 'approval reports failure');
+    assert.equal(first.approvedProblem, null, 'no approved problem on failure');
+    assert.equal(storage.loadStoredProblemDrafts().find((d) => d.id === 'draft-fail').isApproved, false, 'draft not marked approved');
+    assert.equal(storage.loadStoredProblems().length, 0, 'problem not stored');
+    // Retry succeeds with the stable id, no duplicate problem and no version bump.
+    const retry = storage.approveProblemDraft('draft-fail');
+    assert.equal(retry.success, true);
+    const probs = storage.loadStoredProblems().filter((p) => p.draftId === 'draft-fail');
+    assert.equal(probs.length, 1, 'no duplicate problem on retry');
+    assert.equal(probs[0].version, 1, 'no duplicate version bump on retry');
+    assert.equal(storage.loadStoredProblemDrafts().find((d) => d.id === 'draft-fail').isApproved, true);
+  });
+
+  check('batch approval reports per-item failure and only approves persisted problems', () => {
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-batch-A'), mkDraft('draft-batch-B')]);
+    const originalSet = localStorage.setItem;
+    const PROB_KEY = 'redcall_problems_v1';
+    localStorage.setItem = (key, value) => {
+      if (key === PROB_KEY && String(value).includes('draft-batch-B')) throw new Error('B storage down');
+      return originalSet(key, value);
+    };
+    let batch;
+    try {
+      batch = storage.batchApproveProblemDrafts(['draft-batch-A', 'draft-batch-B']);
+    } finally {
+      localStorage.setItem = originalSet;
+    }
+    assert.equal(batch.results.find((r) => r.draftId === 'draft-batch-A').status, 'approved');
+    assert.equal(batch.results.find((r) => r.draftId === 'draft-batch-B').status, 'failed');
+    assert.equal(storage.loadStoredProblemDrafts().find((d) => d.id === 'draft-batch-A').isApproved, true);
+    assert.equal(storage.loadStoredProblemDrafts().find((d) => d.id === 'draft-batch-B').isApproved, false);
+    // Recover only the failed item.
+    const recovered = storage.batchApproveProblemDrafts(['draft-batch-B']);
+    assert.equal(recovered.results[0].status, 'approved');
+    assert.equal(storage.loadStoredProblems().filter((p) => p.draftId === 'draft-batch-B').length, 1);
+  });
+
+  await checkAsync('end-to-end flow preserves links across solve, revise, transfer, approve, reserve and refresh', async () => {
+    const c = { ...structuredClone(INITIAL_CONCEPTS[0]), events: [], exerciseCount: 0 };
+    storage.saveStoredConcepts([c]);
+    storage.saveStoredAttempts([]);
+    storage.saveStoredStudyPlanItems([{ id: 'spi-flow', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: 'flow-p', kind: 'recommended_review', round: 1, assignedDate: '2026-10-01', estimatedMinutes: 15, isEstimatedTime: false, priorityScore: 1, priorityReason: 'r', status: 'pending', snapshotTitle: 't', snapshotDetail: 'd' }]);
+
+    // 1) independent solve linked to a plan item
+    const solve = { id: 'att-flow', problemId: 'flow-p', conceptId: c.id, subjectId: c.subjectId, at: '2026-10-01T08:00:00+09:00', answer: 'answer', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '', planItemId: 'spi-flow' };
+    const solveResult = storage.recordAttemptAndUpdateConcept(solve, undefined, { planItemId: 'spi-flow' });
+    assert.equal(solveResult.status, 'complete');
+    assert.equal(storage.loadStoredStudyPlanItems().find((i) => i.id === 'spi-flow').completedAttemptId, 'att-flow');
+
+    // 2) assisted revision stored separately (assisted event only)
+    const revise = { ...solve, id: 'att-flow-rev', calculatedScore: 90, attemptOrigin: 'assisted_revision', sourceAttemptId: 'att-flow' };
+    storage.recordAssistedRevisionAttempt(revise);
+    const afterRevise = storage.loadStoredConcepts()[0];
+    assert.equal(afterRevise.events.find((e) => e.attemptId === 'att-flow-rev').kind, 'assisted_revision');
+    assert.equal(storage.loadStoredAttempts().find((a) => a.id === 'att-flow').calculatedScore, 70, 'original untouched');
+
+    // 3) transfer draft -> approve
+    storage.saveStoredProblems([]);
+    storage.saveStoredProblemDrafts([mkDraft('draft-transfer-flow-v1', { isTransfer: true, sourceProblemId: 'flow-p', logicSessionId: 'logic-att-flow', transferChanges: 'change', understandingFocus: 'focus' })]);
+    const approved = storage.approveProblemDraft('draft-transfer-flow-v1');
+    assert.equal(approved.success, true);
+    assert.equal(approved.approvedProblem.isTransfer, true);
+    assert.equal(approved.approvedProblem.logicSessionId, 'logic-att-flow');
+
+    // 4) reserve + complete the transfer problem with an attempt id
+    logicSession.saveRechallengeReservation({ id: 'rr-flow', subjectId: c.subjectId, subjectName: 'n', conceptId: c.id, problemId: approved.approvedProblem.id, problemVersion: 1, scheduledDate: '2026-10-05', estimatedMinutes: 20, createdAt: 't', status: 'scheduled', isTransfer: true, sourceLogicSessionId: 'logic-att-flow' });
+    const completion = logicSession.completeRechallengeReservation('rr-flow', { attemptId: 'att-flow-transfer', subjectId: c.subjectId, conceptId: c.id, problemId: approved.approvedProblem.id, problemVersion: 1 });
+    assert.equal(completion.status, 'completed');
+    assert.equal(completion.reservations.find((r) => r.id === 'rr-flow').completedAttemptId, 'att-flow-transfer');
+    // A different attempt must not overwrite the completion.
+    const conflict = logicSession.completeRechallengeReservation('rr-flow', { attemptId: 'att-other', subjectId: c.subjectId, conceptId: c.id, problemId: approved.approvedProblem.id, problemVersion: 1 });
+    assert.equal(conflict.status, 'completed_by_other');
+
+    // 5) refresh: recovery is idempotent and leaves no unresolved items
+    const outcome = storage.recoverMissingAttemptEvents();
+    assert.equal(outcome.unresolved.length, 0, 'no unresolved recovery items');
+    assert.equal(storage.loadStoredAttempts().filter((a) => a.id === 'att-flow').length, 1);
+    assert.equal(storage.loadStoredAttempts().filter((a) => a.id === 'att-flow-rev').length, 1);
+    assert.equal(storage.loadStoredConcepts()[0].events.filter((e) => e.attemptId === 'att-flow-rev').length, 1);
+    assert.equal(logicSession.getRechallengeReservation('rr-flow').completedAttemptId, 'att-flow-transfer');
   });
 
   console.log(`${passed} regression checks passed`);

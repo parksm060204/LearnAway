@@ -61,6 +61,7 @@ import {
   loadStoredPersonalizationSettings,
   saveStoredPersonalizationSettings,
   saveStoredPersonalizationState,
+  AttemptSaveStatus,
 } from '../lib/storage';
 import {
   DEFAULT_RETENTION_SETTINGS,
@@ -76,7 +77,6 @@ import {
   completeRechallengeReservation,
   cancelRechallengeReservation,
   getRechallengeReservation,
-  validateReservationForAttempt,
 } from '../lib/logicSession';
 import { LearningAnalyticsModal } from '../components/LearningAnalyticsModal';
 import { LogicStrengthenModal } from '../components/LogicStrengthenModal';
@@ -585,19 +585,26 @@ export default function RedcallDashboardPage() {
   };
 
   const handleApproveProblemDraft = (draftId: string) => {
-    const { approvedProblem, updatedDrafts, updatedProblems } = approveProblemDraft(draftId);
-    if (approvedProblem) {
-      setProblemDrafts(updatedDrafts);
-      setAllProblems(updatedProblems);
+    const { success, approvedProblem, updatedDrafts, updatedProblems, error } = approveProblemDraft(draftId);
+    setProblemDrafts(updatedDrafts);
+    setAllProblems(updatedProblems);
+    if (success && approvedProblem) {
       showToast(`문제 [${approvedProblem.title}]이(가) 승인되어 풀이 목록에 등록되었습니다.`);
+    } else {
+      showToast(`문제 승인 저장에 실패했습니다. 초안은 승인되지 않았습니다. (${error || '다시 시도해 주세요.'})`);
     }
   };
 
   const handleBatchApproveProblemDrafts = (draftIds: string[]) => {
-    const { approvedCount, updatedDrafts, updatedProblems } = batchApproveProblemDrafts(draftIds);
+    const { approvedCount, results, updatedDrafts, updatedProblems } = batchApproveProblemDrafts(draftIds);
     setProblemDrafts(updatedDrafts);
     setAllProblems(updatedProblems);
-    showToast(`선택한 문제 ${approvedCount}건이 승인 완료되어 풀이에 등록되었습니다.`);
+    const failed = results.filter((r) => r.status === 'failed').length;
+    if (failed > 0) {
+      showToast(`${approvedCount}건 승인 완료, ${failed}건 저장 실패. 실패한 항목만 다시 시도해 주세요.`);
+    } else {
+      showToast(`선택한 문제 ${approvedCount}건이 승인 완료되어 풀이에 등록되었습니다.`);
+    }
   };
 
   const handleUpdateProblemDraft = (updatedDraft: ProblemDraft) => {
@@ -722,22 +729,15 @@ export default function RedcallDashboardPage() {
   };
 
   // Attempt Submission Handler (Updates ReviewEvent & Retention Score)
-  // Returns { partial } so the caller can keep the session open for a retry.
-  const handleSubmitAttempt = (attempt: Attempt): { partial: boolean; message?: string } => {
-    // Verify the reservation matches this attempt before completing it.
-    if (attempt.rechallengeReservationId) {
-      const reservation = getRechallengeReservation(attempt.rechallengeReservationId);
-      const check = validateReservationForAttempt(reservation, {
-        subjectId: attempt.subjectId,
-        conceptId: attempt.conceptId,
-        problemId: attempt.problemId,
-        problemVersion: attempt.problemVersion,
-      });
-      if (!check.ok && check.reason !== 'already_completed') {
-        return { partial: true, message: check.message || '재도전 예약을 완료할 수 없습니다.' };
-      }
-    }
-
+  // Returns a structured outcome so the caller can distinguish retryable failures
+  // from linkage conflicts/targets that the user must resolve.
+  const handleSubmitAttempt = (attempt: Attempt): {
+    partial: boolean;
+    status: AttemptSaveStatus;
+    attemptPersisted: boolean;
+    eventPersisted: boolean;
+    message?: string;
+  } => {
     const result = recordAttemptAndUpdateConcept(attempt, settings, { planItemId: attempt.planItemId });
 
     const { updatedConcepts, updatedAttempts } = result;
@@ -752,32 +752,62 @@ export default function RedcallDashboardPage() {
       setSelectedEventId(newEvent.id);
     }
 
-    if (result.partial) {
-      return { partial: true };
+    // A plan linkage conflict/missing target takes precedence: the record is saved
+    // but the plan link must be resolved by the user (no blind retry loop).
+    if (result.status === 'link_conflict' || result.status === 'target_missing' || result.status === 'retryable_failure') {
+      return {
+        partial: true,
+        status: result.status,
+        attemptPersisted: result.attemptPersisted,
+        eventPersisted: result.eventPersisted,
+        message: result.message,
+      };
     }
 
-    if (attempt.rechallengeReservationId) {
-      // Attempt is saved; a failed reservation completion is a retryable link failure.
+    // Reservation completion only after the critical record is verified persisted.
+    if (result.attemptPersisted && result.eventPersisted && attempt.rechallengeReservationId) {
       const completion = completeRechallengeReservation(attempt.rechallengeReservationId, {
+        attemptId: attempt.id,
         subjectId: attempt.subjectId,
         conceptId: attempt.conceptId,
         problemId: attempt.problemId,
         problemVersion: attempt.problemVersion,
       });
-      if (completion.status === 'save_failed' || completion.status === 'not_found') {
-        setRechallengeReservations(loadRechallengeReservations());
-        return { partial: true, message: completion.message };
-      }
       setRechallengeReservations(completion.reservations);
+      if (completion.status === 'save_failed' || completion.status === 'not_found') {
+        return {
+          partial: true,
+          status: 'retryable_failure',
+          attemptPersisted: true,
+          eventPersisted: true,
+          message: completion.message,
+        };
+      }
+      if (completion.status === 'completed_by_other' || completion.status === 'cancelled' || completion.status === 'mismatch') {
+        return {
+          partial: true,
+          status: 'link_conflict',
+          attemptPersisted: true,
+          eventPersisted: true,
+          message: completion.message,
+        };
+      }
       showToast(
         completion.status === 'already_completed'
           ? '이미 완료된 재도전 예약입니다. 풀이 기록은 저장되었습니다.'
           : '지연 재도전 완료! 독립 풀이로 기록되었습니다.'
       );
+    } else if (result.status === 'already_completed') {
+      showToast('이미 기록된 풀이입니다.');
     } else {
       showToast(`복습 제출 완료! 모델 점수가 ${attempt.calculatedScore}점으로 즉시 갱신되었습니다.`);
     }
-    return { partial: false };
+    return {
+      partial: false,
+      status: result.status,
+      attemptPersisted: result.attemptPersisted,
+      eventPersisted: result.eventPersisted,
+    };
   };
 
   // Stage 13: Answer-logic strengthening handlers

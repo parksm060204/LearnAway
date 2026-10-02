@@ -26,6 +26,7 @@ import {
   beginAsyncRequest,
   createAsyncTracker,
   invalidateAsyncRequests,
+  registerAsyncController,
   settleAsyncRequest,
 } from '../lib/asyncRequestTracker';
 import {
@@ -270,6 +271,8 @@ export function LogicStrengthenModal({
       return;
     }
     const requestId = beginAsyncRequest(questionsTrackerRef.current);
+    const controller = new AbortController();
+    registerAsyncController(questionsTrackerRef.current, requestId, controller);
     const requestSessionId = base.id;
     setIsGenerating(true);
     setError(null);
@@ -278,6 +281,7 @@ export function LogicStrengthenModal({
       const res = await fetch('/api/logic-questions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           subjectId: subject.id,
           domain: subject.domain || 'math_stats',
@@ -340,7 +344,8 @@ export function LogicStrengthenModal({
       });
       setNotice(`질문 세트 v${newVersion}이 생성되었습니다. 이전 질문과 응답은 이력으로 보존됩니다.`);
     } catch (cause) {
-      if (mountedRef.current && requestId === questionsTrackerRef.current.generation) {
+      const aborted = cause instanceof Error && cause.name === 'AbortError';
+      if (!aborted && mountedRef.current && requestId === questionsTrackerRef.current.generation) {
         setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
       }
     } finally {
@@ -385,12 +390,15 @@ export function LogicStrengthenModal({
       sessionId: base.id,
     };
     const requestId = beginAsyncRequest(evalTrackerRef.current);
+    const controller = new AbortController();
+    registerAsyncController(evalTrackerRef.current, requestId, controller);
     setIsEvaluating(true);
     setError(null);
     try {
       const res = await fetch('/api/evaluate-answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           problemId: base.problemId,
           conceptId: base.conceptId,
@@ -436,7 +444,8 @@ export function LogicStrengthenModal({
         status: 'revised_evaluated',
       });
     } catch (cause) {
-      if (mountedRef.current && requestId === evalTrackerRef.current.generation) {
+      const aborted = cause instanceof Error && cause.name === 'AbortError';
+      if (!aborted && mountedRef.current && requestId === evalTrackerRef.current.generation) {
         setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
       }
     } finally {
@@ -566,6 +575,8 @@ export function LogicStrengthenModal({
       return;
     }
     const requestId = beginAsyncRequest(transferTrackerRef.current);
+    const controller = new AbortController();
+    registerAsyncController(transferTrackerRef.current, requestId, controller);
     const requestSessionId = base.id;
     setIsGeneratingTransfer(true);
     setError(null);
@@ -577,6 +588,7 @@ export function LogicStrengthenModal({
       const res = await fetch('/api/transfer-problem', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           subjectId: subject.id,
           domain: subject.domain || 'math_stats',
@@ -682,7 +694,8 @@ export function LogicStrengthenModal({
       });
       setNotice('전이 문제 초안이 생성되었습니다. 검토·승인 전에는 학습 계획에 배정되지 않습니다.');
     } catch (cause) {
-      if (mountedRef.current && requestId === transferTrackerRef.current.generation) {
+      const aborted = cause instanceof Error && cause.name === 'AbortError';
+      if (!aborted && mountedRef.current && requestId === transferTrackerRef.current.generation) {
         setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
       }
     } finally {

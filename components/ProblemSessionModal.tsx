@@ -13,6 +13,7 @@ import {
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
 import { ProblemReportModal } from './ProblemReportModal';
+import { AttemptSaveStatus } from '../lib/storage';
 import {
   X,
   Lightbulb,
@@ -49,7 +50,13 @@ interface ProblemSessionModalProps {
   subject: Subject;
   concept: Concept;
   problem: Problem;
-  onSubmitAttempt: (attempt: Attempt) => { partial: boolean; message?: string };
+  onSubmitAttempt: (attempt: Attempt) => {
+    partial: boolean;
+    status: AttemptSaveStatus;
+    attemptPersisted: boolean;
+    eventPersisted: boolean;
+    message?: string;
+  };
   /** 지연 재도전 예약에서 시작한 경우 전달. 확정 시 예약을 완료 처리하고 독립 풀이로 표시한다. */
   rechallengeReservationId?: string;
   /** 실행한 학습 계획 항목 ID (추적용). */
@@ -91,7 +98,12 @@ export function ProblemSessionModal({
   const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
   const [evaluatedSnapshot, setEvaluatedSnapshot] = useState<EvaluationInputSnapshot | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitNotice, setSubmitNotice] = useState<string | null>(null);
+  const [submitOutcome, setSubmitOutcome] = useState<{
+    status: AttemptSaveStatus;
+    attemptPersisted: boolean;
+    eventPersisted: boolean;
+    message: string;
+  } | null>(null);
   const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(false);
   const [wasModelAnswerRevealed, setWasModelAnswerRevealed] = useState(false);
 
@@ -295,11 +307,18 @@ export function ProblemSessionModal({
     try {
       const result = onSubmitAttempt(newAttempt);
       if (result.partial) {
-        // 풀이/이벤트는 저장됐지만 계획 연결(또는 예약 완료)이 실패한 부분 저장:
-        // 모달을 닫지 않고 재시도를 안내한다. 재시도는 같은 Attempt ID를 사용하며 AI를 다시 호출하지 않는다.
-        setSubmitNotice(
-          result.message || '풀이 기록은 저장됐지만 학습 계획 완료 반영은 실패했습니다. 재시도해 주세요.'
-        );
+        // Distinguish retryable save failures from linkage conflicts/missing targets.
+        // Retry reuses the same Attempt ID and never re-calls the AI.
+        setSubmitOutcome({
+          status: result.status,
+          attemptPersisted: result.attemptPersisted,
+          eventPersisted: result.eventPersisted,
+          message:
+            result.message ||
+            (result.status === 'retryable_failure'
+              ? '풀이 기록 저장이 일부만 완료되었습니다. 같은 기록으로 다시 시도해 주세요.'
+              : '계획/예약 연결을 확인해 주세요.'),
+        });
         setIsSubmitting(false);
         return;
       }
@@ -1080,10 +1099,37 @@ export function ProblemSessionModal({
                   </button>
                 </div>
 
-                {submitNotice && (
-                  <p role="alert" className="w-full p-2.5 bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded-xs">
-                    {submitNotice}
-                  </p>
+                {submitOutcome && (
+                  <div role="alert" className="w-full p-2.5 bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded-xs space-y-1.5">
+                    <p>{submitOutcome.message}</p>
+                    <p className="text-[10.5px]">
+                      {submitOutcome.attemptPersisted && submitOutcome.eventPersisted
+                        ? '풀이 기록은 저장되었습니다.'
+                        : '풀이 기록이 아직 완전히 저장되지 않았습니다.'}
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {submitOutcome.status === 'retryable_failure' && (
+                        <button
+                          type="button"
+                          onClick={handleConfirmAndRecord}
+                          disabled={isSubmitting}
+                          className="px-2.5 py-1 text-[11px] bg-[#191817] text-white rounded-xs font-bold disabled:opacity-50"
+                        >
+                          재시도 (AI 재평가 없음)
+                        </button>
+                      )}
+                      {(submitOutcome.status === 'link_conflict' || submitOutcome.status === 'target_missing') &&
+                        submitOutcome.attemptPersisted && (
+                          <button
+                            type="button"
+                            onClick={onClose}
+                            className="px-2.5 py-1 text-[11px] border border-[#ded6c8] rounded-xs hover:bg-white font-semibold"
+                          >
+                            기록만 보존하고 닫기
+                          </button>
+                        )}
+                    </div>
+                  </div>
                 )}
 
                 <button
@@ -1096,7 +1142,7 @@ export function ProblemSessionModal({
                   <span>
                     {isSubmitting
                       ? '기록 저장 중...'
-                      : submitNotice
+                      : submitOutcome?.status === 'retryable_failure'
                       ? '계획 연결 재시도 (AI 재평가 없음)'
                       : '결과 확인 및 복습 이력에 기록 확정하기'}
                   </span>

@@ -689,6 +689,8 @@ export interface RechallengeReservation {
   sourceLogicSessionId?: string;
   sourceAttemptId?: string;
   isTransfer?: boolean; // 전이 문제 예약 여부
+  completedAttemptId?: string; // 완료 처리 시 연결된 Attempt (덮어쓰지 않음)
+  completedAt?: string;
   note?: string;
 }
 
