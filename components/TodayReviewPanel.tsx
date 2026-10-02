@@ -9,6 +9,7 @@ import {
   ReviewRecommendation,
   isProblemAvailableForPractice,
 } from '../lib/types';
+import { AcademicMathView } from './AcademicMathView';
 import {
   Target,
   Clock,
@@ -299,7 +300,7 @@ export function TodayReviewPanel({
             EXERCISE PROMPT § {activeProblem.title}
           </div>
           <p className="text-sm sm:text-[14px] text-[#191817] leading-[1.65] korean-prose line-clamp-3">
-            &ldquo;{activeProblem.promptText}&rdquo;
+            &ldquo;<AcademicMathView inline content={activeProblem.promptText} />&rdquo;
           </p>
         </div>
       )}

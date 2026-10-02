@@ -13,6 +13,7 @@ import {
 } from '../lib/types';
 import { expireMockExam, getExamScore, loadMockExams, saveMockExam, selectMockExamProblems, updateMockExamAnswer } from '../lib/mockExam';
 import { loadStoredSettings, recordAttemptAndUpdateConcept } from '../lib/storage';
+import { AcademicMathView } from './AcademicMathView';
 import { X, Clock, Award, Compass, HelpCircle } from 'lucide-react';
 
 /** 계획(StudyPlanItem)에서 모의시험을 시작할 때 전달하는 실행 설정 스냅샷 */
@@ -360,7 +361,7 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
           {history.length > 0 && <section className="border-t pt-3"><h3 className="font-semibold">지난 모의시험</h3>{history.map((item) => <details key={item.id} className="border p-2 my-2 text-xs"><summary className="cursor-pointer">{new Date(item.createdAt).toLocaleString('ko-KR')} · {item.problems.length}문항 · AI 평가 평균 {getExamScore(item) ?? '미평가'}점</summary>
             {item.problems.map((p, i) => <div key={p.id} className="border-t mt-2 pt-2 space-y-1">
               <strong>{i + 1}. {p.title} · 버전 {p.version ?? 1}</strong>
-              <p className="whitespace-pre-wrap">{p.promptText}</p>
+              <div className="whitespace-pre-wrap"><AcademicMathView content={p.promptText} /></div>
               <p><strong>제출 풀이:</strong> {item.answers[p.id] || '미응답'}</p>
               <p><strong>방법 선택 이유:</strong> {item.isReasonNotApplicable?.[p.id] ? `[해당 없음] ${item.reasonNotApplicableJustification?.[p.id] || ''}` : (item.reasons?.[p.id] || '이유 서술 없음')}</p>
               <p><strong>풀이 점수:</strong> {item.evaluations[p.id]?.calculatedScore ?? 0}점 · {item.evaluations[p.id]?.feedback || '미응답'}</p>
@@ -372,8 +373,8 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
           <nav className="flex flex-wrap gap-2" aria-label="문항 이동">{session.problems.map((p, i) => <button key={p.id} onClick={() => setIndex(i)} className={`border px-2 py-1 ${index === i ? 'bg-[#191817] text-white' : ''}`}>{i + 1}{session.answers[p.id]?.trim() ? ' ✓' : ''}</button>)}</nav>
           {current && <section className="space-y-3">
             <div className="text-xs text-[#827d73]">문항 {index + 1}/{session.problems.length} · {labels[current.type]} · 권장 {current.timeStandardMinutes}분 · 버전 {current.version ?? 1}</div>
-            <h3 className="font-bold text-lg">{current.title}</h3><p className="whitespace-pre-wrap leading-relaxed">{current.promptText}</p>
-            {current.mathFormula && <pre className="overflow-x-auto bg-[#faf8f4] p-2">{current.mathFormula}</pre>}
+            <h3 className="font-bold text-lg">{current.title}</h3><div className="whitespace-pre-wrap leading-relaxed"><AcademicMathView content={current.promptText} /></div>
+            {current.mathFormula && <div className="p-2.5 bg-white border border-[#e2ded6] rounded-xs text-center overflow-x-auto"><AcademicMathView content={current.mathFormula} displayMode /></div>}
             {current.codeSnippet && <pre className="overflow-x-auto bg-[#191817] text-white p-2">{current.codeSnippet}</pre>}
 
             {/* Dual Input: Solution & Method Reason */}
@@ -462,7 +463,7 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
               </div>
             </div>
 
-            {session.status !== 'in_progress' && <p className="text-xs text-[#827d73]">모범 답안: {current.modelAnswer}</p>}
+            {session.status !== 'in_progress' && <div className="text-xs text-[#827d73]"><strong>모범 답안:</strong> <AcademicMathView content={current.modelAnswer} /></div>}
 
             {/* Graded Result View: Zone 1 (Solution Score) & Zone 2 (Method Reason Diagnosis) */}
             {session.evaluations[current.id] && (
@@ -480,7 +481,7 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
                       <span className="font-semibold text-[#191817]">{r.label}:</span> {r.score}/{r.maxScore}점 · {r.feedback || r.deductionReason}
                     </div>
                   ))}
-                  <p className="text-xs text-[#191817] pt-1">{session.evaluations[current.id].feedback}</p>
+                  <div className="text-xs text-[#191817] pt-1"><AcademicMathView content={session.evaluations[current.id].feedback} /></div>
                 </div>
 
                 {/* Zone 2: Method Selection Diagnosis */}

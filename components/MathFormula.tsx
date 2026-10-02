@@ -1,7 +1,7 @@
 'use client';
 
-import React, { useMemo } from 'react';
-import katex from 'katex';
+import React from 'react';
+import { safeRenderKaTeX, proofreadAcademicText, parseLeanDeclaration } from '../lib/academicProofing';
 
 interface MathFormulaProps {
   math: string;
@@ -10,18 +10,13 @@ interface MathFormulaProps {
 }
 
 export function MathFormula({ math, displayMode = false, className = '' }: MathFormulaProps) {
-  const html = useMemo(() => {
-    try {
-      return katex.renderToString(math, {
-        displayMode,
-        throwOnError: false,
-        strict: false,
-      });
-    } catch (e) {
-      console.warn('KaTeX render error:', e);
-      return `<span class="font-academic-mono text-sm">${math}</span>`;
-    }
-  }, [math, displayMode]);
+  if (!math) return null;
+
+  const leanParsed = parseLeanDeclaration(math);
+  const targetMath = leanParsed
+    ? leanParsed.fullFormula
+    : proofreadAcademicText(math.trim().replace(/^\$\$([\s\S]*)\$\$$/, '$1').replace(/^\$([^\$]+)\$$/, '$1')).replace(/^\$\$([\s\S]*)\$\$$/, '$1').replace(/^\$([^\$]+)\$$/, '$1');
+  const html = safeRenderKaTeX(targetMath, displayMode);
 
   return (
     <span

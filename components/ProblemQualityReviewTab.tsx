@@ -12,6 +12,7 @@ import {
   Material,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
+import { AcademicMathView } from './AcademicMathView';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -523,7 +524,7 @@ export function ProblemQualityReviewTab({
                     </h4>
 
                     <p className="text-[11px] text-[#57544e] line-clamp-2 leading-relaxed">
-                      {p.promptText}
+                      <AcademicMathView inline content={p.promptText} />
                     </p>
 
                     {openReportsCount > 0 && (
@@ -901,7 +902,7 @@ export function ProblemQualityReviewTab({
                         문제 지문 (PROMPT):
                       </div>
                       <p className="text-sm sm:text-base font-bold text-[#191817] font-academic-serif leading-relaxed korean-prose whitespace-pre-wrap">
-                        {activeProblem.promptText}
+                        <AcademicMathView content={activeProblem.promptText} />
                       </p>
                     </div>
 
@@ -927,7 +928,7 @@ export function ProblemQualityReviewTab({
                           {activeProblem.hints.map((h, i) => (
                             <div key={i} className="text-[11.5px] text-[#2e2c29] flex items-start gap-1.5">
                               <span className="font-mono text-[#c52828] font-bold shrink-0">[{i + 1}]</span>
-                              <span>{h}</span>
+                              <span><AcademicMathView inline content={h} /></span>
                             </div>
                           ))}
                         </div>
@@ -951,7 +952,7 @@ export function ProblemQualityReviewTab({
                       </button>
                       {isModelAnswerVisible && (
                         <div className="p-4 bg-white text-xs leading-relaxed text-[#191817] whitespace-pre-wrap border-t border-[#ded6c8] font-serif">
-                          {activeProblem.modelAnswer}
+                          <AcademicMathView content={activeProblem.modelAnswer} />
                         </div>
                       )}
                     </div>
@@ -1248,7 +1249,7 @@ export function ProblemQualityReviewTab({
                                   v{snap.version} 당시 문제 지문:
                                 </span>
                                 <p className="korean-prose whitespace-pre-wrap text-[11.5px] text-[#2e2c29] bg-[#fcfbf9] p-2.5 rounded-2xs border border-[#ded6c8]">
-                                  {snap.promptText}
+                                  <AcademicMathView content={snap.promptText} />
                                 </p>
                               </div>
 
@@ -1257,7 +1258,7 @@ export function ProblemQualityReviewTab({
                                   v{snap.version} 당시 모범 답안:
                                 </span>
                                 <p className="font-serif whitespace-pre-wrap text-[11.5px] text-[#2e2c29] bg-[#fcfbf9] p-2.5 rounded-2xs border border-[#ded6c8]">
-                                  {snap.modelAnswer}
+                                  <AcademicMathView content={snap.modelAnswer} />
                                 </p>
                               </div>
 

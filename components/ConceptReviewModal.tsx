@@ -11,6 +11,7 @@ import {
   markConceptAsLearned,
 } from '../lib/storage';
 import { computeMarkdownHash } from '../lib/markdownUtils';
+import { AcademicMathView } from './AcademicMathView';
 import {
   X,
   Sparkles,
@@ -618,7 +619,7 @@ export function ConceptReviewModal({
 
                     {activeDraft.sourceEvidence.quote && (
                       <div className="p-2.5 bg-white border border-[#ded6c8] rounded text-[11px] font-academic-mono italic text-[#2e2c29] leading-relaxed">
-                        &quot;{activeDraft.sourceEvidence.quote}&quot;
+                        &quot;<AcademicMathView inline content={activeDraft.sourceEvidence.quote} />&quot;
                       </div>
                     )}
 

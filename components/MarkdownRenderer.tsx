@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useMemo } from 'react';
-import katex from 'katex';
+import { proofreadAcademicText, safeRenderKaTeX } from '../lib/academicProofing';
 
 interface MarkdownRendererProps {
   content: string;
@@ -19,30 +19,20 @@ export function MarkdownRenderer({
   const renderedHtml = useMemo(() => {
     if (!content) return '';
 
-    let text = content;
+    // Proofread text: converts Lean blocks, bare LaTeX, and double-escape artifacts
+    let text = proofreadAcademicText(content);
 
     // 1. Process display math blocks: $$ ... $$
     text = text.replace(/\$\$([\s\S]*?)\$\$/g, (_, equation) => {
-      try {
-        return `<div class="my-3 py-2 px-3 bg-[#faf8f5] border border-[#e8e4dc] rounded text-center overflow-x-auto">${katex.renderToString(
-          equation.trim(),
-          { displayMode: true, throwOnError: false }
-        )}</div>`;
-      } catch {
-        return `<div class="my-2 p-2 bg-red-50 text-red-700 font-mono text-xs">$$\n${equation}\n$$</div>`;
-      }
+      return `<div class="my-3 py-2 px-3 bg-[#faf8f5] border border-[#e8e4dc] rounded text-center overflow-x-auto select-text">${safeRenderKaTeX(
+        equation,
+        true
+      )}</div>`;
     });
 
     // 2. Process inline math: $ ... $
     text = text.replace(/\$([^\$\n]+?)\$/g, (_, equation) => {
-      try {
-        return katex.renderToString(equation.trim(), {
-          displayMode: false,
-          throwOnError: false,
-        });
-      } catch {
-        return `<code class="bg-red-50 text-red-600 px-1 py-0.5 rounded text-xs">$${equation}$</code>`;
-      }
+      return safeRenderKaTeX(equation, false);
     });
 
     // 3. Process Page & Speech anchors

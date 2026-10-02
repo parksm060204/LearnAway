@@ -10,6 +10,7 @@ import {
   Material,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
+import { AcademicMathView } from './AcademicMathView';
 import { computeMarkdownHash } from '../lib/markdownUtils';
 import {
   X,
@@ -704,7 +705,7 @@ export function ProblemReviewModal({
                       </div>
                     ) : (
                       <div className="text-sm sm:text-base text-[#191817] leading-relaxed korean-prose whitespace-pre-wrap">
-                        {activeDraft.promptText}
+                        <AcademicMathView content={activeDraft.promptText} />
                       </div>
                     )}
 
@@ -809,7 +810,7 @@ export function ProblemReviewModal({
                       <ol className="space-y-1.5 text-xs text-[#57544e] list-decimal list-inside leading-relaxed">
                         {activeDraft.hints.map((hint, idx) => (
                           <li key={idx} className="p-2 bg-[#faf8f4] rounded-xs border border-[#f1ede4]">
-                            {hint}
+                            <AcademicMathView inline content={hint} />
                           </li>
                         ))}
                       </ol>
@@ -854,7 +855,7 @@ export function ProblemReviewModal({
                         />
                       ) : (
                         <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs text-xs sm:text-sm text-[#191817] whitespace-pre-wrap leading-relaxed korean-prose">
-                          {activeDraft.modelAnswer}
+                          <AcademicMathView content={activeDraft.modelAnswer} />
                         </div>
                       )}
                     </div>

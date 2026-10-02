@@ -12,6 +12,7 @@ import {
   METHOD_REASON_RATING_LABELS,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
+import { AcademicMathView } from './AcademicMathView';
 import { ProblemReportModal } from './ProblemReportModal';
 import { AttemptSaveStatus } from '../lib/storage';
 import {
@@ -431,7 +432,7 @@ export function ProblemSessionModal({
             )}
 
             <h3 className="text-base sm:text-[17px] font-bold text-[#191817] font-academic-serif leading-[1.75] korean-prose">
-              {problem.promptText}
+              <AcademicMathView content={problem.promptText} />
             </h3>
 
             {problem.mathFormula && (
@@ -493,7 +494,9 @@ export function ProblemSessionModal({
                           <span className="font-academic-mono font-bold text-[#c52828] shrink-0">
                             [힌트 {idx + 1}]
                           </span>
-                          <span className="korean-prose">{hint}</span>
+                          <div className="korean-prose flex-1">
+                            <AcademicMathView content={hint} />
+                          </div>
                         </div>
                       ) : (
                         <div className="flex items-center justify-between">
@@ -551,7 +554,7 @@ export function ProblemSessionModal({
                   <div className="font-academic-mono text-[11px] text-[#827d73] font-semibold mb-1">
                     출제자 모범 답안 및 핵심 논증 단계:
                   </div>
-                  {problem.modelAnswer}
+                  <AcademicMathView content={problem.modelAnswer} />
                 </div>
               )}
             </div>
@@ -917,7 +920,7 @@ export function ProblemSessionModal({
                         <div className="text-[11px] text-[#57544e]">
                           <strong className="text-[#827d73] font-academic-mono">확인 근거: </strong>
                           <span className="italic">
-                            &ldquo;{rubric.evidenceQuote}&rdquo;
+                            &ldquo;<AcademicMathView inline content={rubric.evidenceQuote} />&rdquo;
                           </span>
                         </div>
                       )}
@@ -927,7 +930,7 @@ export function ProblemSessionModal({
                         <div className="text-[11px] text-[#57544e]">
                           <strong className="text-[#827d73] font-academic-mono">감점 요인: </strong>
                           <span className={rubric.isVulnerable ? 'text-[#c52828]' : ''}>
-                            {rubric.deductionReason}
+                            <AcademicMathView inline content={rubric.deductionReason} />
                           </span>
                         </div>
                       )}
@@ -936,7 +939,7 @@ export function ProblemSessionModal({
                       {rubric.improvementTip && (
                         <div className="text-[11px] text-[#191817] bg-[#faf8f4] p-1.5 rounded-2xs border border-[#f1ede4]">
                           <strong className="text-[#827d73] font-academic-mono">개선 방법: </strong>
-                          {rubric.improvementTip}
+                          <AcademicMathView inline content={rubric.improvementTip} />
                         </div>
                       )}
                     </div>
@@ -949,7 +952,7 @@ export function ProblemSessionModal({
                 <strong className="text-[#827d73] block font-academic-mono text-[11px] font-semibold">
                   풀이 종합 학술 첨삭 총평:
                 </strong>
-                <p>{evaluationResult.feedback}</p>
+                <AcademicMathView content={evaluationResult.feedback} />
               </div>
 
               {/* Stage 8: Method Selection Reason Diagnosis Zone (Independent from rubric score) */}
@@ -1014,13 +1017,13 @@ export function ProblemSessionModal({
                           {/* Student evidence quote */}
                           <div className="text-[11px] text-[#57544e]">
                             <strong className="text-[#827d73] font-academic-mono text-[10.5px]">확인된 근거: </strong>
-                            <span className="italic text-[#2e2c29]">&ldquo;{crit.evidence}&rdquo;</span>
+                            <span className="italic text-[#2e2c29]">&ldquo;<AcademicMathView inline content={crit.evidence} />&rdquo;</span>
                           </div>
 
                           {/* Feedback */}
                           <div className="text-[11px] text-[#191817] bg-[#fbfbfe] p-1.5 rounded-2xs border border-indigo-100">
                             <strong className="text-indigo-900 font-academic-mono text-[10.5px]">진단 내용: </strong>
-                            <span>{crit.feedback}</span>
+                            <span><AcademicMathView inline content={crit.feedback} /></span>
                           </div>
                         </div>
                       );
@@ -1035,7 +1038,7 @@ export function ProblemSessionModal({
                       이유 진단 종합 총평:
                     </strong>
                     <p className="leading-relaxed">
-                      {evaluationResult.methodSelectionDiagnosis.summary}
+                      <AcademicMathView content={evaluationResult.methodSelectionDiagnosis.summary} />
                     </p>
                   </div>
                 )}

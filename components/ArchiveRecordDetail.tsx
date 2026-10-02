@@ -10,6 +10,7 @@ import {
   isProblemAvailableForPractice,
 } from '../lib/types';
 import { ProblemReportModal } from './ProblemReportModal';
+import { AcademicMathView } from './AcademicMathView';
 import {
   FileText,
   ExternalLink,
@@ -336,7 +337,7 @@ export function ArchiveRecordDetail({
                           {matchedProblem.title}
                         </div>
                         <p className="text-[11.5px] text-[#2e2c29] leading-relaxed whitespace-pre-wrap">
-                          {matchedProblem.promptText}
+                          <AcademicMathView content={matchedProblem.promptText} />
                         </p>
                         <div className="pt-1 text-[10.5px] font-academic-mono text-[#827d73]">
                           최신 모범 답안: {matchedProblem.modelAnswer.slice(0, 120)}...
@@ -483,7 +484,7 @@ export function ArchiveRecordDetail({
                               <span className="italic line-clamp-2">&ldquo;{crit.evidence}&rdquo;</span>
                             </div>
                             <p className="text-[11px] text-[#191817] bg-[#fbfbfe] p-1.5 rounded-2xs border border-indigo-50">
-                              {crit.feedback}
+                              <AcademicMathView inline content={crit.feedback} />
                             </p>
                           </div>
                         );
@@ -493,7 +494,7 @@ export function ArchiveRecordDetail({
                     {matchingAttempt.methodSelectionDiagnosis.summary && (
                       <div className="p-2.5 bg-white border border-indigo-200/70 rounded-xs text-xs text-[#191817]">
                         <strong className="block text-[11px] font-mono text-indigo-900 mb-0.5">이유 진단 종합 총평:</strong>
-                        <span>{matchingAttempt.methodSelectionDiagnosis.summary}</span>
+                        <div className="leading-relaxed"><AcademicMathView content={matchingAttempt.methodSelectionDiagnosis.summary} /></div>
                       </div>
                     )}
 
@@ -540,7 +541,7 @@ export function ArchiveRecordDetail({
                     </button>
                     {isModelAnswerExpanded && (
                       <div className="p-3 bg-white text-xs leading-relaxed text-[#191817] whitespace-pre-wrap border-t border-[#ded6c8]">
-                        {matchingAttempt.modelAnswerSnapshot}
+                        <AcademicMathView content={matchingAttempt.modelAnswerSnapshot} />
                       </div>
                     )}
                   </div>

@@ -14,6 +14,7 @@ import {
   Subject,
   METHOD_REASON_RATING_LABELS,
 } from '../lib/types';
+import { AcademicMathView } from './AcademicMathView';
 import {
   getActiveLogicSessionId,
   loadLogicSessionsForAttempt,
@@ -812,7 +813,7 @@ export function LogicStrengthenModal({
             </div>
             {originalDiag && (
               <div className="text-[11px] text-indigo-900 bg-indigo-50/70 border border-indigo-100 p-2 rounded-2xs">
-                <strong>방법 선택 진단:</strong> {originalDiag.summary}
+                <strong>방법 선택 진단:</strong> <AcademicMathView inline content={originalDiag.summary} />
               </div>
             )}
           </section>
@@ -849,9 +850,9 @@ export function LogicStrengthenModal({
               <ul className="space-y-2">
                 {session.questions.map((q, idx) => (
                   <li key={q.id} className="bg-[#faf8f4] border border-[#ded6c8] rounded-xs p-2.5 space-y-1">
-                    <div className="text-xs font-semibold text-[#191817]">Q{idx + 1}. {q.question}</div>
+                    <div className="text-xs font-semibold text-[#191817]">Q{idx + 1}. <AcademicMathView inline content={q.question} /></div>
                     {q.linkedQuote && <div className="text-[11px] text-[#827d73]">근거: &ldquo;{q.linkedQuote}&rdquo;</div>}
-                    {q.guidance && <div className="text-[11px] text-indigo-800">방향: {q.guidance}</div>}
+                    {q.guidance && <div className="text-[11px] text-indigo-800">방향: <AcademicMathView inline content={q.guidance} /></div>}
                     <textarea
                       className="w-full border border-[#ded6c8] p-2 text-xs rounded-xs bg-white"
                       rows={2}
@@ -897,7 +898,7 @@ export function LogicStrengthenModal({
             {session.revisedEvaluation && (
               <div className={`border p-3 rounded-xs text-xs space-y-1 ${evaluatedMatches ? 'bg-[#faf8f4] border-[#ded6c8]' : 'bg-amber-50 border-amber-300'}`}>
                 <div className="font-semibold text-[#191817]">보완 답안 평가: {session.revisedEvaluation.calculatedScore}점</div>
-                <p className="text-[#57544e]">{session.revisedEvaluation.feedback}</p>
+                <div className="text-[#57544e] leading-relaxed"><AcademicMathView content={session.revisedEvaluation.feedback} /></div>
                 {evaluatedMatches ? (
                   <div className="text-[11px] text-[#827d73]">원본 {session.originalScore}점 → 보완 {session.revisedEvaluation.calculatedScore}점 (동일 문제 참고용, 원본은 변경되지 않음)</div>
                 ) : (
