@@ -58,6 +58,7 @@ exports.requireApiUser = async () => {
   const redirects = load(path.join(output, 'lib/auth/redirects.js'));
   const legacyImport = load(path.join(output, 'lib/legacyImport.js'));
   const appReadiness = load(path.join(output, 'lib/appReadiness.js'));
+  const storageScope = load(path.join(output, 'lib/storageScope.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
@@ -208,6 +209,127 @@ exports.requireApiUser = async () => {
   // ---- Stage 11: material storage reliability ----
   const checkAsync = async (name, fn) => { await fn(); passed++; console.log(`PASS ${name}`); };
 
+  // A minimal in-memory IndexedDB that supports the operations materialStorage
+  // uses, with failure injection so read/write/abort paths can be exercised
+  // without replacing the service under test.
+  function createFakeIndexedDB() {
+    const databases = new Map();
+    const failure = { get: new Set(), getAll: false, put: new Set(), abortPut: new Set(), corruptPut: new Set() };
+
+    const recordFor = (name) => {
+      if (!databases.has(name)) databases.set(name, new Map());
+      return databases.get(name);
+    };
+
+    const makeRequest = () => ({ onsuccess: null, onerror: null, onupgradeneeded: null, result: undefined, error: null });
+
+    const makeTransaction = (stores, storeName) => {
+      if (!stores.has(storeName)) stores.set(storeName, new Map());
+      const store = stores.get(storeName);
+      const tx = { oncomplete: null, onerror: null, onabort: null, error: null, _settled: false };
+      const finish = (kind, error) => {
+        if (tx._settled) return;
+        tx._settled = true;
+        if (kind === 'complete') {
+          if (tx.oncomplete) tx.oncomplete();
+          return;
+        }
+        tx.error = error || new Error(kind);
+        if (kind === 'abort') { if (tx.onabort) tx.onabort(); }
+        else if (tx.onerror) tx.onerror();
+      };
+      const api = {
+        get: (id) => {
+          const req = makeRequest();
+          setTimeout(() => {
+            if (failure.get.has(id)) { req.error = new Error('injected read failure'); if (req.onerror) req.onerror(); finish('error', req.error); return; }
+            req.result = store.has(id) ? structuredClone(store.get(id)) : undefined;
+            if (req.onsuccess) req.onsuccess();
+          }, 0);
+          return req;
+        },
+        getAll: () => {
+          const req = makeRequest();
+          setTimeout(() => {
+            if (failure.getAll) { req.error = new Error('injected getAll failure'); if (req.onerror) req.onerror(); return; }
+            req.result = Array.from(store.values()).map((value) => structuredClone(value));
+            if (req.onsuccess) req.onsuccess();
+          }, 0);
+          return req;
+        },
+        getAllKeys: () => {
+          const req = makeRequest();
+          setTimeout(() => { req.result = Array.from(store.keys()); if (req.onsuccess) req.onsuccess(); }, 0);
+          return req;
+        },
+        put: (value) => {
+          const req = makeRequest();
+          setTimeout(() => {
+            if (failure.abortPut.has(value.materialId)) { finish('abort', new Error('injected abort')); return; }
+            if (failure.put.has(value.materialId)) { req.error = new Error('injected write failure'); if (req.onerror) req.onerror(); finish('error', req.error); return; }
+            if (failure.corruptPut.has(value.materialId)) {
+              store.set(value.materialId, structuredClone({ ...value, markdown: String(value.markdown || '') + ' corrupted' }));
+              req.result = value.materialId;
+              if (req.onsuccess) req.onsuccess();
+              finish('complete');
+              return;
+            }
+            store.set(value.materialId, structuredClone(value));
+            req.result = value.materialId;
+            if (req.onsuccess) req.onsuccess();
+            finish('complete');
+          }, 0);
+          return req;
+        },
+        delete: (id) => {
+          const req = makeRequest();
+          setTimeout(() => { store.delete(id); if (req.onsuccess) req.onsuccess(); finish('complete'); }, 0);
+          return req;
+        },
+        clear: () => {
+          const req = makeRequest();
+          setTimeout(() => { store.clear(); if (req.onsuccess) req.onsuccess(); finish('complete'); }, 0);
+          return req;
+        },
+      };
+      tx.objectStore = () => api;
+      return tx;
+    };
+
+    return {
+      __failure: failure,
+      __databases: databases,
+      open(name) {
+        const request = makeRequest();
+        setTimeout(() => {
+          const stores = recordFor(name);
+          const db = {
+            name,
+            objectStoreNames: { contains: (storeName) => stores.has(storeName) },
+            createObjectStore: (storeName) => { if (!stores.has(storeName)) stores.set(storeName, new Map()); return {}; },
+            transaction: (storeName, mode) => makeTransaction(stores, storeName, mode || 'readonly'),
+            close: () => {},
+          };
+          request.result = db;
+          if (request.onupgradeneeded) request.onupgradeneeded({ target: request });
+          if (request.onsuccess) request.onsuccess({ target: request });
+        }, 0);
+        return request;
+      },
+    };
+  }
+
+  const withFakeIndexedDB = async (fn) => {
+    const fake = createFakeIndexedDB();
+    window.indexedDB = fake;
+    try {
+      return await fn(fake);
+    } finally {
+      storageScope.setStorageScope({ kind: 'legacy' });
+      delete window.indexedDB;
+    }
+  };
+
   await checkAsync('material save reports memory-only persistence honestly', async () => {
     const saved = await matStorage.saveMaterialContent('mat-x', { markdown: '# hello' });
     assert.equal(saved.persisted, false);
@@ -270,18 +392,68 @@ exports.requireApiUser = async () => {
     assert.equal(legacyImport.isLegacyImportCompleted('user-3'), false);
   });
 
-  await checkAsync('failed import rolls back its writes so a retry is not blocked', async () => {
-    const userId = 'user-rollback';
+  await checkAsync('completion marker failure keeps a resumable job without duplicates', async () => {
+    const userId = 'user-markerfail';
+    const markerKey = 'redcall_user_' + userId + '__legacy_import_v1';
+    const jobKey = 'redcall_user_' + userId + '__legacy_import_job_v1';
+    const subjectKey = 'redcall_user_' + userId + '__subjects_v1';
+    const attemptsKey = 'redcall_user_' + userId + '__attempts_v1';
+    localStorage.removeItem(markerKey);
+    localStorage.removeItem(jobKey);
+    localStorage.removeItem(subjectKey);
+    localStorage.removeItem(attemptsKey);
+
+    const legacySubjects = localStorage.getItem('redcall_subjects_v1');
+    const legacyAttempts = localStorage.getItem('redcall_attempts_v1');
+
     const realSetItem = localStorage.setItem.bind(localStorage);
-    let shouldFail = true;
     localStorage.setItem = (key, value) => {
-      if (shouldFail && key.endsWith('__attempts_v1')) {
-        shouldFail = false;
-        throw new Error('simulated quota failure');
-      }
+      if (key === markerKey) throw new Error('simulated marker write failure');
       realSetItem(key, value);
     };
+    let first;
+    try {
+      first = await legacyImport.importLegacyData(userId);
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
 
+    // Copy succeeded but completion could not be recorded.
+    assert.equal(first.verified, false);
+    assert.equal(first.conflict, false);
+    assert.equal(localStorage.getItem(markerKey), null);
+    assert.ok(localStorage.getItem(jobKey) !== null, 'job record is kept for resume');
+    assert.equal(localStorage.getItem(subjectKey), legacySubjects);
+
+    const state = await legacyImport.getLegacyImportState(userId);
+    assert.equal(state.resume, true);
+    assert.equal(state.conflict, false);
+
+    const retry = await legacyImport.importLegacyData(userId);
+    assert.equal(retry.verified, true);
+    assert.equal(retry.resume, true);
+    assert.equal(retry.conflict, false);
+    assert.ok(localStorage.getItem(markerKey) !== null);
+
+    // No duplicates and the legacy source is preserved.
+    assert.equal(localStorage.getItem(subjectKey), legacySubjects);
+    assert.equal(localStorage.getItem(attemptsKey), legacyAttempts);
+    assert.equal(localStorage.getItem('redcall_subjects_v1'), legacySubjects);
+    assert.equal(localStorage.getItem('redcall_attempts_v1'), legacyAttempts);
+  });
+
+  await checkAsync('job progress save failure aborts before any copy', async () => {
+    const userId = 'user-jobfail';
+    const jobKey = 'redcall_user_' + userId + '__legacy_import_job_v1';
+    const subjectKey = 'redcall_user_' + userId + '__subjects_v1';
+    localStorage.removeItem(jobKey);
+    localStorage.removeItem(subjectKey);
+
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = (key, value) => {
+      if (key === jobKey) throw new Error('simulated job write failure');
+      realSetItem(key, value);
+    };
     let result;
     try {
       result = await legacyImport.importLegacyData(userId);
@@ -290,15 +462,159 @@ exports.requireApiUser = async () => {
     }
 
     assert.equal(result.verified, false);
-    // The failed attempt must not leave owned records behind.
-    assert.equal(localStorage.getItem('redcall_user_' + userId + '__subjects_v1'), null);
-    assert.equal(localStorage.getItem('redcall_user_' + userId + '__attempts_v1'), null);
+    assert.match(result.message, /진행 상태/);
+    assert.equal(localStorage.getItem(subjectKey), null);
+    assert.equal(legacyImport.isLegacyImportCompleted(userId), false);
+  });
 
-    // Retry now succeeds and is not rejected as a conflict.
-    const retry = await legacyImport.importLegacyData(userId);
-    assert.equal(retry.conflict, false);
-    assert.equal(retry.verified, true);
-    assert.ok(localStorage.getItem('redcall_user_' + userId + '__subjects_v1') !== null);
+  await checkAsync('legacy import writes to the requested account, not the active scope', async () => {
+    const before = localStorage.getItem('redcall_user_other-account__subjects_v1');
+    storageScope.setStorageScope({ kind: 'user', userId: 'other-account' });
+    let result;
+    try {
+      result = await legacyImport.importLegacyData('pinned-user');
+    } finally {
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+    assert.equal(result.verified, true);
+    assert.ok(localStorage.getItem('redcall_user_pinned-user__subjects_v1') !== null);
+    assert.equal(localStorage.getItem('redcall_user_other-account__subjects_v1'), before);
+  });
+
+  await checkAsync('same material id and content is skipped, different content conflicts', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      const sameScope = storageScope.userIdToScopeId('content-same');
+      storageScope.setStorageScope({ kind: 'legacy' });
+      await matStorage.saveMaterialContent('c-same', { markdown: '# same', rawText: 'r' });
+      storageScope.setStorageScope({ kind: 'user', userId: 'content-same' });
+      await matStorage.saveMaterialContent('c-same', { markdown: '# same', rawText: 'r' });
+      storageScope.setStorageScope({ kind: 'legacy' });
+
+      const same = await matStorage.importMaterialContentsFromScope('shared', sameScope);
+      assert.equal(same.verified, true);
+      assert.equal(same.skipped, 1);
+      assert.equal(same.copied, 0);
+      assert.equal(same.conflicts, 0);
+
+      const mdScope = storageScope.userIdToScopeId('content-md');
+      storageScope.setStorageScope({ kind: 'legacy' });
+      await matStorage.saveMaterialContent('c-md', { markdown: '# original' });
+      storageScope.setStorageScope({ kind: 'user', userId: 'content-md' });
+      await matStorage.saveMaterialContent('c-md', { markdown: '# different' });
+      storageScope.setStorageScope({ kind: 'legacy' });
+
+      const different = await matStorage.importMaterialContentsFromScope('shared', mdScope);
+      assert.equal(different.verified, false);
+      assert.equal(different.conflicts, 1);
+      assert.deepEqual(different.conflictIds, ['c-md']);
+
+      // The conflicting target body is never overwritten.
+      const target = fake.__databases
+        .get('redcall_materials_db_' + mdScope)
+        .get('material_contents')
+        .get('c-md');
+      assert.equal(target.markdown, '# different');
+    });
+  });
+
+  await checkAsync('same id with different rawText or pages is a conflict', async () => {
+    await withFakeIndexedDB(async () => {
+      const scope = storageScope.userIdToScopeId('content-opt');
+      storageScope.setStorageScope({ kind: 'legacy' });
+      await matStorage.saveMaterialContent('c-raw', { markdown: '# x', rawText: 'A' });
+      await matStorage.saveMaterialContent('c-pages', {
+        markdown: '# y',
+        pages: [{ pageNumber: 1, markdown: 'p1' }],
+      });
+      storageScope.setStorageScope({ kind: 'user', userId: 'content-opt' });
+      await matStorage.saveMaterialContent('c-raw', { markdown: '# x', rawText: 'B' });
+      await matStorage.saveMaterialContent('c-pages', {
+        markdown: '# y',
+        pages: [{ pageNumber: 1, markdown: 'p2' }],
+      });
+      storageScope.setStorageScope({ kind: 'legacy' });
+
+      const result = await matStorage.importMaterialContentsFromScope('shared', scope);
+      assert.equal(result.verified, false);
+      assert.equal(result.conflicts, 2);
+      assert.deepEqual([...result.conflictIds].sort(), ['c-pages', 'c-raw']);
+    });
+  });
+
+  await checkAsync('IndexedDB read, write and abort failures leave the import unverified', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      const scope = storageScope.userIdToScopeId('idb-fail');
+      storageScope.setStorageScope({ kind: 'legacy' });
+      await matStorage.saveMaterialContent('f-write', { markdown: '# w' });
+      await matStorage.saveMaterialContent('f-abort', { markdown: '# a' });
+      await matStorage.saveMaterialContent('f-read', { markdown: '# r' });
+      storageScope.setStorageScope({ kind: 'legacy' });
+
+      fake.__failure.put.add('f-write');
+      fake.__failure.abortPut.add('f-abort');
+      fake.__failure.get.add('f-read');
+
+      const result = await matStorage.importMaterialContentsFromScope('shared', scope);
+      assert.equal(result.verified, false);
+      assert.ok(result.writeFailed >= 1, 'write failure is reported');
+      assert.ok(result.aborted >= 1, 'transaction abort is reported');
+      assert.ok(result.readFailed >= 1, 'read failure is reported');
+      assert.equal(matStorage.isMaterialImportVerified(result), false);
+    });
+  });
+
+  await checkAsync('a copied body that fails read-back verification is not marked complete', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      const scope = storageScope.userIdToScopeId('verify-fail');
+      storageScope.setStorageScope({ kind: 'legacy' });
+      await matStorage.saveMaterialContent('v-body', { markdown: '# verify' });
+      storageScope.setStorageScope({ kind: 'legacy' });
+      fake.__failure.corruptPut.add('v-body');
+
+      const result = await matStorage.importMaterialContentsFromScope('shared', scope);
+      assert.equal(result.verified, false);
+      assert.equal(result.verifyFailed, 1);
+      assert.equal(result.copied, 0);
+      assert.equal(matStorage.isMaterialImportVerified(result), false);
+    });
+  });
+
+  await checkAsync('pinned target scope prevents cross-account material mixups', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'legacy' });
+      await matStorage.saveMaterialContent('scope-m', { markdown: '# scope' });
+      // Active scope changes to another account before the import runs.
+      storageScope.setStorageScope({ kind: 'user', userId: 'other-account' });
+
+      const result = await matStorage.importMaterialContentsFromScope(
+        'shared',
+        storageScope.userIdToScopeId('pinned-account')
+      );
+      assert.equal(result.verified, true);
+
+      const pinned = fake.__databases.get('redcall_materials_db_u_pinned-account');
+      const other = fake.__databases.get('redcall_materials_db_u_other-account');
+      assert.ok(pinned && pinned.get('material_contents').has('scope-m'));
+      assert.ok(!other || !other.get('material_contents').has('scope-m'));
+    });
+  });
+
+  check('material content identity follows the documented normalization rules', () => {
+    assert.equal(
+      matStorage.materialContentFingerprint({ markdown: '# a', rawText: undefined, updatedAt: '2020-01-01' }),
+      matStorage.materialContentFingerprint({ markdown: '# a' }),
+      'updatedAt and absent optional fields do not change identity'
+    );
+    assert.equal(
+      matStorage.materialContentFingerprint({ markdown: '# a', rawText: '' }),
+      matStorage.materialContentFingerprint({ markdown: '# a' }),
+      'empty string rawText equals absent rawText'
+    );
+    assert.notEqual(
+      matStorage.materialContentFingerprint({ markdown: '# a', pages: null }),
+      matStorage.materialContentFingerprint({ markdown: '# a', pages: [] }),
+      'absent pages differ from an empty page array'
+    );
   });
 
   check('material import is never verified when a copy write failed', () => {

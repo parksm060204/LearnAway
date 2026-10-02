@@ -341,8 +341,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     try {
       const result = await importLegacyData(currentUser.id);
       showToast(result.message);
+      setLegacyImportState((prev) =>
+        prev
+          ? {
+              ...prev,
+              conflict: result.conflict ? true : prev.conflict,
+              resume: result.resume || prev.resume,
+            }
+          : prev
+      );
       if (result.conflict) {
-        setLegacyImportState((prev) => (prev ? { ...prev, conflict: true } : prev));
         return;
       }
       if (result.verified) {
@@ -1478,10 +1486,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
               <div className="text-xs text-[#57544e] leading-relaxed">
                 <span className="font-bold text-[#c52828]">
-                  기존 학습 기록을 발견했습니다.
+                  {legacyImportState.resume
+                    ? '중단된 가져오기를 이어서 완료할 수 있습니다.'
+                    : '기존 학습 기록을 발견했습니다.'}
                 </span>{' '}
-                이 계정으로 가져오면 로그인 후에도 동일한 기록을 이어서 사용할 수 있습니다. 기존
-                공용 기록은 그대로 보존되며, 다른 계정에는 표시되지 않습니다.
+                {legacyImportState.resume
+                  ? '이미 복사된 기록은 원본과 일치하는지 검증한 뒤 건너뛰고, 남은 기록만 복사합니다. 기존 공용 기록과 현재 계정 기록은 그대로 보존됩니다.'
+                  : '이 계정으로 가져오면 로그인 후에도 동일한 기록을 이어서 사용할 수 있습니다. 기존 공용 기록은 그대로 보존되며, 다른 계정에는 표시되지 않습니다.'}
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <button
@@ -1490,7 +1501,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                   disabled={isImportingLegacy}
                   className="text-xs font-semibold bg-[#c52828] text-white px-3 py-1.5 rounded-xs hover:bg-[#a81f1f] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  {isImportingLegacy ? '가져오는 중...' : '기존 학습 기록 가져오기'}
+                  {isImportingLegacy
+                    ? '가져오는 중...'
+                    : legacyImportState.resume
+                      ? '가져오기 계속하기'
+                      : '기존 학습 기록 가져오기'}
                 </button>
                 <button
                   type="button"

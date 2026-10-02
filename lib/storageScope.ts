@@ -26,9 +26,14 @@ export function getStorageScope(): StorageScope {
   return currentScope;
 }
 
+/** Stable scope id for a user, independent of the currently active scope. */
+export function userIdToScopeId(userId: string): string {
+  return `u_${encodeURIComponent(userId)}`;
+}
+
 export function getStorageScopeId(): string {
   return currentScope.kind === 'user'
-    ? `u_${encodeURIComponent(currentScope.userId)}`
+    ? userIdToScopeId(currentScope.userId)
     : LEGACY_SCOPE_ID;
 }
 

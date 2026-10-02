@@ -47,9 +47,12 @@ const STORE_NAME = 'material_contents';
 // Keys are namespaced by scope so two accounts never share a cached body.
 const memoryCache = new Map<string, MaterialContent>();
 
-function getDbName(): string {
-  const scopeId = getStorageScopeId();
+function scopeIdToDbName(scopeId: string): string {
   return scopeId === 'shared' ? LEGACY_DB_NAME : `${LEGACY_DB_NAME}_${scopeId}`;
+}
+
+function getDbName(): string {
+  return scopeIdToDbName(getStorageScopeId());
 }
 
 function cacheKey(materialId: string): string {
@@ -102,6 +105,39 @@ export interface MaterialImportResult {
   failed: number;
   verified: boolean;
   error?: string;
+  /** Distinct failure reasons, so callers can explain recovery accurately. */
+  readFailed: number;
+  writeFailed: number;
+  aborted: number;
+  conflicts: number;
+  verifyFailed: number;
+  conflictIds: string[];
+}
+
+interface MaterialImportCounts {
+  copied: number;
+  skipped: number;
+  failed: number;
+  readFailed: number;
+  writeFailed: number;
+  aborted: number;
+  conflicts: number;
+  verifyFailed: number;
+  conflictIds: string[];
+}
+
+function emptyCounts(): MaterialImportCounts {
+  return {
+    copied: 0,
+    skipped: 0,
+    failed: 0,
+    readFailed: 0,
+    writeFailed: 0,
+    aborted: 0,
+    conflicts: 0,
+    verifyFailed: 0,
+    conflictIds: [],
+  };
 }
 
 function readAllContents(db: IDBDatabase): Promise<MaterialContent[] | null> {
@@ -117,77 +153,126 @@ function readAllContents(db: IDBDatabase): Promise<MaterialContent[] | null> {
   });
 }
 
-function readAllKeys(db: IDBDatabase): Promise<Set<string> | null> {
-  return new Promise((resolve) => {
-    try {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).getAllKeys();
-      req.onsuccess = () => resolve(new Set((req.result as IDBValidKey[]).map(String)));
-      req.onerror = () => resolve(null);
-    } catch {
-      resolve(null);
-    }
+/**
+ * Deterministic serialization with sorted object keys, used to compare material
+ * content identity independently of property order or `updatedAt`.
+ */
+function stableStringify(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+}
+
+/**
+ * Content identity fingerprint. Comparison rules:
+ *  - `markdown` is required; a missing value is treated as an empty string.
+ *  - `rawText`: `undefined`, `null` and `''` are equivalent (absent text).
+ *  - `pages`: `undefined`, `null` and a non-array are equivalent (absent pages).
+ *  - `updatedAt` (and any other field) is storage metadata, NOT identity.
+ */
+export function materialContentFingerprint(content: {
+  markdown?: string;
+  rawText?: string;
+  pages?: MaterialPage[];
+}): string {
+  return stableStringify({
+    markdown: typeof content.markdown === 'string' ? content.markdown : '',
+    rawText: typeof content.rawText === 'string' ? content.rawText : '',
+    pages: Array.isArray(content.pages) ? content.pages : null,
   });
 }
 
-function hasContent(db: IDBDatabase, materialId: string): Promise<boolean | null> {
+type ContentRead =
+  | { status: 'found'; content: MaterialContent }
+  | { status: 'missing' }
+  | { status: 'error' };
+
+type ContentWrite = { status: 'ok' } | { status: 'error' } | { status: 'abort' };
+
+function readContent(db: IDBDatabase, materialId: string): Promise<ContentRead> {
   return new Promise((resolve) => {
     try {
       const tx = db.transaction(STORE_NAME, 'readonly');
       const req = tx.objectStore(STORE_NAME).get(materialId);
-      req.onsuccess = () => resolve(Boolean(req.result));
-      req.onerror = () => resolve(null);
+      req.onsuccess = () => {
+        const result = req.result as MaterialContent | undefined;
+        resolve(result ? { status: 'found', content: result } : { status: 'missing' });
+      };
+      req.onerror = () => resolve({ status: 'error' });
     } catch {
-      resolve(null);
+      resolve({ status: 'error' });
     }
   });
 }
 
-function putContent(db: IDBDatabase, content: MaterialContent): Promise<boolean> {
+function writeContent(db: IDBDatabase, content: MaterialContent): Promise<ContentWrite> {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: ContentWrite) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     try {
       const tx = db.transaction(STORE_NAME, 'readwrite');
-      tx.oncomplete = () => resolve(true);
-      tx.onerror = () => resolve(false);
-      tx.onabort = () => resolve(false);
+      tx.oncomplete = () => finish({ status: 'ok' });
+      tx.onerror = () => finish({ status: 'error' });
+      tx.onabort = () => finish({ status: 'abort' });
       tx.objectStore(STORE_NAME).put(content);
     } catch {
-      resolve(false);
+      finish({ status: 'error' });
     }
   });
+}
+
+function describeImportFailure(counts: MaterialImportCounts): string {
+  const parts: string[] = [];
+  if (counts.readFailed > 0) parts.push(`읽기 실패 ${counts.readFailed}`);
+  if (counts.writeFailed > 0) parts.push(`쓰기 실패 ${counts.writeFailed}`);
+  if (counts.aborted > 0) parts.push(`트랜잭션 중단 ${counts.aborted}`);
+  if (counts.conflicts > 0) parts.push(`내용 충돌 ${counts.conflicts}`);
+  if (counts.verifyFailed > 0) parts.push(`재검증 실패 ${counts.verifyFailed}`);
+  return `자료 본문 이전 미완료 (${parts.join(', ')})`;
 }
 
 /**
- * Copies every stored material body from a source scope's IndexedDB into the
- * current scope's IndexedDB. Existing target bodies are never overwritten, so
- * re-running the import cannot duplicate or clobber records.
+ * Copies stored material bodies from a source scope's IndexedDB into a target
+ * scope's IndexedDB. The target scope can be pinned explicitly so a mid-run
+ * account change cannot redirect writes to a different account.
  *
- * The result reports write failures and re-reads the target store to verify
- * that every source body is actually present before callers may mark the
- * import complete.
+ * Content identity (markdown/rawText/pages, ignoring updatedAt) is compared:
+ *  - same id, same content  -> skipped (safe, idempotent)
+ *  - same id, different content -> conflict (never overwritten)
+ *  - absent -> copied, then read back and re-verified after the transaction
+ * Any read/write/abort/conflict/verify failure makes the result unverified, so
+ * callers must not write the overall import completion marker.
  */
 export async function importMaterialContentsFromScope(
-  sourceScopeId: string
+  sourceScopeId: string,
+  targetScopeId?: string
 ): Promise<MaterialImportResult> {
-  const sourceName = sourceScopeId === 'shared' ? LEGACY_DB_NAME : `${LEGACY_DB_NAME}_${sourceScopeId}`;
-  const targetName = getDbName();
+  const resolvedTargetScopeId = targetScopeId ?? getStorageScopeId();
+  const sourceName = scopeIdToDbName(sourceScopeId);
+  const targetName = scopeIdToDbName(resolvedTargetScopeId);
 
   if (sourceName === targetName) {
-    return { available: true, copied: 0, skipped: 0, failed: 0, verified: true };
+    return { available: true, verified: true, ...emptyCounts() };
   }
   if (!isIndexedDBAvailable()) {
     // Without IndexedDB there are no durable material bodies to move.
-    return { available: false, copied: 0, skipped: 0, failed: 0, verified: true };
+    return { available: false, verified: true, ...emptyCounts() };
   }
 
   const source = await openDBByName(sourceName);
   if (!source) {
     return {
       available: false,
-      copied: 0,
-      skipped: 0,
-      failed: 0,
       verified: false,
+      ...emptyCounts(),
+      readFailed: 1,
       error: '원본 자료 저장소를 열 수 없습니다.',
     };
   }
@@ -200,10 +285,9 @@ export async function importMaterialContentsFromScope(
     }
     return {
       available: false,
-      copied: 0,
-      skipped: 0,
-      failed: 0,
       verified: false,
+      ...emptyCounts(),
+      writeFailed: 1,
       error: '대상 자료 저장소를 열 수 없습니다.',
     };
   }
@@ -218,43 +302,50 @@ export async function importMaterialContentsFromScope(
     }
     return {
       available: true,
-      copied: 0,
-      skipped: 0,
-      failed: 0,
       verified: false,
+      ...emptyCounts(),
+      readFailed: 1,
       error: '원본 자료를 읽지 못했습니다.',
     };
   }
 
-  let copied = 0;
-  let skipped = 0;
-  let failed = 0;
+  const counts = emptyCounts();
+
   for (const content of contents) {
     if (!content || typeof content.materialId !== 'string') continue;
-    const exists = await hasContent(target, content.materialId);
-    if (exists === null) {
-      failed += 1;
-      continue;
-    }
-    if (exists) {
-      skipped += 1;
-      continue;
-    }
-    const written = await putContent(target, content);
-    if (written) copied += 1;
-    else failed += 1;
-  }
+    const sourceFingerprint = materialContentFingerprint(content);
 
-  // Verify by reading the target store back: every source body must be present.
-  const targetIds = await readAllKeys(target);
-  let verified = failed === 0 && targetIds !== null;
-  if (targetIds) {
-    for (const content of contents) {
-      if (!content || typeof content.materialId !== 'string') continue;
-      if (!targetIds.has(content.materialId)) {
-        verified = false;
-        break;
+    const existing = await readContent(target, content.materialId);
+    if (existing.status === 'error') {
+      counts.readFailed += 1;
+      continue;
+    }
+    if (existing.status === 'found') {
+      if (materialContentFingerprint(existing.content) === sourceFingerprint) {
+        counts.skipped += 1;
+      } else {
+        counts.conflicts += 1;
+        counts.conflictIds.push(content.materialId);
       }
+      continue;
+    }
+
+    const write = await writeContent(target, content);
+    if (write.status === 'abort') {
+      counts.aborted += 1;
+      continue;
+    }
+    if (write.status === 'error') {
+      counts.writeFailed += 1;
+      continue;
+    }
+
+    // Re-read the target after the transaction completes and verify content.
+    const verify = await readContent(target, content.materialId);
+    if (verify.status === 'found' && materialContentFingerprint(verify.content) === sourceFingerprint) {
+      counts.copied += 1;
+    } else {
+      counts.verifyFailed += 1;
     }
   }
 
@@ -265,23 +356,33 @@ export async function importMaterialContentsFromScope(
     // ignore close failures
   }
 
+  const failed =
+    counts.readFailed +
+    counts.writeFailed +
+    counts.aborted +
+    counts.conflicts +
+    counts.verifyFailed;
+
   return {
     available: true,
-    copied,
-    skipped,
+    copied: counts.copied,
+    skipped: counts.skipped,
     failed,
-    verified,
-    error: verified
-      ? undefined
-      : failed > 0
-        ? '일부 자료 본문을 복사하지 못했습니다.'
-        : '복사한 자료 본문을 검증하지 못했습니다.',
+    verified: failed === 0,
+    ...(failed === 0 ? {} : { error: describeImportFailure(counts) }),
+    readFailed: counts.readFailed,
+    writeFailed: counts.writeFailed,
+    aborted: counts.aborted,
+    conflicts: counts.conflicts,
+    verifyFailed: counts.verifyFailed,
+    conflictIds: counts.conflictIds,
   };
 }
 
 /**
  * A material import is complete only when every body was copied/re-verified and
- * no write failed. Callers must gate their "import completed" marker on this.
+ * no read/write/abort/conflict/verify failure occurred. Callers must gate their
+ * "import completed" marker on this.
  */
 export function isMaterialImportVerified(result: MaterialImportResult): boolean {
   return result.verified && result.failed === 0 && !result.error;
