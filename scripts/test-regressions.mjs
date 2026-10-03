@@ -20,6 +20,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/subjectsRepository.ts', 'lib/cloud/materialsRepository.ts', 'lib/cloud/library.ts',
   'lib/cloud/migrationOriginals.ts', 'lib/cloud/localMigration.ts',
   'lib/cloud/learningMappers.ts', 'lib/cloud/learningPlan.ts', 'lib/cloud/learningRepository.ts',
+  'lib/cloud/mergeLearning.ts', 'lib/learningApproval.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -84,6 +85,8 @@ exports.requireApiUser = async () => {
   const cloudLearningMappers = load(path.join(output, 'lib/cloud/learningMappers.js'));
   const cloudLearningPlan = load(path.join(output, 'lib/cloud/learningPlan.js'));
   const cloudLearningRepo = load(path.join(output, 'lib/cloud/learningRepository.js'));
+  const cloudMerge = load(path.join(output, 'lib/cloud/mergeLearning.js'));
+  const learningApproval = load(path.join(output, 'lib/learningApproval.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
@@ -1433,6 +1436,46 @@ exports.requireApiUser = async () => {
       assert.equal(second.ok, true, second.ok ? '' : second.error);
       assert.equal(client.__state.concept_drafts.length, 1, 'idempotent by draft id');
     });
+  });
+
+  check('server concepts merge with locally-derived review state', () => {
+    const server = [{ id: 'c1', subjectId: 's1', title: 'A', events: [], currentScore: 0, status: 'unstudied' }];
+    const local = [{ id: 'c1', subjectId: 's1', title: 'A', events: [{ id: 'e1' }], currentScore: 70, baseScore: 60, status: 'review', postponeDays: 2 }];
+    const merged = cloudMerge.mergeConcepts(server, local);
+    assert.equal(merged[0].title, 'A');
+    assert.equal(merged[0].currentScore, 70);
+    assert.equal(merged[0].events.length, 1);
+    assert.equal(merged[0].status, 'review');
+  });
+
+  check('server problems keep version history and local quality metadata', () => {
+    const server = [{ id: 'p1', subjectId: 's1', title: 'P', qualityStatus: 'normal', isOutdated: false }];
+    const local = [{ id: 'p1', subjectId: 's1', title: 'P', qualityStatus: 'reported', reports: [{ id: 'r1' }] }];
+    const versions = { p1: [{ version: 1, title: 'P', promptText: 'q', hints: [], modelAnswer: 'a', rubric: [], editedAt: '' }] };
+    const merged = cloudMerge.mergeProblems(server, local, versions);
+    assert.equal(merged[0].qualityStatus, 'reported');
+    assert.equal(merged[0].versionHistory.length, 1);
+    assert.equal(merged[0].reports.length, 1);
+  });
+
+  check('draft merge keeps local-only (unpersisted) drafts', () => {
+    const server = [{ id: 'd1', title: 'saved' }];
+    const local = [{ id: 'd1', title: 'saved' }, { id: 'd2', title: 'unsaved' }];
+    const merged = cloudMerge.mergeDrafts(server, local);
+    assert.deepEqual(merged.map((d) => d.id), ['d1', 'd2']);
+  });
+
+  check('concept approval builder derives a stable id and chapter ref', () => {
+    const draft = {
+      id: 'd1', subjectId: 's1', materialId: 'm1', title: 'A', description: '',
+      prerequisites: [], relatedConcepts: [], commonMisconceptions: [], examples: [],
+      sourceEvidence: { type: 'page', pageNumber: 3, quote: 'q', verified: true },
+    };
+    const concept = learningApproval.buildConceptFromDraft(draft, undefined, 1);
+    assert.equal(concept.id, 'c-ai-d1');
+    assert.equal(concept.draftId, 'd1');
+    assert.equal(concept.chapterRef, '제3페이지');
+    assert.deepEqual(concept.materialIds, ['m1']);
   });
 
   check('material import is never verified when a copy write failed', () => {

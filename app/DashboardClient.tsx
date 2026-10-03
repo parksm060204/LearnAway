@@ -30,14 +30,13 @@ import {
   loadStoredMaterials,
   saveStoredMaterials,
   loadStoredConcepts,
+  saveStoredConcepts,
   loadStoredConceptDrafts,
   saveStoredConceptDrafts,
   loadStoredProblems,
   saveStoredProblems,
   loadStoredProblemDrafts,
   saveStoredProblemDrafts,
-  approveProblemDraft,
-  batchApproveProblemDrafts,
   deleteProblemDraft,
   updateProblemDraft,
   loadStoredAttempts,
@@ -62,8 +61,16 @@ import {
   saveStoredPersonalizationSettings,
   saveStoredPersonalizationState,
   checkStoredDataIntegrity,
+  buildProblemFromDraft,
   AttemptSaveStatus,
 } from '../lib/storage';
+import { loadLearningLibrary } from '../lib/cloud/learningLibrary';
+import { mergeConcepts, mergeDrafts, mergeProblems } from '../lib/cloud/mergeLearning';
+import {
+  approveConceptDraft as approveConceptDraftCloud,
+  approveProblemDraft as approveProblemDraftCloud,
+} from '../lib/cloud/learningRepository';
+import { buildConceptFromDraft } from '../lib/learningApproval';
 import {
   DEFAULT_RETENTION_SETTINGS,
   rankConceptsForReview,
@@ -312,6 +319,35 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           }
         }
         if (cancelled) return;
+
+        // Load server learning content (concepts / drafts / problems / versions).
+        // Server data is authoritative; locally-derived review state is merged
+        // in and unpersisted local drafts are kept.
+        const supabase = createBrowserSupabaseClient();
+        const library = await loadLearningLibrary(supabase);
+        if (cancelled) return;
+        if (!library.ok) {
+          setCloudStatus('error');
+          setCloudError(`학습 콘텐츠를 불러오지 못했습니다. ${library.error}`);
+          return;
+        }
+        const mergedConcepts = mergeConcepts(library.data.concepts, loadStoredConcepts());
+        const mergedProblems = mergeProblems(
+          library.data.problems,
+          loadStoredProblems(),
+          library.data.problemVersions
+        );
+        const mergedConceptDrafts = mergeDrafts(library.data.conceptDrafts, loadStoredConceptDrafts());
+        const mergedProblemDrafts = mergeDrafts(library.data.problemDrafts, loadStoredProblemDrafts());
+        saveStoredConcepts(mergedConcepts);
+        saveStoredProblems(mergedProblems);
+        saveStoredConceptDrafts(mergedConceptDrafts);
+        saveStoredProblemDrafts(mergedProblemDrafts);
+        setAllConcepts(mergedConcepts);
+        setAllProblems(mergedProblems);
+        setConceptDrafts(mergedConceptDrafts);
+        setProblemDrafts(mergedProblemDrafts);
+
         // Record that the live scope now holds the server cache, so a later
         // load does not merge server records back into the migration originals.
         markServerCache(currentUser.id);
@@ -1033,29 +1069,116 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     showToast(`AI 고난도 문제 ${newDrafts.length}건이 성공적으로 생성되었습니다. 검토를 진행해 주세요.`);
   };
 
-  const handleApproveProblemDraft = (draftId: string) => {
-    const { success, status, approvedProblem, updatedDrafts, updatedProblems, error } = approveProblemDraft(draftId);
-    setProblemDrafts(updatedDrafts);
-    setAllProblems(updatedProblems);
-    if (success && approvedProblem) {
-      showToast(`문제 [${approvedProblem.title}]이(가) 승인되어 풀이 목록에 등록되었습니다.`);
-    } else if (status === 'partial_draft_failed') {
-      showToast(error || '문제는 저장됐지만 초안 승인 상태 저장에 실패했습니다. 다시 시도해 주세요.');
+  // Approves one problem draft through the transactional server RPC, then
+  // mirrors the confirmed entity into the local cache/state.
+  const approveProblemViaServer = async (
+    draftId: string,
+    problems: Problem[],
+    drafts: ProblemDraft[]
+  ): Promise<{ ok: boolean; title?: string; error?: string; problems: Problem[]; drafts: ProblemDraft[] }> => {
+    const draft = drafts.find((d) => d.id === draftId);
+    if (!draft) return { ok: false, error: '초안을 찾을 수 없습니다.', problems, drafts };
+    const now = new Date().toISOString();
+    const existing = problems.find((p) => p.draftId === draftId);
+    const built = buildProblemFromDraft(draft, existing, now);
+    let id = built.id;
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const rpc = await approveProblemDraftCloud(supabase, draft, built, draft.updatedAt ?? null);
+      if (!rpc.ok) return { ok: false, error: rpc.error, problems, drafts };
+      id = rpc.data.id;
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : '문제 승인에 실패했습니다.', problems, drafts };
+    }
+    const approvedProblem: Problem = { ...built, id, draftId };
+    const nextProblems = existing
+      ? problems.map((p) => (p.draftId === draftId ? approvedProblem : p))
+      : [...problems, approvedProblem];
+    const nextDrafts = drafts.map((d) =>
+      d.id === draftId ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now } : d
+    );
+    return { ok: true, title: approvedProblem.title, problems: nextProblems, drafts: nextDrafts };
+  };
+
+  // Approves one concept draft through the server RPC, then mirrors locally.
+  const approveConceptViaServer = async (
+    draft: ConceptDraft,
+    concepts: Concept[],
+    drafts: ConceptDraft[]
+  ): Promise<{ ok: boolean; error?: string; concepts: Concept[]; drafts: ConceptDraft[] }> => {
+    const existing = concepts.find((c) => c.draftId === draft.id);
+    const order = existing
+      ? existing.order
+      : concepts.filter((c) => c.subjectId === draft.subjectId).length + 1;
+    const built = buildConceptFromDraft(draft, existing, order);
+    let id = built.id;
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const rpc = await approveConceptDraftCloud(supabase, draft, built, draft.updatedAt ?? null);
+      if (!rpc.ok) return { ok: false, error: rpc.error, concepts, drafts };
+      id = rpc.data.id;
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : '개념 승인에 실패했습니다.', concepts, drafts };
+    }
+    const approvedConcept: Concept = { ...built, id };
+    const nextConcepts = existing
+      ? concepts.map((c) => (c.draftId === draft.id ? approvedConcept : c))
+      : [...concepts, approvedConcept];
+    const now = new Date().toISOString();
+    const nextDrafts = drafts.map((d) =>
+      d.id === draft.id ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now } : d
+    );
+    return { ok: true, concepts: nextConcepts, drafts: nextDrafts };
+  };
+
+  const approvalErrorMessage = (error?: string): string => {
+    if (!error) return '문제 승인에 실패했습니다.';
+    if (error.startsWith('not_pending')) return '이미 승인된 초안입니다.';
+    if (error.startsWith('stale')) return '다른 곳에서 초안이 수정되었습니다. 새로고침 후 다시 시도하세요.';
+    if (error.startsWith('rubric')) return '루브릭 합계가 100점이 아닙니다. 서버 검증에 실패했습니다.';
+    if (error.startsWith('no_concept')) return '연결된 개념이 없습니다.';
+    if (error.startsWith('incomplete')) return '필수 항목(제목·문제·모범답안)이 누락되었습니다.';
+    if (error.startsWith('missing')) return '초안을 찾을 수 없습니다.';
+    return `문제 승인 실패: ${error}`;
+  };
+
+  const handleApproveProblemDraft = async (draftId: string) => {
+    const result = await approveProblemViaServer(draftId, allProblems, problemDrafts);
+    if (result.ok) {
+      setAllProblems(result.problems);
+      saveStoredProblems(result.problems);
+      setProblemDrafts(result.drafts);
+      saveStoredProblemDrafts(result.drafts);
+      showToast(`문제 [${result.title}]이(가) 서버에 승인되어 풀이 목록에 등록되었습니다.`);
     } else {
-      showToast(`문제 승인 저장에 실패했습니다. 초안은 승인되지 않았습니다. (${error || '다시 시도해 주세요.'})`);
+      showToast(approvalErrorMessage(result.error));
     }
   };
 
-  const handleBatchApproveProblemDrafts = (draftIds: string[]) => {
-    const { approvedCount, results, updatedDrafts, updatedProblems } = batchApproveProblemDrafts(draftIds);
-    setProblemDrafts(updatedDrafts);
-    setAllProblems(updatedProblems);
-    const failed = results.filter((r) => r.status === 'failed').length;
-    const partial = results.filter((r) => r.status === 'partial_draft_failed').length;
-    if (failed > 0 || partial > 0) {
-      showToast(`${approvedCount}건 승인 완료, 실패 ${failed}건·부분 ${partial}건. 해당 항목만 다시 시도해 주세요.`);
+  const handleBatchApproveProblemDrafts = async (draftIds: string[]) => {
+    let problems = allProblems;
+    let drafts = problemDrafts;
+    let approvedCount = 0;
+    let failed = 0;
+    for (const draftId of draftIds) {
+      const result = await approveProblemViaServer(draftId, problems, drafts);
+      if (result.ok) {
+        problems = result.problems;
+        drafts = result.drafts;
+        approvedCount += 1;
+      } else {
+        // A failed candidate never contaminates later items.
+        failed += 1;
+      }
+    }
+    setAllProblems(problems);
+    saveStoredProblems(problems);
+    setProblemDrafts(drafts);
+    saveStoredProblemDrafts(drafts);
+    if (failed > 0) {
+      showToast(`${approvedCount}건 승인 완료, 실패 ${failed}건. 실패 항목만 다시 시도해 주세요.`);
     } else {
-      showToast(`선택한 문제 ${approvedCount}건이 승인 완료되어 풀이에 등록되었습니다.`);
+      showToast(`선택한 문제 ${approvedCount}건이 서버에 승인 완료되었습니다.`);
     }
   };
 
@@ -1071,14 +1194,22 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     showToast('문제 초안이 삭제되었습니다.');
   };
 
-  const handleStartPracticeFromDraft = (draft: ProblemDraft) => {
+  const handleStartPracticeFromDraft = async (draft: ProblemDraft) => {
     let problemToPracticeId = '';
     if (!draft.isApproved) {
-      const { approvedProblem, updatedDrafts, updatedProblems } = approveProblemDraft(draft.id);
-      if (approvedProblem) {
-        problemToPracticeId = approvedProblem.id;
-        setProblemDrafts(updatedDrafts);
-        setAllProblems(updatedProblems);
+      // Approve on the server first (unapproved drafts are never exposed as
+      // practice targets), then start practice with the confirmed problem.
+      const result = await approveProblemViaServer(draft.id, allProblems, problemDrafts);
+      if (result.ok) {
+        setProblemDrafts(result.drafts);
+        saveStoredProblemDrafts(result.drafts);
+        setAllProblems(result.problems);
+        saveStoredProblems(result.problems);
+        const approved = result.problems.find((p) => p.draftId === draft.id);
+        problemToPracticeId = approved?.id ?? '';
+      } else {
+        showToast(approvalErrorMessage(result.error));
+        return;
       }
     } else {
       const existing = allProblems.find((p) => p.draftId === draft.id);
@@ -2222,6 +2353,45 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }}
         onTriggerAnalysis={handleTriggerAiAnalysis}
         isAnalyzing={isAiAnalyzing}
+        onApproveConceptDraft={async (draft) => {
+          const result = await approveConceptViaServer(draft, allConcepts, conceptDrafts);
+          if (!result.ok) {
+            showToast(`개념 승인 실패: ${result.error ?? '다시 시도해 주세요.'}`);
+            return false;
+          }
+          setAllConcepts(result.concepts);
+          saveStoredConcepts(result.concepts);
+          setConceptDrafts(result.drafts);
+          saveStoredConceptDrafts(result.drafts);
+          showToast(`개념 [${draft.title}]이(가) 서버에 승인되었습니다.`);
+          return true;
+        }}
+        onBatchApproveConceptDrafts={async (pending) => {
+          let concepts = allConcepts;
+          let drafts = conceptDrafts;
+          let approvedCount = 0;
+          let failed = 0;
+          for (const draft of pending) {
+            const result = await approveConceptViaServer(draft, concepts, drafts);
+            if (result.ok) {
+              concepts = result.concepts;
+              drafts = result.drafts;
+              approvedCount += 1;
+            } else {
+              failed += 1;
+            }
+          }
+          setAllConcepts(concepts);
+          saveStoredConcepts(concepts);
+          setConceptDrafts(drafts);
+          saveStoredConceptDrafts(drafts);
+          showToast(
+            failed > 0
+              ? `${approvedCount}건 승인 완료, 실패 ${failed}건. 실패 항목만 다시 시도해 주세요.`
+              : `선택한 개념 ${approvedCount}건이 서버에 승인 완료되었습니다.`
+          );
+          return true;
+        }}
       />
 
       {/* 5. PDF Reference Excerpt Reader Modal */}

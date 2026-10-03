@@ -39,6 +39,10 @@ interface ConceptReviewModalProps {
   onOpenMaterialEditor?: (material: Material) => void;
   onTriggerAnalysis?: (material: Material) => void;
   isAnalyzing?: boolean;
+  /** Server-backed approval (transactional RPC). When provided, the modal uses
+   *  it instead of the local-only storage approval. */
+  onApproveConceptDraft?: (draft: ConceptDraft) => Promise<boolean>;
+  onBatchApproveConceptDrafts?: (drafts: ConceptDraft[]) => Promise<boolean>;
 }
 
 export function ConceptReviewModal({
@@ -52,6 +56,8 @@ export function ConceptReviewModal({
   onOpenMaterialEditor,
   onTriggerAnalysis,
   isAnalyzing = false,
+  onApproveConceptDraft,
+  onBatchApproveConceptDrafts,
 }: ConceptReviewModalProps) {
   const [selectedDraftId, setSelectedDraftId] = useState<string>('');
   const [filterMode, setFilterMode] = useState<'all' | 'pending' | 'approved' | 'unverified'>('all');
@@ -166,20 +172,31 @@ export function ConceptReviewModal({
     alert('개념 초안 수정사항이 저장되었습니다.');
   };
 
-  const handleApproveSingle = (draftId: string) => {
+  const handleApproveSingle = async (draftId: string) => {
+    if (onApproveConceptDraft) {
+      const draft = drafts.find((d) => d.id === draftId);
+      if (draft) await onApproveConceptDraft(draft);
+      return;
+    }
     const { updatedDrafts, updatedConcepts } = approveConceptDraft(draftId);
     onUpdateDrafts(updatedDrafts);
     onConceptsUpdated(updatedConcepts);
   };
 
-  const handleBatchApprove = () => {
-    const pendingIds = subjectDrafts.filter((d) => !d.isApproved).map((d) => d.id);
-    if (pendingIds.length === 0) {
+  const handleBatchApprove = async () => {
+    const pending = subjectDrafts.filter((d) => !d.isApproved);
+    if (pending.length === 0) {
       alert('승인 대기 중인 초안이 없습니다.');
       return;
     }
-    if (confirm(`총 ${pendingIds.length}개의 개념 초안을 일괄 승인하시겠습니까?`)) {
-      const { updatedDrafts, updatedConcepts } = batchApproveConceptDrafts(pendingIds);
+    if (onBatchApproveConceptDrafts) {
+      if (confirm(`총 ${pending.length}개의 개념 초안을 일괄 승인하시겠습니까?`)) {
+        await onBatchApproveConceptDrafts(pending);
+      }
+      return;
+    }
+    if (confirm(`총 ${pending.length}개의 개념 초안을 일괄 승인하시겠습니까?`)) {
+      const { updatedDrafts, updatedConcepts } = batchApproveConceptDrafts(pending.map((d) => d.id));
       onUpdateDrafts(updatedDrafts);
       onConceptsUpdated(updatedConcepts);
     }
