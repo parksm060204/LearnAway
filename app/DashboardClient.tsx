@@ -37,7 +37,6 @@ import {
   saveStoredProblems,
   loadStoredProblemDrafts,
   saveStoredProblemDrafts,
-  deleteProblemDraft,
   updateProblemDraft,
   loadStoredAttempts,
   loadStoredSettings,
@@ -69,8 +68,24 @@ import { mergeConcepts, mergeDrafts, mergeProblems } from '../lib/cloud/mergeLea
 import {
   approveConceptDraft as approveConceptDraftCloud,
   approveProblemDraft as approveProblemDraftCloud,
+  getConceptById,
+  getConceptDraftById,
+  getProblemById,
+  getProblemDraftById,
+  deleteProblemDraft as deleteProblemDraftCloud,
+  updateProblemDraft as updateProblemDraftCloud,
+  deleteConceptDraft as deleteConceptDraftCloud,
+  updateConceptDraft as updateConceptDraftCloud,
+  updateProblemQuality,
+  reviseProblem,
 } from '../lib/cloud/learningRepository';
 import { buildConceptFromDraft } from '../lib/learningApproval';
+import {
+  ensureLearningOriginals,
+  loadLearningOriginals,
+  getMigratedIds,
+  markLearningServerCache,
+} from '../lib/cloud/learningOriginals';
 import {
   DEFAULT_RETENTION_SETTINGS,
   rankConceptsForReview,
@@ -331,14 +346,38 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           setCloudError(`학습 콘텐츠를 불러오지 못했습니다. ${library.error}`);
           return;
         }
-        const mergedConcepts = mergeConcepts(library.data.concepts, loadStoredConcepts());
+        // Preserve un-migrated local learning content into a dedicated originals
+        // area BEFORE the server cache can overwrite the live scope.
+        const serverIds = new Set<string>([
+          ...library.data.concepts.map((c) => c.id),
+          ...library.data.conceptDrafts.map((d) => d.id),
+          ...library.data.problems.map((p) => p.id),
+          ...library.data.problemDrafts.map((d) => d.id),
+        ]);
+        const preserved = ensureLearningOriginals(currentUser.id, serverIds);
+        if (!preserved.ok) {
+          setCloudStatus('error');
+          setCloudError(preserved.error ?? '학습 콘텐츠 원본을 보존하지 못했습니다.');
+          return;
+        }
+        const originals = loadLearningOriginals(currentUser.id);
+        if (!originals.ok) {
+          setCloudStatus('error');
+          setCloudError(originals.error);
+          return;
+        }
+        const migratedIds = getMigratedIds(currentUser.id);
+
+        const mergedConcepts = mergeConcepts(library.data.concepts, originals.data.concepts, migratedIds);
         const mergedProblems = mergeProblems(
           library.data.problems,
-          loadStoredProblems(),
-          library.data.problemVersions
+          originals.data.problems,
+          library.data.problemVersions,
+          migratedIds
         );
-        const mergedConceptDrafts = mergeDrafts(library.data.conceptDrafts, loadStoredConceptDrafts());
-        const mergedProblemDrafts = mergeDrafts(library.data.problemDrafts, loadStoredProblemDrafts());
+        const mergedConceptDrafts = mergeDrafts(library.data.conceptDrafts, originals.data.conceptDrafts, migratedIds);
+        const mergedProblemDrafts = mergeDrafts(library.data.problemDrafts, originals.data.problemDrafts, migratedIds);
+        markLearningServerCache(currentUser.id);
         saveStoredConcepts(mergedConcepts);
         saveStoredProblems(mergedProblems);
         saveStoredConceptDrafts(mergedConceptDrafts);
@@ -1069,66 +1108,107 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     showToast(`AI 고난도 문제 ${newDrafts.length}건이 성공적으로 생성되었습니다. 검토를 진행해 주세요.`);
   };
 
+  // Approval outcome: 'ok' (server confirmed + refetched), 'partial' (server
+  // approved but the screen could not be reconciled), or 'error'.
+  type ApprovalOutcome<T, L> = {
+    status: 'ok' | 'partial' | 'error';
+    error?: string;
+    title?: string;
+    entities: T[];
+    drafts: L[];
+  };
+
   // Approves one problem draft through the transactional server RPC, then
-  // mirrors the confirmed entity into the local cache/state.
+  // RE-READS the confirmed entity + draft from the server. The local candidate
+  // is never used as the approval result.
   const approveProblemViaServer = async (
     draftId: string,
     problems: Problem[],
     drafts: ProblemDraft[]
-  ): Promise<{ ok: boolean; title?: string; error?: string; problems: Problem[]; drafts: ProblemDraft[] }> => {
+  ): Promise<ApprovalOutcome<Problem, ProblemDraft>> => {
     const draft = drafts.find((d) => d.id === draftId);
-    if (!draft) return { ok: false, error: '초안을 찾을 수 없습니다.', problems, drafts };
-    const now = new Date().toISOString();
+    if (!draft) return { status: 'error', error: '초안을 찾을 수 없습니다.', entities: problems, drafts };
     const existing = problems.find((p) => p.draftId === draftId);
-    const built = buildProblemFromDraft(draft, existing, now);
-    let id = built.id;
+    const built = buildProblemFromDraft(draft, existing, new Date().toISOString());
     try {
       const supabase = createBrowserSupabaseClient();
       const rpc = await approveProblemDraftCloud(supabase, draft, built, draft.updatedAt ?? null);
-      if (!rpc.ok) return { ok: false, error: rpc.error, problems, drafts };
-      id = rpc.data.id;
+      if (!rpc.ok) return { status: 'error', error: rpc.error, entities: problems, drafts };
+      const [fetched, fetchedDraft] = await Promise.all([
+        getProblemById(supabase, rpc.data.id),
+        getProblemDraftById(supabase, draftId),
+      ]);
+      if (!fetched.ok || !fetched.data) {
+        return {
+          status: 'partial',
+          error: '서버 승인은 완료됐지만 화면 갱신에 실패했습니다. 새로고침해 주세요.',
+          entities: problems,
+          drafts,
+        };
+      }
+      const approvedProblem = fetched.data;
+      const nextProblems = existing
+        ? problems.map((p) => (p.draftId === draftId ? approvedProblem : p))
+        : [...problems, approvedProblem];
+      const nextDrafts =
+        fetchedDraft.ok && fetchedDraft.data
+          ? drafts.map((d) => (d.id === draftId ? (fetchedDraft.data as ProblemDraft) : d))
+          : drafts;
+      return { status: 'ok', title: approvedProblem.title, entities: nextProblems, drafts: nextDrafts };
     } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : '문제 승인에 실패했습니다.', problems, drafts };
+      return {
+        status: 'error',
+        error: e instanceof Error ? e.message : '문제 승인에 실패했습니다.',
+        entities: problems,
+        drafts,
+      };
     }
-    const approvedProblem: Problem = { ...built, id, draftId };
-    const nextProblems = existing
-      ? problems.map((p) => (p.draftId === draftId ? approvedProblem : p))
-      : [...problems, approvedProblem];
-    const nextDrafts = drafts.map((d) =>
-      d.id === draftId ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now } : d
-    );
-    return { ok: true, title: approvedProblem.title, problems: nextProblems, drafts: nextDrafts };
   };
 
-  // Approves one concept draft through the server RPC, then mirrors locally.
+  // Approves one concept draft through the server RPC, then re-reads it.
   const approveConceptViaServer = async (
     draft: ConceptDraft,
     concepts: Concept[],
     drafts: ConceptDraft[]
-  ): Promise<{ ok: boolean; error?: string; concepts: Concept[]; drafts: ConceptDraft[] }> => {
+  ): Promise<ApprovalOutcome<Concept, ConceptDraft>> => {
     const existing = concepts.find((c) => c.draftId === draft.id);
     const order = existing
       ? existing.order
       : concepts.filter((c) => c.subjectId === draft.subjectId).length + 1;
     const built = buildConceptFromDraft(draft, existing, order);
-    let id = built.id;
     try {
       const supabase = createBrowserSupabaseClient();
       const rpc = await approveConceptDraftCloud(supabase, draft, built, draft.updatedAt ?? null);
-      if (!rpc.ok) return { ok: false, error: rpc.error, concepts, drafts };
-      id = rpc.data.id;
+      if (!rpc.ok) return { status: 'error', error: rpc.error, entities: concepts, drafts };
+      const [fetched, fetchedDraft] = await Promise.all([
+        getConceptById(supabase, rpc.data.id),
+        getConceptDraftById(supabase, draft.id),
+      ]);
+      if (!fetched.ok || !fetched.data) {
+        return {
+          status: 'partial',
+          error: '서버 승인은 완료됐지만 화면 갱신에 실패했습니다. 새로고침해 주세요.',
+          entities: concepts,
+          drafts,
+        };
+      }
+      const approvedConcept = fetched.data;
+      const nextConcepts = existing
+        ? concepts.map((c) => (c.draftId === draft.id ? approvedConcept : c))
+        : [...concepts, approvedConcept];
+      const nextDrafts =
+        fetchedDraft.ok && fetchedDraft.data
+          ? drafts.map((d) => (d.id === draft.id ? (fetchedDraft.data as ConceptDraft) : d))
+          : drafts;
+      return { status: 'ok', title: approvedConcept.title, entities: nextConcepts, drafts: nextDrafts };
     } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : '개념 승인에 실패했습니다.', concepts, drafts };
+      return {
+        status: 'error',
+        error: e instanceof Error ? e.message : '개념 승인에 실패했습니다.',
+        entities: concepts,
+        drafts,
+      };
     }
-    const approvedConcept: Concept = { ...built, id };
-    const nextConcepts = existing
-      ? concepts.map((c) => (c.draftId === draft.id ? approvedConcept : c))
-      : [...concepts, approvedConcept];
-    const now = new Date().toISOString();
-    const nextDrafts = drafts.map((d) =>
-      d.id === draft.id ? { ...d, isApproved: true, status: 'approved' as const, updatedAt: now } : d
-    );
-    return { ok: true, concepts: nextConcepts, drafts: nextDrafts };
   };
 
   const approvalErrorMessage = (error?: string): string => {
@@ -1144,12 +1224,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
   const handleApproveProblemDraft = async (draftId: string) => {
     const result = await approveProblemViaServer(draftId, allProblems, problemDrafts);
-    if (result.ok) {
-      setAllProblems(result.problems);
-      saveStoredProblems(result.problems);
+    if (result.status === 'ok') {
+      setAllProblems(result.entities);
+      saveStoredProblems(result.entities);
       setProblemDrafts(result.drafts);
       saveStoredProblemDrafts(result.drafts);
       showToast(`문제 [${result.title}]이(가) 서버에 승인되어 풀이 목록에 등록되었습니다.`);
+    } else if (result.status === 'partial') {
+      showToast(result.error ?? '서버 승인은 완료됐지만 화면 갱신에 실패했습니다. 새로고침해 주세요.');
     } else {
       showToast(approvalErrorMessage(result.error));
     }
@@ -1160,12 +1242,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     let drafts = problemDrafts;
     let approvedCount = 0;
     let failed = 0;
+    let partial = 0;
     for (const draftId of draftIds) {
       const result = await approveProblemViaServer(draftId, problems, drafts);
-      if (result.ok) {
-        problems = result.problems;
+      if (result.status === 'ok') {
+        problems = result.entities;
         drafts = result.drafts;
         approvedCount += 1;
+      } else if (result.status === 'partial') {
+        // Server approved but the screen could not be reconciled.
+        partial += 1;
       } else {
         // A failed candidate never contaminates later items.
         failed += 1;
@@ -1175,22 +1261,85 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     saveStoredProblems(problems);
     setProblemDrafts(drafts);
     saveStoredProblemDrafts(drafts);
-    if (failed > 0) {
-      showToast(`${approvedCount}건 승인 완료, 실패 ${failed}건. 실패 항목만 다시 시도해 주세요.`);
+    if (failed > 0 || partial > 0) {
+      showToast(`${approvedCount}건 승인 완료, 실패 ${failed}건·부분 ${partial}건. 해당 항목을 새로고침 후 확인해 주세요.`);
     } else {
       showToast(`선택한 문제 ${approvedCount}건이 서버에 승인 완료되었습니다.`);
     }
   };
 
-  const handleUpdateProblemDraft = (updatedDraft: ProblemDraft) => {
-    const updated = updateProblemDraft(updatedDraft);
-    setProblemDrafts(updated);
-    showToast('문제 초안 수정 내용이 저장되었습니다.');
+  // Best-effort server sync for locally-managed problem writes. Reports a
+  // warning (never a false success) when the server rejects the change.
+  const pushProblemToServer = async (
+    problemId: string,
+    opts: { revise?: boolean; expectedVersion?: number } = {}
+  ): Promise<void> => {
+    const problem = loadStoredProblems().find((p) => p.id === problemId);
+    if (!problem) return;
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const result = opts.revise
+        ? await reviseProblem(
+            supabase,
+            problemId,
+            opts.expectedVersion ?? Math.max(1, (problem.version ?? 1) - 1),
+            problem
+          )
+        : await updateProblemQuality(supabase, problemId, {
+            qualityStatus: problem.qualityStatus,
+            isOutdated: problem.isOutdated,
+            needsSourceReview: problem.needsSourceReview,
+            payload: problem as unknown as Record<string, unknown>,
+          });
+      if (!result.ok) showToast(`서버 동기화 실패: ${result.error}`);
+    } catch (e) {
+      showToast(`서버 동기화 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+    }
   };
 
-  const handleDeleteProblemDraft = (draftId: string) => {
-    const updated = deleteProblemDraft(draftId);
+  const handleUpdateProblemDraft = async (updatedDraft: ProblemDraft) => {
+    // Drafts loaded from the server carry contentVersion; local-only drafts do not.
+    if (updatedDraft.contentVersion !== undefined) {
+      try {
+        const supabase = createBrowserSupabaseClient();
+        const result = await updateProblemDraftCloud(supabase, updatedDraft, updatedDraft.contentVersion);
+        if (!result.ok) {
+          showToast(`문제 초안 수정 저장 실패: ${result.error}`);
+          return;
+        }
+        const next = problemDrafts.map((d) => (d.id === result.data.id ? result.data : d));
+        setProblemDrafts(next);
+        saveStoredProblemDrafts(next);
+        showToast('문제 초안 수정 내용이 서버에 저장되었습니다.');
+        return;
+      } catch (e) {
+        showToast(`문제 초안 수정 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+        return;
+      }
+    }
+    const updated = updateProblemDraft(updatedDraft);
     setProblemDrafts(updated);
+    showToast('문제 초안 수정 내용이 로컬에 저장되었습니다. (아직 서버에 이전되지 않음)');
+  };
+
+  const handleDeleteProblemDraft = async (draftId: string) => {
+    const draft = problemDrafts.find((d) => d.id === draftId);
+    if (draft?.contentVersion !== undefined) {
+      try {
+        const supabase = createBrowserSupabaseClient();
+        const result = await deleteProblemDraftCloud(supabase, draftId);
+        if (!result.ok) {
+          showToast(`문제 초안 삭제 실패: ${result.error}`);
+          return;
+        }
+      } catch (e) {
+        showToast(`문제 초안 삭제 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+        return;
+      }
+    }
+    const updated = problemDrafts.filter((d) => d.id !== draftId);
+    setProblemDrafts(updated);
+    saveStoredProblemDrafts(updated);
     showToast('문제 초안이 삭제되었습니다.');
   };
 
@@ -1200,15 +1349,19 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       // Approve on the server first (unapproved drafts are never exposed as
       // practice targets), then start practice with the confirmed problem.
       const result = await approveProblemViaServer(draft.id, allProblems, problemDrafts);
-      if (result.ok) {
+      if (result.status === 'ok') {
         setProblemDrafts(result.drafts);
         saveStoredProblemDrafts(result.drafts);
-        setAllProblems(result.problems);
-        saveStoredProblems(result.problems);
-        const approved = result.problems.find((p) => p.draftId === draft.id);
+        setAllProblems(result.entities);
+        saveStoredProblems(result.entities);
+        const approved = result.entities.find((p) => p.draftId === draft.id);
         problemToPracticeId = approved?.id ?? '';
       } else {
-        showToast(approvalErrorMessage(result.error));
+        showToast(
+          result.status === 'partial'
+            ? result.error ?? '서버 승인은 완료됐지만 화면 갱신에 실패했습니다. 새로고침해 주세요.'
+            : approvalErrorMessage(result.error)
+        );
         return;
       }
     } else {
@@ -1238,6 +1391,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
+      void pushProblemToServer(problemId);
       showToast('문제 오류가 신고되었습니다. 품질 검토 및 수정 완료 시까지 출제에서 제외됩니다.');
     } else {
       showToast(`신고 접수 실패: ${res.error}`);
@@ -1254,6 +1408,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     if (updated) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
+      void pushProblemToServer(problemId);
       showToast(`문제 상태가 [${newStatus}]으로 변경되었습니다.`);
     }
   };
@@ -1267,6 +1422,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
+      void pushProblemToServer(problemId);
       showToast('신고가 기각 사유와 함께 종결 처리되었습니다.');
     } else {
       showToast(`신고 기각 실패: ${res.error}`);
@@ -1279,10 +1435,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     updates: Partial<Problem>,
     editReason: string
   ) => {
+    const beforeVersion = allProblems.find((p) => p.id === problemId)?.version ?? 1;
     const res = editAndReviseProblem(problemId, updates, editReason);
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
+      void pushProblemToServer(problemId, { revise: true, expectedVersion: beforeVersion });
       showToast('문제가 수정되어 새 버전으로 기록되었습니다. (수정 후 재검토 상태)');
     } else {
       showToast(`문제 수정 실패: ${res.error}`);
@@ -1291,10 +1449,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   };
 
   const handleReapproveProblem = (problemId: string, reapprovalNote?: string) => {
+    const beforeVersion = allProblems.find((p) => p.id === problemId)?.version ?? 1;
     const res = reapproveProblem(problemId, reapprovalNote, materials);
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
+      void pushProblemToServer(problemId, { revise: true, expectedVersion: beforeVersion });
       showToast('문제 품질 검토 및 재승인이 완료되어 다시 출제에 포함됩니다.');
     } else {
       showToast(`재승인 실패: ${res.error}`);
@@ -1307,6 +1467,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     if (suspended) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
+      void pushProblemToServer(problemId);
       showToast('문제가 사용 중지 처리되었습니다.');
     }
   };
@@ -2355,28 +2516,35 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         isAnalyzing={isAiAnalyzing}
         onApproveConceptDraft={async (draft) => {
           const result = await approveConceptViaServer(draft, allConcepts, conceptDrafts);
-          if (!result.ok) {
-            showToast(`개념 승인 실패: ${result.error ?? '다시 시도해 주세요.'}`);
-            return false;
+          if (result.status === 'ok') {
+            setAllConcepts(result.entities);
+            saveStoredConcepts(result.entities);
+            setConceptDrafts(result.drafts);
+            saveStoredConceptDrafts(result.drafts);
+            showToast(`개념 [${draft.title}]이(가) 서버에 승인되었습니다.`);
+            return true;
           }
-          setAllConcepts(result.concepts);
-          saveStoredConcepts(result.concepts);
-          setConceptDrafts(result.drafts);
-          saveStoredConceptDrafts(result.drafts);
-          showToast(`개념 [${draft.title}]이(가) 서버에 승인되었습니다.`);
-          return true;
+          showToast(
+            result.status === 'partial'
+              ? result.error ?? '서버 승인은 완료됐지만 화면 갱신에 실패했습니다. 새로고침해 주세요.'
+              : `개념 승인 실패: ${result.error ?? '다시 시도해 주세요.'}`
+          );
+          return false;
         }}
         onBatchApproveConceptDrafts={async (pending) => {
           let concepts = allConcepts;
           let drafts = conceptDrafts;
           let approvedCount = 0;
           let failed = 0;
+          let partial = 0;
           for (const draft of pending) {
             const result = await approveConceptViaServer(draft, concepts, drafts);
-            if (result.ok) {
-              concepts = result.concepts;
+            if (result.status === 'ok') {
+              concepts = result.entities;
               drafts = result.drafts;
               approvedCount += 1;
+            } else if (result.status === 'partial') {
+              partial += 1;
             } else {
               failed += 1;
             }
@@ -2386,10 +2554,48 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           setConceptDrafts(drafts);
           saveStoredConceptDrafts(drafts);
           showToast(
-            failed > 0
-              ? `${approvedCount}건 승인 완료, 실패 ${failed}건. 실패 항목만 다시 시도해 주세요.`
+            failed > 0 || partial > 0
+              ? `${approvedCount}건 승인 완료, 실패 ${failed}건·부분 ${partial}건. 해당 항목을 새로고침 후 확인해 주세요.`
               : `선택한 개념 ${approvedCount}건이 서버에 승인 완료되었습니다.`
           );
+          return true;
+        }}
+        onUpdateConceptDraft={async (draft) => {
+          if (draft.contentVersion === undefined) return false;
+          try {
+            const supabase = createBrowserSupabaseClient();
+            const result = await updateConceptDraftCloud(supabase, draft, draft.contentVersion);
+            if (!result.ok) {
+              showToast(`개념 초안 수정 저장 실패: ${result.error}`);
+              return false;
+            }
+            const next = conceptDrafts.map((d) => (d.id === result.data.id ? result.data : d));
+            setConceptDrafts(next);
+            saveStoredConceptDrafts(next);
+            return true;
+          } catch (e) {
+            showToast(`개념 초안 수정 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+            return false;
+          }
+        }}
+        onDeleteConceptDraft={async (draftId) => {
+          const draft = conceptDrafts.find((d) => d.id === draftId);
+          if (draft?.contentVersion !== undefined) {
+            try {
+              const supabase = createBrowserSupabaseClient();
+              const result = await deleteConceptDraftCloud(supabase, draftId);
+              if (!result.ok) {
+                showToast(`개념 초안 삭제 실패: ${result.error}`);
+                return false;
+              }
+            } catch (e) {
+              showToast(`개념 초안 삭제 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+              return false;
+            }
+          }
+          const next = conceptDrafts.filter((d) => d.id !== draftId);
+          setConceptDrafts(next);
+          saveStoredConceptDrafts(next);
           return true;
         }}
       />

@@ -37,6 +37,16 @@ export interface ConceptDraftRow {
 }
 export type ConceptDraftUpsert = Omit<ConceptDraftRow, 'user_id' | 'created_at' | 'updated_at'>;
 
+/** Content-only draft write: never touches approval columns on conflict. */
+export interface ConceptDraftContentUpsert {
+  id: string;
+  subject_id: string;
+  material_id: string | null;
+  title: string;
+  generation_job_id: string | null;
+  payload: Record<string, unknown>;
+}
+
 export interface ProblemRow {
   id: string;
   user_id: string;
@@ -78,6 +88,17 @@ export interface ProblemDraftRow {
   updated_at: string;
 }
 export type ProblemDraftUpsert = Omit<ProblemDraftRow, 'user_id' | 'created_at' | 'updated_at'>;
+
+/** Content-only draft write: never touches approval columns on conflict. */
+export interface ProblemDraftContentUpsert {
+  id: string;
+  subject_id: string;
+  title: string;
+  type: string;
+  is_demo: boolean;
+  generation_job_id: string | null;
+  payload: Record<string, unknown>;
+}
 
 export interface ProblemVersionRow {
   id: number;

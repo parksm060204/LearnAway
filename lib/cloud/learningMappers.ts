@@ -1,9 +1,11 @@
 import type { Concept, ConceptDraft, Problem, ProblemDraft } from '../types';
 import type {
+  ConceptDraftContentUpsert,
   ConceptDraftRow,
   ConceptDraftUpsert,
   ConceptRow,
   ConceptUpsert,
+  ProblemDraftContentUpsert,
   ProblemDraftRow,
   ProblemDraftUpsert,
   ProblemRow,
@@ -17,7 +19,18 @@ function doc<T>(payload: Record<string, unknown> | null): Partial<T> {
 // --- concepts --------------------------------------------------------------
 
 export function rowToConcept(row: ConceptRow): Concept {
-  return { ...doc<Concept>(row.payload), id: row.id, subjectId: row.subject_id } as Concept;
+  return {
+    ...doc<Concept>(row.payload),
+    id: row.id,
+    subjectId: row.subject_id,
+    title: row.title,
+    order: row.order_index,
+    status: row.status as Concept['status'],
+    currentScore: Number(row.current_score),
+    isLearned: row.is_learned,
+    isDemo: row.is_demo,
+    draftId: row.draft_id ?? undefined,
+  } as Concept;
 }
 
 export function conceptToUpsert(concept: Concept): ConceptUpsert {
@@ -38,10 +51,28 @@ export function conceptToUpsert(concept: Concept): ConceptUpsert {
 
 // --- concept drafts --------------------------------------------------------
 
+/**
+ * Authoritative fields come from DB columns (status / is_approved /
+ * updated_at / content_version / approval_state / approved_concept_id), so a
+ * stale payload can never make an approved draft look unapproved.
+ */
 export function rowToConceptDraft(row: ConceptDraftRow): ConceptDraft {
-  return { ...doc<ConceptDraft>(row.payload), id: row.id, subjectId: row.subject_id } as ConceptDraft;
+  return {
+    ...doc<ConceptDraft>(row.payload),
+    id: row.id,
+    subjectId: row.subject_id,
+    materialId: row.material_id ?? undefined,
+    title: row.title,
+    status: row.status as ConceptDraft['status'],
+    isApproved: row.is_approved,
+    updatedAt: row.updated_at,
+    contentVersion: row.content_version,
+    approvalState: row.approval_state as ConceptDraft['approvalState'],
+    approvedConceptId: row.approved_concept_id ?? undefined,
+  } as ConceptDraft;
 }
 
+/** Full write used by migration (explicitly sets approval columns). */
 export function conceptDraftToUpsert(draft: ConceptDraft): ConceptDraftUpsert {
   return {
     id: draft.id,
@@ -50,11 +81,26 @@ export function conceptDraftToUpsert(draft: ConceptDraft): ConceptDraftUpsert {
     title: draft.title,
     status: draft.status ?? 'draft',
     is_approved: draft.isApproved ?? false,
-    content_version: 1,
+    content_version: draft.contentVersion ?? 1,
     generation_job_id: null,
-    approved_concept_id: null,
-    approval_state: draft.isApproved ? 'approved' : 'pending',
+    approved_concept_id: draft.approvedConceptId ?? null,
+    approval_state: draft.approvalState ?? (draft.isApproved ? 'approved' : 'pending'),
     approval_error: null,
+    payload: draft as unknown as Record<string, unknown>,
+  };
+}
+
+/** Content-only write for AI generation / persistence retries. */
+export function conceptDraftContentUpsert(
+  draft: ConceptDraft,
+  jobId?: string | null
+): ConceptDraftContentUpsert {
+  return {
+    id: draft.id,
+    subject_id: draft.subjectId,
+    material_id: draft.materialId ?? null,
+    title: draft.title,
+    generation_job_id: jobId ?? null,
     payload: draft as unknown as Record<string, unknown>,
   };
 }
@@ -66,11 +112,14 @@ export function rowToProblem(row: ProblemRow): Problem {
     ...doc<Problem>(row.payload),
     id: row.id,
     subjectId: row.subject_id,
+    title: row.title,
     version: row.version,
+    draftId: row.draft_id ?? undefined,
     isApproved: row.is_approved,
     isOutdated: row.is_outdated,
     needsSourceReview: row.needs_source_review,
     qualityStatus: (row.quality_status as Problem['qualityStatus']) ?? 'normal',
+    isDemo: row.is_demo,
   } as Problem;
 }
 
@@ -97,7 +146,20 @@ export function problemToUpsert(problem: Problem): ProblemUpsert {
 // --- problem drafts --------------------------------------------------------
 
 export function rowToProblemDraft(row: ProblemDraftRow): ProblemDraft {
-  return { ...doc<ProblemDraft>(row.payload), id: row.id, subjectId: row.subject_id } as ProblemDraft;
+  return {
+    ...doc<ProblemDraft>(row.payload),
+    id: row.id,
+    subjectId: row.subject_id,
+    title: row.title,
+    type: row.type as ProblemDraft['type'],
+    status: row.status as ProblemDraft['status'],
+    isApproved: row.is_approved,
+    isDemo: row.is_demo,
+    updatedAt: row.updated_at,
+    contentVersion: row.content_version,
+    approvalState: row.approval_state as ProblemDraft['approvalState'],
+    approvedProblemId: row.approved_problem_id ?? undefined,
+  } as ProblemDraft;
 }
 
 export function problemDraftToUpsert(draft: ProblemDraft): ProblemDraftUpsert {
@@ -109,11 +171,26 @@ export function problemDraftToUpsert(draft: ProblemDraft): ProblemDraftUpsert {
     status: draft.status ?? 'draft',
     is_approved: draft.isApproved ?? false,
     is_demo: draft.isDemo ?? false,
-    content_version: 1,
+    content_version: draft.contentVersion ?? 1,
     generation_job_id: null,
-    approved_problem_id: null,
-    approval_state: draft.isApproved ? 'approved' : 'pending',
+    approved_problem_id: draft.approvedProblemId ?? null,
+    approval_state: draft.approvalState ?? (draft.isApproved ? 'approved' : 'pending'),
     approval_error: null,
+    payload: draft as unknown as Record<string, unknown>,
+  };
+}
+
+export function problemDraftContentUpsert(
+  draft: ProblemDraft,
+  jobId?: string | null
+): ProblemDraftContentUpsert {
+  return {
+    id: draft.id,
+    subject_id: draft.subjectId,
+    title: draft.title,
+    type: draft.type,
+    is_demo: draft.isDemo ?? false,
+    generation_job_id: jobId ?? null,
     payload: draft as unknown as Record<string, unknown>,
   };
 }

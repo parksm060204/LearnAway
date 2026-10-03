@@ -1,10 +1,12 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Concept, ConceptDraft, Problem, ProblemDraft, ProblemVersionSnapshot } from '../types';
 import {
-  conceptToUpsert,
+  conceptDraftContentUpsert,
   conceptDraftToUpsert,
-  problemToUpsert,
+  conceptToUpsert,
+  problemDraftContentUpsert,
   problemDraftToUpsert,
+  problemToUpsert,
   rowToConcept,
   rowToConceptDraft,
   rowToProblem,
@@ -102,9 +104,12 @@ export async function listProblemVersions(
 }
 
 // ---------------------------------------------------------------------------
-// Draft writes (idempotent by draft id; job id recorded for AI generation)
+// Draft writes
 // ---------------------------------------------------------------------------
 
+/** Content-only upsert for AI generation / persistence retries. Approval
+ *  columns (status, is_approved, content_version, approval_state, approved_*) are
+ *  NEVER written here, so a re-save cannot reset an edited/approved draft. */
 export async function upsertConceptDrafts(
   supabase: SupabaseClient,
   drafts: ConceptDraft[],
@@ -112,7 +117,7 @@ export async function upsertConceptDrafts(
 ): Promise<RepoResult<ConceptDraft[]>> {
   try {
     if (drafts.length === 0) return repoOk([]);
-    const rows = drafts.map((draft) => ({ ...conceptDraftToUpsert(draft), generation_job_id: jobId ?? null }));
+    const rows = drafts.map((draft) => conceptDraftContentUpsert(draft, jobId ?? null));
     const { data, error } = await supabase
       .from('concept_drafts')
       .upsert(rows, { onConflict: 'id,user_id' })
@@ -131,7 +136,7 @@ export async function upsertProblemDrafts(
 ): Promise<RepoResult<ProblemDraft[]>> {
   try {
     if (drafts.length === 0) return repoOk([]);
-    const rows = drafts.map((draft) => ({ ...problemDraftToUpsert(draft), generation_job_id: jobId ?? null }));
+    const rows = drafts.map((draft) => problemDraftContentUpsert(draft, jobId ?? null));
     const { data, error } = await supabase
       .from('problem_drafts')
       .upsert(rows, { onConflict: 'id,user_id' })
@@ -143,14 +148,57 @@ export async function upsertProblemDrafts(
   }
 }
 
-/** Saves an edited draft and bumps its content_version (optimistic concurrency). */
+/** Full draft upsert used by migration (explicitly sets approval columns). */
+export async function upsertConceptDraftsFull(
+  supabase: SupabaseClient,
+  drafts: ConceptDraft[],
+  jobId?: string
+): Promise<RepoResult<ConceptDraft[]>> {
+  try {
+    if (drafts.length === 0) return repoOk([]);
+    const rows = drafts.map((draft) => ({ ...conceptDraftToUpsert(draft), generation_job_id: jobId ?? null }));
+    const { data, error } = await supabase.from('concept_drafts').upsert(rows, { onConflict: 'id,user_id' }).select('*');
+    if (error) return repoError(error.message);
+    return repoOk(((data as ConceptDraftRow[]) ?? []).map(rowToConceptDraft));
+  } catch (error) {
+    return repoError(message(error, '개념 초안을 저장하지 못했습니다.'));
+  }
+}
+
+export async function upsertProblemDraftsFull(
+  supabase: SupabaseClient,
+  drafts: ProblemDraft[],
+  jobId?: string
+): Promise<RepoResult<ProblemDraft[]>> {
+  try {
+    if (drafts.length === 0) return repoOk([]);
+    const rows = drafts.map((draft) => ({ ...problemDraftToUpsert(draft), generation_job_id: jobId ?? null }));
+    const { data, error } = await supabase.from('problem_drafts').upsert(rows, { onConflict: 'id,user_id' }).select('*');
+    if (error) return repoError(error.message);
+    return repoOk(((data as ProblemDraftRow[]) ?? []).map(rowToProblemDraft));
+  } catch (error) {
+    return repoError(message(error, '문제 초안을 저장하지 못했습니다.'));
+  }
+}
+
+/** Saves an edited draft and bumps its content_version (optimistic concurrency).
+ *  Approval pointer/state are preserved unless the caller marks it pending. */
 export async function updateConceptDraft(
   supabase: SupabaseClient,
   draft: ConceptDraft,
   expectedContentVersion: number
 ): Promise<RepoResult<ConceptDraft>> {
   try {
-    const row = { ...conceptDraftToUpsert(draft), content_version: expectedContentVersion + 1, edited_by_user: true } as Record<string, unknown>;
+    const row = {
+      subject_id: draft.subjectId,
+      material_id: draft.materialId ?? null,
+      title: draft.title,
+      status: draft.status ?? 'draft',
+      is_approved: draft.isApproved ?? false,
+      content_version: expectedContentVersion + 1,
+      edited_by_user: true,
+      payload: draft as unknown as Record<string, unknown>,
+    };
     const { data, error } = await supabase
       .from('concept_drafts')
       .update(row)
@@ -159,7 +207,7 @@ export async function updateConceptDraft(
       .select('*')
       .maybeSingle();
     if (error) return repoError(error.message);
-    if (!data) return repoError('다른 곳에서 초안이 먼저 수정되었습니다. 새로고침 후 다시 시도해 주세요.');
+    if (!data) return repoError('stale: 다른 곳에서 초안이 먼저 수정되었습니다. 새로고침 후 다시 시도해 주세요.');
     return repoOk(rowToConceptDraft(data as ConceptDraftRow));
   } catch (error) {
     return repoError(message(error, '개념 초안을 수정하지 못했습니다.'));
@@ -172,7 +220,17 @@ export async function updateProblemDraft(
   expectedContentVersion: number
 ): Promise<RepoResult<ProblemDraft>> {
   try {
-    const row = { ...problemDraftToUpsert(draft), content_version: expectedContentVersion + 1, edited_by_user: true } as Record<string, unknown>;
+    const row = {
+      subject_id: draft.subjectId,
+      title: draft.title,
+      type: draft.type,
+      status: draft.status ?? 'draft',
+      is_approved: draft.isApproved ?? false,
+      is_demo: draft.isDemo ?? false,
+      content_version: expectedContentVersion + 1,
+      edited_by_user: true,
+      payload: draft as unknown as Record<string, unknown>,
+    };
     const { data, error } = await supabase
       .from('problem_drafts')
       .update(row)
@@ -181,10 +239,94 @@ export async function updateProblemDraft(
       .select('*')
       .maybeSingle();
     if (error) return repoError(error.message);
-    if (!data) return repoError('다른 곳에서 초안이 먼저 수정되었습니다. 새로고침 후 다시 시도해 주세요.');
+    if (!data) return repoError('stale: 다른 곳에서 초안이 먼저 수정되었습니다. 새로고침 후 다시 시도해 주세요.');
     return repoOk(rowToProblemDraft(data as ProblemDraftRow));
   } catch (error) {
     return repoError(message(error, '문제 초안을 수정하지 못했습니다.'));
+  }
+}
+
+export async function rejectConceptDraft(supabase: SupabaseClient, id: string): Promise<RepoResult<{ id: string }>> {
+  try {
+    const { error } = await supabase.from('concept_drafts').update({ status: 'rejected', is_approved: false }).eq('id', id);
+    if (error) return repoError(error.message);
+    return repoOk({ id });
+  } catch (error) {
+    return repoError(message(error, '개념 초안을 거절하지 못했습니다.'));
+  }
+}
+
+export async function rejectProblemDraft(supabase: SupabaseClient, id: string): Promise<RepoResult<{ id: string }>> {
+  try {
+    const { error } = await supabase.from('problem_drafts').update({ status: 'rejected', is_approved: false }).eq('id', id);
+    if (error) return repoError(error.message);
+    return repoOk({ id });
+  } catch (error) {
+    return repoError(message(error, '문제 초안을 거절하지 못했습니다.'));
+  }
+}
+
+export async function deleteConceptDraft(supabase: SupabaseClient, id: string): Promise<RepoResult<{ id: string }>> {
+  try {
+    const { error } = await supabase.from('concept_drafts').delete().eq('id', id);
+    if (error) return repoError(error.message);
+    return repoOk({ id });
+  } catch (error) {
+    return repoError(message(error, '개념 초안을 삭제하지 못했습니다.'));
+  }
+}
+
+export async function deleteProblemDraft(supabase: SupabaseClient, id: string): Promise<RepoResult<{ id: string }>> {
+  try {
+    const { error } = await supabase.from('problem_drafts').delete().eq('id', id);
+    if (error) return repoError(error.message);
+    return repoOk({ id });
+  } catch (error) {
+    return repoError(message(error, '문제 초안을 삭제하지 못했습니다.'));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Single-entity reads (used to reconcile after approval)
+// ---------------------------------------------------------------------------
+
+export async function getConceptDraftById(supabase: SupabaseClient, id: string): Promise<RepoResult<ConceptDraft | null>> {
+  try {
+    const { data, error } = await supabase.from('concept_drafts').select('*').eq('id', id).maybeSingle();
+    if (error) return repoError(error.message);
+    return repoOk(data ? rowToConceptDraft(data as ConceptDraftRow) : null);
+  } catch (error) {
+    return repoError(message(error, '개념 초안을 다시 읽지 못했습니다.'));
+  }
+}
+
+export async function getProblemDraftById(supabase: SupabaseClient, id: string): Promise<RepoResult<ProblemDraft | null>> {
+  try {
+    const { data, error } = await supabase.from('problem_drafts').select('*').eq('id', id).maybeSingle();
+    if (error) return repoError(error.message);
+    return repoOk(data ? rowToProblemDraft(data as ProblemDraftRow) : null);
+  } catch (error) {
+    return repoError(message(error, '문제 초안을 다시 읽지 못했습니다.'));
+  }
+}
+
+export async function getConceptById(supabase: SupabaseClient, id: string): Promise<RepoResult<Concept | null>> {
+  try {
+    const { data, error } = await supabase.from('concepts').select('*').eq('id', id).maybeSingle();
+    if (error) return repoError(error.message);
+    return repoOk(data ? rowToConcept(data as ConceptRow) : null);
+  } catch (error) {
+    return repoError(message(error, '개념을 다시 읽지 못했습니다.'));
+  }
+}
+
+export async function getProblemById(supabase: SupabaseClient, id: string): Promise<RepoResult<Problem | null>> {
+  try {
+    const { data, error } = await supabase.from('problems').select('*').eq('id', id).maybeSingle();
+    if (error) return repoError(error.message);
+    return repoOk(data ? rowToProblem(data as ProblemRow) : null);
+  } catch (error) {
+    return repoError(message(error, '문제를 다시 읽지 못했습니다.'));
   }
 }
 
@@ -205,6 +347,9 @@ function approvalErrorCode(error: { message?: string; code?: string } | null): s
   if (raw.includes('RUBRIC_NOT_100')) return 'rubric';
   if (raw.includes('DRAFT_INCOMPLETE')) return 'incomplete';
   if (raw.includes('NO_CONCEPT_LINK')) return 'no_concept';
+  if (raw.includes('ENTITY_ID_CONFLICT')) return 'id_conflict';
+  if (raw.includes('DRAFT_SCOPE_MISMATCH')) return 'scope';
+  if (raw.includes('VERSION_CONFLICT')) return 'version_conflict';
   return 'error';
 }
 
@@ -243,6 +388,58 @@ export async function approveProblemDraft(
     return repoOk({ id: String(data), alreadyApproved: false });
   } catch (error) {
     return repoError(message(error, '문제 승인에 실패했습니다.'));
+  }
+}
+
+export interface ProblemQualityPatch {
+  qualityStatus?: string;
+  isOutdated?: boolean;
+  needsSourceReview?: boolean;
+  /** Full updated Problem document (carries reports / review notes). */
+  payload?: Record<string, unknown>;
+}
+
+/** Persists a quality/review status change (report, dismiss, suspend, ...). */
+export async function updateProblemQuality(
+  supabase: SupabaseClient,
+  id: string,
+  patch: ProblemQualityPatch
+): Promise<RepoResult<Problem>> {
+  try {
+    const row: Record<string, unknown> = {};
+    if (patch.qualityStatus !== undefined) row.quality_status = patch.qualityStatus;
+    if (patch.isOutdated !== undefined) row.is_outdated = patch.isOutdated;
+    if (patch.needsSourceReview !== undefined) row.needs_source_review = patch.needsSourceReview;
+    if (patch.payload !== undefined) row.payload = patch.payload;
+    const { data, error } = await supabase.from('problems').update(row).eq('id', id).select('*').maybeSingle();
+    if (error) return repoError(error.message);
+    if (!data) return repoError('missing: 문제를 찾을 수 없습니다.');
+    return repoOk(rowToProblem(data as ProblemRow));
+  } catch (error) {
+    return repoError(message(error, '문제 품질 상태를 저장하지 못했습니다.'));
+  }
+}
+
+/** Revises a problem: writes a new immutable version in one transaction. */
+export async function reviseProblem(
+  supabase: SupabaseClient,
+  problemId: string,
+  expectedVersion: number,
+  problem: Problem
+): Promise<RepoResult<Problem>> {
+  try {
+    const { error } = await supabase.rpc('revise_problem', {
+      p_problem_id: problemId,
+      p_expected_version: expectedVersion,
+      p_problem: problem as unknown as Record<string, unknown>,
+    });
+    if (error) return repoError(`${approvalErrorCode(error)}:${error.message}`);
+    const refetched = await getProblemById(supabase, problemId);
+    if (!refetched.ok) return refetched;
+    if (!refetched.data) return repoError('missing: 수정된 문제를 찾을 수 없습니다.');
+    return repoOk(refetched.data);
+  } catch (error) {
+    return repoError(message(error, '문제 수정에 실패했습니다.'));
   }
 }
 

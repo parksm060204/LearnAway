@@ -161,6 +161,10 @@ export interface ConceptDraft {
   createdAt: string;
   updatedAt: string;
   editedByUser?: boolean;
+  // Server-authoritative contract fields (present when loaded from Supabase).
+  contentVersion?: number;
+  approvalState?: 'pending' | 'approved' | 'failed';
+  approvedConceptId?: string;
 }
 
 export interface Concept {
@@ -288,6 +292,10 @@ export interface ProblemDraft {
   createdAt: string;
   updatedAt: string;
   editedByUser?: boolean;
+  // Server-authoritative contract fields (present when loaded from Supabase).
+  contentVersion?: number;
+  approvalState?: 'pending' | 'approved' | 'failed';
+  approvedProblemId?: string;
 }
 
 export interface Problem {

@@ -10,11 +10,12 @@ import {
 import { setStorageScope } from '../storageScope';
 import type { Concept, ConceptDraft, Problem, ProblemDraft, ProblemVersionSnapshot } from '../types';
 import { loadLearningLibrary } from './learningLibrary';
+import { loadLearningOriginals, recordMigratedIds } from './learningOriginals';
 import { conceptIdentity, planLearningMigration, problemIdentity, type LearningConflict } from './learningPlan';
 import {
-  upsertConceptDrafts,
+  upsertConceptDraftsFull,
   upsertConcepts,
-  upsertProblemDrafts,
+  upsertProblemDraftsFull,
   upsertProblems,
   upsertProblemVersions,
 } from './learningRepository';
@@ -106,6 +107,10 @@ function readLocal(userId: string): {
   problems: Problem[];
   problemDrafts: ProblemDraft[];
 } {
+  // Prefer the preserved originals; fall back to the live scope before a
+  // snapshot exists. Never read from the overwritable server cache.
+  const originals = loadLearningOriginals(userId);
+  if (originals.ok) return originals.data;
   setStorageScope({ kind: 'user', userId });
   return {
     concepts: loadStoredConcepts(),
@@ -296,7 +301,7 @@ export async function migrateLocalLearningToCloud(
   }
 
   if (plan.conceptDrafts.length > 0) {
-    const saved = await upsertConceptDrafts(supabase, plan.conceptDrafts, job.jobId);
+    const saved = await upsertConceptDraftsFull(supabase, plan.conceptDrafts, job.jobId);
     if (!saved.ok) {
       writeVerified(storage, userId, JOB_BASE, { ...job, updatedAt: new Date().toISOString() });
       return failure(`개념 초안 저장 실패: ${saved.error}`, resuming);
@@ -321,7 +326,7 @@ export async function migrateLocalLearningToCloud(
   }
 
   if (plan.problemDrafts.length > 0) {
-    const saved = await upsertProblemDrafts(supabase, plan.problemDrafts, job.jobId);
+    const saved = await upsertProblemDraftsFull(supabase, plan.problemDrafts, job.jobId);
     if (!saved.ok) {
       writeVerified(storage, userId, JOB_BASE, { ...job, updatedAt: new Date().toISOString() });
       return failure(`문제 초안 저장 실패: ${saved.error}`, resuming);
@@ -334,6 +339,12 @@ export async function migrateLocalLearningToCloud(
     writeVerified(storage, userId, JOB_BASE, { ...job, updatedAt: new Date().toISOString() });
     return failure(`이전 검증 실패: ${verified.error}`, resuming);
   }
+
+  // These ids now live on the server; never show them as un-migrated again
+  // (deleting them on the server must not resurrect them locally).
+  recordMigratedIds(userId, [
+    ...local.concepts, ...local.conceptDrafts, ...local.problems, ...local.problemDrafts,
+  ].map((record) => record.id));
 
   const marked = writeVerified(storage, userId, MARKER_BASE, {
     completed: true, completedAt: new Date().toISOString(), jobId: job.jobId, uploaded,

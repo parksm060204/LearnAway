@@ -20,7 +20,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/subjectsRepository.ts', 'lib/cloud/materialsRepository.ts', 'lib/cloud/library.ts',
   'lib/cloud/migrationOriginals.ts', 'lib/cloud/localMigration.ts',
   'lib/cloud/learningMappers.ts', 'lib/cloud/learningPlan.ts', 'lib/cloud/learningRepository.ts',
-  'lib/cloud/mergeLearning.ts', 'lib/learningApproval.ts',
+  'lib/cloud/mergeLearning.ts', 'lib/cloud/learningOriginals.ts', 'lib/learningApproval.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -86,6 +86,7 @@ exports.requireApiUser = async () => {
   const cloudLearningPlan = load(path.join(output, 'lib/cloud/learningPlan.js'));
   const cloudLearningRepo = load(path.join(output, 'lib/cloud/learningRepository.js'));
   const cloudMerge = load(path.join(output, 'lib/cloud/mergeLearning.js'));
+  const cloudLearningOriginals = load(path.join(output, 'lib/cloud/learningOriginals.js'));
   const learningApproval = load(path.join(output, 'lib/learningApproval.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
@@ -370,6 +371,11 @@ exports.requireApiUser = async () => {
       rpcCalls: [],
       rpcResult: options.rpcResult,
     };
+    // Seed any additional table arrays provided in options.
+    for (const key of Object.keys(options)) {
+      if (['user', 'subjects', 'materials', 'objects', 'fail', 'rpcResult'].includes(key)) continue;
+      if (Array.isArray(options[key])) state[key] = [...options[key]];
+    }
     const clone = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
     const nowIso = () => new Date().toISOString();
     const matchFilters = (rows, filters) =>
@@ -1476,6 +1482,106 @@ exports.requireApiUser = async () => {
     assert.equal(concept.draftId, 'd1');
     assert.equal(concept.chapterRef, '제3페이지');
     assert.deepEqual(concept.materialIds, ['m1']);
+  });
+
+  check('draft mapping uses authoritative DB columns over stale payload', () => {
+    const row = {
+      id: 'd1', user_id: 'u1', subject_id: 's1', material_id: 'm1', title: 'A',
+      status: 'approved', is_approved: true, content_version: 3, generation_job_id: null,
+      approved_concept_id: 'c1', approval_state: 'approved', approval_error: null,
+      payload: { id: 'd1', subjectId: 's1', title: 'A', status: 'draft', isApproved: false, updatedAt: '2000-01-01' },
+      created_at: '', updated_at: '2026-01-02T00:00:00.000Z',
+    };
+    const draft = cloudLearningMappers.rowToConceptDraft(row);
+    assert.equal(draft.status, 'approved');
+    assert.equal(draft.isApproved, true);
+    assert.equal(draft.updatedAt, '2026-01-02T00:00:00.000Z');
+    assert.equal(draft.contentVersion, 3);
+    assert.equal(draft.approvedConceptId, 'c1');
+  });
+
+  check('merge keeps un-migrated originals and drops migrated/server ids', () => {
+    const originals = [{ id: 'c1', subjectId: 's1', title: 'A' }, { id: 'c2', subjectId: 's1', title: 'B' }];
+    const merged = cloudMerge.mergeConcepts([], originals, new Set(['c1']));
+    assert.deepEqual(merged.map((c) => c.id), ['c2']);
+    const server = [{ id: 'c1', subjectId: 's1', title: 'A' }];
+    const merged2 = cloudMerge.mergeDrafts(server, [{ id: 'd1' }, { id: 'd2' }], new Set(['d2']));
+    assert.deepEqual(merged2.map((d) => d.id), ['c1', 'd1']);
+  });
+
+  await checkAsync('empty server keeps un-migrated local concepts/problems', async () => {
+    const userId = 'learn-orig-1';
+    for (const base of ['__concepts_v1', '__problems_v1', '__origin_learning_snapshot_v1', '__origin_learning_concepts_v1', '__origin_learning_problems_v1', '__learning_migrated_ids_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+    localStorage.setItem('redcall_user_' + userId + '__concepts_v1', JSON.stringify([{ id: 'c1', title: 'A' }]));
+    localStorage.setItem('redcall_user_' + userId + '__problems_v1', JSON.stringify([{ id: 'p1', title: 'P' }]));
+
+    const preserved = cloudLearningOriginals.ensureLearningOriginals(userId, new Set());
+    assert.equal(preserved.ok, true, preserved.ok ? '' : preserved.error);
+    // Simulate the server cache overwriting the live scope with an empty list.
+    localStorage.setItem('redcall_user_' + userId + '__concepts_v1', JSON.stringify([]));
+    localStorage.setItem('redcall_user_' + userId + '__problems_v1', JSON.stringify([]));
+    const loaded = cloudLearningOriginals.loadLearningOriginals(userId);
+    assert.equal(loaded.ok, true);
+    assert.equal(loaded.data.concepts.length, 1, 'concept original preserved');
+    assert.equal(loaded.data.problems.length, 1, 'problem original preserved');
+    assert.equal(loaded.data.source, 'origin');
+  });
+
+  await checkAsync('learning originals exclude server and migrated ids', async () => {
+    const userId = 'learn-orig-2';
+    for (const base of ['__concepts_v1', '__origin_learning_snapshot_v1', '__origin_learning_concepts_v1', '__learning_migrated_ids_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+    localStorage.setItem('redcall_user_' + userId + '__concepts_v1', JSON.stringify([{ id: 'c1' }, { id: 'c2' }]));
+    cloudLearningOriginals.recordMigratedIds(userId, ['c2']);
+    const preserved = cloudLearningOriginals.ensureLearningOriginals(userId, new Set(['c1']));
+    assert.equal(preserved.ok, true);
+    const loaded = cloudLearningOriginals.loadLearningOriginals(userId);
+    assert.equal(loaded.data.concepts.length, 0, 'server + migrated ids are not kept as originals');
+  });
+
+  await checkAsync('content-only draft upsert preserves approval on conflict', async () => {
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      concept_drafts: [{
+        id: 'd1', user_id: 'u1', subject_id: 's1', material_id: null, title: 'old',
+        status: 'approved', is_approved: true, content_version: 2, generation_job_id: null,
+        approved_concept_id: 'c1', approval_state: 'approved', approval_error: null,
+        payload: { title: 'old' }, created_at: '', updated_at: '',
+      }],
+    }, async (client) => {
+      const draft = {
+        id: 'd1', subjectId: 's1', materialId: null, title: 'new', domain: 'math_stats', description: '',
+        prerequisites: [], relatedConcepts: [], commonMisconceptions: [], examples: [],
+        sourceEvidence: { type: 'page', quote: 'q', verified: true },
+        status: 'draft', isApproved: false, sourceMarkdownHash: 'h', createdAt: '', updatedAt: '',
+      };
+      const result = await cloudLearningRepo.upsertConceptDrafts(client, [draft], 'job-1');
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      const row = client.__state.concept_drafts.find((d) => d.id === 'd1');
+      assert.equal(row.is_approved, true, 'approval pointer/state preserved');
+      assert.equal(row.status, 'approved');
+      assert.equal(row.title, 'new', 'content updated');
+      assert.equal(row.content_version, 2, 'content_version not reset');
+    });
+  });
+
+  await checkAsync('approval reconciliation reads the server entity', async () => {
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      concepts: [{
+        id: 'c1', user_id: 'u1', subject_id: 's1', title: 'server-title', order_index: 1, status: 'unstudied',
+        current_score: 0, is_learned: false, is_demo: false, version: 1, draft_id: 'd1',
+        payload: { id: 'c1', subjectId: 's1', title: 'server-title' }, created_at: '', updated_at: '',
+      }],
+    }, async (client) => {
+      const result = await cloudLearningRepo.getConceptById(client, 'c1');
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      assert.equal(result.data.id, 'c1');
+      assert.equal(result.data.title, 'server-title');
+    });
   });
 
   check('material import is never verified when a copy write failed', () => {

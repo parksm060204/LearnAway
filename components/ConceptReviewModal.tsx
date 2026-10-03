@@ -43,6 +43,8 @@ interface ConceptReviewModalProps {
    *  it instead of the local-only storage approval. */
   onApproveConceptDraft?: (draft: ConceptDraft) => Promise<boolean>;
   onBatchApproveConceptDrafts?: (drafts: ConceptDraft[]) => Promise<boolean>;
+  onUpdateConceptDraft?: (draft: ConceptDraft) => Promise<boolean>;
+  onDeleteConceptDraft?: (draftId: string) => Promise<boolean>;
 }
 
 export function ConceptReviewModal({
@@ -58,6 +60,8 @@ export function ConceptReviewModal({
   isAnalyzing = false,
   onApproveConceptDraft,
   onBatchApproveConceptDrafts,
+  onUpdateConceptDraft,
+  onDeleteConceptDraft,
 }: ConceptReviewModalProps) {
   const [selectedDraftId, setSelectedDraftId] = useState<string>('');
   const [filterMode, setFilterMode] = useState<'all' | 'pending' | 'approved' | 'unverified'>('all');
@@ -138,7 +142,7 @@ export function ConceptReviewModal({
   const approvedCount = subjectDrafts.filter((d) => d.isApproved).length;
   const unverifiedCount = subjectDrafts.filter((d) => !d.sourceEvidence.verified).length;
 
-  const handleSaveDraftEdits = () => {
+  const handleSaveDraftEdits = async () => {
     if (!activeDraft) return;
 
     const updated: ConceptDraft = {
@@ -167,6 +171,16 @@ export function ConceptReviewModal({
     };
 
     const nextDrafts = drafts.map((d) => (d.id === activeDraft.id ? updated : d));
+    if (onUpdateConceptDraft) {
+      const ok = await onUpdateConceptDraft(updated);
+      if (!ok) {
+        alert('개념 초안 수정을 서버에 저장하지 못했습니다. 입력 내용은 유지됩니다. 다시 시도해 주세요.');
+        return;
+      }
+      // The parent already updated the drafts from the server response.
+      alert('개념 초안 수정사항이 서버에 저장되었습니다.');
+      return;
+    }
     onUpdateDrafts(nextDrafts);
     saveStoredConceptDrafts(nextDrafts);
     alert('개념 초안 수정사항이 저장되었습니다.');
@@ -202,14 +216,20 @@ export function ConceptReviewModal({
     }
   };
 
-  const handleDelete = (draftId: string) => {
-    if (confirm('이 개념 초안을 삭제하시겠습니까?')) {
-      const updated = deleteConceptDraft(draftId);
-      onUpdateDrafts(updated);
-      setSelectedForMerge((prev) => prev.filter((id) => id !== draftId));
-      if (selectedDraftId === draftId) {
-        setSelectedDraftId('');
+  const handleDelete = async (draftId: string) => {
+    if (!confirm('이 개념 초안을 삭제하시겠습니까?')) return;
+    if (onDeleteConceptDraft) {
+      const ok = await onDeleteConceptDraft(draftId);
+      if (!ok) {
+        alert('개념 초안을 서버에서 삭제하지 못했습니다. 다시 시도해 주세요.');
+        return;
       }
+    } else {
+      onUpdateDrafts(deleteConceptDraft(draftId));
+    }
+    setSelectedForMerge((prev) => prev.filter((id) => id !== draftId));
+    if (selectedDraftId === draftId) {
+      setSelectedDraftId('');
     }
   };
 

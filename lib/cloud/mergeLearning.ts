@@ -1,14 +1,20 @@
 import type { Concept, Problem, ProblemVersionSnapshot } from '../types';
 
 /**
- * Server concept definitions are authoritative, but locally-derived review
- * state (events, scores, schedule) stays local in this stage and must not be
- * lost when the server copy is loaded.
+ * Server concepts are authoritative. Locally-derived review state (events,
+ * scores, schedule) stays local and is merged by id; un-migrated originals
+ * (never on the server, never migrated) are kept as un-synced. Records that were
+ * migrated and then deleted on the server are NOT resurrected.
  */
-export function mergeConcepts(server: Concept[], local: Concept[]): Concept[] {
-  const localById = new Map(local.map((c) => [c.id, c]));
-  return server.map((remote) => {
-    const mine = localById.get(remote.id);
+export function mergeConcepts(
+  server: Concept[],
+  originals: Concept[],
+  migratedIds: Set<string> = new Set()
+): Concept[] {
+  const originById = new Map(originals.map((c) => [c.id, c]));
+  const serverIds = new Set(server.map((c) => c.id));
+  const merged = server.map((remote) => {
+    const mine = originById.get(remote.id);
     if (!mine) return remote;
     return {
       ...remote,
@@ -26,20 +32,22 @@ export function mergeConcepts(server: Concept[], local: Concept[]): Concept[] {
       postponeDays: mine.postponeDays,
     };
   });
+  const unSynced = originals.filter((o) => !serverIds.has(o.id) && !migratedIds.has(o.id));
+  return [...merged, ...unSynced];
 }
 
-/**
- * Server problems are authoritative. Immutable version history and locally
- * managed quality metadata (reports, review notes) are preserved.
- */
+/** Server problems are authoritative; version history + local quality metadata
+ *  and un-migrated originals are preserved. */
 export function mergeProblems(
   server: Problem[],
-  local: Problem[],
-  versions: Record<string, ProblemVersionSnapshot[]>
+  originals: Problem[],
+  versions: Record<string, ProblemVersionSnapshot[]>,
+  migratedIds: Set<string> = new Set()
 ): Problem[] {
-  const localById = new Map(local.map((p) => [p.id, p]));
-  return server.map((remote) => {
-    const mine = localById.get(remote.id);
+  const originById = new Map(originals.map((p) => [p.id, p]));
+  const serverIds = new Set(server.map((p) => p.id));
+  const merged = server.map((remote) => {
+    const mine = originById.get(remote.id);
     const versionHistory = versions[remote.id];
     return {
       ...remote,
@@ -56,14 +64,17 @@ export function mergeProblems(
         : {}),
     };
   });
+  const unSynced = originals.filter((o) => !serverIds.has(o.id) && !migratedIds.has(o.id));
+  return [...merged, ...unSynced];
 }
 
-/**
- * Server drafts replace local ones, but local-only drafts (e.g. a generation
- * whose server save failed and has not been retried) are kept so unpersisted
- * edits are never silently dropped.
- */
-export function mergeDrafts<T extends { id: string }>(server: T[], local: T[]): T[] {
+/** Server drafts replace originals, but un-migrated drafts (never on the server,
+ *  never migrated) are kept so unpersisted edits are not silently dropped. */
+export function mergeDrafts<T extends { id: string }>(
+  server: T[],
+  originals: T[],
+  migratedIds: Set<string> = new Set()
+): T[] {
   const serverIds = new Set(server.map((d) => d.id));
-  return [...server, ...local.filter((d) => !serverIds.has(d.id))];
+  return [...server, ...originals.filter((d) => !serverIds.has(d.id) && !migratedIds.has(d.id))];
 }

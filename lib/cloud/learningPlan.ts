@@ -58,9 +58,18 @@ export function problemIdentity(problem: Problem): string {
   return JSON.stringify(evaluation);
 }
 
-function draftIdentity<T extends { updatedAt?: string }>(draft: T): string {
-  const { updatedAt, ...rest } = draft;
-  void updatedAt;
+/**
+ * Draft identity for migration is CONTENT only. Approval state, concurrency
+ * token and timestamps are server-authoritative and must not turn an identical
+ * draft into a conflict.
+ */
+function draftIdentity(draft: Record<string, unknown>): string {
+  const {
+    updatedAt, status, isApproved, approvalState, approvedConceptId, approvedProblemId,
+    contentVersion, ...rest
+  } = draft;
+  void updatedAt; void status; void isApproved; void approvalState;
+  void approvedConceptId; void approvedProblemId; void contentVersion;
   return JSON.stringify(rest);
 }
 
@@ -103,9 +112,9 @@ export function planLearningMigration(input: {
   cloudProblemDrafts: ProblemDraft[];
 }): LearningPlan {
   const concepts = planEntity('concept', input.localConcepts, input.cloudConcepts, conceptIdentity, '같은 ID의 개념이 서버에 다른 내용으로 존재합니다.');
-  const conceptDrafts = planEntity('conceptDraft', input.localConceptDrafts, input.cloudConceptDrafts, draftIdentity, '같은 ID의 개념 초안이 서버에 다른 내용으로 존재합니다.');
+  const conceptDrafts = planEntity('conceptDraft', input.localConceptDrafts, input.cloudConceptDrafts, (d) => draftIdentity(d as unknown as Record<string, unknown>), '같은 ID의 개념 초안이 서버에 다른 내용으로 존재합니다.');
   const problems = planEntity('problem', input.localProblems, input.cloudProblems, problemIdentity, '같은 ID의 문제가 서버에 다른 내용으로 존재합니다.');
-  const problemDrafts = planEntity('problemDraft', input.localProblemDrafts, input.cloudProblemDrafts, draftIdentity, '같은 ID의 문제 초안이 서버에 다른 내용으로 존재합니다.');
+  const problemDrafts = planEntity('problemDraft', input.localProblemDrafts, input.cloudProblemDrafts, (d) => draftIdentity(d as unknown as Record<string, unknown>), '같은 ID의 문제 초안이 서버에 다른 내용으로 존재합니다.');
 
   return {
     concepts: concepts.upload,
