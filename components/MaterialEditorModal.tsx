@@ -137,7 +137,10 @@ export function MaterialEditorModal({
       // Record the body identity ONLY after a durable save succeeded; a failed
       // save must not leave a hash that claims a body that is not persisted.
       if (result.persisted) {
-        recordMaterialBodyHash(material.id, computeMarkdownHash(markdown));
+        recordMaterialBodyHash(material.id, computeMarkdownHash(markdown), {
+          subjectId: material.subjectId,
+          kind: material.kind,
+        });
       }
 
       // 2. Update lightweight material metadata (the body identity hash is

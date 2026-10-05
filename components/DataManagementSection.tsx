@@ -17,6 +17,7 @@ import {
   buildMaterialBackup,
   findBackupLimitViolations,
   materialBackupBlobParts,
+  measureMaterialBackupPartsSize,
   parseMaterialBackup,
   summarizeBackupCompleteness,
   verifyBackupOriginalHashes,
@@ -124,10 +125,13 @@ export function DataManagementSection({
         },
       });
       const summary = summarizeBackupCompleteness(backup);
-      // Enforce the SAME limits the import parser uses, BEFORE serializing the
-      // whole backup (a download that import would refuse is never produced,
-      // and the tab does not spend memory stringifying an oversized backup).
-      const limitViolations = findBackupLimitViolations(backup);
+      // Serialize ONCE into separate parts and measure them for the SAME limits
+      // the import parser uses. The Blob below reuses these parts, so the whole
+      // backup is never materialized as a single JSON string and no oversized
+      // download is produced.
+      const parts = materialBackupBlobParts(backup);
+      const serializedSize = measureMaterialBackupPartsSize(parts);
+      const limitViolations = findBackupLimitViolations(backup, MATERIAL_BACKUP_LIMITS, serializedSize);
       if (limitViolations.length > 0) {
         setExportResult({
           total: backup.materials.length,
@@ -139,9 +143,7 @@ export function DataManagementSection({
         });
         return;
       }
-      // Serialize as SEPARATE parts so the download never materializes the
-      // whole file in one extra string on top of the built entries.
-      const blob = new Blob(materialBackupBlobParts(backup), { type: 'application/json' });
+      const blob = new Blob(parts, { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -170,7 +172,10 @@ export function DataManagementSection({
     }
   };
 
-  const runRestore = async (backup: MaterialBackupFile, subjectOverride?: Record<string, string>) => {
+  const runRestore = async (
+    backup: MaterialBackupFile,
+    subjectOverride?: Record<string, string>
+  ): Promise<Awaited<ReturnType<typeof executeMaterialRestore>>> => {
     // Pin the storage scope for the whole run: every read, write and
     // verification goes to the account the restore started in, even if the
     // global account changes mid-flight. The scope check below then stops
@@ -200,6 +205,7 @@ export function DataManagementSection({
       missing: outcome.missing,
       aborted: outcome.aborted,
     });
+    return outcome;
   };
 
   const handleImportFile = async (file: File) => {
@@ -229,8 +235,15 @@ export function DataManagementSection({
         );
         return;
       }
+      // Only materials whose metadata must be CREATED need a subject choice;
+      // entries that already exist locally are compared by their own identity.
+      const localMaterialIds = new Set(materials.map((m) => m.id));
       const unknownSubjectIds = Array.from(
-        new Set(parsed.backup.materials.map((entry) => entry.material.subjectId))
+        new Set(
+          parsed.backup.materials
+            .filter((entry) => !localMaterialIds.has(entry.material.id))
+            .map((entry) => entry.material.subjectId)
+        )
       ).filter((subjectId) => !subjects.some((s) => s.id === subjectId));
       if (unknownSubjectIds.length > 0) {
         if (subjects.length === 0) {
@@ -244,7 +257,10 @@ export function DataManagementSection({
         });
         return;
       }
-      await runRestore(parsed.backup);
+      const outcome = await runRestore(parsed.backup);
+      if (outcome.blockedBySubject) {
+        setImportError('대상 과목을 지정할 수 없는 자료가 있어 복원하지 않았습니다. 대상 과목을 확인해 주세요.');
+      }
     } catch (error) {
       setImportError(error instanceof Error ? error.message : '백업을 가져오지 못했습니다.');
     } finally {
@@ -254,10 +270,31 @@ export function DataManagementSection({
 
   const confirmSubjectChoice = async () => {
     if (!pendingSubjectChoice || importBusy) return;
+    // Validate the user's picks BEFORE any write: every chosen target must be a
+    // subject that still exists in THIS account. A deleted target must be
+    // re-chosen instead of writing to a subject that is gone.
+    const knownSubjectIds = new Set(subjects.map((s) => s.id));
+    const unresolved = pendingSubjectChoice.unknownSubjectIds.filter((sourceSubjectId) => {
+      const target = pendingSubjectChoice.choices[sourceSubjectId];
+      return !target || !knownSubjectIds.has(target);
+    });
+    if (unresolved.length > 0) {
+      setImportError(
+        '선택한 대상 과목을 현재 계정에서 찾을 수 없습니다. 대상 과목을 다시 선택해 주세요.'
+      );
+      return;
+    }
     setImportBusy(true);
     setImportError('');
     try {
-      await runRestore(pendingSubjectChoice.backup, pendingSubjectChoice.choices);
+      const outcome = await runRestore(pendingSubjectChoice.backup, pendingSubjectChoice.choices);
+      if (outcome.blockedBySubject) {
+        // Keep the chooser open so the user can resolve the remaining subjects.
+        setImportError(
+          '대상 과목이 지정되지 않은 자료가 있어 복원하지 않았습니다. 대상 과목을 선택한 뒤 다시 시도해 주세요.'
+        );
+        return;
+      }
       setPendingSubjectChoice(null);
     } catch (error) {
       setImportError(error instanceof Error ? error.message : '백업을 가져오지 못했습니다.');

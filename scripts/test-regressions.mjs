@@ -1244,6 +1244,99 @@ exports.requireApiUser = async () => {
     assert.ok(plan2.toRestore.includes('m-sub'));
   });
 
+  await checkAsync('a material from an unknown subject restores after the user maps its source subject', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-map' });
+      const entries = [restoreEntry('m-map', { body: { markdown: '# mapped body' } }, { subjectId: 'legacy-subject' })];
+      const { io, writtenMetadata } = makeRestoreIo({ subjectOverride: { 'legacy-subject': 's1' } });
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.equal(outcome.blockedBySubject, false);
+      assert.ok(outcome.restored.includes('m-map'), JSON.stringify(outcome));
+      assert.equal(writtenMetadata.length, 1);
+      assert.equal(writtenMetadata[0].subjectId, 's1', 'the chosen target subject is written');
+      assert.equal(writtenMetadata[0].id, 'm-map', 'the material id is unchanged');
+      const body = await matStorage.loadMaterialContentResult('m-map');
+      assert.equal(body.status, 'found');
+      assert.equal(body.content.markdown, '# mapped body');
+    });
+  });
+
+  await checkAsync('all materials of one unknown source subject map to the chosen target together', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-map-many' });
+      const entries = [
+        restoreEntry('m-a1', { body: { markdown: '# a1' } }, { subjectId: 'missing-s' }),
+        restoreEntry('m-a2', { body: { markdown: '# a2' } }, { subjectId: 'missing-s' }),
+        restoreEntry('m-b1', { body: { markdown: '# b1' } }, { subjectId: 's1' }),
+      ];
+      const { io, writtenMetadata } = makeRestoreIo({ subjectOverride: { 'missing-s': 's1' } });
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.equal(outcome.blockedBySubject, false);
+      assert.ok(['m-a1', 'm-a2', 'm-b1'].every((id) => outcome.restored.includes(id)), JSON.stringify(outcome));
+      assert.equal(writtenMetadata.length, 3);
+      assert.ok(writtenMetadata.every((m) => m.subjectId === 's1'));
+    });
+  });
+
+  await checkAsync('an unresolved subject blocks the whole restore without any write', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-block' });
+      const entries = [restoreEntry('m-block', { body: { markdown: '# blocked' } }, { subjectId: 'missing-s' })];
+      const { io, writtenMetadata } = makeRestoreIo();
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.equal(outcome.blockedBySubject, true);
+      assert.deepEqual(outcome.restored, []);
+      assert.equal(writtenMetadata.length, 0, 'no metadata written');
+      assert.equal((await matStorage.loadMaterialContentResult('m-block')).status, 'missing', 'no body written');
+      assert.ok(outcome.failed.some((f) => f.id === 'm-block' && /대상 과목/.test(f.reason)));
+    });
+  });
+
+  await checkAsync('a mapped entry whose id already has a different identity is not overwritten', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-map-conflict' });
+      const localMaterials = [restoreEntry('m-cf', {}, { subjectId: 's2', kind: 'transcript' }).material];
+      const entries = [restoreEntry('m-cf', { body: { markdown: '# backup' } }, { subjectId: 'legacy-subject' })];
+      const { io, writtenMetadata } = makeRestoreIo({ materials: localMaterials, subjectOverride: { 'legacy-subject': 's1' } });
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.ok(!outcome.restored.includes('m-cf'));
+      assert.ok(outcome.conflicts.some((c) => c.id === 'm-cf'), 'identity conflict reported');
+      assert.equal(writtenMetadata.length, 0, 'existing record not overwritten');
+    });
+  });
+
+  await checkAsync('a deleted target subject blocks the write instead of using a stale choice', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-target-gone' });
+      const entries = [restoreEntry('m-gone', { body: { markdown: '# x' } }, { subjectId: 'missing-s' })];
+      // The user picked 'deleted-subject', but it no longer exists in this account.
+      const { io, writtenMetadata } = makeRestoreIo({ subjectOverride: { 'missing-s': 'deleted-subject' } });
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.equal(outcome.blockedBySubject, true);
+      assert.equal(writtenMetadata.length, 0);
+      assert.equal((await matStorage.loadMaterialContentResult('m-gone')).status, 'missing');
+    });
+  });
+
+  await checkAsync('the UI subject-choice object shape drives the executor (source subject -> target)', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-ui-shape' });
+      const subjects = [{ id: 's1', name: 'S1' }];
+      const entries = [restoreEntry('m-ui', { body: { markdown: '# ui' } }, { subjectId: 'csv-subject' })];
+      // Exactly what DataManagementSection builds.
+      const unknownSubjectIds = Array.from(new Set(entries.map((e) => e.material.subjectId)))
+        .filter((subjectId) => !subjects.some((s) => s.id === subjectId));
+      const choices = Object.fromEntries(unknownSubjectIds.map((id) => [id, subjects[0].id]));
+      const { io, writtenMetadata } = makeRestoreIo({
+        subjectOverride: choices,
+        knownSubjectIds: subjects.map((s) => s.id),
+      });
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.ok(outcome.restored.includes('m-ui'), JSON.stringify(outcome));
+      assert.equal(writtenMetadata[0].subjectId, 's1');
+    });
+  });
+
   await checkAsync('backup build records read failures and metadata-embedded bodies', async () => {
     const base = restoreEntry('m-build').material;
     const failed = await materialPolicy.buildMaterialBackup([base], {
@@ -1530,6 +1623,87 @@ exports.requireApiUser = async () => {
     assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(atBoundary), tinyLimits).ok, true, 'an exported boundary backup re-imports under the same limits');
   });
 
+  check('serialized size measures characters and UTF-8 bytes from the same parts', () => {
+    const backup = {
+      version: 2,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      materials: [
+        restoreEntry('m-ascii', { body: { markdown: 'ascii body' } }),
+        restoreEntry('m-kr', { body: { markdown: '한글 본문입니다' } }),
+        restoreEntry('m-emoji', { body: { markdown: '😀 이모지 "escaped" \\n line' } }),
+      ],
+    };
+    const partsText = materialPolicy.materialBackupBlobParts(backup).join('');
+    assert.equal(partsText, JSON.stringify(backup), 'chunked parts equal the whole JSON');
+    const size = materialPolicy.measureMaterialBackupSerializedSize(backup);
+    assert.equal(size.chars, JSON.stringify(backup).length, 'char count matches the parser view');
+    assert.equal(size.bytes, Buffer.byteLength(JSON.stringify(backup), 'utf8'), 'byte count matches the real file size');
+    assert.ok(size.bytes > size.chars, 'korean and emoji make the byte size larger than the char count');
+  });
+
+  check('export rejects a backup whose UTF-8 bytes exceed the limit even when chars pass', () => {
+    const backup = { version: 2, materials: [restoreEntry('m-kr', { body: { markdown: '한'.repeat(50) } })] };
+    const size = materialPolicy.measureMaterialBackupSerializedSize(backup);
+    assert.ok(size.bytes > size.chars && size.chars < size.bytes);
+    const limits = {
+      fileBytes: size.bytes, textChars: size.chars, materials: 100,
+      bodyTextChars: 1e9, originalBase64Chars: 1e9,
+    };
+    // Exactly at both limits: accepted.
+    assert.deepEqual(materialPolicy.findBackupLimitViolations(backup, limits), []);
+    // One byte over the file limit (chars still pass): rejected before download.
+    const byteTight = { ...limits, fileBytes: size.bytes - 1 };
+    const violations = materialPolicy.findBackupLimitViolations(backup, byteTight);
+    assert.ok(violations.some((v) => /바이트/.test(v.reason) && v.id === null), 'byte-size violation reported');
+    assert.ok(size.chars <= byteTight.textChars, 'the char limit still passes');
+    assert.equal(
+      materialPolicy.parseMaterialBackup(JSON.stringify(backup), byteTight).ok,
+      false,
+      'the import parser enforces the same byte limit'
+    );
+  });
+
+  await checkAsync('an exported Korean backup round-trips through the real import validation path', async () => {
+    const limits = { fileBytes: 400 * 1024 * 1024, textChars: 256 * 1024 * 1024, materials: 100, bodyTextChars: 20 * 1024 * 1024, originalBase64Chars: 224 * 1024 * 1024 };
+    const backup = await materialPolicy.buildMaterialBackup(
+      [restoreEntry('m-roundtrip').material],
+      {
+        loadBody: async () => ({ status: 'found', body: { markdown: '한글 강의 본문 😀\n둘째 줄' } }),
+        loadOriginal: async () => ({ status: 'missing' }),
+      },
+      limits
+    );
+    const parts = materialPolicy.materialBackupBlobParts(backup);
+    const text = parts.join('');
+    const size = materialPolicy.measureMaterialBackupSerializedSize(backup);
+    // Export limit check (pre-download) and the import file-size gate agree.
+    assert.deepEqual(materialPolicy.findBackupLimitViolations(backup, limits), []);
+    assert.ok(size.bytes <= limits.fileBytes, 'file.size gate passes');
+    assert.ok(text.length <= limits.textChars, 'parser gate passes');
+    const parsed = materialPolicy.parseMaterialBackup(text, limits);
+    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.error);
+    if (parsed.ok) assert.equal(parsed.backup.materials[0].body.markdown, '한글 강의 본문 😀\n둘째 줄');
+  });
+
+  check('the summed UTF-8 byte size across materials is checked too', () => {
+    const backup = {
+      version: 2,
+      materials: [
+        restoreEntry('m1', { body: { markdown: '한'.repeat(20) } }),
+        restoreEntry('m2', { body: { markdown: '한'.repeat(20) } }),
+        restoreEntry('m3', { body: { markdown: '한'.repeat(20) } }),
+      ],
+    };
+    const size = materialPolicy.measureMaterialBackupSerializedSize(backup);
+    const limits = {
+      fileBytes: size.bytes, textChars: 1e9, materials: 100,
+      bodyTextChars: 1e9, originalBase64Chars: 1e9,
+    };
+    assert.deepEqual(materialPolicy.findBackupLimitViolations(backup, limits), []);
+    const tightened = { ...limits, fileBytes: size.bytes - 1 };
+    assert.ok(materialPolicy.findBackupLimitViolations(backup, tightened).some((v) => /바이트/.test(v.reason)));
+  });
+
   // ---- Boundary 2: failed body migration keeps the localStorage original ----
 
   await checkAsync('a stored-then-corrupted body fails verification and keeps the local copy', async () => {
@@ -1742,6 +1916,113 @@ exports.requireApiUser = async () => {
     });
   });
 
+  // ---- Boundary 5: server cache replacement must not delete un-migrated data ----
+
+  await checkAsync('a server cache replacement preserves an un-migrated material missing from an empty server list', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'server-merge-empty' });
+      const key = 'redcall_user_server-merge-empty__materials_v1';
+      localStorage.setItem(key, JSON.stringify([{
+        id: 'm-local', subjectId: 's1', kind: 'pdf', title: 'Local', status: 'ready', isConverted: true,
+        uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# last local copy',
+      }]));
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      fake.__failure.put.add('m-local'); // migration cannot persist the body
+
+      const merged = storage.saveStoredMaterialsFromServerCache([]);
+      const raw = JSON.parse(localStorage.getItem(key));
+      assert.equal(raw.find((m) => m.id === 'm-local').parsedMarkdown, '# last local copy', 'the un-migrated body survives an empty server list');
+      assert.ok(merged.some((m) => m.id === 'm-local'));
+      assert.equal(storage.loadStoredMaterials().find((m) => m.id === 'm-local').parsedMarkdown, '# last local copy');
+    });
+  });
+
+  await checkAsync('a partial server list does not delete the local material it omits', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'server-merge-partial' });
+      const key = 'redcall_user_server-merge-partial__materials_v1';
+      localStorage.setItem(key, JSON.stringify([
+        { id: 'm-server', subjectId: 's1', kind: 'pdf', title: 'Server', status: 'ready', isConverted: true, uploadedAt: 't' },
+        { id: 'm-only-local', subjectId: 's1', kind: 'pdf', title: 'Local', status: 'ready', isConverted: true, uploadedAt: 't', parsedMarkdown: '# local body' },
+      ]));
+      const merged = storage.saveStoredMaterialsFromServerCache([
+        { id: 'm-server', subjectId: 's1', kind: 'pdf', title: 'Server renamed', status: 'ready', isConverted: true, uploadedAt: 't' },
+      ]);
+      const raw = JSON.parse(localStorage.getItem(key));
+      assert.equal(raw.find((m) => m.id === 'm-server').title, 'Server renamed', 'server metadata wins for its own ids');
+      assert.equal(raw.find((m) => m.id === 'm-only-local').parsedMarkdown, '# local body', 'omitted local material preserved');
+      assert.ok(merged.some((m) => m.id === 'm-only-local'));
+    });
+  });
+
+  await checkAsync('an explicitly deleted material is never resurrected by a server cache replacement', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'server-merge-deleted' });
+      storage.markMaterialDeleted('m-deleted');
+      const merged = storage.saveStoredMaterialsFromServerCache([
+        { id: 'm-deleted', subjectId: 's1', kind: 'pdf', title: 'Back', status: 'ready', isConverted: true, uploadedAt: 't' },
+        { id: 'm-keep', subjectId: 's1', kind: 'pdf', title: 'Keep', status: 'ready', isConverted: true, uploadedAt: 't' },
+      ]);
+      assert.ok(!merged.some((m) => m.id === 'm-deleted'), 'deleted id not resurrected');
+      assert.ok(merged.some((m) => m.id === 'm-keep'));
+      const raw = JSON.parse(localStorage.getItem('redcall_user_server-merge-deleted__materials_v1'));
+      assert.ok(!raw.some((m) => m.id === 'm-deleted'));
+    });
+  });
+
+  await checkAsync('a restored local-only material survives a server refresh and is dropped only after it syncs', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'server-localonly' });
+      // Simulate a restored material: metadata present, body already durable in
+      // IndexedDB, marked local-only, and NOT present on the server yet.
+      await matStorage.saveMaterialContent('m-restored', { markdown: '# restored body' });
+      storage.saveStoredMaterials([{ id: 'm-restored', subjectId: 's1', kind: 'pdf', title: 'Restored', status: 'ready', isConverted: true, uploadedAt: 't' }]);
+      storage.markMaterialLocalOnly('m-restored');
+
+      const otherServer = [{ id: 'm-other', subjectId: 's1', kind: 'pdf', title: 'Other', status: 'ready', isConverted: true, uploadedAt: 't' }];
+      let merged = storage.saveStoredMaterialsFromServerCache(otherServer);
+      assert.ok(merged.some((m) => m.id === 'm-restored'), 'restored metadata survives a server refresh');
+
+      // Once the server list contains it, it is no longer local-only.
+      merged = storage.saveStoredMaterialsFromServerCache([
+        ...otherServer,
+        { id: 'm-restored', subjectId: 's1', kind: 'pdf', title: 'Restored', status: 'ready', isConverted: true, uploadedAt: 't' },
+      ]);
+      assert.ok(merged.some((m) => m.id === 'm-restored'));
+      // A later refresh that omits it now drops it (the server is authoritative).
+      merged = storage.saveStoredMaterialsFromServerCache(otherServer);
+      assert.ok(!merged.some((m) => m.id === 'm-restored'), 'after sync, the server list is authoritative');
+    });
+  });
+
+  await checkAsync('a preserved un-migrated body is removed only after a verified migration retry', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'server-merge-retry' });
+      const key = 'redcall_user_server-merge-retry__materials_v1';
+      localStorage.setItem(key, JSON.stringify([{
+        id: 'm-retry', subjectId: 's1', kind: 'pdf', title: 'Retry', status: 'ready', isConverted: true,
+        uploadedAt: 't', parsedMarkdown: '# retry body',
+      }]));
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      fake.__failure.put.add('m-retry');
+      const first = await storage.migrateStoredMaterialBodies();
+      assert.equal(first.ok, false);
+
+      // A server refresh keeps the un-migrated body.
+      storage.saveStoredMaterialsFromServerCache([]);
+      assert.equal(JSON.parse(localStorage.getItem(key))[0].parsedMarkdown, '# retry body');
+
+      // Retry succeeds: the body is verified in IndexedDB, then the duplicate is removed.
+      fake.__failure.put.delete('m-retry');
+      const retry = await storage.migrateStoredMaterialBodies();
+      assert.equal(retry.ok, true, retry.error ?? '');
+      assert.equal(JSON.parse(localStorage.getItem(key))[0].parsedMarkdown, undefined, 'duplicate removed only after verified migration');
+      const body = await matStorage.loadMaterialContentResult('m-retry');
+      assert.equal(body.status, 'found');
+      assert.equal(body.content.markdown, '# retry body');
+    });
+  });
+
   // ---- Boundary 4: the local body hash registry ----
 
   await checkAsync('the local body hash registry survives metadata replacement and reload', async () => {
@@ -1778,6 +2059,50 @@ exports.requireApiUser = async () => {
     storage.recordMaterialBodyHash('m-f', 'h9');
     storageScope.setStorageScope({ kind: 'user', userId: 'hash-other' });
     assert.equal(storage.getStoredMaterialBodyHash('m-f'), undefined, 'another account cannot read the hash');
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('a body hash recorded for one identity is never used for the same id with a different identity', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'hash-identity' });
+    assert.equal(storage.recordMaterialBodyHash('m-id', 'h-pdf', { subjectId: 's1', kind: 'pdf' }), true);
+    const same = { id: 'm-id', subjectId: 's1', kind: 'pdf', title: 'T', status: 'ready', isConverted: true, uploadedAt: 't' };
+    const otherSubject = { ...same, subjectId: 's2' };
+    const otherKind = { ...same, kind: 'transcript' };
+    assert.equal(storage.resolveStoredMaterialBodyHash(same), 'h-pdf', 'same identity keeps the hash');
+    assert.equal(storage.resolveStoredMaterialBodyHash(otherSubject), undefined, 'a different subject must not use the old hash');
+    assert.equal(storage.resolveStoredMaterialBodyHash(otherKind), undefined, 'a different kind must not use the old hash');
+    assert.equal(storage.getStoredMaterialBodyHash('m-id', { subjectId: 's2', kind: 'pdf' }), undefined);
+    assert.equal(storage.getStoredMaterialBodyHash('m-id', { subjectId: 's1', kind: 'pdf' }), 'h-pdf');
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('a stale metadata bodyHash does not bypass the registry identity check', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'hash-identity-stale' });
+    storage.recordMaterialBodyHash('m-stale', 'h-correct', { subjectId: 's1', kind: 'pdf' });
+    const staleMaterial = {
+      id: 'm-stale', subjectId: 's2', kind: 'pdf', title: 'T', status: 'ready',
+      isConverted: true, uploadedAt: 't', bodyHash: 'h-stale-metadata',
+    };
+    assert.equal(
+      storage.resolveStoredMaterialBodyHash(staleMaterial),
+      undefined,
+      'a registry identity mismatch must not fall back to the stale metadata hash'
+    );
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('a cloud refresh then reload keeps the identity-matching hash and rejects a changed identity', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'hash-refresh' });
+    storage.recordMaterialBodyHash('m-cr', 'h-cr', { subjectId: 's1', kind: 'pdf' });
+    // Server metadata rows do not carry bodyHash; the registry must re-attach it.
+    storage.saveStoredMaterials([{ id: 'm-cr', subjectId: 's1', kind: 'pdf', title: 'T', status: 'ready', isConverted: true, uploadedAt: 't' }]);
+    assert.equal(storage.loadStoredMaterials()[0].bodyHash, 'h-cr');
+    // A different identity for the same id must not inherit the old hash.
+    storage.saveStoredMaterials([{ id: 'm-cr', subjectId: 's1', kind: 'transcript', title: 'T', status: 'ready', isConverted: true, uploadedAt: 't' }]);
+    assert.equal(storage.loadStoredMaterials()[0].bodyHash, undefined);
+    // A legitimate change under the SAME identity updates the hash.
+    assert.equal(storage.recordMaterialBodyHash('m-cr', 'h-cr-v2', { subjectId: 's1', kind: 'pdf' }), true);
+    assert.equal(storage.getStoredMaterialBodyHash('m-cr', { subjectId: 's1', kind: 'pdf' }), 'h-cr-v2');
     storageScope.setStorageScope({ kind: 'legacy' });
   });
 

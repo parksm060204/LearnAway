@@ -169,12 +169,14 @@ import {
 } from '../lib/materialStorage';
 import { computeMarkdownHash } from '../lib/markdownUtils';
 import {
-  getStoredMaterialBodyHash,
   recordMaterialBodyHash,
+  resolveStoredMaterialBodyHash,
   removeStoredMaterialBodyHash,
   markMaterialDeleted,
+  markMaterialLocalOnly,
   clearDeletedMaterialMarker,
   reconcileDeletedMaterialMarkers,
+  saveStoredMaterialsFromServerCache,
   type MaterialHashIdentity,
 } from '../lib/storage';
 import { loadDefaultMaterialPolicy } from '../lib/materialPolicy';
@@ -376,18 +378,22 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           }
         }
 
-        // A id visible in this authoritative load re-exists on the server only
-        // when its delete committed BEFORE this load started.
-        const stillDeletedIds = reconcileDeletedMaterialMarkers(
+        // A stale snapshot may still contain a material deleted mid-load. A
+        // marker whose delete committed BEFORE this load started is cleared
+        // when the id is visible again (a legitimate server-side re-add).
+        reconcileDeletedMaterialMarkers(
           result.data.materials.map((m) => m.id),
           loadStartedAt
         );
-        const keptMaterials = result.data.materials.filter((m) => !stillDeletedIds.has(m.id));
 
         // Mirror the server library into the local cache for offline reads.
+        // This is a SERVER CACHE REPLACEMENT, not a local delete: un-migrated
+        // materials (body only in localStorage) and local-only (restored)
+        // materials that the server list lacks are MERGED back in, never
+        // silently dropped. Explicitly deleted ids are never reintroduced.
         saveStoredSubjects(result.data.subjects);
-        saveStoredMaterials(keptMaterials);
-        for (const material of keptMaterials) {
+        const mirroredMaterials = saveStoredMaterialsFromServerCache(result.data.materials);
+        for (const material of result.data.materials) {
           if (
             material.parsedMarkdown !== undefined ||
             material.rawText !== undefined ||
@@ -513,7 +519,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         markServerCache(currentUser.id);
 
         setSubjects(result.data.subjects);
-        setMaterials(keptMaterials);
+        setMaterials(mirroredMaterials);
         setCloudOriginalPaths(result.data.originalPathByMaterialId);
         setActiveSubjectId((prev) =>
           result.data.subjects.some((s) => s.id === prev)
@@ -874,8 +880,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       return false;
     }
     const candidateHash = computeMarkdownHash(text);
-    // Same hash rule for the stored identity and the candidate file.
-    const expectedHash = material.bodyHash ?? getStoredMaterialBodyHash(material.id);
+    // The identity-aware resolver never returns a hash recorded for a different
+    // subjectId/kind, and never falls back to a stale metadata hash in that case.
+    const expectedHash = resolveStoredMaterialBodyHash(material);
     if (expectedHash) {
       if (expectedHash !== candidateHash) {
         showToast('선택한 파일의 내용이 이 자료의 본문 식별 정보와 일치하지 않습니다. 기존 자료는 그대로 유지됩니다.');
@@ -1240,6 +1247,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     const persisted = saveStoredMaterialsVerified(updated);
     if (persisted) {
       for (const material of restored) {
+        // Restored materials live only on this device until they are synced;
+        // mark them so a later server cache refresh keeps their metadata.
+        markMaterialLocalOnly(material.id);
         if (material.bodyHash) {
           recordMaterialBodyHash(material.id, material.bodyHash, {
             subjectId: material.subjectId,

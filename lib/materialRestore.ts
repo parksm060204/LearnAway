@@ -43,7 +43,11 @@ export interface MaterialRestoreIo {
   /** Active storage scope id, sampled to detect account changes. */
   getScopeId(): string;
   knownSubjectIds: string[];
-  /** Explicit target subject per material id (user decision for unknown subjects). */
+  /**
+   * User-chosen target subject per SOURCE subject id (the backup's subjectId),
+   * applied to EVERY material of that source subject before planning. The key is
+   * the source subject id, never a material id.
+   */
   subjectOverride?: Record<string, string>;
 }
 
@@ -55,6 +59,8 @@ export interface MaterialRestoreOutcome {
   missing: RestoreMissingFile[];
   metadataPersisted: boolean;
   aborted: boolean;
+  /** Some entries still had no resolvable target subject: nothing was written. */
+  blockedBySubject: boolean;
   plan: RestorePlan;
 }
 
@@ -75,8 +81,18 @@ export async function executeMaterialRestore(
   const scopeAtStart = io.getScopeId();
   const currentMetadata = io.getMaterials();
 
+  // Apply the user's subject choices FIRST, keyed by the backup's source
+  // subjectId. Every material of the same source subject gets the same target,
+  // so the plan is built from the metadata that will actually be written.
+  const overrides = io.subjectOverride ?? {};
+  const effectiveEntries: MaterialBackupEntry[] = entries.map((entry) => {
+    const target = overrides[entry.material.subjectId];
+    if (!target || target === entry.material.subjectId) return entry;
+    return { ...entry, material: { ...entry.material, subjectId: target } };
+  });
+
   const snapshots: RestoreExistingSnapshot[] = [];
-  for (const entry of entries) {
+  for (const entry of effectiveEntries) {
     const id = entry.material.id;
     const metadata = currentMetadata.find((m) => m.id === id);
     const body = await io.loadBodyResult(id);
@@ -92,7 +108,28 @@ export async function executeMaterialRestore(
     });
   }
 
-  const plan = planMaterialRestore(entries, snapshots, { knownSubjectIds: io.knownSubjectIds });
+  const plan = planMaterialRestore(effectiveEntries, snapshots, { knownSubjectIds: io.knownSubjectIds });
+
+  // If any entry still has no resolvable target subject (a choice was not made,
+  // or the chosen subject no longer exists in this account), do not write
+  // anything: report exactly which materials need a subject and stop.
+  if (plan.needsSubjectChoice.length > 0) {
+    return {
+      restored: [],
+      skippedExisting: plan.alreadyPresent,
+      conflicts: plan.conflicts,
+      failed: plan.needsSubjectChoice.map((needed) => ({
+        id: needed.id,
+        title: needed.title,
+        reason: `대상 과목(${needed.subjectId})을 이 계정에서 찾을 수 없어 복원하지 않았습니다. 대상 과목을 선택해 주세요.`,
+      })),
+      missing: plan.missingFiles,
+      metadataPersisted: false,
+      aborted: false,
+      blockedBySubject: true,
+      plan,
+    };
+  }
 
   const restored: string[] = [];
   const conflicts: RestoreConflict[] = [...plan.conflicts];
@@ -101,7 +138,7 @@ export async function executeMaterialRestore(
   let aborted = false;
 
   for (const id of plan.toRestore) {
-    const entry = entries.find((e) => e.material.id === id);
+    const entry = effectiveEntries.find((e) => e.material.id === id);
     if (!entry) continue;
     const title = entry.material.title;
 
@@ -111,10 +148,8 @@ export async function executeMaterialRestore(
       continue;
     }
 
-    const overrideSubject = io.subjectOverride?.[id];
-    const materialMeta: Material = overrideSubject
-      ? { ...entry.material, subjectId: overrideSubject }
-      : entry.material;
+    // The effective entry already carries the target subject chosen by the user.
+    const materialMeta: Material = entry.material;
     const needsMetadata = plan.metadataToCreate.includes(id);
     let ok = true;
 
@@ -247,6 +282,7 @@ export async function executeMaterialRestore(
     missing: plan.missingFiles,
     metadataPersisted,
     aborted,
+    blockedBySubject: false,
     plan,
   };
 }

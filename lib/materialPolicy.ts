@@ -200,16 +200,65 @@ function countBodyChars(body: NonNullable<MaterialBackupEntry['body']>): number 
   return total;
 }
 
+/** UTF-8 byte length of a string (matches how a Blob encodes string parts). */
+function utf8ByteLength(text: string): number {
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(text).byteLength;
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      bytes += 4;
+      i += 1;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+export interface MaterialBackupSerializedSize {
+  /** UTF-16 code units (what `text.length` / the parser sees). */
+  chars: number;
+  /** Real UTF-8 byte size (what the downloaded file / `file.size` reports). */
+  bytes: number;
+}
+
+/** Measures already-serialized parts so a caller can reuse one serialization. */
+export function measureMaterialBackupPartsSize(parts: string[]): MaterialBackupSerializedSize {
+  let chars = 0;
+  let bytes = 0;
+  for (const part of parts) {
+    chars += part.length;
+    bytes += utf8ByteLength(part);
+  }
+  return { chars, bytes };
+}
+
 /**
- * Export-side twin of the parser's limit checks. The TOTAL is the EXACT length
- * of the serialized file (computed by stringifying one entry at a time, so the
- * peak memory is bounded by the largest entry, not by the whole backup), which
- * is the same number the parser checks on import. Uses THE SAME
- * MATERIAL_BACKUP_LIMITS, so anything this app exports can be imported back.
+ * Measures the exact serialized size of a backup in BOTH characters and UTF-8
+ * bytes, using the same part-by-part structure the download writes. Korean and
+ * emoji inflate the byte count, so the byte size must be validated too.
+ */
+export function measureMaterialBackupSerializedSize(
+  backup: MaterialBackupFile
+): MaterialBackupSerializedSize {
+  return measureMaterialBackupPartsSize(materialBackupBlobParts(backup));
+}
+
+/**
+ * Export-side twin of the parser's limit checks. The TOTAL is the EXACT size of
+ * the serialized file (computed by stringifying one entry at a time, so the peak
+ * memory is bounded by the largest entry, not by the whole backup), which is the
+ * same text the parser sees on import. BOTH the character count and the real
+ * UTF-8 byte size are validated against THE SAME MATERIAL_BACKUP_LIMITS, so
+ * anything this app exports can be imported back. The check runs BEFORE the
+ * download Blob is created. A caller that already serialized the parts may pass
+ * `serializedSize` to avoid serializing twice.
  */
 export function findBackupLimitViolations(
   backup: MaterialBackupFile,
-  limits: MaterialBackupLimits = MATERIAL_BACKUP_LIMITS
+  limits: MaterialBackupLimits = MATERIAL_BACKUP_LIMITS,
+  serializedSize?: MaterialBackupSerializedSize
 ): BackupLimitViolation[] {
   const violations: BackupLimitViolation[] = [];
   if (backup.materials.length > limits.materials) {
@@ -219,9 +268,7 @@ export function findBackupLimitViolations(
       reason: `자료 수(${backup.materials.length}건)가 처리 가능한 범위(${limits.materials}건)를 초과했습니다. 자료를 나누어 내보내 주세요.`,
     });
   }
-  let entryChars = 0;
   for (const entry of backup.materials) {
-    entryChars += JSON.stringify(entry).length;
     if (entry.body && countBodyChars(entry.body) > limits.bodyTextChars) {
       violations.push({
         id: entry.material.id,
@@ -238,16 +285,19 @@ export function findBackupLimitViolations(
       });
     }
   }
-  // Exact serialized length: the fixed wrapper (…,"materials":[]) keeps its
-  // brackets, and the entries are joined by commas inside them.
-  const wrapper = JSON.stringify({ ...backup, materials: [] });
-  const totalText =
-    wrapper.length + entryChars + Math.max(0, backup.materials.length - 1);
-  if (totalText > limits.textChars) {
+  const size = serializedSize ?? measureMaterialBackupSerializedSize(backup);
+  if (size.chars > limits.textChars) {
     violations.push({
       id: null,
       title: null,
       reason: `백업 전체 크기가 처리 가능한 범위(${limits.textChars}자)를 초과했습니다. 자료를 나누어 내보내 주세요.`,
+    });
+  }
+  if (size.bytes > limits.fileBytes) {
+    violations.push({
+      id: null,
+      title: null,
+      reason: `백업 파일의 실제 크기(${size.bytes}바이트)가 가져오기 제한(${limits.fileBytes}바이트)을 초과했습니다. 한글·이모지 등은 바이트가 더 크므로 자료를 나누어 내보내 주세요.`,
     });
   }
   return violations;
@@ -727,6 +777,12 @@ export function parseMaterialBackup(
   }
   if (text.length > limits.textChars) {
     return { ok: false, error: '백업 파일이 처리 가능한 크기를 초과했습니다.' };
+  }
+  // The downloaded file is UTF-8, so the byte size is checked with the SAME
+  // limit the UI applies to `file.size`. Korean and emoji inflate the byte
+  // count, so this is not redundant with the character check above.
+  if (utf8ByteLength(text) > limits.fileBytes) {
+    return { ok: false, error: '백업 파일의 실제 크기가 처리 가능한 범위를 초과했습니다.' };
   }
   let parsed: unknown;
   try {

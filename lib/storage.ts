@@ -304,6 +304,8 @@ export function markMaterialDeleted(materialId: string): void {
   const registry = readDeletedMaterialMarkers();
   registry[materialId] = { deletedAt: new Date().toISOString() };
   writeDeletedMaterialMarkers(registry);
+  // A deleted material is no longer local-only.
+  clearLocalOnlyMaterialMarker(materialId);
 }
 
 /** Clears the marker when the material legitimately exists again (explicit restore, re-upload). */
@@ -336,6 +338,52 @@ export function reconcileDeletedMaterialMarkers(
   }
   writeDeletedMaterialMarkers(registry);
   return new Set(Object.keys(registry));
+}
+
+// ---------------------------------------------------------------------------
+// Local-only material markers (account-scoped).
+//
+// A material that exists ONLY on this device (e.g. restored from a backup and
+// not (yet) on the server) is recorded here. A server cache replacement merges
+// these back in instead of dropping them just because the server list lacks
+// them. The marker is cleared once the server list actually contains the id.
+// ---------------------------------------------------------------------------
+
+const LOCAL_ONLY_MATERIAL_IDS_KEY = 'local_only_material_ids_v1';
+
+interface LocalOnlyMaterialMarker {
+  markedAt: string;
+}
+
+function readLocalOnlyMaterialMarkers(): Record<string, LocalOnlyMaterialMarker> {
+  return safeGetItem<Record<string, LocalOnlyMaterialMarker>>(LOCAL_ONLY_MATERIAL_IDS_KEY, {});
+}
+
+function writeLocalOnlyMaterialMarkers(registry: Record<string, LocalOnlyMaterialMarker>): boolean {
+  safeSetItem(LOCAL_ONLY_MATERIAL_IDS_KEY, registry);
+  const readBack = safeGetItem<Record<string, LocalOnlyMaterialMarker>>(LOCAL_ONLY_MATERIAL_IDS_KEY, {});
+  return JSON.stringify(readBack) === JSON.stringify(registry);
+}
+
+/** Marks a material that lives ONLY on this device (restored / explicitly local). */
+export function markMaterialLocalOnly(materialId: string): void {
+  if (!materialId) return;
+  const registry = readLocalOnlyMaterialMarkers();
+  registry[materialId] = { markedAt: new Date().toISOString() };
+  writeLocalOnlyMaterialMarkers(registry);
+}
+
+/** Clears the local-only marker once the material is server-known (or deleted). */
+export function clearLocalOnlyMaterialMarker(materialId: string): void {
+  if (!materialId) return;
+  const registry = readLocalOnlyMaterialMarkers();
+  if (registry[materialId] === undefined) return;
+  delete registry[materialId];
+  writeLocalOnlyMaterialMarkers(registry);
+}
+
+function isLocalOnlyMaterial(materialId: string): boolean {
+  return readLocalOnlyMaterialMarkers()[materialId] !== undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,10 +435,21 @@ function mergeStoredBodyHash(
   const record = registry[material.id];
   if (!record) return material.bodyHash;
   if (!storedHashIdentityMatches(record, { subjectId: material.subjectId, kind: material.kind })) {
-    // A different material identity with the same id: never merge the old hash.
-    return material.bodyHash;
+    // A different material identity with the same id: never use the old hash,
+    // and never fall back to the (possibly stale) metadata-carried hash either.
+    return undefined;
   }
   return record.hash;
+}
+
+/**
+ * Resolves the body identity hash for a material with the SAME rule everywhere:
+ * the account-scoped registry wins; a hash recorded for a DIFFERENT identity is
+ * ignored (no fallback to a stale metadata hash); only when no registry record
+ * exists is the material's own bodyHash used.
+ */
+export function resolveStoredMaterialBodyHash(material: Material): string | undefined {
+  return mergeStoredBodyHash(readBodyHashRegistry(), material);
 }
 
 /**
@@ -487,6 +546,44 @@ export function saveStoredMaterials(materials: Material[]): void {
  */
 export function saveStoredMaterialsVerified(materials: Material[]): boolean {
   return persistMaterialsMetadata(materials, true);
+}
+
+/**
+ * Replaces the local material cache with an AUTHORITATIVE server list, while
+ * preserving local-only materials that must not disappear:
+ *  - un-migrated materials whose only body copy is embedded in localStorage,
+ *  - materials explicitly marked local-only (e.g. restored from a backup),
+ *  - never an id recorded in the deletion ledger.
+ *
+ * This is the ONLY path that may drop a local material merely because the
+ * server list lacks it; every other save is a local modification/delete and
+ * keeps its exact list. Returns the list that is now persisted (for UI state).
+ */
+export function saveStoredMaterialsFromServerCache(serverMaterials: Material[]): Material[] {
+  const deletedIds = deletedMaterialMarkerIds();
+  const current = safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, []);
+  const currentList = Array.isArray(current) ? current : [];
+  const serverIds = new Set(serverMaterials.map((m) => m.id));
+
+  const preserved = currentList.filter(
+    (m) =>
+      m &&
+      typeof m.id === 'string' &&
+      !serverIds.has(m.id) &&
+      !deletedIds.has(m.id) &&
+      // Preserve a material whose last persistent body is still only embedded,
+      // or that is explicitly local-only (restored / not yet synced).
+      (hasEmbeddedMaterialBody(m) || isLocalOnlyMaterial(m.id))
+  );
+
+  const merged = preserved.length > 0 ? [...serverMaterials, ...preserved] : serverMaterials;
+  persistMaterialsMetadata(merged, false);
+
+  // The server list is authoritative for its own ids: those are no longer
+  // local-only, so a later server refresh will not treat them as preserved.
+  for (const material of serverMaterials) clearLocalOnlyMaterialMarker(material.id);
+
+  return loadStoredMaterials();
 }
 
 export interface MaterialBodyMigrationResult {
@@ -1701,6 +1798,7 @@ export function resetToInitialDemoData(): void {
   safeRemoveItem(STORAGE_KEYS.MATERIALS);
   safeRemoveItem(MATERIAL_BODY_HASHES_KEY);
   safeRemoveItem(DELETED_MATERIAL_IDS_KEY);
+  safeRemoveItem(LOCAL_ONLY_MATERIAL_IDS_KEY);
   safeRemoveItem(STORAGE_KEYS.CONCEPTS);
   safeRemoveItem(STORAGE_KEYS.CONCEPT_DRAFTS);
   safeRemoveItem(STORAGE_KEYS.PROBLEMS);
