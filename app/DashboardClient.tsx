@@ -94,7 +94,10 @@ import {
   listStudyPlanItems,
   getStudyPlanSettings,
   listMockExamSessions,
+  createStudyPlanItems,
+  saveStudyPlanItem,
   submitAttempt as submitAttemptCloud,
+  upsertStudyPlanSettings,
 } from '../lib/cloud/historyRepository';
 import { mergeById as mergeHistoryById, mergeEventsIntoConcepts } from '../lib/cloud/historyMerge';
 import {
@@ -231,6 +234,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [isProblemSessionOpen, setIsProblemSessionOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [aiConnectionMissing, setAiConnectionMissing] = useState(false);
   const [isMockExamModalOpen, setIsMockExamModalOpen] = useState(false);
   const [mockExamInitialConfig, setMockExamInitialConfig] = useState<MockExamInitialConfig | null>(null);
   const [isMaterialsListOpen, setIsMaterialsListOpen] = useState(false);
@@ -558,6 +562,25 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     return () => {
       document.removeEventListener('visibilitychange', onActive);
       window.removeEventListener('focus', onActive);
+    };
+  }, [currentUser.id]);
+
+  // Guide the user to register their own AI connection when neither a personal
+  // key nor an operator fallback is available.
+  useEffect(() => {
+    let cancelled = false;
+    void fetch('/api/ai-connection')
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!cancelled && data?.success) {
+          setAiConnectionMissing(!data.connected && !data.operatorFallback);
+        }
+      })
+      .catch(() => {
+        // Status will be surfaced again when an AI feature is used.
+      });
+    return () => {
+      cancelled = true;
     };
   }, [currentUser.id]);
 
@@ -912,6 +935,37 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     });
   }, [subjects, allConcepts, allProblems, attempts, studyPlanSettings, settings, studyPlanItems, intervalMultiplier, personalizationNote, rechallengeReservations]);
 
+  // Persist newly-generated plan items to the server (insert-only, so a stale
+  // regeneration can never overwrite a server-side completion).
+  const planItemSignature = useMemo(() => {
+    const items = [
+      ...studyPlanSummary.days.flatMap((d) => d.items),
+      ...studyPlanSummary.days.flatMap((d) => d.unassignedItems),
+    ];
+    return items.map((i) => i.id).sort().join('|');
+  }, [studyPlanSummary]);
+  const lastPlanSyncRef = useRef('');
+  useEffect(() => {
+    if (!isLoaded || !isSupabaseConfigured()) return;
+    if (planItemSignature === lastPlanSyncRef.current) return;
+    lastPlanSyncRef.current = planItemSignature;
+    const byId = new Map<string, StudyPlanItem>();
+    for (const day of studyPlanSummary.days) {
+      for (const item of [...day.items, ...day.unassignedItems]) byId.set(item.id, item);
+    }
+    const items = Array.from(byId.values());
+    if (items.length === 0) return;
+    void (async () => {
+      try {
+        const supabase = createBrowserSupabaseClient();
+        const result = await createStudyPlanItems(supabase, items);
+        if (!result.ok) showToast(`학습 계획 서버 저장 실패: ${result.error}`);
+      } catch {
+        // transient; retried when the plan signature changes
+      }
+    })();
+  }, [isLoaded, planItemSignature, studyPlanSummary]);
+
   const selectedConcept = useMemo(() => {
     return (
       subjectConcepts.find((c) => c.id === selectedConceptId) ||
@@ -1128,7 +1182,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         return;
       }
 
-      const newDrafts: ConceptDraft[] = data.drafts || [];
+      let newDrafts: ConceptDraft[] = data.drafts || [];
       if (newDrafts.length === 0) {
         showToast('추출된 새로운 개념이 없습니다.');
         return;
@@ -1147,6 +1201,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             showToast(
               `개념 초안을 서버에 저장하지 못했습니다. 로컬에 보관했으며 다시 시도할 수 있습니다. (${data.persistError || retryData.error || '오류'})`
             );
+          } else if (Array.isArray(retryData.drafts)) {
+            // Adopt the server drafts (DB updatedAt/contentVersion/approval).
+            newDrafts = retryData.drafts as ConceptDraft[];
           }
         } catch {
           showToast('개념 초안 서버 저장 재시도에 실패했습니다. 로컬에 보관되어 있습니다.');
@@ -1590,6 +1647,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     // the result, but a server failure is surfaced, never reported as success.
     const syncEvent = updatedConcept?.events.find((e) => e.attemptId === attempt.id);
     if (syncEvent && isSupabaseConfigured()) {
+      // Pass the validated review round of the linked plan item so the server
+      // can refuse to complete a plan whose round does not match.
+      const linkedItem = attempt.planItemId
+        ? loadStoredStudyPlanItems().find((i) => i.id === attempt.planItemId)
+        : undefined;
+      const planRound = linkedItem?.round ?? null;
       void (async () => {
         try {
           const supabase = createBrowserSupabaseClient();
@@ -1598,10 +1661,18 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             attempt,
             syncEvent,
             attempt.planItemId ?? null,
-            null
+            planRound
           );
           if (!submitted.ok) {
             showToast(`풀이는 로컬에 저장됐지만 서버 저장에 실패했습니다: ${submitted.error}`);
+            return;
+          }
+          // Attempt persistence and plan linkage are distinct outcomes.
+          const planStatus = submitted.data.planStatus;
+          if (planStatus === 'PLAN_ITEM_MISMATCH' || planStatus === 'PLAN_ITEM_NOT_FOUND' || planStatus === 'PLAN_ITEM_SKIPPED') {
+            showToast('풀이는 저장됐지만 계획 연결은 반영되지 않았습니다. 올바른 계획을 선택해 다시 시도해 주세요.');
+          } else if (planStatus === 'PLAN_ITEM_COMPLETED_BY_OTHER') {
+            showToast('이 계획은 다른 풀이로 이미 완료되어 기존 완료 기록을 유지했습니다.');
           }
         } catch (e) {
           showToast(`풀이 서버 저장 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
@@ -1845,17 +1916,44 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     }
   };
 
+  // Mirror a single study-plan item change to the server without ever reverting
+  // a completion recorded on another device.
+  const syncPlanItemToServer = async (item: StudyPlanItem, actionLabel: string) => {
+    if (!isSupabaseConfigured()) return;
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const result = await saveStudyPlanItem(supabase, item);
+      if (!result.ok) {
+        if ('conflict' in result && result.conflict) {
+          const server = result.server;
+          const merged = loadStoredStudyPlanItems().map((i) => (i.id === server.id ? server : i));
+          setStudyPlanItems(merged);
+          saveStoredStudyPlanItems(merged);
+          showToast('다른 기기에서 이미 완료된 계획이라 로컬 변경을 되돌리지 않았습니다.');
+        } else {
+          showToast(`${actionLabel} 서버 반영에 실패했습니다: ${result.error}`);
+        }
+      }
+    } catch (e) {
+      showToast(`${actionLabel} 서버 반영 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+    }
+  };
+
   const handlePostponePlanItem = (item: StudyPlanItem) => {
     const currentAssigned = item.assignedDate || toSeoulDateString(new Date());
     const nextDate = toSeoulDateString(addDaysToDate(currentAssigned, 1));
     const updated = postponeStudyPlanItem(item.id, nextDate);
     setStudyPlanItems(updated);
+    const next = updated.find((i) => i.id === item.id);
+    if (next) void syncPlanItemToServer(next, '일정 미루기');
     showToast(`[${item.snapshotTitle}] 일정이 내일(${nextDate})로 미뤄졌습니다. (학습 점수 불변)`);
   };
 
   const handleSkipPlanItem = (item: StudyPlanItem) => {
     const updated = skipStudyPlanItem(item.id);
     setStudyPlanItems(updated);
+    const next = updated.find((i) => i.id === item.id);
+    if (next) void syncPlanItemToServer(next, '계획 건너뛰기');
     showToast(`[${item.snapshotTitle}] 이번 계획에서 건너뛰었습니다. (시험 범위는 유지됩니다)`);
   };
 
@@ -2300,6 +2398,24 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             </div>
           </div>
         )}
+
+      {aiConnectionMissing && (
+        <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
+          <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-2.5 flex flex-col sm:flex-row sm:items-center gap-2 justify-between">
+            <div className="text-xs text-[#57544e]">
+              <span className="font-bold text-[#191817]">AI 기능을 사용하려면 내 API 연결이 필요합니다.</span>{' '}
+              학교 BAZE API 키를 등록하면 AI 호출 크레딧이 키를 발급한 계정에서 차감됩니다.
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsSettingsModalOpen(true)}
+              className="text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors shrink-0"
+            >
+              내 API 연결
+            </button>
+          </div>
+        </div>
+      )}
 
       {historyMigrationState &&
         historyMigrationState.hasLocalData &&
@@ -2796,6 +2912,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         subject={activeSubject}
         concepts={subjectConcepts}
         problems={availableSubjectProblems}
+        userId={currentUser.id}
         initialConfig={mockExamInitialConfig}
         onExamRecorded={() => {
           setAllConcepts(loadStoredConcepts());
@@ -2863,6 +2980,17 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           setStudyPlanSettings(newSettings);
           saveStoredStudyPlanSettings(newSettings);
           showToast('학습 계획 설정이 저장되었습니다.');
+          if (isSupabaseConfigured()) {
+            void (async () => {
+              try {
+                const supabase = createBrowserSupabaseClient();
+                const result = await upsertStudyPlanSettings(supabase, newSettings);
+                if (!result.ok) showToast(`학습 계획 설정 서버 저장 실패: ${result.error}`);
+              } catch (e) {
+                showToast(`학습 계획 설정 서버 저장 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+              }
+            })();
+          }
         }}
         onStartItem={handleStartPlanItem}
         onPostponeItem={handlePostponePlanItem}

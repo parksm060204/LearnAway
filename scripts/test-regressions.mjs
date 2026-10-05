@@ -14,7 +14,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
-  'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
+  'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/aiClient.ts', 'lib/aiCredentials.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
   'lib/storageScope.ts', 'lib/auth/redirects.ts', 'lib/legacyImport.ts', 'lib/appReadiness.ts',
   'lib/cloud/hash.ts', 'lib/cloud/mappers.ts', 'lib/cloud/plan.ts',
   'lib/cloud/subjectsRepository.ts', 'lib/cloud/materialsRepository.ts', 'lib/cloud/library.ts',
@@ -22,7 +22,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/learningMappers.ts', 'lib/cloud/learningPlan.ts', 'lib/cloud/learningRepository.ts',
   'lib/cloud/mergeLearning.ts', 'lib/cloud/learningOriginals.ts', 'lib/learningApproval.ts',
   'lib/cloud/historyMappers.ts', 'lib/cloud/historyMerge.ts', 'lib/cloud/historyRepository.ts',
-  'lib/cloud/mockExamSync.ts',
+  'lib/cloud/mockExamSync.ts', 'lib/cloud/pendingExamAnswers.ts', 'lib/cloud/draftPersistence.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -80,6 +80,15 @@ exports.requireApiUser = async () => {
   );
   delete load.cache[supabaseClientPath];
 
+  // The server client (used by lib/aiCredentials) is stubbed to the same fake.
+  const supabaseServerPath = path.join(output, 'lib', 'supabase', 'server.js');
+  fs.mkdirSync(path.dirname(supabaseServerPath), { recursive: true });
+  fs.writeFileSync(
+    supabaseServerPath,
+    `exports.createClient = async () => { if (!globalThis.__fakeSupabaseClient) throw new Error('no fake supabase'); return globalThis.__fakeSupabaseClient; };`
+  );
+  delete load.cache[supabaseServerPath];
+
   const cloudSubjects = load(path.join(output, 'lib/cloud/subjectsRepository.js'));
   const cloudMaterials = load(path.join(output, 'lib/cloud/materialsRepository.js'));
   const cloudOriginals = load(path.join(output, 'lib/cloud/migrationOriginals.js'));
@@ -94,6 +103,8 @@ exports.requireApiUser = async () => {
   const cloudHistoryMerge = load(path.join(output, 'lib/cloud/historyMerge.js'));
   const cloudHistoryRepo = load(path.join(output, 'lib/cloud/historyRepository.js'));
   const cloudMockExamSync = load(path.join(output, 'lib/cloud/mockExamSync.js'));
+  const pendingAnswers = load(path.join(output, 'lib/cloud/pendingExamAnswers.js'));
+  const cloudDraftPersistence = load(path.join(output, 'lib/cloud/draftPersistence.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
@@ -190,6 +201,8 @@ exports.requireApiUser = async () => {
 
   const { AI_CONFIG } = load(path.join(output, 'lib/aiConfig.js'));
   AI_CONFIG.apiKey = 'test-only-not-a-real-key';
+  const aiClient = load(path.join(output, 'lib/aiClient.js'));
+  const aiCredentials = load(path.join(output, 'lib/aiCredentials.js'));
   const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
   const { POST } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
   const body = { ...attempt, domain: 'math_stats', problemTitle: 'Test', problemPrompt: 'Test question',
@@ -376,6 +389,8 @@ exports.requireApiUser = async () => {
       fail: options.fail || {},
       rpcCalls: [],
       rpcResult: options.rpcResult,
+      rpcResults: options.rpcResults || {},
+      rpcImpl: options.rpcImpl || null,
     };
     // Seed any additional table arrays provided in options.
     for (const key of Object.keys(options)) {
@@ -388,13 +403,19 @@ exports.requireApiUser = async () => {
       rows.filter((row) => filters.every(([col, val]) => row[col] === val));
 
     function tableBuilder(table) {
-      const ctx = { op: 'select', payload: null, onConflict: null, filters: [], order: null };
+      const ctx = { op: 'select', payload: null, onConflict: null, ignoreDuplicates: false, filters: [], order: null };
       const builder = {
         select() { return builder; },
         order(col, opts) { ctx.order = { col, opts }; return builder; },
         eq(col, val) { ctx.filters.push([col, val]); return builder; },
         update(payload) { ctx.op = 'update'; ctx.payload = payload; return builder; },
-        upsert(payload, opts) { ctx.op = 'upsert'; ctx.payload = payload; ctx.onConflict = opts && opts.onConflict; return builder; },
+        upsert(payload, opts) {
+          ctx.op = 'upsert';
+          ctx.payload = payload;
+          ctx.onConflict = opts && opts.onConflict;
+          ctx.ignoreDuplicates = Boolean(opts && opts.ignoreDuplicates);
+          return builder;
+        },
         delete() { ctx.op = 'delete'; return builder; },
         maybeSingle() { return exec(true); },
         single() { return exec(false); },
@@ -429,6 +450,8 @@ exports.requireApiUser = async () => {
               const idx = rows.findIndex((row) => keys.every((k) => row[k] === payload[k]));
               let saved;
               if (idx >= 0) {
+                // ON CONFLICT DO NOTHING: existing rows are neither modified nor returned.
+                if (ctx.ignoreDuplicates) continue;
                 saved = { ...rows[idx], ...payload, updated_at: nowIso() };
                 rows[idx] = saved;
               } else {
@@ -528,9 +551,14 @@ exports.requireApiUser = async () => {
       from(table) { return tableBuilder(table); },
       rpc(name, params) {
         if (state.fail.rpc) {
+          state.rpcCalls.push({ name, params });
           return Promise.resolve({ data: null, error: { message: state.fail.rpcMessage || 'injected rpc failure' } });
         }
         state.rpcCalls.push({ name, params });
+        if (state.rpcImpl) return Promise.resolve(state.rpcImpl(name, params));
+        if (Object.prototype.hasOwnProperty.call(state.rpcResults, name)) {
+          return Promise.resolve(state.rpcResults[name]);
+        }
         return Promise.resolve({ data: state.rpcResult ?? 'created-id', error: null });
       },
       storage,
@@ -1732,6 +1760,170 @@ exports.requireApiUser = async () => {
     const fetched = await cloudMockExamSync.fetchMockExamFromServer('exam-2');
     assert.equal(fetched.ok, false);
     assert.equal(fetched.code, 'not_configured');
+  });
+
+  // Enable the configured code paths (env is not set for the rest of the suite).
+  const withConfigured = async (options, fn) => {
+    const prevUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const prevKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://example.supabase.co';
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = 'test-key';
+    try {
+      return await withFakeSupabase(options, fn);
+    } finally {
+      if (prevUrl === undefined) delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+      else process.env.NEXT_PUBLIC_SUPABASE_URL = prevUrl;
+      if (prevKey === undefined) delete process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+      else process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = prevKey;
+    }
+  };
+
+  await checkAsync('creating an identical existing exam is an idempotent success', async () => {
+    const local = {
+      id: 'e2', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60,
+      status: 'in_progress', selectedConceptIds: [], selectedTypes: [], problems: [],
+      answers: { p1: 'same' }, evaluations: {},
+    };
+    await withConfigured({
+      rpcImpl: () => ({ data: { created: false, status: 'in_progress', version: 3, payload: local }, error: null }),
+    }, async () => {
+      const result = await cloudMockExamSync.createMockExamOnServer(local);
+      assert.equal(result.ok, true);
+      assert.equal(result.created, false);
+      assert.equal(result.version, 3);
+    });
+  });
+
+  await checkAsync('creating an exam with a conflicting existing id is refused, not overwritten', async () => {
+    const serverSession = {
+      id: 'e1', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60,
+      status: 'submitted', submittedAt: 't3', selectedConceptIds: [], selectedTypes: [], problems: [],
+      answers: { p1: 'server' }, evaluations: {},
+    };
+    await withConfigured({
+      rpcImpl: (name) => {
+        assert.equal(name, 'create_mock_exam_session');
+        return { data: { created: false, status: 'submitted', version: 5, payload: serverSession }, error: null };
+      },
+    }, async () => {
+      const local = { ...serverSession, status: 'in_progress', answers: {} };
+      const result = await cloudMockExamSync.createMockExamOnServer(local);
+      assert.equal(result.ok, false);
+      assert.equal(result.code, 'conflict');
+      assert.equal(result.server.status, 'submitted');
+      assert.equal(result.server.serverVersion, 5);
+    });
+  });
+
+  await checkAsync('migration create is insert-only and never resets a submitted session', async () => {
+    const submittedRow = {
+      id: 'e3', user_id: 'user-a', subject_id: 's1', status: 'submitted', duration_minutes: 60,
+      created_at: 't', ends_at: 't2', submitted_at: 't3', version: 5, payload: { id: 'e3' }, updated_at: 't',
+    };
+    await withConfigured({ user: { id: 'user-a' }, mock_exam_sessions: [submittedRow] }, async (client) => {
+      const local = {
+        id: 'e3', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60,
+        status: 'in_progress', selectedConceptIds: [], selectedTypes: [], problems: [],
+        answers: { p1: 'local' }, evaluations: {},
+      };
+      const result = await cloudHistoryRepo.createMockExamSessions(client, [local]);
+      assert.equal(result.ok, true);
+      assert.equal(result.data.length, 0, 'existing row is not returned or overwritten');
+      const row = client.__state.mock_exam_sessions[0];
+      assert.equal(row.status, 'submitted', 'status preserved');
+      assert.equal(row.version, 5, 'version preserved');
+    });
+  });
+
+  await checkAsync('grading save maps status/version and surfaces stale/locked', async () => {
+    const session = {
+      id: 'e4', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60,
+      status: 'submitted', selectedConceptIds: [], selectedTypes: [], problems: [], answers: {}, evaluations: {},
+    };
+    await withConfigured({ rpcResults: { save_mock_exam_grading: { data: { version: 9 }, error: null } } }, async (client) => {
+      const result = await cloudMockExamSync.saveMockExamGradingOnServer(session, 8, 'graded');
+      assert.equal(result.ok, true);
+      assert.equal(result.version, 9);
+      const call = client.__state.rpcCalls.find((c) => c.name === 'save_mock_exam_grading');
+      assert.equal(call.params.p_status, 'graded');
+      assert.equal(call.params.p_expected_version, 8);
+    });
+    await withConfigured({ fail: { rpc: true, rpcMessage: 'MOCK_SESSION_STALE: v' } }, async () => {
+      const result = await cloudMockExamSync.saveMockExamGradingOnServer(session, 8, 'recorded');
+      assert.equal(result.ok, false);
+      assert.equal(result.code, 'stale');
+    });
+    await withConfigured({ fail: { rpc: true, rpcMessage: 'MOCK_SESSION_STATUS_REGRESSION: x' } }, async () => {
+      const result = await cloudMockExamSync.saveMockExamGradingOnServer(session, 8, 'graded');
+      assert.equal(result.ok, false);
+      assert.equal(result.code, 'locked');
+    });
+  });
+
+  await checkAsync('a stale local plan change cannot revert a server completion', async () => {
+    const serverRow = {
+      id: 'spi-1', user_id: 'user-a', subject_id: 's1', kind: 'review', assigned_date: '2026-01-01',
+      status: 'completed', round: 2, completed_attempt_id: 'a-old', completed_event_id: 'e-old',
+      completed_mock_session_id: null, payload: { id: 'spi-1', subjectId: 's1', status: 'completed' },
+      created_at: 't', updated_at: 't',
+    };
+    await withConfigured({ user: { id: 'user-a' }, study_plan_items: [serverRow] }, async (client) => {
+      const local = {
+        id: 'spi-1', subjectId: 's1', subjectName: 'S', kind: 'review', assignedDate: '2026-01-01',
+        estimatedMinutes: 30, isEstimatedTime: false, priorityScore: 0, priorityReason: '',
+        status: 'pending', round: 2, snapshotTitle: 't', snapshotDetail: 'd',
+      };
+      const result = await cloudHistoryRepo.saveStudyPlanItem(client, local);
+      assert.equal(result.ok, false);
+      assert.equal(result.conflict, true);
+      assert.equal(result.server.status, 'completed');
+      assert.equal(client.__state.study_plan_items[0].status, 'completed', 'server completion preserved');
+    });
+  });
+
+  check('pending unsaved answers are preserved and merged without deletion', () => {
+    const userId = 'pending-user';
+    const session = {
+      id: 'pe1', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60,
+      status: 'in_progress', selectedConceptIds: [], selectedTypes: [], problems: [],
+      answers: { p1: 'typed' }, evaluations: {}, reasons: { p1: 'why' },
+    };
+    assert.equal(pendingAnswers.savePendingExamAnswers(userId, session), true);
+    const loaded = pendingAnswers.loadPendingExamAnswers(userId, 'pe1');
+    assert.equal(loaded.answers.p1, 'typed');
+    const server = { ...session, answers: { p1: 'server' }, reasons: {} };
+    assert.equal(pendingAnswers.pendingDiffersFrom(server, loaded), true);
+    const merged = pendingAnswers.applyPendingAnswers(server, loaded);
+    assert.equal(merged.answers.p1, 'typed');
+    assert.equal(merged.reasons.p1, 'why');
+    // Conflict resolution must not delete pending answers.
+    assert.ok(pendingAnswers.loadPendingExamAnswers(userId, 'pe1'));
+    pendingAnswers.clearPendingExamAnswers(userId, 'pe1');
+    assert.equal(pendingAnswers.loadPendingExamAnswers(userId, 'pe1'), null);
+  });
+
+  await checkAsync('generation persistence returns server drafts and preserves them on failure', async () => {
+    const draft = {
+      id: 'd1', subjectId: 's1', materialId: 'm1', title: 'A', domain: 'math_stats', description: '',
+      prerequisites: [], relatedConcepts: [], commonMisconceptions: [], examples: [],
+      sourceEvidence: { type: 'page', quote: 'q', verified: true },
+      status: 'draft', isApproved: false, sourceMarkdownHash: 'h',
+      createdAt: '2000-01-01', updatedAt: '2000-01-01',
+    };
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const saved = await cloudDraftPersistence.persistConceptDraftsForResponse(client, [draft], 'job-1');
+      assert.equal(saved.persisted, true);
+      assert.equal(saved.drafts.length, 1);
+      assert.notEqual(saved.drafts[0].updatedAt, '2000-01-01', 'server updatedAt adopted');
+      const row = client.__state.concept_drafts.find((d) => d.id === 'd1');
+      assert.ok(!row.is_approved, 'approval columns are not written by content upsert');
+    });
+    await withFakeSupabase({ user: { id: 'u1' }, fail: { upsert: true } }, async (client) => {
+      const saved = await cloudDraftPersistence.persistConceptDraftsForResponse(client, [draft], 'job-1');
+      assert.equal(saved.persisted, false);
+      assert.equal(saved.drafts[0].id, 'd1');
+      assert.equal(saved.drafts[0].updatedAt, '2000-01-01', 'original drafts preserved for retry');
+    });
   });
 
   check('material import is never verified when a copy write failed', () => {
@@ -3193,6 +3385,270 @@ exports.requireApiUser = async () => {
       assert.equal(config.apiKey, 'key');
     }
   });
+  check('AI_PROVIDER selects one provider and never mixes other keys', () => {
+    const school = aiConfig.resolveAiConfig({
+      AI_PROVIDER: 'school_gateway', BAZE_API_KEY: 'baze', GEMINI_API_KEY: 'gem',
+      OPENAI_API_KEY: 'oa', AI_API_KEY: 'generic',
+    });
+    assert.equal(school.provider, 'school_gateway');
+    assert.equal(school.apiKey, 'baze');
+    assert.equal(school.model, 'deepseek-v4.1-flash');
+    assert.equal(school.apiBase, 'https://factchat-cloud.mindlogic.ai/v1/gateway');
+    assert.ok(school.minOutputTokens >= 16000, 'reasoning output floor');
+
+    const openai = aiConfig.resolveAiConfig({ AI_PROVIDER: 'openai', OPENAI_API_KEY: 'oa', OPENAI_MODEL: 'gpt-x', BAZE_API_KEY: 'baze' });
+    assert.equal(openai.provider, 'openai');
+    assert.equal(openai.apiKey, 'oa');
+    assert.equal(openai.model, 'gpt-x');
+    assert.equal(openai.apiBase, 'https://api.openai.com/v1');
+
+    // Missing school key: unconfigured, and other providers' keys do NOT leak in.
+    const noKey = aiConfig.resolveAiConfig({ AI_PROVIDER: 'school_gateway', GEMINI_API_KEY: 'gem', OPENAI_API_KEY: 'oa' });
+    assert.equal(noKey.provider, 'school_gateway');
+    assert.equal(noKey.apiKey, '');
+
+    const unknown = aiConfig.resolveAiConfig({ AI_PROVIDER: 'nope', GEMINI_API_KEY: 'gem' });
+    assert.equal(unknown.apiKey, '', 'unknown provider does not fall back to another key');
+    assert.ok(unknown.providerError);
+  });
+
+  check('gateway endpoints use the documented trailing slash', () => {
+    assert.equal(
+      aiClient.buildChatEndpoint('school_gateway', 'https://factchat-cloud.mindlogic.ai/v1/gateway'),
+      'https://factchat-cloud.mindlogic.ai/v1/gateway/chat/completions/'
+    );
+    assert.equal(
+      aiClient.buildChatEndpoint('openai', 'https://api.openai.com/v1'),
+      'https://api.openai.com/v1/chat/completions'
+    );
+    assert.equal(
+      aiClient.buildModelsEndpoint('https://factchat-cloud.mindlogic.ai/v1/gateway'),
+      'https://factchat-cloud.mindlogic.ai/v1/gateway/models/?type=llm'
+    );
+  });
+
+  const SCHOOL_CONFIG = {
+    provider: 'school_gateway', apiKey: 'baze-secret-key', model: 'deepseek-v4.1-flash',
+    apiBase: 'https://factchat-cloud.mindlogic.ai/v1/gateway', minOutputTokens: 16000, jsonMode: 'none',
+  };
+  const restoreAiConfig = (saved) => { Object.assign(AI_CONFIG, saved); delete AI_CONFIG.providerError; };
+
+  await checkAsync('school gateway request uses exact url/model/auth and no unverified options', async () => {
+    const saved = { ...AI_CONFIG };
+    const originalFetch = global.fetch;
+    const fetchCalls = [];
+    try {
+      Object.assign(AI_CONFIG, SCHOOL_CONFIG);
+      global.fetch = async (url, init) => {
+        fetchCalls.push({ url, init });
+        return Response.json({ choices: [{ message: { content: '{"ok":true}' } }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } });
+      };
+      const result = await aiClient.callAiChat({ system: 's', user: 'u', temperature: 0.2, json: true, maxOutputTokens: 100, label: 't' });
+      assert.equal(result.ok, true);
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, 'https://factchat-cloud.mindlogic.ai/v1/gateway/chat/completions/');
+      const headers = fetchCalls[0].init.headers;
+      assert.equal(headers.Authorization, 'Bearer baze-secret-key');
+      assert.ok(headers['User-Agent'] && headers['User-Agent'].length > 0, 'non-empty User-Agent (Cloudflare)');
+      const body = JSON.parse(fetchCalls[0].init.body);
+      assert.equal(body.model, 'deepseek-v4.1-flash');
+      assert.ok(!('thinking_budget' in body) && !('thinking_level' in body) && !('reasoning_effort' in body));
+      assert.ok(!('response_format' in body), 'unverified json mode is off by default');
+      assert.ok(body.max_tokens >= 16000, 'reasoning output budget floor applied');
+    } finally {
+      global.fetch = originalFetch;
+      restoreAiConfig(saved);
+    }
+  });
+
+  await checkAsync('provider errors map to distinct codes and are not auto-retried', async () => {
+    const saved = { ...AI_CONFIG };
+    const originalFetch = global.fetch;
+    try {
+      Object.assign(AI_CONFIG, { provider: 'gemini', apiKey: 'k', model: 'm', apiBase: 'https://x', minOutputTokens: 0, jsonMode: 'none' });
+      const cases = [[400, 'bad_request'], [401, 'auth'], [402, 'credit'], [403, 'forbidden'], [404, 'not_found'], [500, 'provider']];
+      for (const [status, code] of cases) {
+        let calls = 0;
+        global.fetch = async () => { calls += 1; return new Response('{"detail":"x"}', { status }); };
+        const r = await aiClient.callAiChat({ system: 's', user: 'u', json: true, label: 'err' });
+        assert.equal(r.ok, false, `status ${status} fails`);
+        assert.equal(r.error.code, code, `status ${status} -> ${code}`);
+        assert.equal(calls, 1, `status ${status} not retried`);
+        assert.ok(aiClient.httpStatusForAiError(code) >= 400);
+      }
+    } finally {
+      global.fetch = originalFetch;
+      restoreAiConfig(saved);
+    }
+  });
+
+  await checkAsync('429 honors Retry-After and then succeeds', async () => {
+    const saved = { ...AI_CONFIG };
+    const originalFetch = global.fetch;
+    let calls = 0;
+    try {
+      Object.assign(AI_CONFIG, { provider: 'gemini', apiKey: 'k', model: 'm', apiBase: 'https://x', minOutputTokens: 0, jsonMode: 'none' });
+      global.fetch = async () => {
+        calls += 1;
+        if (calls === 1) return new Response('{}', { status: 429, headers: { 'retry-after': '0' } });
+        return Response.json({ choices: [{ message: { content: '{"ok":1}' } }] });
+      };
+      const r = await aiClient.callAiChat({ system: 's', user: 'u', json: true, label: 'retry' });
+      assert.equal(r.ok, true);
+      assert.equal(calls, 2);
+    } finally {
+      global.fetch = originalFetch;
+      restoreAiConfig(saved);
+    }
+  });
+
+  await checkAsync('empty, truncated and invalid outputs are never accepted', async () => {
+    const saved = { ...AI_CONFIG };
+    const originalFetch = global.fetch;
+    try {
+      Object.assign(AI_CONFIG, { provider: 'gemini', apiKey: 'k', model: 'm', apiBase: 'https://x', minOutputTokens: 0, jsonMode: 'none' });
+      global.fetch = async () => Response.json({ choices: [{ message: { content: '' } }] });
+      assert.equal((await aiClient.callAiChat({ system: 's', user: 'u', label: 'empty' })).error.code, 'empty');
+      global.fetch = async () => Response.json({ choices: [{ message: { content: '{"a":1}' }, finish_reason: 'length' }] });
+      assert.equal((await aiClient.callAiChat({ system: 's', user: 'u', label: 'trunc' })).error.code, 'truncated');
+      global.fetch = async () => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => { throw new Error('bad json'); } });
+      assert.equal((await aiClient.callAiChat({ system: 's', user: 'u', label: 'badjson' })).error.code, 'invalid_json');
+    } finally {
+      global.fetch = originalFetch;
+      restoreAiConfig(saved);
+    }
+  });
+
+  check('sanitize removes API keys and bearer tokens from any logged text', () => {
+    const saved = { ...AI_CONFIG };
+    try {
+      Object.assign(AI_CONFIG, { apiKey: 'super-secret-key' });
+      const out = aiClient.sanitizeAiText('Authorization: Bearer super-secret-key {"api_key":"super-secret-key"}');
+      assert.ok(!out.includes('super-secret-key'), 'key is redacted');
+      assert.ok(out.includes('[redacted]'));
+    } finally {
+      restoreAiConfig(saved);
+    }
+  });
+
+  await checkAsync('gateway model check finds the model and distinguishes 403 causes', async () => {
+    const saved = { ...AI_CONFIG };
+    const originalFetch = global.fetch;
+    try {
+      Object.assign(AI_CONFIG, SCHOOL_CONFIG);
+      global.fetch = async () => Response.json({ object: 'list', data: [{ id: 'deepseek-v4.1-flash' }, { id: 'gpt-5.5' }] });
+      const ok = await aiClient.verifyGatewayModel();
+      assert.equal(ok.ok, true);
+      assert.equal(ok.hasModel, true);
+      assert.equal(ok.reason, 'ok');
+
+      global.fetch = async () => new Response('Model X is not enabled for your tenant.', { status: 403 });
+      const forbidden = await aiClient.verifyGatewayModel();
+      assert.equal(forbidden.ok, false);
+      assert.equal(forbidden.reason, 'forbidden');
+      assert.match(forbidden.message, /잘못된 키가 아니라/);
+
+      global.fetch = async () => new Response('gone', { status: 500 });
+      const providerErr = await aiClient.verifyGatewayModel();
+      assert.equal(providerErr.reason, 'provider');
+    } finally {
+      global.fetch = originalFetch;
+      restoreAiConfig(saved);
+    }
+  });
+
+  check('per-user API keys round-trip through AES-256-GCM and are masked', () => {
+    const key = Buffer.alloc(32, 7);
+    const enc = aiCredentials.encryptSecret('ba-ze-secret-key-1234', key);
+    assert.ok(enc.ciphertext && enc.iv && enc.tag);
+    assert.ok(!enc.ciphertext.includes('ba-ze'), 'plaintext is not present in ciphertext');
+    assert.equal(aiCredentials.decryptSecret(enc, key), 'ba-ze-secret-key-1234');
+    assert.throws(() => aiCredentials.decryptSecret(enc, Buffer.alloc(32, 8)), 'wrong key fails auth tag');
+    assert.equal(aiCredentials.maskKey('abcdefghijkl1234'), 'abcd••••1234');
+    const rawKey = Buffer.alloc(32, 1);
+    assert.equal(aiCredentials.parseEncryptionKey(rawKey.toString('base64')).length, 32);
+    assert.equal(aiCredentials.parseEncryptionKey(rawKey.toString('hex')).length, 32);
+    assert.equal(aiCredentials.parseEncryptionKey('short'), null);
+  });
+
+  check('connection policy picks the default model and maps errors', () => {
+    const preferred = aiCredentials.selectAvailableModel(['a', 'deepseek-v4.1-flash']);
+    assert.equal(preferred.ok, true);
+    assert.equal(preferred.model, 'deepseek-v4.1-flash');
+    assert.equal(aiCredentials.selectAvailableModel(['a', 'b']).model, 'a');
+    assert.equal(aiCredentials.selectAvailableModel([], 'a').code, 'NO_MODELS');
+    assert.equal(aiCredentials.selectAvailableModel(['a'], 'z').code, 'MODEL_NOT_AVAILABLE');
+    assert.equal(aiCredentials.reasonToCode('auth'), 'AUTH');
+    assert.equal(aiCredentials.reasonToCode('forbidden'), 'FORBIDDEN');
+    assert.equal(aiCredentials.connectionCheckHttpStatus('forbidden'), 400);
+    assert.equal(aiCredentials.connectionCheckHttpStatus('provider'), 502);
+    assert.equal(aiCredentials.connectionCheckHttpStatus('rate_limit'), 429);
+    assert.equal(aiCredentials.validateApiKeyInput('   ').code, 'EMPTY_KEY');
+    assert.equal(aiCredentials.validateApiKeyInput('x'.repeat(600)).code, 'BAD_REQUEST');
+    assert.equal(aiCredentials.validateApiKeyInput(' k ').apiKey, 'k');
+  });
+
+  await checkAsync('AI config resolver prefers the user key and never falls back on failure', async () => {
+    const savedConfig = { ...AI_CONFIG };
+    const savedEncKey = process.env.AI_CREDENTIAL_ENCRYPTION_KEY;
+    const encKey = Buffer.alloc(32, 9);
+    process.env.AI_CREDENTIAL_ENCRYPTION_KEY = encKey.toString('base64');
+    try {
+      // Operator key is configured throughout to prove the isolation rules.
+      Object.assign(AI_CONFIG, { provider: 'gemini', apiKey: 'operator-key', model: 'm', apiBase: 'https://x', minOutputTokens: 0, jsonMode: 'none' });
+      const good = aiCredentials.encryptSecret('user-key-1234', encKey);
+
+      await withFakeSupabase({
+        user: { id: 'u1' },
+        rpcResults: {
+          get_ai_connection_secret: { data: { provider: 'school_gateway', model: 'deepseek-v4.1-flash', key_hint: '••••1234', ciphertext: good.ciphertext, iv: good.iv, tag: good.tag }, error: null },
+        },
+      }, async () => {
+        const r = await aiCredentials.resolveAiConfigForUser('u1');
+        assert.equal(r.ok, true);
+        assert.equal(r.source, 'user');
+        assert.equal(r.config.apiKey, 'user-key-1234');
+        assert.equal(r.config.apiBase, 'https://factchat-cloud.mindlogic.ai/v1/gateway');
+      });
+
+      // A present-but-corrupt user key is an error, NOT an operator fallback.
+      await withFakeSupabase({
+        user: { id: 'u1' },
+        rpcResults: { get_ai_connection_secret: { data: { ciphertext: 'AAAA', iv: 'AAAA', tag: 'AAAA' }, error: null } },
+      }, async () => {
+        const r = await aiCredentials.resolveAiConfigForUser('u1');
+        assert.equal(r.ok, false);
+        assert.equal(r.code, 'credential_error');
+      });
+
+      // No user connection -> operator key is allowed.
+      await withFakeSupabase({
+        user: { id: 'u1' },
+        rpcResults: { get_ai_connection_secret: { data: null, error: null } },
+      }, async () => {
+        const r = await aiCredentials.resolveAiConfigForUser('u1');
+        assert.equal(r.ok, true);
+        assert.equal(r.source, 'operator');
+        assert.equal(r.config.apiKey, 'operator-key');
+      });
+
+      // No user connection and no operator key -> registration required.
+      Object.assign(AI_CONFIG, { apiKey: '' });
+      await withFakeSupabase({
+        user: { id: 'u1' },
+        rpcResults: { get_ai_connection_secret: { data: null, error: null } },
+      }, async () => {
+        const r = await aiCredentials.resolveAiConfigForUser('u1');
+        assert.equal(r.ok, false);
+        assert.equal(r.code, 'no_credentials');
+      });
+    } finally {
+      restoreAiConfig(savedConfig);
+      if (savedEncKey === undefined) delete process.env.AI_CREDENTIAL_ENCRYPTION_KEY;
+      else process.env.AI_CREDENTIAL_ENCRYPTION_KEY = savedEncKey;
+    }
+  });
+
   check('new users start empty and existing stored data survives reload', () => {
     const backup = new Map(data);
     try {

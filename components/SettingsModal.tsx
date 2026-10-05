@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { RetentionModelSettings } from '../lib/types';
 import { DEFAULT_RETENTION_SETTINGS } from '../lib/retentionModel';
 import { X, Settings, RotateCcw, Check, Info } from 'lucide-react';
+import { AiConnectionSection } from './AiConnectionSection';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -172,6 +173,11 @@ export function SettingsModal({
             </button>
           </div>
         </form>
+
+        {/* My AI API connection */}
+        <div className="px-5 pb-5">
+          <AiConnectionSection />
+        </div>
       </div>
     </div>
   );

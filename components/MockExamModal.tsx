@@ -18,9 +18,17 @@ import {
   autosaveMockExam,
   createMockExamOnServer,
   fetchMockExamFromServer,
+  saveMockExamGradingOnServer,
   submitExamAttemptOnServer,
   submitMockExamOnServer,
 } from '../lib/cloud/mockExamSync';
+import {
+  applyPendingAnswers,
+  clearPendingExamAnswers,
+  loadPendingExamAnswers,
+  pendingDiffersFrom,
+  savePendingExamAnswers,
+} from '../lib/cloud/pendingExamAnswers';
 import { AcademicMathView } from './AcademicMathView';
 import { X, Clock, Award, Compass, HelpCircle } from 'lucide-react';
 
@@ -40,6 +48,8 @@ interface Props {
   subject: Subject;
   concepts: Concept[];
   problems: Problem[];
+  /** 계정 ID — 미저장 답안 보존 영역을 계정·세션별로 분리한다. */
+  userId?: string;
   /** 계획에서 시작한 경우 전달되는 초기 설정. 일반 메뉴에서는 undefined. */
   initialConfig?: MockExamInitialConfig | null;
   onExamRecorded: () => void;
@@ -51,7 +61,7 @@ const labels: Partial<Record<ProblemType, string>> = {
   complexity_proof: '복잡도 증명', debug_counterexample: '디버깅·반례',
 };
 
-export function MockExamModal({ isOpen, onClose, subject, concepts, problems, initialConfig, onExamRecorded }: Props) {
+export function MockExamModal({ isOpen, onClose, subject, concepts, problems, userId = '', initialConfig, onExamRecorded }: Props) {
   const eligible = useMemo(() => problems.filter((p) => p.subjectId === subject.id && p.isApproved !== false && isProblemAvailableForPractice(p)), [problems, subject.id]);
   const availableTypes = useMemo(() => Array.from(new Set(eligible.map((p) => p.type))), [eligible]);
 
@@ -106,19 +116,124 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
   const [error, setError] = useState('');
   const [syncNotice, setSyncNotice] = useState('');
   const [syncBlocked, setSyncBlocked] = useState(false);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error' | 'conflict'>('idle');
+  const [saveMessage, setSaveMessage] = useState('');
+  const [pendingAvailable, setPendingAvailable] = useState(false);
   // Server-authoritative version guard for optimistic autosave/submit.
   const serverVersionRef = useRef(1);
   const autosaveTimerRef = useRef<number | null>(null);
+  // Autosave/submit are serialized so an older request can never overwrite a
+  // newer one, and a final submit always runs after pending autosaves.
+  const syncChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Bumped on unmount / account change so late responses never touch other UI.
+  const opTokenRef = useRef(0);
+  const sessionRef = useRef<MockExamSession | null>(session);
 
-  const pushServerSubmit = (submitted: MockExamSession) => {
-    void submitMockExamOnServer(submitted, serverVersionRef.current).then((result) => {
+  const enqueue = (task: () => Promise<void>) => {
+    syncChainRef.current = syncChainRef.current.then(task, task);
+  };
+
+  const runAutosave = (target: MockExamSession, token: number) => {
+    setSaveState('saving');
+    return autosaveMockExam(target, serverVersionRef.current).then((result) => {
+      if (token !== opTokenRef.current) return;
       if (result.ok) {
         serverVersionRef.current = result.version;
+        setSyncBlocked(false);
+        setSaveState('saved');
+        if (userId) clearPendingExamAnswers(userId, target.id);
+        setPendingAvailable(false);
       } else if (result.code === 'stale' || result.code === 'locked') {
+        if (userId) savePendingExamAnswers(userId, target);
+        setPendingAvailable(true);
         setSyncBlocked(true);
+        setSaveState('conflict');
+      } else if (result.code === 'not_configured') {
+        setSaveState('idle');
+      } else {
+        if (userId) savePendingExamAnswers(userId, target);
+        setPendingAvailable(true);
+        setSaveState('error');
+        setSaveMessage('서버 자동 저장에 실패했습니다. 답안은 이 기기에 보존되며 다시 시도할 수 있습니다.');
       }
     });
   };
+
+  const runGrading = (
+    target: MockExamSession,
+    status: 'submitted' | 'graded' | 'recorded',
+    token: number
+  ) => {
+    setSaveState('saving');
+    return saveMockExamGradingOnServer(target, serverVersionRef.current, status).then((result) => {
+      if (token !== opTokenRef.current) return;
+      if (result.ok) {
+        serverVersionRef.current = result.version;
+        setSyncBlocked(false);
+        setSaveState('saved');
+      } else if (result.code === 'stale' || result.code === 'locked') {
+        setSyncBlocked(true);
+        setSaveState('conflict');
+      } else if (result.code === 'not_configured') {
+        setSaveState('idle');
+      } else {
+        setSaveState('error');
+        setSaveMessage('채점 결과를 서버에 저장하지 못했습니다. 다시 시도할 수 있습니다.');
+      }
+    });
+  };
+
+  const flushAutosaveTimer = () => {
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+  };
+
+  const scheduleAutosave = (target: MockExamSession) => {
+    flushAutosaveTimer();
+    autosaveTimerRef.current = window.setTimeout(() => {
+      const token = opTokenRef.current;
+      enqueue(() => runAutosave(sessionRef.current ?? target, token));
+    }, 800);
+  };
+
+  // Persist local, then mirror to the server according to the exam phase.
+  const save = (updated: MockExamSession) => {
+    saveMockExam(updated);
+    setSession(updated);
+    const token = opTokenRef.current;
+    if (updated.status === 'in_progress' && !syncBlocked) {
+      scheduleAutosave(updated);
+    } else if (updated.status === 'graded' || updated.status === 'recorded') {
+      enqueue(() => runGrading(updated, updated.status === 'recorded' ? 'recorded' : 'graded', token));
+    }
+  };
+
+  // Persists partial grading progress while the exam is still 'submitted'.
+  const saveGradingProgress = (updated: MockExamSession) => {
+    saveMockExam(updated);
+    setSession(updated);
+    const token = opTokenRef.current;
+    enqueue(() => runGrading(updated, 'submitted', token));
+  };
+
+  // Keep the ref in sync for async callbacks without touching refs during render.
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  useEffect(() => {
+    return () => {
+      opTokenRef.current += 1;
+      flushAutosaveTimer();
+    };
+  }, []);
+
+  // Account change: invalidate in-flight work so results don't leak to another UI.
+  useEffect(() => {
+    opTokenRef.current += 1;
+  }, [userId]);
 
   useEffect(() => {
     if (!isOpen || session?.status !== 'in_progress') return;
@@ -130,9 +245,20 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
           if (!previous || previous.status !== 'in_progress') return previous;
           const submitted = expireMockExam(previous, tick);
           saveMockExam(submitted);
-          void submitMockExamOnServer(submitted, serverVersionRef.current).then((result) => {
-            if (result.ok) serverVersionRef.current = result.version;
-            else if (result.code === 'stale' || result.code === 'locked') setSyncBlocked(true);
+          const token = opTokenRef.current;
+          enqueue(async () => {
+            const result = await submitMockExamOnServer(submitted, serverVersionRef.current);
+            if (token !== opTokenRef.current) return;
+            if (result.ok) {
+              serverVersionRef.current = result.version;
+              setSaveState('saved');
+            } else if (result.code === 'stale' || result.code === 'locked') {
+              setSyncBlocked(true);
+              setSaveState('conflict');
+            } else if (result.code !== 'not_configured') {
+              setSaveState('error');
+              setSaveMessage('제출을 서버에 저장하지 못했습니다. 다시 시도해 주세요.');
+            }
           });
           return submitted;
         });
@@ -141,67 +267,96 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
     return () => window.clearInterval(timer);
   }, [isOpen, session?.status, session?.endsAt]);
 
-  // Learn the server version when opening an existing (possibly multi-device) session.
+  // On open (or session change) reconcile with the server WITHOUT clobbering
+  // unsaved local answers: answers + version come from ONE query.
   useEffect(() => {
     if (!isOpen || !session?.id) return;
+    const token = opTokenRef.current;
     let cancelled = false;
     void fetchMockExamFromServer(session.id).then((result) => {
-      if (!cancelled && result.ok) serverVersionRef.current = result.version;
+      if (cancelled || token !== opTokenRef.current) return;
+      const local = sessionRef.current;
+      if (!result.ok) {
+        if (result.code === 'missing' && local && local.status === 'in_progress') {
+          void createMockExamOnServer(local).then((created) => {
+            if (cancelled || token !== opTokenRef.current) return;
+            if (created.ok) serverVersionRef.current = created.version;
+            else if (created.code === 'conflict') setSyncBlocked(true);
+          });
+        }
+        return;
+      }
+      const pending = userId ? loadPendingExamAnswers(userId, result.session.id) : null;
+      if (pending && local && pendingDiffersFrom(local, pending)) {
+        setPendingAvailable(true);
+        setSyncBlocked(true);
+        serverVersionRef.current = result.version;
+        setSyncNotice('이 기기에 저장되지 않은 답안이 있습니다. 서버 답안과 확인 후 복구할 수 있습니다.');
+        return;
+      }
+      serverVersionRef.current = result.version;
+      if (!local) return;
+      const serverEvaluations = result.session.evaluations ?? {};
+      const needsEvalMerge = Object.keys(serverEvaluations).some((id) => !local.evaluations?.[id]);
+      if (result.session.status !== local.status || needsEvalMerge) {
+        // Server is authoritative for status/evaluations, but local answers are
+        // kept so an in-flight edit is never lost.
+        const merged: MockExamSession = {
+          ...result.session,
+          answers: { ...result.session.answers, ...local.answers },
+          reasons: { ...result.session.reasons, ...local.reasons },
+          isReasonNotApplicable: { ...result.session.isReasonNotApplicable, ...local.isReasonNotApplicable },
+          reasonNotApplicableJustification: {
+            ...result.session.reasonNotApplicableJustification,
+            ...local.reasonNotApplicableJustification,
+          },
+        };
+        saveMockExam(merged);
+        setSession(merged);
+        setSyncNotice(
+          result.session.status === 'in_progress'
+            ? '다른 기기의 최신 기록(답안·채점)을 불러왔습니다.'
+            : '다른 기기에서 이미 제출되어 이 시험은 종료되었습니다.'
+        );
+      }
     });
     return () => { cancelled = true; };
-  }, [isOpen, session?.id]);
-
-  useEffect(() => () => {
-    if (autosaveTimerRef.current !== null) window.clearTimeout(autosaveTimerRef.current);
-  }, []);
-
-  const scheduleAutosave = (updated: MockExamSession) => {
-    if (autosaveTimerRef.current !== null) window.clearTimeout(autosaveTimerRef.current);
-    autosaveTimerRef.current = window.setTimeout(() => {
-      void autosaveMockExam(updated, serverVersionRef.current).then((result) => {
-        if (result.ok) {
-          serverVersionRef.current = result.version;
-          setSyncBlocked(false);
-        } else if (result.code === 'stale' || result.code === 'locked') {
-          setSyncBlocked(true);
-        }
-      });
-    }, 800);
-  };
-
-  const save = (updated: MockExamSession) => {
-    saveMockExam(updated);
-    setSession(updated);
-    if (updated.status === 'in_progress' && !syncBlocked) scheduleAutosave(updated);
-  };
+  }, [isOpen, session?.id, userId]);
 
   const resolveFromServer = async () => {
-    if (!session) return;
-    const result = await fetchMockExamFromServer(session.id);
+    const local = sessionRef.current;
+    if (!local) return;
+    const result = await fetchMockExamFromServer(local.id);
     if (!result.ok) {
-      if (result.code === 'missing') {
-        const created = await createMockExamOnServer(session);
-        if (created.ok) {
-          serverVersionRef.current = created.version;
-          setSyncBlocked(false);
-          setSyncNotice('서버에 현재 시험을 다시 저장했습니다.');
-        } else {
-          setSyncNotice('서버 기록을 다시 만들지 못했습니다. 로그인 상태와 자료 이전 여부를 확인해 주세요.');
-        }
-      } else {
-        setSyncNotice('서버 기록을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.');
-      }
+      setSyncNotice('서버 기록을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.');
       return;
     }
-    saveMockExam(result.session);
-    setSession(result.session);
+    // Never delete pending answers: merge them over the server copy.
+    const pending = userId ? loadPendingExamAnswers(userId, local.id) : null;
+    const merged = pending ? applyPendingAnswers(result.session, pending) : result.session;
+    saveMockExam(merged);
+    setSession(merged);
     serverVersionRef.current = result.version;
     setSyncBlocked(false);
+    setSaveState('saved');
     setSyncNotice(
-      result.session.status === 'in_progress'
-        ? '서버의 최신 답안으로 동기화했습니다.'
-        : '다른 기기에서 이미 제출되어 이 시험은 종료되었습니다.'
+      pending
+        ? '서버 기록을 불러오고 이 기기의 미저장 답안을 유지했습니다. 다시 저장을 시도합니다.'
+        : '서버의 최신 기록으로 동기화했습니다.'
     );
+    if (pending && merged.status === 'in_progress') scheduleAutosave(merged);
+  };
+
+  const restorePending = () => {
+    const local = sessionRef.current;
+    const pending = userId && local ? loadPendingExamAnswers(userId, local.id) : null;
+    if (!local || !pending) return;
+    const merged = applyPendingAnswers(local, pending);
+    saveMockExam(merged);
+    setSession(merged);
+    setSyncBlocked(false);
+    setSyncNotice('이 기기의 미저장 답안을 복구했습니다. 서버 저장을 다시 시도합니다.');
+    if (merged.status === 'in_progress') scheduleAutosave(merged);
   };
   const current = session?.problems[index];
   const remaining = session ? Math.max(0, Math.ceil((new Date(session.endsAt).getTime() - now) / 1000)) : 0;
@@ -269,11 +424,24 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
       setError('');
       serverVersionRef.current = 1;
       setSyncBlocked(false);
+      setSaveState('saving');
+      setSaveMessage('');
+      const startToken = opTokenRef.current;
       void createMockExamOnServer(newSession).then((result) => {
+        if (startToken !== opTokenRef.current) return;
         if (result.ok) {
           serverVersionRef.current = result.version;
+          setSaveState('saved');
+        } else if (result.code === 'conflict') {
+          // An identical id already exists with different content: never overwrite.
+          setSaveState('conflict');
+          setSyncBlocked(true);
+          setSyncNotice('같은 ID의 시험이 서버에 다른 내용으로 존재합니다. 서버 기록을 확인해 주세요.');
         } else if (result.code === 'error') {
-          setSyncNotice('시험을 서버에 저장하지 못했습니다. 로컬 기록은 보존되며, 로그인·자료 이전 후 다시 시작하면 동기화됩니다.');
+          setSaveState('error');
+          setSaveMessage('시험을 서버에 저장하지 못했습니다. 로컬 기록은 보존됩니다.');
+        } else {
+          setSaveState('idle');
         }
       });
     } catch (cause) {
@@ -291,7 +459,34 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
       : { ...checked, status: 'submitted' as const, submittedAt: new Date().toISOString() };
     saveMockExam(submitted);
     setSession(submitted);
-    pushServerSubmit(submitted);
+    // Cancel any debounced autosave, then enqueue submit AFTER in-flight saves
+    // (the chain is FIFO) so the latest answers are what gets submitted.
+    flushAutosaveTimer();
+    const token = opTokenRef.current;
+    setSaveState('saving');
+    enqueue(async () => {
+      const result = await submitMockExamOnServer(submitted, serverVersionRef.current);
+      if (token !== opTokenRef.current) return;
+      if (result.ok) {
+        serverVersionRef.current = result.version;
+        setSaveState('saved');
+        setSaveMessage('');
+        if (userId) clearPendingExamAnswers(userId, submitted.id);
+        setPendingAvailable(false);
+      } else if (result.code === 'stale' || result.code === 'locked') {
+        if (userId) savePendingExamAnswers(userId, submitted);
+        setPendingAvailable(true);
+        setSyncBlocked(true);
+        setSaveState('conflict');
+      } else if (result.code === 'not_configured') {
+        setSaveState('idle');
+      } else {
+        if (userId) savePendingExamAnswers(userId, submitted);
+        setPendingAvailable(true);
+        setSaveState('error');
+        setSaveMessage('제출을 서버에 저장하지 못했습니다. 로컬에 보존되며 다시 시도할 수 있습니다.');
+      }
+    });
   };
 
   const gradeExam = async () => {
@@ -335,19 +530,23 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
         const data = await response.json();
         if (!response.ok || !data.success) throw new Error(`문항 「${problem.title}」: ${data.error || '평가 실패'}`);
         evaluations[problem.id] = data.evaluation as EvaluationResult;
-        save({ ...session, evaluations: { ...evaluations } });
+        // Persist each completed evaluation (server + local) so a failure midway
+        // can be recovered without re-calling the paid AI.
+        saveGradingProgress({ ...session, evaluations: { ...evaluations } });
       }
       save({ ...session, evaluations, status: 'graded' });
     } catch (cause) { setError(cause instanceof Error ? cause.message : '평가에 실패했습니다. 완료된 문항은 보존했습니다.'); }
     finally { setBusy(false); }
   };
 
-  const recordExam = () => {
-    if (!session || session.status !== 'graded' || blocked.length) return;
+  const recordExam = async () => {
+    if (!session || session.status !== 'graded' || blocked.length || busy) return;
+    setBusy(true);
+    setError('');
     try {
     const settings = loadStoredSettings();
     let partialCount = 0;
-    const serverSyncs: Array<Promise<{ ok: boolean }>> = [];
+    const serverSyncs: Array<Promise<{ ok: boolean; code?: string }>> = [];
     for (const problem of session.problems) {
       const answer = session.answers[problem.id]?.trim();
       const evaluation = session.evaluations[problem.id];
@@ -398,22 +597,22 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
       const event = concept?.events.find((e) => e.attemptId === id);
       if (event) serverSyncs.push(submitExamAttemptOnServer(attemptRecord, event));
     }
-    if (serverSyncs.length) {
-      void Promise.all(serverSyncs).then((results) => {
-        const failed = results.filter((r) => !r.ok).length;
-        if (failed > 0) {
-          setSyncNotice(
-            `평가 ${failed}건은 로컬에 저장됐지만 서버 반영에는 실패했습니다. 로그인·자료 이전 후 다시 기록하면 반영됩니다.`
-          );
-        }
-      });
-    }
     if (partialCount > 0) {
       // 계획 연결만 실패한 부분 저장: recorded로 확정하지 않고(재시도 가능) 실제 상태를 안내한다.
       // Attempt/ReviewEvent는 이미 저장되어 있고 재시도는 멱등하므로 중복 생성되지 않는다.
       setError(
         `일부 문항(${partialCount}건)의 학습 계획 연결 저장이 완료되지 않았습니다. 다시 시도하면 누락된 계획 연결만 복구됩니다. 평가 결과는 보존됩니다.`
       );
+      return;
+    }
+    // Verify server persistence BEFORE confirming 'recorded'. A dropped response
+    // is recovered by re-reading (submit_attempt is idempotent by attempt id).
+    const results = await Promise.all(serverSyncs);
+    const failed = results.filter((r) => !r.ok && r.code !== 'not_configured').length;
+    if (failed > 0) {
+      setSaveState('error');
+      setSaveMessage('일부 풀이가 서버에 저장되지 않아 기록 완료를 보류했습니다. 다시 시도하면 누락분만 저장됩니다.');
+      setError('서버 저장이 완료되지 않아 기록 완료로 확정하지 않았습니다. 다시 시도해 주세요.');
       return;
     }
     save({
@@ -423,9 +622,12 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
         .filter((p) => Boolean(session.answers[p.id]?.trim() && session.evaluations[p.id]))
         .map((p) => `att-exam-${session.id}-${p.id}`),
     });
+    setSyncNotice('');
     onExamRecorded();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '학습 이력 저장에 실패했습니다.');
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -439,15 +641,44 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, in
       <div className="p-5 space-y-4 text-sm">
         {error && <p role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800">{error}</p>}
         {syncNotice && <p className="p-2 bg-[#faf8f4] border border-[#e2ded6] text-xs text-[#57544e]">{syncNotice}</p>}
+        {saveState !== 'idle' && (
+          <p
+            role="status"
+            className={`p-2 border text-xs ${
+              saveState === 'error'
+                ? 'bg-red-50 border-red-200 text-red-800'
+                : saveState === 'conflict'
+                ? 'bg-amber-50 border-amber-300 text-amber-900'
+                : 'bg-[#faf8f4] border-[#e2ded6] text-[#57544e]'
+            }`}
+          >
+            {saveState === 'saving' && '서버에 저장 중...'}
+            {saveState === 'saved' && '서버 저장 완료'}
+            {saveState === 'error' && (saveMessage || '서버 저장에 실패했습니다.')}
+            {saveState === 'conflict' && '서버 기록과 충돌했습니다.'}
+          </p>
+        )}
+        {pendingAvailable && (
+          <div role="alert" className="p-3 bg-[#faf8f4] border border-[#e2ded6] text-xs space-y-2 text-[#57544e]">
+            <p>이 기기에 저장되지 않은 답안이 있습니다. 삭제하지 않고 보존 중입니다.</p>
+            <button
+              type="button"
+              onClick={restorePending}
+              className="border border-[#c8c2b5] bg-white px-3 py-1 font-bold"
+            >
+              미저장 답안 복구
+            </button>
+          </div>
+        )}
         {syncBlocked && (
           <div role="alert" className="p-3 bg-amber-50 border border-amber-300 text-amber-900 text-xs space-y-2">
-            <p>다른 기기에서 이 모의시험이 변경되어 자동 저장을 멈췄습니다. 서버 기록을 기준으로 다시 불러올 수 있습니다.</p>
+            <p>다른 기기에서 이 모의시험이 변경되어 자동 저장을 멈췄습니다. 서버 기록과 이 기기의 미저장 답안을 확인해 복구할 수 있습니다.</p>
             <button
               type="button"
               onClick={() => void resolveFromServer()}
               className="border border-amber-400 bg-white px-3 py-1 font-bold"
             >
-              최신 서버 기록 불러오기
+              최신 서버 기록 불러오기 (미저장 답안 유지)
             </button>
           </div>
         )}

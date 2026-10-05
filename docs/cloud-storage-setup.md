@@ -34,6 +34,7 @@
 - `supabase/migrations/20260101000004_learning_content.sql` — 개념·개념 초안·문제·문제 초안·문제-개념 연결·불변 문제 버전 + RLS + 승인 RPC
 - `supabase/migrations/20260101000005_approval_integrity.sql` — 승인 무결성 보강(중복 승인·범위 검증)
 - `supabase/migrations/20260101000006_learning_history.sql` — 풀이·복습 이벤트·학습 계획·모의시험 세션 + RLS + 트랜잭션 RPC
+- `supabase/migrations/20260101000007_history_integrity.sql` — 모의시험 상태/버전 가드·계획 완료 불변 트리거, insert-only 생성 RPC, 채점 저장 RPC, 회차 검증 강화
 
 ### 학습 콘텐츠(개념·문제) 저장
 - `concepts`, `concept_drafts`, `problems`, `problem_drafts`는 각 행에 인덱스용 키 컬럼과 함께
@@ -53,11 +54,22 @@
 - 기록은 RPC로 **단일 트랜잭션·멱등** 처리합니다:
   - `submit_attempt` — 풀이 + 복습 이벤트 + (선택) 계획 완료를 한 번에 저장. 재시도해도 중복 생성되지 않습니다.
   - `save_mock_exam_answers` — `version`으로 낙관적 잠금. 진행 중이 아닌 세션은 잠깁니다.
+  - `save_mock_exam_grading` — `submitted`·`graded`·`recorded`로의 **단조 전진**만 허용(진행 중으로 되돌릴 수 없음). 채점 결과를 증분 저장해 재접속 시 복원합니다.
   - `submit_mock_exam` — 최종 제출(멱등).
+  - `create_mock_exam_session` — **insert-only**. 같은 ID가 이미 있으면 서버 상태/버전/payload를 반환하고, 내용이 다르면 클라이언트가 충돌로 처리합니다.
+- 트리거로 직접 테이블 UPDATE 우회를 막습니다: 모의시험은 `in_progress`로 되돌리거나 `version`을 낮출 수 없고,
+  완료된 학습 계획은 `completed`에서 되돌릴 수 없습니다.
+- `submit_attempt`는 계획 항목에 회차(`round`)가 있으면 **일치하는 회차가 전달된 경우에만** 완료 처리하며,
+  회차가 누락되면 비교를 생략하지 않고 완료시키지 않습니다(회차 없는 레거시 항목은 별도 규칙으로 허용).
 - 클라이언트는 로그인 후 서버 이력을 내려받아 **ID 기준으로 병합**하고, 아직 서버에 없는
   로컬 전용 기록은 보존합니다. 복습 이벤트는 개념별 점수·상태를 다시 계산합니다.
 - 최초 1회, 로컬 학습 이력을 `migrateLocalHistoryToCloud`로 이전할 수 있습니다(유형별 재개 가능,
-  검증은 서버 재조회로 확인, 읽기 실패를 "없음"으로 간주하지 않음). 로컬 원본은 검증 전까지 보존됩니다.
+  insert-only라 재시도해도 서버의 제출된 시험·완료 계획을 덮어쓰지 않음, 검증은 서버 재조회,
+  읽기 실패를 "없음"으로 간주하지 않음). 로컬 원본은 검증 전까지 보존됩니다.
+- 자동 저장 실패·충돌 시 미저장 답안은 계정·세션별 pending 영역(`pendingExamAnswers`)에 보존되어
+  서버 기록을 불러와도 삭제되지 않고, 사용자가 "미저장 답안 복구"로 다시 저장할 수 있습니다.
+- AI 생성 API는 저장 성공 시 **서버 초안(saved.data)** 을 반환하고, 실패 시 생성 결과를 그대로 반환해
+  `/api/persist-drafts`로 AI 재호출 없이 저장만 재시도할 수 있습니다.
 
 ### 방법 A — Supabase CLI
 ```bash

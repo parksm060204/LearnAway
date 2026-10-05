@@ -182,10 +182,27 @@ export function ProblemGeneratorModal({
         return;
       }
 
-      const generatedDrafts: ProblemDraft[] = Array.isArray(data.drafts) ? data.drafts : [];
+      let generatedDrafts: ProblemDraft[] = Array.isArray(data.drafts) ? data.drafts : [];
       if (generatedDrafts.length === 0) {
         setErrorMessage('생성된 문제가 없습니다. 다시 시도해 주세요.');
         return;
+      }
+
+      if (data.persisted === false) {
+        // Retry saving the already-generated drafts WITHOUT re-calling the AI.
+        try {
+          const retry = await fetch('/api/persist-drafts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'problem', generationJobId: data.generationJobId, drafts: generatedDrafts }),
+          });
+          const retryData = await retry.json();
+          if (retry.ok && retryData.persisted && Array.isArray(retryData.drafts)) {
+            generatedDrafts = retryData.drafts as ProblemDraft[];
+          }
+        } catch {
+          // Keep the locally-generated drafts; persistence can be retried later.
+        }
       }
 
       onGenerateSuccess(generatedDrafts);

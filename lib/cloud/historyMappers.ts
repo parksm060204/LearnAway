@@ -129,6 +129,7 @@ export function rowToMockExamSession(row: MockExamSessionRow): MockExamSession {
     createdAt: row.created_at,
     endsAt: row.ends_at,
     submittedAt: row.submitted_at ?? undefined,
+    serverVersion: Number(row.version ?? 1),
   } as MockExamSession;
 }
 
@@ -141,7 +142,6 @@ export function mockExamSessionToUpsert(session: MockExamSession): MockExamSessi
     created_at: session.createdAt,
     ends_at: session.endsAt,
     submitted_at: session.submittedAt ?? null,
-    version: 1,
     payload: session as unknown as Record<string, unknown>,
   };
 }

@@ -11,14 +11,14 @@ import { setStorageScope } from '../storageScope';
 import { loadMockExams } from '../mockExam';
 import type { Attempt, MockExamSession, ReviewEvent, StudyPlanItem } from '../types';
 import {
+  createAttempts,
+  createMockExamSessions,
+  createReviewEvents,
+  createStudyPlanItems,
   listAttempts,
   listMockExamSessions,
   listReviewEvents,
   listStudyPlanItems,
-  upsertAttempts,
-  upsertMockExamSessions,
-  upsertReviewEvents,
-  upsertStudyPlanItems,
   upsertStudyPlanSettings,
 } from './historyRepository';
 
@@ -157,23 +157,25 @@ export async function migrateLocalHistoryToCloud(
   const uploaded = { attempts: 0, events: 0, planItems: 0, mockExams: 0 };
   const failures: string[] = [];
 
+  // Insert-only: a retried migration never overwrites rows already on the
+  // server (submitted exams, completed plan items, immutable attempts/events).
   if (local.attempts.length > 0) {
-    const result = await upsertAttempts(supabase, local.attempts);
+    const result = await createAttempts(supabase, local.attempts);
     if (result.ok) uploaded.attempts = result.data.length;
     else failures.push(`풀이: ${result.error}`);
   }
   if (local.events.length > 0 && failures.length === 0) {
-    const result = await upsertReviewEvents(supabase, local.events);
+    const result = await createReviewEvents(supabase, local.events);
     if (result.ok) uploaded.events = result.data.length;
     else failures.push(`복습: ${result.error}`);
   }
   if (local.planItems.length > 0 && failures.length === 0) {
-    const result = await upsertStudyPlanItems(supabase, local.planItems);
+    const result = await createStudyPlanItems(supabase, local.planItems);
     if (result.ok) uploaded.planItems = result.data.length;
     else failures.push(`계획: ${result.error}`);
   }
   if (local.mockExams.length > 0 && failures.length === 0) {
-    const result = await upsertMockExamSessions(supabase, local.mockExams);
+    const result = await createMockExamSessions(supabase, local.mockExams);
     if (result.ok) uploaded.mockExams = result.data.length;
     else failures.push(`모의시험: ${result.error}`);
   }

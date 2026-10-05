@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
-import { AI_CONFIG, isAiConfigured } from '@/lib/aiConfig';
+import { callAiChat, httpStatusForAiError } from '@/lib/aiClient';
+import { resolveAiConfigForUser } from '@/lib/aiCredentials';
 import { createClient } from '@/lib/supabase/server';
-import { upsertProblemDrafts } from '@/lib/cloud/learningRepository';
+import { persistProblemDraftsForResponse } from '@/lib/cloud/draftPersistence';
 import {
   ProblemDraft,
   ProblemType,
@@ -146,16 +147,13 @@ export async function POST(req: NextRequest) {
         ? [{ materialId: 'legacy', title: '학습 자료', markdown: legacyMarkdown, sourceRefs: '' }]
         : [];
 
-    // 1. Validation: AI Configuration
-    if (!isAiConfigured()) {
+    // 1. Resolve AI credentials (user's registered key first, then operator).
+    const cred = await resolveAiConfigForUser(auth.user.id);
+    if (!cred.ok) {
+      const needsAiConnection = cred.code === 'no_credentials';
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            '서버 환경 변수에 유효한 AI API 키(AI_API_KEY 또는 GEMINI_API_KEY 또는 OPENAI_API_KEY)가 설정되어 있지 않습니다. .env.local 설정을 확인해 주세요.',
-          errorCode: 'API_KEY_MISSING',
-        },
-        { status: 400 }
+        { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
+        { status: needsAiConnection ? 400 : 502 }
       );
     }
 
@@ -358,64 +356,21 @@ ${combinedSource}
 5. sourceRefs에는 인용한 자료의 제목을 명시하십시오.
 6. 반드시 지정된 JSON 포맷으로 응답하십시오.`;
 
-    const endpoint = `${AI_CONFIG.apiBase.replace(/\/+$/, '')}/chat/completions`;
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout for complex academic synthesis
-
-    try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${AI_CONFIG.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: AI_CONFIG.model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          temperature: 0.25,
-          response_format: { type: 'json_object' },
-        }),
-        signal: controller.signal,
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        clearTimeout(timeoutId);
-        let parsedErrMsg = errText;
-        try {
-          const errJson = JSON.parse(errText);
-          parsedErrMsg = errJson.error?.message || errJson.message || errText;
-        } catch {
-          // fallback to raw text
-        }
-
-        return NextResponse.json(
-          {
-            success: false,
-            error: `AI API 호출 실패 (HTTP ${response.status}): ${parsedErrMsg}`,
-            rawError: parsedErrMsg,
-          },
-          { status: response.status >= 500 ? 502 : 400 }
-        );
-      }
-
-      const data = await response.json();
-      clearTimeout(timeoutId);
-      const content = data.choices?.[0]?.message?.content;
-
-      if (!content) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: 'AI 응답 본문이 비어 있습니다.',
-          },
-          { status: 502 }
-        );
-      }
+    const aiCall = await callAiChat({
+      system: systemPrompt,
+      user: userPrompt,
+      temperature: 0.25,
+      json: true,
+      timeoutMs: 60000,
+      label: 'generate-problems',
+    }, cred.config);
+    if (!aiCall.ok) {
+      return NextResponse.json(
+        { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
+        { status: httpStatusForAiError(aiCall.error.code) }
+      );
+    }
+    const content = aiCall.content;
 
       const cleanedJson = content.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
       let parsedResult: unknown;
@@ -596,49 +551,33 @@ ${combinedSource}
         id: `${generationJobId}-p${index + 1}`,
       }));
 
-      let persisted = false;
-      let persistError: string | undefined;
+      // Return the SERVER drafts on success (DB updatedAt / contentVersion /
+      // approval) so a first approval cannot hit DRAFT_STALE. On failure the
+      // generated drafts are preserved so saving can be retried without AI.
+      let outcome: { persisted: boolean; drafts: ProblemDraft[]; persistError?: string } = {
+        persisted: false,
+        drafts: draftsWithIds,
+        persistError: '초안 저장을 시도하지 않았습니다.',
+      };
       try {
         const supabase = await createClient();
-        const saved = await upsertProblemDrafts(supabase, draftsWithIds, generationJobId);
-        if (saved.ok) {
-          persisted = true;
-        } else {
-          persistError = saved.error;
-        }
+        outcome = await persistProblemDraftsForResponse(supabase, draftsWithIds, generationJobId);
       } catch (e) {
-        persistError = e instanceof Error ? e.message : '초안 저장에 실패했습니다.';
+        outcome = {
+          persisted: false,
+          drafts: draftsWithIds,
+          persistError: e instanceof Error ? e.message : '초안 저장에 실패했습니다.',
+        };
       }
 
       return NextResponse.json({
         success: true,
-        drafts: draftsWithIds,
-        count: draftsWithIds.length,
+        drafts: outcome.drafts,
+        count: outcome.drafts.length,
         generationJobId,
-        persisted,
-        persistError,
+        persisted: outcome.persisted,
+        persistError: outcome.persistError,
       });
-    } catch (fetchErr) {
-      clearTimeout(timeoutId);
-      if (fetchErr instanceof Error && fetchErr.name === 'AbortError') {
-        return NextResponse.json(
-          {
-            success: false,
-            error: 'AI API 요청 시간이 초과되었습니다 (60초 초과). 잠시 후 다시 시도해 주세요.',
-          },
-          { status: 504 }
-        );
-      }
-      return NextResponse.json(
-        {
-          success: false,
-          error: `AI API 연결 실패: ${
-            fetchErr instanceof Error ? fetchErr.message : '네트워크 오류'
-          }`,
-        },
-        { status: 502 }
-      );
-    }
   } catch (err) {
     console.error('Error generating problems:', err);
     return NextResponse.json(

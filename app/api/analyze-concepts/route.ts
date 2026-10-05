@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
-import { AI_CONFIG, isAiConfigured } from '@/lib/aiConfig';
+import { callAiChat, httpStatusForAiError } from '@/lib/aiClient';
+import { resolveAiConfigForUser } from '@/lib/aiCredentials';
 import { createClient } from '@/lib/supabase/server';
-import { upsertConceptDrafts } from '@/lib/cloud/learningRepository';
+import { persistConceptDraftsForResponse } from '@/lib/cloud/draftPersistence';
 import { ConceptDraft, ConceptEvidence } from '@/lib/types';
 import {
   computeMarkdownHash,
@@ -74,16 +75,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 2. Validation: Server Environment AI API Key
-    if (!isAiConfigured()) {
+    // 2. Resolve AI credentials (user's registered key first, then operator).
+    const cred = await resolveAiConfigForUser(auth.user.id);
+    if (!cred.ok) {
+      const needsAiConnection = cred.code === 'no_credentials';
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            '서버 환경 변수에 유효한 AI API 키(AI_API_KEY 또는 OPENAI_API_KEY)가 설정되어 있지 않습니다. .env.local 설정을 확인해 주세요.',
-          errorCode: 'API_KEY_MISSING',
-        },
-        { status: 400 }
+        { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
+        { status: needsAiConnection ? 400 : 502 }
       );
     }
 
@@ -91,6 +89,7 @@ export async function POST(req: NextRequest) {
     const chunks = chunkMarkdownForAnalysis(markdown, 4500);
 
     const allExtractedDrafts: ConceptDraft[] = [];
+    let responseModel = cred.config.model;
 
     // System instruction prompt
     const domainContext =
@@ -135,65 +134,22 @@ ${chunk.text}
 
 위 텍스트에서 학술적으로 독립적인 핵심 개념들을 추출하여 지정된 JSON 스키마로 반환해 주세요.`;
 
-      const endpoint = `${AI_CONFIG.apiBase.replace(/\/+$/, '')}/chat/completions`;
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 50000);
-
-      try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${AI_CONFIG.apiKey}`,
-          },
-          body: JSON.stringify({
-            model: AI_CONFIG.model,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-            temperature: 0.15,
-            response_format: { type: 'json_object' },
-          }),
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          const errText = await response.text();
-          // Keep the timeout alive through body reception, then release it.
-          clearTimeout(timeoutId);
-          let parsedErrMsg = errText;
-          try {
-            const errJson = JSON.parse(errText);
-            parsedErrMsg = errJson.error?.message || errJson.message || errText;
-          } catch {
-            // raw string
-          }
-
-          return NextResponse.json(
-            {
-              success: false,
-              error: `AI API 호출 실패 (HTTP ${response.status}): ${parsedErrMsg}`,
-              rawError: parsedErrMsg,
-            },
-            { status: response.status >= 500 ? 502 : 400 }
-          );
-        }
-
-        const data = await response.json();
-        clearTimeout(timeoutId);
-        const content = data.choices?.[0]?.message?.content;
-
-        if (!content) {
-          return NextResponse.json(
-            {
-              success: false,
-              error: 'AI 응답 본문이 비어 있습니다.',
-            },
-            { status: 502 }
-          );
-        }
+      const aiCall = await callAiChat({
+        system: systemPrompt,
+        user: userPrompt,
+        temperature: 0.15,
+        json: true,
+        timeoutMs: 50000,
+        label: 'analyze-concepts',
+      }, cred.config);
+      if (!aiCall.ok) {
+        return NextResponse.json(
+          { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
+          { status: httpStatusForAiError(aiCall.error.code) }
+        );
+      }
+      const content = aiCall.content;
+      responseModel = aiCall.model;
 
         // Clean any accidental markdown code fences
         const cleanedJson = content.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
@@ -264,27 +220,6 @@ ${chunk.text}
 
           allExtractedDrafts.push(draft);
         }
-      } catch (callErr) {
-        clearTimeout(timeoutId);
-        if (callErr instanceof Error && callErr.name === 'AbortError') {
-          return NextResponse.json(
-            {
-              success: false,
-              error: 'AI 분석 요청 시간이 초과되었습니다 (타임아웃 50초).',
-            },
-            { status: 504 }
-          );
-        }
-        return NextResponse.json(
-          {
-            success: false,
-            error: `AI 통신 중 오류가 발생했습니다: ${
-              callErr instanceof Error ? callErr.message : '알 수 없는 오류'
-            }`,
-          },
-          { status: 500 }
-        );
-      }
     }
 
     // Deduplicate concepts across chunks by similar title
@@ -327,30 +262,36 @@ ${chunk.text}
       id: `${generationJobId}-c${index + 1}`,
     }));
 
-    let persisted = false;
-    let persistError: string | undefined;
+    // On success return the SERVER drafts (with DB updatedAt / contentVersion /
+    // approval state) so a first approval cannot hit DRAFT_STALE. On failure the
+    // generated drafts are returned unchanged so persistence can be retried
+    // without re-calling the paid AI.
+    let outcome: { persisted: boolean; drafts: ConceptDraft[]; persistError?: string } = {
+      persisted: false,
+      drafts: draftsWithIds,
+      persistError: '초안 저장을 시도하지 않았습니다.',
+    };
     try {
       const supabase = await createClient();
-      const saved = await upsertConceptDrafts(supabase, draftsWithIds, generationJobId);
-      if (saved.ok) {
-        persisted = true;
-      } else {
-        persistError = saved.error;
-      }
+      outcome = await persistConceptDraftsForResponse(supabase, draftsWithIds, generationJobId);
     } catch (e) {
-      persistError = e instanceof Error ? e.message : '초안 저장에 실패했습니다.';
+      outcome = {
+        persisted: false,
+        drafts: draftsWithIds,
+        persistError: e instanceof Error ? e.message : '초안 저장에 실패했습니다.',
+      };
     }
 
     return NextResponse.json({
       success: true,
-      drafts: draftsWithIds,
-      count: draftsWithIds.length,
+      drafts: outcome.drafts,
+      count: outcome.drafts.length,
       markdownHash,
-      model: AI_CONFIG.model,
+      model: responseModel,
       chunkCount: chunks.length,
       generationJobId,
-      persisted,
-      persistError,
+      persisted: outcome.persisted,
+      persistError: outcome.persistError,
     });
   } catch (err) {
     console.error('AI Analysis Route Exception:', err);

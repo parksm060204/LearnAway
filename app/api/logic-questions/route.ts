@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
-import { AI_CONFIG, isAiConfigured } from '../../../lib/aiConfig';
+import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
+import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { RubricCriterion } from '../../../lib/types';
 import { LOGIC_QUESTION_MAX, LOGIC_QUESTION_MIN, validateLogicQuestionsOutput } from '../../../lib/logicValidation';
 
@@ -81,10 +82,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!isAiConfigured()) {
+    const cred = await resolveAiConfigForUser(auth.user.id);
+    if (!cred.ok) {
+      const needsAiConnection = cred.code === 'no_credentials';
       return NextResponse.json(
-        { success: false, error: 'AI API 키가 설정되지 않았습니다. 서버 환경 변수를 확인해 주세요.', errorCode: 'API_KEY_MISSING' },
-        { status: 400 }
+        { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
+        { status: needsAiConnection ? 400 : 502 }
       );
     }
 
@@ -140,59 +143,22 @@ ${diagnosisSummary || '(요약 없음)'}
 
 위 학생 답안의 논리를 스스로 보완하도록 이끄는 핵심 질문 ${LOGIC_QUESTION_MIN}~${LOGIC_QUESTION_MAX}개를 지정된 JSON으로 반환하십시오.`;
 
-    const endpoint = `${AI_CONFIG.apiBase.replace(/\/+$/, '')}/chat/completions`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 45000);
-
-    let response: Response;
-    try {
-      response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_CONFIG.apiKey}` },
-        body: JSON.stringify({
-          model: AI_CONFIG.model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          temperature: 0.2,
-          max_tokens: MAX_OUTPUT_TOKENS,
-          response_format: { type: 'json_object' },
-        }),
-        signal: controller.signal,
-      });
-    } catch (networkErr) {
-      clearTimeout(timeoutId);
+    const aiCall = await callAiChat({
+      system: systemPrompt,
+      user: userPrompt,
+      temperature: 0.2,
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
+      json: true,
+      timeoutMs: 45000,
+      label: 'logic-questions',
+    }, cred.config);
+    if (!aiCall.ok) {
       return NextResponse.json(
-        {
-          success: false,
-          error: `AI 질문 생성 네트워크 실패: ${
-            networkErr instanceof Error && networkErr.name === 'AbortError'
-              ? '요청 시간이 초과되었습니다.'
-              : networkErr instanceof Error
-              ? networkErr.message
-              : '네트워크 오류'
-          }`,
-        },
-        { status: 502 }
+        { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
+        { status: httpStatusForAiError(aiCall.error.code) }
       );
     }
-
-    if (!response.ok) {
-      const errText = await response.text();
-      clearTimeout(timeoutId);
-      return NextResponse.json(
-        { success: false, error: `AI API 호출 실패 (HTTP ${response.status}): ${errText.slice(0, 300)}` },
-        { status: response.status >= 500 ? 502 : 400 }
-      );
-    }
-
-    const data = await response.json();
-    clearTimeout(timeoutId);
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || !content.trim()) {
-      return NextResponse.json({ success: false, error: 'AI 질문 응답이 비어 있습니다.' }, { status: 502 });
-    }
+    const content = aiCall.content;
 
     let questions;
     try {
@@ -205,7 +171,7 @@ ${diagnosisSummary || '(요약 없음)'}
       );
     }
 
-    return NextResponse.json({ success: true, questions, model: AI_CONFIG.model });
+    return NextResponse.json({ success: true, questions, model: aiCall.model });
   } catch (err) {
     return NextResponse.json(
       { success: false, error: `서버 내부 처리 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}` },

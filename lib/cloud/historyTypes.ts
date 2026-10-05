@@ -68,4 +68,4 @@ export interface MockExamSessionRow {
   payload: Record<string, unknown> | null;
   updated_at: string;
 }
-export type MockExamSessionUpsert = Omit<MockExamSessionRow, 'user_id' | 'updated_at'>;
+export type MockExamSessionUpsert = Omit<MockExamSessionRow, 'user_id' | 'updated_at' | 'version'>;

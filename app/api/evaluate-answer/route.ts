@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
-import { AI_CONFIG, isAiConfigured } from '../../../lib/aiConfig';
+import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
+import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { validateEvaluationOutput, validateEvaluationRubric } from '../../../lib/evaluationValidation';
 import {
   RubricCriterion,
@@ -95,15 +96,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: cause instanceof Error ? cause.message : '채점 기준 오류' }, { status: 400 });
     }
 
-    // 2. Check AI Configuration
-    if (!isAiConfigured()) {
+    // 2. Resolve AI credentials (user's registered key first, then operator).
+    const cred = await resolveAiConfigForUser(auth.user.id);
+    if (!cred.ok) {
+      const needsAiConnection = cred.code === 'no_credentials';
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            'AI API 키가 설정되지 않았습니다. .env.local 파일에 GEMINI_API_KEY 또는 AI_API_KEY를 설정해 주세요.',
-        },
-        { status: 400 }
+        { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
+        { status: needsAiConnection ? 400 : 502 }
       );
     }
 
@@ -273,76 +272,22 @@ ${
 
 위 학생의 답안과 방법 선택 이유를 [필수 평가 원칙]에 따라 면밀히 검토하고, 각 루브릭 기준별 점수, 확인된 근거 인용, 감점 이유, 개선 방법, 종합 피드백, 그리고 독립된 방법 선택 이유 진단 결과를 지정된 JSON 형식으로 산출해 주십시오.`;
 
-    // 6. Call AI Model
-    const endpoint = `${AI_CONFIG.apiBase.replace(/\/+$/, '')}/chat/completions`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s timeout
-
-    let rawResponse: Response;
-    try {
-      rawResponse = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${AI_CONFIG.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: AI_CONFIG.model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          response_format: { type: 'json_object' },
-          temperature: 0.15, // Low temperature for consistent academic grading
-        }),
-        signal: controller.signal,
-      });
-    } catch (networkErr) {
-      clearTimeout(timeoutId);
+    // 6. Call AI Model through the shared server client
+    const aiCall = await callAiChat({
+      system: systemPrompt,
+      user: userPrompt,
+      temperature: 0.15, // Low temperature for consistent academic grading
+      json: true,
+      timeoutMs: 45000,
+      label: 'evaluate-answer',
+    }, cred.config);
+    if (!aiCall.ok) {
       return NextResponse.json(
-        {
-          success: false,
-          error: `AI 평가 API 네트워크 연결 실패: ${
-            networkErr instanceof Error && networkErr.name === 'AbortError'
-              ? '요청 시간이 초과되었습니다 (45초 타임아웃).'
-              : networkErr instanceof Error ? networkErr.message : '네트워크 오류'
-          }`,
-        },
-        { status: 502 }
+        { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
+        { status: httpStatusForAiError(aiCall.error.code) }
       );
     }
-
-    if (!rawResponse.ok) {
-      let errorBody = '';
-      try {
-        errorBody = await rawResponse.text();
-      } catch {
-        errorBody = rawResponse.statusText;
-      }
-      // Keep the timeout alive through body reception, then release it.
-      clearTimeout(timeoutId);
-      return NextResponse.json(
-        {
-          success: false,
-          error: `AI 평가 API 호출 실패 (HTTP ${rawResponse.status}): ${errorBody}`,
-          rawError: errorBody,
-        },
-        { status: rawResponse.status >= 500 ? 502 : 400 }
-      );
-    }
-
-    const aiData = await rawResponse.json();
-    clearTimeout(timeoutId);
-    const content = aiData?.choices?.[0]?.message?.content;
-    if (!content) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: 'AI 모델로부터 빈 평가 응답이 수신되었습니다.',
-        },
-        { status: 502 }
-      );
-    }
+    const content = aiCall.content;
 
     // 7. Parse and Validate AI Evaluation Output
     let parsed: Record<string, unknown>;

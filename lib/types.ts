@@ -599,6 +599,8 @@ export interface MockExamSession {
   reasons?: Record<string, string>; // 문항별 방법 선택 이유
   isReasonNotApplicable?: Record<string, boolean>; // 문항별 해당 없음 선택 여부
   reasonNotApplicableJustification?: Record<string, string>; // 문항별 해당 없음 사유
+  /** Server-authoritative optimistic-lock version. Not part of the exam content. */
+  serverVersion?: number;
 }
 
 export interface RetentionModelSettings {

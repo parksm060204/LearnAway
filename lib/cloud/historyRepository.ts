@@ -98,15 +98,19 @@ export async function listMockExamSessions(supabase: SupabaseClient): Promise<Re
 }
 
 // ---------------------------------------------------------------------------
-// Bulk upserts (migration / local mirror sync)
+// Insert-only bulk writes (migration / local mirror sync)
+//
+// History rows are immutable (attempts / review events) or must never be
+// reverted from a stale local copy (plan completion, submitted mock exams), so
+// these use ON CONFLICT DO NOTHING. Existing server rows always win.
 // ---------------------------------------------------------------------------
 
-export async function upsertAttempts(supabase: SupabaseClient, attempts: Attempt[]): Promise<RepoResult<Attempt[]>> {
+export async function createAttempts(supabase: SupabaseClient, attempts: Attempt[]): Promise<RepoResult<Attempt[]>> {
   try {
     if (attempts.length === 0) return repoOk([]);
     const { data, error } = await supabase
       .from('attempts')
-      .upsert(attempts.map(attemptToUpsert), { onConflict: 'id,user_id' })
+      .upsert(attempts.map(attemptToUpsert), { onConflict: 'id,user_id', ignoreDuplicates: true })
       .select('*');
     if (error) return repoError(error.message);
     return repoOk(((data as AttemptRow[]) ?? []).map(rowToAttempt));
@@ -115,7 +119,7 @@ export async function upsertAttempts(supabase: SupabaseClient, attempts: Attempt
   }
 }
 
-export async function upsertReviewEvents(
+export async function createReviewEvents(
   supabase: SupabaseClient,
   events: Array<{ event: ReviewEvent; subjectId: string }>
 ): Promise<RepoResult<ReviewEvent[]>> {
@@ -133,7 +137,7 @@ export async function upsertReviewEvents(
   }
 }
 
-export async function upsertStudyPlanItems(
+export async function createStudyPlanItems(
   supabase: SupabaseClient,
   items: StudyPlanItem[]
 ): Promise<RepoResult<StudyPlanItem[]>> {
@@ -141,10 +145,63 @@ export async function upsertStudyPlanItems(
     if (items.length === 0) return repoOk([]);
     const { data, error } = await supabase
       .from('study_plan_items')
-      .upsert(items.map(studyPlanItemToUpsert), { onConflict: 'id,user_id' })
+      .upsert(items.map(studyPlanItemToUpsert), { onConflict: 'id,user_id', ignoreDuplicates: true })
       .select('*');
     if (error) return repoError(error.message);
     return repoOk(((data as StudyPlanItemRow[]) ?? []).map(rowToStudyPlanItem));
+  } catch (error) {
+    return repoError(message(error, '학습 계획을 저장하지 못했습니다.'));
+  }
+}
+
+export interface PlanItemConflict {
+  ok: false;
+  error: string;
+  conflict: true;
+  server: StudyPlanItem;
+}
+
+/**
+ * Updates ONE plan item (postpone / skip / completion linkage) without ever
+ * reverting a server-side completion. Returns a conflict when the server copy
+ * is already completed and the local change is not, so stale local data can
+ * never undo a completion recorded on another device.
+ */
+export async function saveStudyPlanItem(
+  supabase: SupabaseClient,
+  item: StudyPlanItem
+): Promise<RepoResult<StudyPlanItem> | PlanItemConflict> {
+  try {
+    const existing = await supabase
+      .from('study_plan_items')
+      .select('*')
+      .eq('id', item.id)
+      .maybeSingle();
+    if (existing.error) return repoError(existing.error.message);
+    const serverRow = existing.data as StudyPlanItemRow | null;
+    if (serverRow) {
+      const server = rowToStudyPlanItem(serverRow);
+      const serverCompleted = server.status === 'completed';
+      const localCompleted = item.status === 'completed';
+      if (serverCompleted && !localCompleted) {
+        return { ok: false, error: 'PLAN_ITEM_COMPLETED_ON_SERVER', conflict: true, server };
+      }
+      if (
+        localCompleted &&
+        serverCompleted &&
+        server.completedAttemptId &&
+        server.completedAttemptId !== item.completedAttemptId
+      ) {
+        return { ok: false, error: 'PLAN_ITEM_COMPLETED_BY_OTHER', conflict: true, server };
+      }
+    }
+    const { data, error } = await supabase
+      .from('study_plan_items')
+      .upsert(studyPlanItemToUpsert(item), { onConflict: 'id,user_id' })
+      .select('*')
+      .single();
+    if (error) return repoError(error.message);
+    return repoOk(rowToStudyPlanItem(data as StudyPlanItemRow));
   } catch (error) {
     return repoError(message(error, '학습 계획을 저장하지 못했습니다.'));
   }
@@ -165,7 +222,11 @@ export async function upsertStudyPlanSettings(
   }
 }
 
-export async function upsertMockExamSessions(
+/**
+ * Insert-only mock exam creation. Existing rows are never touched (a retried
+ * migration or creation cannot reset a submitted exam's answers/version).
+ */
+export async function createMockExamSessions(
   supabase: SupabaseClient,
   sessions: MockExamSession[]
 ): Promise<RepoResult<MockExamSession[]>> {
@@ -173,12 +234,29 @@ export async function upsertMockExamSessions(
     if (sessions.length === 0) return repoOk([]);
     const { data, error } = await supabase
       .from('mock_exam_sessions')
-      .upsert(sessions.map(mockExamSessionToUpsert), { onConflict: 'id,user_id' })
+      .upsert(sessions.map(mockExamSessionToUpsert), { onConflict: 'id,user_id', ignoreDuplicates: true })
       .select('*');
     if (error) return repoError(error.message);
     return repoOk(((data as MockExamSessionRow[]) ?? []).map(rowToMockExamSession));
   } catch (error) {
     return repoError(message(error, '모의시험 기록을 저장하지 못했습니다.'));
+  }
+}
+
+export async function getMockExamSession(
+  supabase: SupabaseClient,
+  sessionId: string
+): Promise<RepoResult<MockExamSession | null>> {
+  try {
+    const { data, error } = await supabase
+      .from('mock_exam_sessions')
+      .select('*')
+      .eq('id', sessionId)
+      .maybeSingle();
+    if (error) return repoError(error.message);
+    return repoOk(data ? rowToMockExamSession(data as MockExamSessionRow) : null);
+  } catch (error) {
+    return repoError(message(error, '모의시험 기록을 확인하지 못했습니다.'));
   }
 }
 
@@ -191,8 +269,10 @@ function rpcCode(error: { message?: string } | null): string {
   if (raw.includes('MOCK_SESSION_STALE')) return 'stale';
   if (raw.includes('MOCK_SESSION_LOCKED')) return 'locked';
   if (raw.includes('MOCK_SESSION_NOT_FOUND')) return 'missing';
+  if (raw.includes('MOCK_SESSION_STATUS_REGRESSION')) return 'locked';
   if (raw.includes('CONCEPT_SCOPE_MISMATCH')) return 'concept_scope';
   if (raw.includes('PROBLEM_SCOPE_MISMATCH')) return 'problem_scope';
+  if (raw.includes('PLAN_ROUND_REQUIRED')) return 'incomplete';
   if (raw.includes('ATTEMPT_INCOMPLETE')) return 'incomplete';
   return 'error';
 }
@@ -245,6 +325,32 @@ export async function saveMockExamAnswers(
     return repoOk(Number(result.version ?? expectedVersion + 1));
   } catch (error) {
     return repoError(message(error, '모의시험 답안을 저장하지 못했습니다.'));
+  }
+}
+
+/**
+ * Persists grading/recorded progress (evaluations, status, recordedAttemptIds)
+ * WITHOUT ever moving the exam back to in_progress. Answers and the frozen
+ * problem snapshot are preserved because the whole session is the payload.
+ */
+export async function saveMockExamGrading(
+  supabase: SupabaseClient,
+  session: MockExamSession,
+  expectedVersion: number,
+  status: 'submitted' | 'graded' | 'recorded'
+): Promise<RepoResult<number>> {
+  try {
+    const { data, error } = await supabase.rpc('save_mock_exam_grading', {
+      p_session_id: session.id,
+      p_expected_version: expectedVersion,
+      p_payload: session as unknown as Record<string, unknown>,
+      p_status: status,
+    });
+    if (error) return repoError(`${rpcCode(error)}:${error.message}`);
+    const result = (data ?? {}) as Record<string, unknown>;
+    return repoOk(Number(result.version ?? expectedVersion + 1));
+  } catch (error) {
+    return repoError(message(error, '모의시험 채점 결과를 저장하지 못했습니다.'));
   }
 }
 
