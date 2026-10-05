@@ -1,11 +1,12 @@
 'use client';
 
 import React, { useState } from 'react';
-import { RetentionModelSettings } from '../lib/types';
+import type { Material, RetentionModelSettings } from '../lib/types';
 import { DEFAULT_RETENTION_SETTINGS } from '../lib/retentionModel';
 import { X, Settings, RotateCcw, Check, Info } from 'lucide-react';
 import { AiConnectionSection } from './AiConnectionSection';
 import { MaterialPolicySection } from './MaterialPolicySection';
+import { DataManagementSection, type MigrationUiBlock } from './DataManagementSection';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -13,6 +14,9 @@ interface SettingsModalProps {
   settings: RetentionModelSettings;
   onSaveSettings: (settings: RetentionModelSettings) => void;
   onResetData: () => void;
+  materials: Material[];
+  onRestoreMaterials: (restored: Material[]) => void;
+  migrationBlocks: MigrationUiBlock[];
 }
 
 export function SettingsModal({
@@ -21,6 +25,9 @@ export function SettingsModal({
   settings,
   onSaveSettings,
   onResetData,
+  materials,
+  onRestoreMaterials,
+  migrationBlocks,
 }: SettingsModalProps) {
   const [tau, setTau] = useState(settings.tau);
   const [alpha, setAlpha] = useState(settings.alpha);
@@ -175,10 +182,15 @@ export function SettingsModal({
           </div>
         </form>
 
-        {/* My AI API connection */}
+        {/* Settings sections: API connection, storage policy, data management */}
         <div className="px-5 pb-5 space-y-4">
           <AiConnectionSection />
           <MaterialPolicySection />
+          <DataManagementSection
+            migrations={migrationBlocks}
+            materials={materials}
+            onRestoreMaterials={onRestoreMaterials}
+          />
         </div>
       </div>
     </div>

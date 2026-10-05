@@ -6,7 +6,6 @@ import {
   Upload,
   PenTool,
   Award,
-  Calendar,
   CalendarCheck,
   Settings,
   ChevronDown,
@@ -58,7 +57,6 @@ export function TopUtilityBar({
   onOpenProblemReview,
   problemDraftCount = 0,
   problemReportedCount = 0,
-  onOpenStudyPlan,
   onOpenLearningAnalytics,
   onOpenProblemSession,
   onOpenMockExam,
@@ -70,6 +68,12 @@ export function TopUtilityBar({
 }: TopUtilityBarProps) {
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [openMenu, setOpenMenu] = useState<'materials' | 'problems' | null>(null);
+
+  const closeMenus = () => {
+    setOpenMenu(null);
+    setIsDropdownOpen(false);
+  };
 
   return (
     <header className="w-full bg-[#ffffff] border-b border-[#e2ded6] sticky top-0 z-40 shadow-xs">
@@ -166,140 +170,187 @@ export function TopUtilityBar({
           </div>
         </div>
 
-        {/* Right Desktop Nav */}
+        {/* Right Desktop Nav: five main menus */}
         <nav className="hidden lg:flex items-center gap-1 text-xs">
           <button
-            onClick={onOpenAddSubject}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-xs text-[#c52828] hover:bg-[#fef2f2] border border-[#fecaca] font-semibold transition-colors mr-1"
+            onClick={() => {
+              closeMenus();
+              onScrollToTodayReview();
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#191817] bg-[#faf8f4] hover:bg-[#f1ede4] border border-[#e2ded6] font-bold transition-colors"
+            title="오늘의 학습 요약으로 이동"
           >
-            <Plus className="w-3.5 h-3.5 text-[#c52828]" />
-            <span>과목 추가</span>
+            <CalendarCheck className="w-3.5 h-3.5 text-[#c52828]" />
+            <span>오늘 학습</span>
           </button>
 
-          <button
-            onClick={onOpenUpload}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
-          >
-            <Upload className="w-3.5 h-3.5 text-[#827d73]" />
-            <span>자료 등록</span>
-          </button>
-
-          {onOpenMaterialsList && (
+          {/* 자료: 등록 · 보관함 · 개념 검토 (재연결은 보관함 안) */}
+          <div className="relative">
             <button
-              onClick={onOpenMaterialsList}
+              onClick={() => setOpenMenu(openMenu === 'materials' ? null : 'materials')}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
+              aria-expanded={openMenu === 'materials'}
+              aria-label="자료 메뉴"
             >
               <FolderOpen className="w-3.5 h-3.5 text-[#c52828]" />
-              <span>자료 보관함</span>
+              <span>자료</span>
+              <ChevronDown className="w-3 h-3 text-[#827d73]" />
             </button>
-          )}
+            {openMenu === 'materials' && (
+              <div className="absolute left-0 mt-1 w-56 bg-white border border-[#c8c2b5] shadow-lg rounded-xs z-50 py-1 font-sans">
+                <button
+                  onClick={() => {
+                    closeMenus();
+                    onOpenUpload();
+                  }}
+                  className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+                >
+                  <Upload className="w-4 h-4 text-[#827d73]" />
+                  <span>자료 등록 (PDF / 전사본)</span>
+                </button>
+                {onOpenMaterialsList && (
+                  <button
+                    onClick={() => {
+                      closeMenus();
+                      onOpenMaterialsList();
+                    }}
+                    className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+                  >
+                    <FolderOpen className="w-4 h-4 text-[#c52828]" />
+                    <span>자료 보관함 · 파일 재연결</span>
+                  </button>
+                )}
+                {onOpenConceptReview && (
+                  <button
+                    onClick={() => {
+                      closeMenus();
+                      onOpenConceptReview();
+                    }}
+                    className="w-full flex items-center justify-between py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+                    title="AI 개념 추출 및 검토"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Sparkles className="w-4 h-4 text-amber-600" />
+                      <span>개념 검토 및 승인</span>
+                    </div>
+                    {draftCount > 0 && (
+                      <span className="text-[10px] font-academic-mono bg-amber-100 text-amber-800 border border-amber-300 px-1 rounded-full font-bold">
+                        {draftCount}
+                      </span>
+                    )}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
 
-          {onOpenConceptReview && (
+          {/* 문제은행: 출제 · 검토 · 풀기 · 모의시험 */}
+          <div className="relative">
             <button
-              onClick={onOpenConceptReview}
+              onClick={() => setOpenMenu(openMenu === 'problems' ? null : 'problems')}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
-              title="AI 개념 추출 및 검토"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-amber-600" />
-              <span>개념 검토</span>
-              {draftCount > 0 && (
-                <span className="text-[10px] font-academic-mono bg-amber-100 text-amber-800 border border-amber-300 px-1 rounded-full font-bold">
-                  {draftCount}
-                </span>
-              )}
-            </button>
-          )}
-
-          {onOpenProblemReview && (
-            <button
-              onClick={onOpenProblemReview}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
-              title="AI 시험 문제 검토, 승인 및 신고 관리"
+              aria-expanded={openMenu === 'problems'}
+              aria-label="문제은행 메뉴"
             >
               <FileQuestion className="w-3.5 h-3.5 text-blue-600" />
-              <span>문제 검토</span>
-              {problemDraftCount > 0 && (
-                <span
-                  className="text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 px-1.5 py-0.2 rounded-full font-bold"
-                  title={`초안 ${problemDraftCount}건`}
+              <span>문제은행</span>
+              <ChevronDown className="w-3 h-3 text-[#827d73]" />
+            </button>
+            {openMenu === 'problems' && (
+              <div className="absolute left-0 mt-1 w-60 bg-white border border-[#c8c2b5] shadow-lg rounded-xs z-50 py-1 font-sans">
+                {onOpenProblemGenerator && (
+                  <button
+                    onClick={() => {
+                      closeMenus();
+                      onOpenProblemGenerator();
+                    }}
+                    className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+                    title="AI 고난도 문제 출제"
+                  >
+                    <Sparkles className="w-4 h-4 text-amber-600" />
+                    <span>문제 출제</span>
+                  </button>
+                )}
+                {onOpenProblemReview && (
+                  <button
+                    onClick={() => {
+                      closeMenus();
+                      onOpenProblemReview();
+                    }}
+                    className="w-full flex items-center justify-between py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+                    title="AI 시험 문제 검토, 승인 및 신고 관리"
+                  >
+                    <div className="flex items-center gap-2">
+                      <FileQuestion className="w-4 h-4 text-blue-600" />
+                      <span>문제 검토·검색·승인</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      {problemDraftCount > 0 && (
+                        <span
+                          className="text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 px-1.5 py-0.2 rounded-full font-bold"
+                          title={`초안 ${problemDraftCount}건`}
+                        >
+                          {problemDraftCount}
+                        </span>
+                      )}
+                      {problemReportedCount > 0 && (
+                        <span
+                          className="text-[10px] font-academic-mono bg-red-100 text-red-800 border border-red-300 px-1.5 py-0.2 rounded-full font-bold flex items-center gap-0.5"
+                          title={`신고/검토 필요 문제 ${problemReportedCount}건`}
+                        >
+                          <ShieldAlert className="w-2.5 h-2.5 text-red-600" />
+                          {problemReportedCount}
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    closeMenus();
+                    onOpenProblemSession();
+                  }}
+                  className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
                 >
-                  {problemDraftCount}
-                </span>
-              )}
-              {problemReportedCount > 0 && (
-                <span
-                  className="text-[10px] font-academic-mono bg-red-100 text-red-800 border border-red-300 px-1.5 py-0.2 rounded-full font-bold flex items-center gap-0.5"
-                  title={`신고/검토 필요 문제 ${problemReportedCount}건`}
+                  <PenTool className="w-4 h-4 text-[#827d73]" />
+                  <span>문제 풀기 (서술·논술형)</span>
+                </button>
+                <button
+                  onClick={() => {
+                    closeMenus();
+                    onOpenMockExam();
+                  }}
+                  className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+                  title="혼합형 모의시험 응시 및 AI 평가"
                 >
-                  <ShieldAlert className="w-2.5 h-2.5 text-red-600" />
-                  {problemReportedCount}
-                </span>
-              )}
-            </button>
-          )}
-
-          {onOpenProblemGenerator && (
-            <button
-              onClick={onOpenProblemGenerator}
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xs text-[#191817] hover:bg-[#faf8f4] border border-[#ded6c8] font-semibold transition-colors mr-1"
-              title="AI 고난도 문제 출제"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-amber-600" />
-              <span>문제 출제</span>
-            </button>
-          )}
-
-          <button
-            onClick={onOpenProblemSession}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
-          >
-            <PenTool className="w-3.5 h-3.5 text-[#827d73]" />
-            <span>문제 풀기</span>
-          </button>
-
-          <button
-            onClick={onOpenMockExam}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
-            title="혼합형 모의시험 응시 및 AI 평가"
-          >
-            <Award className="w-3.5 h-3.5 text-purple-600" />
-            <span>모의시험</span>
-          </button>
-
-          {onOpenStudyPlan && (
-            <button
-              onClick={onOpenStudyPlan}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#191817] bg-[#fef2f2] hover:bg-[#fee2e2] border border-[#fecaca] font-bold transition-colors"
-              title="시험일까지의 학습 계획 설정 및 조회"
-            >
-              <Calendar className="w-3.5 h-3.5 text-[#c52828]" />
-              <span>학습 계획</span>
-            </button>
-          )}
+                  <Award className="w-4 h-4 text-purple-600" />
+                  <span>모의시험</span>
+                </button>
+              </div>
+            )}
+          </div>
 
           {onOpenLearningAnalytics && (
             <button
-              onClick={onOpenLearningAnalytics}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#191817] bg-[#faf8f4] hover:bg-[#f1ede4] border border-[#e2ded6] font-semibold transition-colors"
-              title="실제 학습 기록 분석과 개인별 복습 추천 근거"
+              onClick={() => {
+                closeMenus();
+                onOpenLearningAnalytics();
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent hover:border-[#e2ded6] transition-colors"
+              title="과거 답안·평가와 오답·취약 개념 분석"
             >
               <BarChart3 className="w-3.5 h-3.5 text-indigo-600" />
-              <span>학습 분석</span>
+              <span>학습 기록</span>
             </button>
           )}
 
           <button
-            onClick={onScrollToTodayReview}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xs text-[#191817] bg-[#faf8f4] hover:bg-[#f1ede4] border border-[#e2ded6] font-semibold transition-colors"
-          >
-            <CalendarCheck className="w-3.5 h-3.5 text-[#c52828]" />
-            <span>오늘의 복습 패널</span>
-          </button>
-
-          <button
-            onClick={onOpenSettings}
+            onClick={() => {
+              closeMenus();
+              onOpenSettings();
+            }}
             className="p-1.5 text-[#827d73] hover:text-[#191817] hover:bg-[#faf8f4] rounded-xs transition-colors ml-1"
-            title="모델 및 시연 파라미터 설정"
+            title="설정 (API 연결 · 저장 정책 · 데이터 관리)"
             aria-label="설정"
           >
             <Settings className="w-4 h-4" />
@@ -346,9 +397,20 @@ export function TopUtilityBar({
         </div>
       </div>
 
-      {/* Mobile Drawer */}
+      {/* Mobile Drawer: same five main menus */}
       {isMobileMenuOpen && (
         <div className="lg:hidden border-t border-[#e2ded6] bg-white px-4 py-3 space-y-2">
+          <button
+            onClick={() => {
+              onScrollToTodayReview();
+              setIsMobileMenuOpen(false);
+            }}
+            className="w-full flex items-center gap-2 py-2 px-3 text-xs font-bold text-[#191817] bg-[#faf8f4] hover:bg-[#f1ede4] rounded-xs"
+          >
+            <CalendarCheck className="w-4 h-4 text-[#c52828]" />
+            <span>오늘 학습</span>
+          </button>
+
           <button
             onClick={() => {
               onOpenUpload();
@@ -369,7 +431,7 @@ export function TopUtilityBar({
               className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
             >
               <FolderOpen className="w-4 h-4 text-[#c52828]" />
-              <span>과목 자료 보관함</span>
+              <span>자료 보관함 · 파일 재연결</span>
             </button>
           )}
 
@@ -393,6 +455,19 @@ export function TopUtilityBar({
             </button>
           )}
 
+          {onOpenProblemGenerator && (
+            <button
+              onClick={() => {
+                onOpenProblemGenerator();
+                setIsMobileMenuOpen(false);
+              }}
+              className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
+            >
+              <Sparkles className="w-4 h-4 text-amber-600" />
+              <span>문제 출제</span>
+            </button>
+          )}
+
           {onOpenProblemReview && (
             <button
               onClick={() => {
@@ -403,7 +478,7 @@ export function TopUtilityBar({
             >
               <div className="flex items-center gap-2">
                 <FileQuestion className="w-4 h-4 text-blue-600" />
-                <span>문제 검토 및 승인</span>
+                <span>문제 검토·검색·승인</span>
               </div>
               <div className="flex items-center gap-1.5">
                 {problemDraftCount > 0 && (
@@ -418,19 +493,6 @@ export function TopUtilityBar({
                   </span>
                 )}
               </div>
-            </button>
-          )}
-
-          {onOpenProblemGenerator && (
-            <button
-              onClick={() => {
-                onOpenProblemGenerator();
-                setIsMobileMenuOpen(false);
-              }}
-              className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
-            >
-              <Sparkles className="w-4 h-4 text-amber-600" />
-              <span>AI 고난도 시험 문제 출제</span>
             </button>
           )}
 
@@ -453,21 +515,8 @@ export function TopUtilityBar({
             className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
           >
             <Award className="w-4 h-4 text-purple-600" />
-            <span>혼합형 모의시험 응시</span>
+            <span>모의시험</span>
           </button>
-
-          {onOpenStudyPlan && (
-            <button
-              onClick={() => {
-                onOpenStudyPlan();
-                setIsMobileMenuOpen(false);
-              }}
-              className="w-full flex items-center gap-2 py-2 px-3 text-xs font-bold text-[#c52828] bg-[#fef2f2] hover:bg-[#fee2e2] rounded-xs"
-            >
-              <Calendar className="w-4 h-4 text-[#c52828]" />
-              <span>학습 계획 (시간·범위 설정)</span>
-            </button>
-          )}
 
           {onOpenLearningAnalytics && (
             <button
@@ -478,7 +527,7 @@ export function TopUtilityBar({
               className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
             >
               <BarChart3 className="w-4 h-4 text-indigo-600" />
-              <span>학습 분석 (개인별 복습 추천)</span>
+              <span>학습 기록</span>
             </button>
           )}
 
@@ -490,7 +539,7 @@ export function TopUtilityBar({
             className="w-full flex items-center gap-2 py-2 px-3 text-xs text-[#191817] hover:bg-[#faf8f4] rounded-xs"
           >
             <Settings className="w-4 h-4 text-[#827d73]" />
-            <span>시연 파라미터 및 모델 설정</span>
+            <span>설정 (API 연결·저장 정책·데이터 관리)</span>
           </button>
 
           {onLogout && (

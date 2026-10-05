@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Material, Subject } from '../lib/types';
 import { listMaterialContentIds, listMaterialOriginalIds } from '../lib/materialStorage';
 import { deriveMaterialStorageState } from '../lib/materialPolicy';
@@ -35,6 +35,8 @@ interface MaterialsListModalProps {
   onOpenConceptReview?: (material: Material) => void;
   onTriggerAnalysis?: (material: Material) => void;
   isAnalyzing?: boolean;
+  /** Reconnect a local file (original PDF or converted MD) for a material. */
+  onReconnectFile?: (material: Material, kind: 'original' | 'body', file: File) => Promise<boolean>;
 }
 
 export function MaterialsListModal({
@@ -51,26 +53,50 @@ export function MaterialsListModal({
   onOpenConceptReview,
   onTriggerAnalysis,
   isAnalyzing = false,
+  onReconnectFile,
 }: MaterialsListModalProps) {
   const [filterKind, setFilterKind] = useState<'all' | 'pdf' | 'transcript' | 'user' | 'demo'>('all');
   const [bodyIds, setBodyIds] = useState<Set<string>>(new Set());
   const [originalIds, setOriginalIds] = useState<Set<string>>(new Set());
+  const [reconnectTarget, setReconnectTarget] = useState<{ id: string; kind: 'original' | 'body' } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const refreshPresence = useCallback(async () => {
+    const [bodies, originals] = await Promise.all([listMaterialContentIds(), listMaterialOriginalIds()]);
+    setBodyIds(new Set(bodies ?? []));
+    setOriginalIds(new Set(originals ?? []));
+  }, []);
 
   useEffect(() => {
     if (!isOpen) return;
-    let cancelled = false;
     const timer = window.setTimeout(() => {
-      void Promise.all([listMaterialContentIds(), listMaterialOriginalIds()]).then(([bodies, originals]) => {
-        if (cancelled) return;
-        setBodyIds(new Set(bodies ?? []));
-        setOriginalIds(new Set(originals ?? []));
-      });
+      void refreshPresence();
     }, 0);
     return () => {
-      cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [isOpen, materials]);
+  }, [isOpen, materials, refreshPresence]);
+
+  const startReconnect = (mat: Material, kind: 'original' | 'body') => {
+    setReconnectTarget({ id: mat.id, kind });
+    // Set accept before opening so the picker filters correctly.
+    if (fileInputRef.current) {
+      fileInputRef.current.accept = kind === 'original' ? 'application/pdf,.pdf' : '.md,.markdown,.txt,text/plain';
+      fileInputRef.current.click();
+    }
+  };
+
+  const handleReconnectFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] ?? null;
+    e.target.value = '';
+    const target = reconnectTarget;
+    setReconnectTarget(null);
+    if (!file || !target || !onReconnectFile) return;
+    const mat = materials.find((m) => m.id === target.id);
+    if (!mat) return;
+    const ok = await onReconnectFile(mat, target.kind, file);
+    if (ok) await refreshPresence();
+  };
 
   if (!isOpen) return null;
 
@@ -370,6 +396,28 @@ export function MaterialsListModal({
                         </button>
                       )}
 
+                      {onReconnectFile && !mat.isDemo && mat.kind === 'pdf' && !originalIds.has(mat.id) && !hasOriginal?.(mat.id) && (
+                        <button
+                          onClick={() => startReconnect(mat, 'original')}
+                          className="px-3 py-1.5 bg-white hover:bg-[#faf8f4] border border-[#c8c2b5] text-[#191817] text-xs font-semibold rounded-xs flex items-center gap-1 transition-colors"
+                          title="이 기기에 PDF 원본 파일을 다시 연결합니다 (서버에 업로드하지 않음)"
+                        >
+                          <FileText className="w-3.5 h-3.5 text-[#827d73]" />
+                          <span>원본 다시 연결</span>
+                        </button>
+                      )}
+
+                      {onReconnectFile && !mat.isDemo && !bodyIds.has(mat.id) && !mat.parsedMarkdown && (
+                        <button
+                          onClick={() => startReconnect(mat, 'body')}
+                          className="px-3 py-1.5 bg-white hover:bg-[#faf8f4] border border-[#c8c2b5] text-[#191817] text-xs font-semibold rounded-xs flex items-center gap-1 transition-colors"
+                          title="이 기기에 변환된 Markdown 본문을 다시 연결합니다 (서버에 업로드하지 않음)"
+                        >
+                          <FileText className="w-3.5 h-3.5 text-[#827d73]" />
+                          <span>본문 다시 연결</span>
+                        </button>
+                      )}
+
                       {!mat.isDemo && onDeleteMaterial && (
                         <button
                           onClick={() => {
@@ -402,6 +450,14 @@ export function MaterialsListModal({
           </button>
         </div>
       </div>
+      <input
+        ref={fileInputRef}
+        type="file"
+        className="hidden"
+        aria-hidden="true"
+        tabIndex={-1}
+        onChange={handleReconnectFileChange}
+      />
     </div>
   );
 }

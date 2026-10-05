@@ -131,6 +131,8 @@ import { ConceptRail, SortMode } from '../components/ConceptRail';
 import { ForgettingCurveChart } from '../components/ForgettingCurveChart';
 import { ArchiveRecordDetail } from '../components/ArchiveRecordDetail';
 import { TodayReviewPanel } from '../components/TodayReviewPanel';
+import { TodayStudyList } from '../components/TodayStudyList';
+import { type MigrationUiBlock } from '../components/DataManagementSection';
 import { ProblemSessionModal } from '../components/ProblemSessionModal';
 import { ExamScheduleModal } from '../components/ExamScheduleModal';
 import { ScopeManageModal } from '../components/ScopeManageModal';
@@ -146,6 +148,7 @@ import { MockExamModal, MockExamInitialConfig } from '../components/MockExamModa
 import { AddSubjectModal } from '../components/AddSubjectModal';
 import { StudyPlanModal } from '../components/StudyPlanModal';
 import { calculateDDay, toSeoulDateString, addDaysToDate } from '../lib/dateUtils';
+import { getTodayPendingItems, resolvePrimaryCta } from '../lib/todayStudy';
 import {
   clearAllMaterialContent,
   deleteMaterialContent,
@@ -153,6 +156,7 @@ import {
   loadMaterialContent,
   saveMaterialContent,
   saveMaterialOriginal,
+  hashBlob,
 } from '../lib/materialStorage';
 import { loadDefaultMaterialPolicy } from '../lib/materialPolicy';
 import { loadCloudLibrary } from '../lib/cloud/library';
@@ -240,6 +244,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [isProblemSessionOpen, setIsProblemSessionOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [aiConnectionMissing, setAiConnectionMissing] = useState(false);
+  const [isArchiveOpen, setIsArchiveOpen] = useState(false);
+  const [isPracticeOpen, setIsPracticeOpen] = useState(false);
   const [isMockExamModalOpen, setIsMockExamModalOpen] = useState(false);
   const [mockExamInitialConfig, setMockExamInitialConfig] = useState<MockExamInitialConfig | null>(null);
   const [isMaterialsListOpen, setIsMaterialsListOpen] = useState(false);
@@ -751,6 +757,71 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     window.open(result.data, '_blank', 'noopener,noreferrer');
   };
 
+  // Local-only relink: connect a file on this device to metadata-only material.
+  // Never uploads to the server; material id, concept/problem links and history
+  // are preserved because the material record itself is not replaced.
+  const handleReconnectOriginal = async (material: Material, file: File): Promise<boolean> => {
+    let hash = '';
+    try {
+      hash = await hashBlob(file);
+    } catch {
+      showToast('파일을 읽지 못했습니다. 다시 시도해 주세요.');
+      return false;
+    }
+    if (material.originalHash && hash !== material.originalHash) {
+      showToast('선택한 파일의 해시가 이 자료의 원본과 일치하지 않습니다. 기존 자료는 그대로 유지됩니다.');
+      return false;
+    }
+    if (!material.originalHash) {
+      const ok = window.confirm(
+        '이 자료에는 원본 식별 정보(해시)가 없어 자동 확인할 수 없습니다. 선택한 파일을 이 자료의 원본으로 연결할까요?'
+      );
+      if (!ok) return false;
+    }
+    const saved = await saveMaterialOriginal(material.id, file, file.type || 'application/pdf');
+    if (!saved.persisted) {
+      showToast(`원본 저장 실패: ${saved.error}. 다시 시도해 주세요.`);
+      return false;
+    }
+    const updated = materials.map((m) =>
+      m.id === material.id ? { ...m, originalHash: m.originalHash ?? saved.hash, fileSize: saved.size } : m
+    );
+    setMaterials(updated);
+    saveStoredMaterials(updated);
+    // If the body is still missing, guide the next supported action.
+    const body = await loadMaterialContent(material.id);
+    if (!body?.markdown) {
+      showToast('원본이 이 기기에 연결되었습니다. 변환 본문(MD)도 없으니 "본문 다시 연결"을 누르거나 자료를 다시 변환해 주세요.');
+    } else {
+      showToast('원본이 이 기기에 다시 연결되었습니다.');
+    }
+    return true;
+  };
+
+  const handleReconnectBody = async (material: Material, file: File): Promise<boolean> => {
+    let text = '';
+    try {
+      text = await file.text();
+    } catch {
+      showToast('파일을 읽지 못했습니다. 다시 시도해 주세요.');
+      return false;
+    }
+    if (!text.trim()) {
+      showToast('빈 파일입니다. 변환된 Markdown 파일을 선택해 주세요.');
+      return false;
+    }
+    const saved = await saveMaterialContent(material.id, { markdown: text });
+    if (!saved.persisted) {
+      showToast(`본문 저장 실패: ${saved.error}. 다시 시도해 주세요.`);
+      return false;
+    }
+    const updated = materials.map((m) => (m.id === material.id ? { ...m, parsedMarkdown: text } : m));
+    setMaterials(updated);
+    saveStoredMaterials(updated);
+    showToast('변환 본문(Markdown)이 이 기기에 다시 연결되었습니다.');
+    return true;
+  };
+
   // Hydration-safe flag: false during SSR/first hydration commit, true after.
   const isHydrated = useSyncExternalStore(hydrationSubscribe, () => true, () => false);
 
@@ -977,6 +1048,99 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       subjectConcepts[0]
     );
   }, [subjectConcepts, selectedConceptId]);
+
+  // Compact today-study summary for the main page (top pending items only).
+  const todayDigest = useMemo(
+    () => getTodayPendingItems(studyPlanSummary, 4),
+    [studyPlanSummary]
+  );
+  const todayDayLabel = useMemo(() => {
+    const day = studyPlanSummary.days.find((d) => d.date === studyPlanSummary.todayDate);
+    return day?.dayLabel;
+  }, [studyPlanSummary]);
+  const activeMockSession = useMemo(() => {
+    if (!activeSubject) return null;
+    return (
+      mockExams.find((s) => s.subjectId === activeSubject.id && s.status !== 'recorded' && s.status !== 'abandoned') ??
+      null
+    );
+  }, [mockExams, activeSubject]);
+  const primaryCta = useMemo(
+    () => resolvePrimaryCta(activeMockSession, todayDigest.items[0] ?? null),
+    [activeMockSession, todayDigest]
+  );
+
+  const handleRestoreMaterials = (restored: Material[]) => {
+    const byId = new Map(materials.map((m) => [m.id, m]));
+    for (const material of restored) {
+      if (!byId.has(material.id)) byId.set(material.id, material);
+    }
+    const updated = Array.from(byId.values());
+    setMaterials(updated);
+    saveStoredMaterials(updated);
+    showToast(`백업에서 자료 ${restored.length}건의 메타데이터를 복원했습니다.`);
+  };
+
+  const migrationBlocks: MigrationUiBlock[] = (() => {
+    const blocks: MigrationUiBlock[] = [];
+    if (legacyImportState && legacyImportState.hasLegacyData && !legacyImportState.imported && !legacyImportState.declined) {
+      blocks.push({
+        key: 'legacy',
+        title: '기존 학습 기록 가져오기',
+        description: legacyImportState.conflict
+          ? '이미 이 계정에 학습 기록이 있어 자동으로 가져오지 않습니다. 현재 계정 기록을 그대로 유지합니다.'
+          : legacyImportState.resume
+            ? '중단된 가져오기를 이어서 완료합니다. 이미 복사된 기록은 검증 후 건너뜁니다.'
+            : '이전에 이 브라우저에서 쓰던 공용 학습 기록을 이 계정으로 가져옵니다. 기존 기록은 보존됩니다.',
+        pending: true,
+        busy: isImportingLegacy,
+        actionLabel: legacyImportState.resume ? '가져오기 계속하기' : '기존 학습 기록 가져오기',
+        onMigrate: legacyImportState.conflict ? undefined : handleImportLegacy,
+        onDecline: handleDeclineLegacy,
+        declineLabel: legacyImportState.conflict ? '확인' : '나중에',
+      });
+    }
+    if (cloudMigrationState && cloudMigrationState.hasLocalData && !cloudMigrationState.imported && !cloudMigrationState.declined) {
+      blocks.push({
+        key: 'cloud',
+        title: '과목·자료 이전',
+        description:
+          '과목과 학습 자료의 목록을 클라우드로 이전합니다. 로컬 원본은 그대로 보존되며, 같은 ID의 다른 내용은 자동으로 덮어쓰지 않습니다.',
+        pending: true,
+        busy: isMigratingCloud,
+        actionLabel: '클라우드로 이전',
+        onMigrate: handleMigrateCloud,
+        onDecline: handleDeclineCloudMigration,
+      });
+    }
+    if (learningMigrationState && learningMigrationState.hasLocalData && !learningMigrationState.imported && !learningMigrationState.declined) {
+      blocks.push({
+        key: 'learning',
+        title: '학습 콘텐츠 이전',
+        description:
+          '개념·문제·버전 기록을 이전합니다. 풀이·복습 이력은 학습 이력 단계에서 별도로 이전합니다. 과목·자료 이전을 먼저 완료해야 합니다.',
+        pending: true,
+        busy: isMigratingLearning,
+        actionLabel: '학습 콘텐츠 이전',
+        onMigrate: handleMigrateLearning,
+        onDecline: handleDeclineLearning,
+      });
+    }
+    if (historyMigrationState && historyMigrationState.hasLocalData && !historyMigrationState.imported && !historyMigrationState.declined) {
+      blocks.push({
+        key: 'history',
+        title: '학습 이력 이전',
+        description:
+          '풀이·복습·계획·모의시험 기록을 이전합니다. 로컬 원본은 서버 반영이 검증될 때까지 그대로 보존됩니다.',
+        pending: true,
+        busy: isMigratingHistory,
+        actionLabel: '학습 이력 이전',
+        onMigrate: handleMigrateHistory,
+        onDecline: handleDeclineHistory,
+      });
+    }
+    return blocks;
+  })();
 
   const sessionConcept = activeSessionProblem && (
     subjectConcepts.find((c) => c.id === selectedConcept?.id && activeSessionProblem.conceptIds.includes(c.id)) ||
@@ -1210,7 +1374,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     }
 
     setIsAiAnalyzing(true);
-    showToast(`[${targetMaterial.title}] AI 개념 분석 시작... (Gemini API 호출 중)`);
+    showToast(`[${targetMaterial.title}] AI 개념 분석 시작... (AI 처리 중)`);
 
     try {
       const res = await fetch('/api/analyze-concepts', {
@@ -1968,6 +2132,21 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     }
   };
 
+  const handleResumeMockExam = () => {
+    setMockExamInitialConfig(null);
+    setIsMockExamModalOpen(true);
+  };
+
+  const handleStartTodayPrimary = () => {
+    if (!primaryCta) return;
+    if (primaryCta.kind === 'resume-mock') {
+      handleResumeMockExam();
+      return;
+    }
+    const item = todayDigest.items.find((i) => i.id === primaryCta.itemId);
+    if (item) handleStartPlanItem(item);
+  };
+
   // Mirror a single study-plan item change to the server without ever reverting
   // a completion recorded on another device.
   const syncPlanItemToServer = async (item: StudyPlanItem, actionLabel: string) => {
@@ -2077,6 +2256,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       setSelectedEventId(lastEvent ? lastEvent.id : null);
     }
 
+    setIsArchiveOpen(true);
     setTimeout(() => {
       const el = document.getElementById('archive-record-detail');
       if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -2323,134 +2503,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         </div>
       )}
 
-      {legacyImportState &&
-        legacyImportState.hasLegacyData &&
-        !legacyImportState.imported &&
-        !legacyImportState.declined &&
-        (legacyImportState.conflict ? (
-          <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
-            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
-              <div className="text-xs text-[#57544e] leading-relaxed">
-                <span className="font-bold text-[#191817]">기존 공용 학습 기록이 있습니다.</span>{' '}
-                이미 이 계정에 학습 기록이 있어 자동으로 가져오지 않습니다. 두 기록을 섞으면
-                과목·자료 연결이 깨질 수 있어 현재 계정 기록을 그대로 유지합니다.
-              </div>
-              <button
-                type="button"
-                onClick={handleDeclineLegacy}
-                className="shrink-0 text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors"
-              >
-                확인
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="w-full bg-[#fef2f2] border-b border-[#f3c6c6]">
-            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
-              <div className="text-xs text-[#57544e] leading-relaxed">
-                <span className="font-bold text-[#c52828]">
-                  {legacyImportState.resume
-                    ? '중단된 가져오기를 이어서 완료할 수 있습니다.'
-                    : '기존 학습 기록을 발견했습니다.'}
-                </span>{' '}
-                {legacyImportState.resume
-                  ? '이미 복사된 기록은 원본과 일치하는지 검증한 뒤 건너뛰고, 남은 기록만 복사합니다. 기존 공용 기록과 현재 계정 기록은 그대로 보존됩니다.'
-                  : '이 계정으로 가져오면 로그인 후에도 동일한 기록을 이어서 사용할 수 있습니다. 기존 공용 기록은 그대로 보존되며, 다른 계정에는 표시되지 않습니다.'}
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={handleImportLegacy}
-                  disabled={isImportingLegacy}
-                  className="text-xs font-semibold bg-[#c52828] text-white px-3 py-1.5 rounded-xs hover:bg-[#a81f1f] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {isImportingLegacy
-                    ? '가져오는 중...'
-                    : legacyImportState.resume
-                      ? '가져오기 계속하기'
-                      : '기존 학습 기록 가져오기'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDeclineLegacy}
-                  disabled={isImportingLegacy}
-                  className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
-                >
-                  나중에
-                </button>
-              </div>
-            </div>
-          </div>
-        ))}
-
-      {cloudMigrationState &&
-        cloudMigrationState.hasLocalData &&
-        !cloudMigrationState.imported &&
-        !cloudMigrationState.declined && (
-          <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
-            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
-              <div className="text-xs text-[#57544e] leading-relaxed">
-                <span className="font-bold text-[#191817]">이 계정의 로컬 과목·자료를 클라우드로 이전할 수 있습니다.</span>{' '}
-                이전하면 다른 기기에서도 같은 과목·자료를 사용할 수 있습니다. 로컬 원본은 그대로
-                보존되며, 같은 ID의 다른 내용은 자동으로 덮어쓰지 않습니다. (문제·답안·복습 이력은
-                아직 로컬에 남습니다.)
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={handleMigrateCloud}
-                  disabled={isMigratingCloud}
-                  className="text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {isMigratingCloud ? '이전 중...' : '클라우드로 이전'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDeclineCloudMigration}
-                  disabled={isMigratingCloud}
-                  className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
-                >
-                  나중에
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-      {learningMigrationState &&
-        learningMigrationState.hasLocalData &&
-        !learningMigrationState.imported &&
-        !learningMigrationState.declined && (
-          <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
-            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
-              <div className="text-xs text-[#57544e] leading-relaxed">
-                <span className="font-bold text-[#191817]">로컬 개념·문제·버전을 클라우드로 이전할 수 있습니다.</span>{' '}
-                이전하면 다른 기기에서도 승인한 개념과 문제를 이어서 사용할 수 있습니다. 로컬 원본은 그대로
-                보존되며, 같은 ID의 다른 내용은 자동으로 덮어쓰지 않습니다. (답안·복습 이력은 이번 단계에서
-                로컬에 남습니다.) 과목·자료 이전을 먼저 완료해야 합니다.
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={handleMigrateLearning}
-                  disabled={isMigratingLearning}
-                  className="text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {isMigratingLearning ? '이전 중...' : '학습 콘텐츠 이전'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDeclineLearning}
-                  disabled={isMigratingLearning}
-                  className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
-                >
-                  나중에
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
       {aiConnectionMissing && (
         <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
           <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-2.5 flex flex-col sm:flex-row sm:items-center gap-2 justify-between">
@@ -2469,57 +2521,22 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         </div>
       )}
 
-      {historyMigrationState &&
-        historyMigrationState.hasLocalData &&
-        !historyMigrationState.imported &&
-        !historyMigrationState.declined && (
-          <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
-            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
-              <div className="text-xs text-[#57544e] leading-relaxed">
-                <span className="font-bold text-[#191817]">로컬 풀이·복습·계획·모의시험 이력을 클라우드로 이전할 수 있습니다.</span>{' '}
-                이전하면 다른 기기에서도 기존 풀이 기록과 진행 중인 모의시험을 이어갈 수 있습니다. 로컬
-                원본은 서버 반영이 검증될 때까지 그대로 보존됩니다.
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={handleMigrateHistory}
-                  disabled={isMigratingHistory}
-                  className="text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {isMigratingHistory ? '이전 중...' : '학습 이력 이전'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDeclineHistory}
-                  disabled={isMigratingHistory}
-                  className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
-                >
-                  나중에
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
       {/* Main Workspace Container */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-3 sm:px-6 py-4 sm:py-6 space-y-4">
         {/* Section 1: Subject Exam Record & D-Day */}
         <ExamRecordCard
           subject={activeSubject}
-          materialCount={materials.filter((m) => m.subjectId === activeSubject.id).length}
           onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
           onOpenScopeModal={() => setIsScopeModalOpen(true)}
-          onOpenStudyPlanModal={() => setIsStudyPlanOpen(true)}
-          onOpenUploadModal={() => setIsUploadModalOpen(true)}
-          onOpenMaterialsListModal={() => setIsMaterialsListOpen(true)}
+          onPrimaryAction={primaryCta ? handleStartTodayPrimary : undefined}
+          primaryLabel={primaryCta ? (primaryCta.kind === 'resume-mock' ? '이어서 풀기' : '오늘 복습 시작') : undefined}
+          estimatedMinutesText={todayDigest.estimateText}
         />
 
         {/* Section 2: Status Strip */}
         <StatusStrip
           subject={activeSubject}
           concepts={subjectConcepts}
-          onOpenSettings={() => setIsSettingsModalOpen(true)}
         />
 
         {/* Section 3: Concept Rail (Table 1.0) */}
@@ -2534,48 +2551,56 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           onToggleCompareConcept={handleToggleCompareConcept}
         />
 
-        {/* Section 4: Main 2-Column Split (Left: Chart & Archive Record / Right: Today Review) */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
-          {/* Left Column (Approx 65% width: 8 of 12 cols) */}
-          <div className="lg:col-span-8 space-y-4">
-            {/* SVG Forgetting Curve Chart */}
-            {selectedConcept && (
-              <ForgettingCurveChart
-                concept={selectedConcept}
-                comparedConcepts={comparedConcepts}
-                isComparisonMode={isComparisonMode}
-                onToggleComparisonMode={() => {
-                  const nextMode = !isComparisonMode;
-                  setIsComparisonMode(nextMode);
-                  if (nextMode && comparedConceptIds.length === 0 && selectedConcept) {
-                    setComparedConceptIds([selectedConcept.id]);
-                  }
-                }}
-                selectedEventId={selectedEventId}
-                onSelectEvent={(evId) => setSelectedEventId(evId)}
-                settings={settings}
-                examDayOffset={examDDay}
-                hasExamDate={Boolean(activeSubject.examAt && !isNaN(new Date(activeSubject.examAt).getTime()))}
-              />
-            )}
+        {/* Section 4: Forgetting Curve (center, full width) */}
+        {selectedConcept && (
+          <ForgettingCurveChart
+            concept={selectedConcept}
+            comparedConcepts={comparedConcepts}
+            isComparisonMode={isComparisonMode}
+            onToggleComparisonMode={() => {
+              const nextMode = !isComparisonMode;
+              setIsComparisonMode(nextMode);
+              if (nextMode && comparedConceptIds.length === 0 && selectedConcept) {
+                setComparedConceptIds([selectedConcept.id]);
+              }
+            }}
+            selectedEventId={selectedEventId}
+            onSelectEvent={(evId) => {
+              setSelectedEventId(evId);
+              setIsArchiveOpen(true);
+            }}
+            settings={settings}
+            examDayOffset={examDDay}
+            hasExamDate={Boolean(activeSubject.examAt && !isNaN(new Date(activeSubject.examAt).getTime()))}
+          />
+        )}
 
-            {/* Archive Record Detail Box */}
-            {selectedConcept && (
-              <ArchiveRecordDetail
-                concept={selectedConcept}
-                event={selectedEvent}
-                attempts={attempts}
-                problems={allProblems}
-                onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
-                onReportProblem={handleReportProblem}
-                onOpenLogicStrengthen={handleOpenLogicStrengthen}
-              />
-            )}
-          </div>
+        {/* Section 5: Today Study (compact top items + full plan link) */}
+        <TodayStudyList
+          dayLabel={todayDayLabel}
+          items={todayDigest.items}
+          pendingCount={todayDigest.pendingCount}
+          estimatedMinutesText={todayDigest.estimateText}
+          hasActiveSession={Boolean(activeMockSession)}
+          onStartItem={handleStartPlanItem}
+          onResumeMock={handleResumeMockExam}
+          onOpenAll={() => setIsStudyPlanOpen(true)}
+        />
 
-          {/* Right Column (Approx 35% width: 4 of 12 cols) */}
-          <div className="lg:col-span-4 sticky top-16">
-            {selectedConcept && (
+        {/* Section 6: Selected-concept practice detail (collapsible) */}
+        {selectedConcept && (
+          <details
+            open={isPracticeOpen}
+            onToggle={(e) => setIsPracticeOpen((e.target as HTMLDetailsElement).open)}
+            className="w-full bg-white border border-[#e2ded6] rounded-xs shadow-2xs"
+          >
+            <summary className="cursor-pointer list-none px-4 py-3 flex items-center justify-between gap-2 text-xs font-bold text-[#191817] hover:bg-[#faf8f4] transition-colors">
+              <span>선택한 개념 상세 연습 · {selectedConcept.title}</span>
+              <span className="text-[11px] font-academic-mono font-medium text-[#827d73]">
+                {isPracticeOpen ? '접기' : '펼치기'}
+              </span>
+            </summary>
+            <div className="px-4 pb-4 max-w-3xl">
               <TodayReviewPanel
                 subject={activeSubject}
                 concept={selectedConcept}
@@ -2603,9 +2628,36 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 recommendation={selectedConceptRecommendation}
                 totalConceptsCount={subjectConcepts.length}
               />
-            )}
-          </div>
-        </div>
+            </div>
+          </details>
+        )}
+
+        {/* Section 7: Learning record detail (collapsible) */}
+        {selectedConcept && (
+          <details
+            open={isArchiveOpen}
+            onToggle={(e) => setIsArchiveOpen((e.target as HTMLDetailsElement).open)}
+            className="w-full bg-white border border-[#e2ded6] rounded-xs shadow-2xs"
+          >
+            <summary className="cursor-pointer list-none px-4 py-3 flex items-center justify-between gap-2 text-xs font-bold text-[#191817] hover:bg-[#faf8f4] transition-colors">
+              <span>학습 기록 상세 · {selectedConcept.title}</span>
+              <span className="text-[11px] font-academic-mono font-medium text-[#827d73]">
+                {isArchiveOpen ? '접기' : '펼치기'}
+              </span>
+            </summary>
+            <div id="archive-record-detail" className="px-4 pb-4 scroll-mt-20">
+              <ArchiveRecordDetail
+                concept={selectedConcept}
+                event={selectedEvent}
+                attempts={attempts}
+                problems={allProblems}
+                onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
+                onReportProblem={handleReportProblem}
+                onOpenLogicStrengthen={handleOpenLogicStrengthen}
+              />
+            </div>
+          </details>
+        )}
 
         {/* Notice Banner */}
         <div className="bg-[#f6f3eb] border border-[#ded6c8] p-3 rounded-xs text-[11px] font-academic-mono text-[#57544e] flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
@@ -2629,15 +2681,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           </div>
 
           <div className="flex flex-wrap items-center gap-3 text-[#57544e]">
-            <span>ENGINE: POWER-LAW v2.4</span>
-            <span className="text-[#c8c2b5]">·</span>
-            <span>EVALUATION ADAPTER: RUBRIC-3D</span>
-            <span className="text-[#c8c2b5]">·</span>
             <button
               onClick={() => setIsSettingsModalOpen(true)}
               className="hover:text-[#191817] underline decoration-dotted"
             >
-              모델 설정
+              설정
             </button>
           </div>
         </div>
@@ -2712,6 +2760,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }}
         hasOriginal={(materialId) => Boolean(cloudOriginalPaths[materialId])}
         onOpenOriginal={handleOpenOriginal}
+        onReconnectFile={async (material, kind, file) =>
+          kind === 'original'
+            ? handleReconnectOriginal(material, file)
+            : handleReconnectBody(material, file)
+        }
         onDeleteMaterial={async (materialId) => {
           // Delete on the server first; never report success on failure.
           const result = await deleteMaterial(materialId);
@@ -2954,6 +3007,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           showToast('복습 감쇠 모델 설정이 저장되었습니다.');
         }}
         onResetData={handleResetData}
+        materials={materials}
+        onRestoreMaterials={handleRestoreMaterials}
+        migrationBlocks={migrationBlocks}
       />
 
       {/* 7. Mock Exam Modal */}

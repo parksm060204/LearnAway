@@ -1,4 +1,6 @@
 import type { Material, MaterialPage, MaterialStoragePolicy } from './types';
+import { scopedStorageKey } from './storageScope';
+import { materialContentHash } from './cloud/hash';
 
 /**
  * Local-first material storage policy.
@@ -17,37 +19,59 @@ export function materialPolicyOf(material: Pick<Material, 'storagePolicy'>): Mat
   return material.storagePolicy ?? { syncBody: true, backupOriginal: true };
 }
 
-const DEFAULT_POLICY_KEY = 'redcall_material_storage_policy_v1';
+// The default policy for NEW materials is stored per account (storageScope).
+// The unscoped legacy key only ever applied before login; it is never copied
+// into an account, so one account's choice cannot leak into another.
+const POLICY_BASE_KEY = 'material_storage_policy_v1';
 
-/** User-chosen default policy applied to NEW materials. */
-export function loadDefaultMaterialPolicy(): MaterialStoragePolicy {
+function policyStorage(): Storage | null {
   try {
-    if (typeof localStorage !== 'undefined') {
-      const raw = localStorage.getItem(DEFAULT_POLICY_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as Partial<MaterialStoragePolicy>;
-        return {
-          syncBody: Boolean(parsed.syncBody),
-          backupOriginal: Boolean(parsed.backupOriginal),
-        };
-      }
-    }
+    if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
   } catch {
-    // fall through to the local-first default
+    // privacy mode
   }
-  return { ...DEFAULT_MATERIAL_POLICY };
+  return null;
 }
 
-export function saveDefaultMaterialPolicy(policy: MaterialStoragePolicy): void {
+function parsePolicy(raw: string | null): MaterialStoragePolicy | null {
+  if (!raw) return null;
   try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(
-        DEFAULT_POLICY_KEY,
-        JSON.stringify({ syncBody: Boolean(policy.syncBody), backupOriginal: Boolean(policy.backupOriginal) })
-      );
-    }
+    const parsed = JSON.parse(raw) as Partial<MaterialStoragePolicy>;
+    return {
+      syncBody: Boolean(parsed.syncBody),
+      backupOriginal: Boolean(parsed.backupOriginal),
+    };
   } catch {
-    // best effort
+    return null;
+  }
+}
+
+/** Account-scoped default policy applied to NEW materials. */
+export function loadDefaultMaterialPolicy(): MaterialStoragePolicy {
+  const storage = policyStorage();
+  if (!storage) return { ...DEFAULT_MATERIAL_POLICY };
+  const parsed = parsePolicy(storage.getItem(scopedStorageKey(POLICY_BASE_KEY)));
+  return parsed ?? { ...DEFAULT_MATERIAL_POLICY };
+}
+
+/**
+ * Persists the account-scoped default policy and verifies the write.
+ * Returns false when the value could not be stored, so callers never show a
+ * failed save as success.
+ */
+export function saveDefaultMaterialPolicy(policy: MaterialStoragePolicy): boolean {
+  const storage = policyStorage();
+  if (!storage) return false;
+  const key = scopedStorageKey(POLICY_BASE_KEY);
+  const value = JSON.stringify({
+    syncBody: Boolean(policy.syncBody),
+    backupOriginal: Boolean(policy.backupOriginal),
+  });
+  try {
+    storage.setItem(key, value);
+    return storage.getItem(key) === value;
+  } catch {
+    return false;
   }
 }
 
@@ -155,7 +179,7 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-export function base64ToBytes(value: string): Uint8Array {
+export function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
   if (typeof Buffer !== 'undefined') return new Uint8Array(Buffer.from(value, 'base64'));
   const binary = atob(value);
   const out = new Uint8Array(binary.length);
@@ -208,4 +232,127 @@ export function parseMaterialBackup(text: string): MaterialBackupParse {
 export function backupContainsSecrets(backup: MaterialBackupFile): boolean {
   const text = JSON.stringify(backup);
   return /api[_-]?key|authorization|bearer\s|access[_-]?token|refresh[_-]?token/i.test(text);
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect decisions (pure): re-linking a file to metadata-only material.
+// ---------------------------------------------------------------------------
+
+export type ReconnectDecision = 'accept' | 'mismatch' | 'confirm-required';
+
+/**
+ * Decides whether a candidate original file may be linked:
+ * - accept: hashes match,
+ * - mismatch: hashes differ -> existing record is preserved, never overwritten,
+ * - confirm-required: the record carries no identity hash, so only an explicit
+ *   user confirmation may link the file (never an automatic match).
+ */
+export function decideOriginalReconnect(
+  expectedHash: string | undefined,
+  candidateHash: string
+): ReconnectDecision {
+  if (!expectedHash) return 'confirm-required';
+  return expectedHash === candidateHash ? 'accept' : 'mismatch';
+}
+
+// ---------------------------------------------------------------------------
+// Restore planning (pure): never silently overwrites existing records.
+// ---------------------------------------------------------------------------
+
+export interface RestoreConflict {
+  id: string;
+  title: string;
+  reason: string;
+}
+
+export interface RestoreMissingFile {
+  id: string;
+  title: string;
+  which: Array<'body' | 'original'>;
+}
+
+export interface RestorePlan {
+  /** Entry ids safe to write (new, or already-identical files). */
+  toRestore: string[];
+  /** Entry ids whose files already exist unchanged locally. */
+  alreadyPresent: string[];
+  /** Same id but different content: skipped, reported, never overwritten. */
+  conflicts: RestoreConflict[];
+  /** Entries with no files at all (metadata only): restored as metadata. */
+  missingFiles: RestoreMissingFile[];
+}
+
+export interface RestoreExistingSnapshot {
+  id: string;
+  /** Hash of the locally stored body, or null when absent. */
+  localBodyHash: string | null;
+  /** Hash of the locally stored original, or null when absent. */
+  localOriginalHash: string | null;
+}
+
+/**
+ * Plans a restore without writing anything. Identity is checked by content
+ * hash (never name or path alone). Existing records are never overwritten.
+ */
+export function planMaterialRestore(
+  entries: MaterialBackupEntry[],
+  existing: RestoreExistingSnapshot[]
+): RestorePlan {
+  const toRestore: string[] = [];
+  const alreadyPresent: string[] = [];
+  const conflicts: RestoreConflict[] = [];
+  const missingFiles: RestoreMissingFile[] = [];
+
+  for (const entry of entries) {
+    const cur = existing.find((e) => e.id === entry.material.id);
+    const entryBodyHash = entry.body ? materialContentHash(entry.body) : null;
+    const entryOriginalHash = entry.original?.hash ?? null;
+
+    if (!entry.body && !entry.original) {
+      if (cur) {
+        alreadyPresent.push(entry.material.id);
+      } else {
+        toRestore.push(entry.material.id);
+      }
+      missingFiles.push({ id: entry.material.id, title: entry.material.title, which: ['body', 'original'] });
+      continue;
+    }
+
+    if (!cur) {
+      toRestore.push(entry.material.id);
+      const which: Array<'body' | 'original'> = [];
+      if (!entry.body) which.push('body');
+      if (!entry.original) which.push('original');
+      if (which.length > 0) {
+        missingFiles.push({ id: entry.material.id, title: entry.material.title, which });
+      }
+      continue;
+    }
+
+    const localBody = cur.localBodyHash ?? null;
+    const localOriginal = cur.localOriginalHash ?? null;
+    const bodyDiffers =
+      entryBodyHash !== null && localBody !== null && entryBodyHash !== localBody;
+    const originalDiffers =
+      entryOriginalHash !== null && localOriginal !== null && entryOriginalHash !== localOriginal;
+    if (bodyDiffers || originalDiffers) {
+      conflicts.push({
+        id: entry.material.id,
+        title: entry.material.title,
+        reason: '같은 ID에 다른 내용이 이미 있습니다. 덮어쓰지 않고 건너뜁니다.',
+      });
+      continue;
+    }
+    // Files this side lacks can be added; identical files are skipped.
+    const bodyAddable = entryBodyHash !== null && localBody === null;
+    const originalAddable = entryOriginalHash !== null && localOriginal === null;
+    if (bodyAddable || originalAddable) {
+      toRestore.push(entry.material.id);
+      continue;
+    }
+    // Identical files: keep the existing record, do not rewrite it.
+    alreadyPresent.push(entry.material.id);
+  }
+
+  return { toRestore, alreadyPresent, conflicts, missingFiles };
 }

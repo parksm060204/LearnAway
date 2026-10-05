@@ -103,7 +103,7 @@ export function ArchiveRecordDetail({
   );
 
   return (
-    <div id="archive-record-detail" className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 sm:p-5 shadow-2xs space-y-3.5 scroll-mt-20">
+    <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 sm:p-5 shadow-2xs space-y-3.5 scroll-mt-20">
       {/* Archive Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-[#f1ede4]">
         <div className="flex flex-wrap items-center gap-2">

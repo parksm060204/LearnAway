@@ -12,6 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts',
+  'lib/todayStudy.ts', 'lib/reviewStats.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
   'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/aiClient.ts', 'lib/aiCredentials.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
@@ -113,6 +114,8 @@ exports.requireApiUser = async () => {
   const validation = load(path.join(output, 'lib/evaluationValidation.js'));
   const matStorage = load(path.join(output, 'lib/materialStorage.js'));
   const materialPolicy = load(path.join(output, 'lib/materialPolicy.js'));
+  const todayStudy = load(path.join(output, 'lib/todayStudy.js'));
+  const reviewStats = load(path.join(output, 'lib/reviewStats.js'));
   const problemSources = load(path.join(output, 'lib/problemSources.js'));
   const problemFreshness = load(path.join(output, 'lib/problemFreshness.js'));
   const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
@@ -910,6 +913,114 @@ exports.requireApiUser = async () => {
     assert.equal(materialPolicy.reconnectHashMatches('h1', 'h1'), true);
     assert.equal(materialPolicy.reconnectHashMatches('h1', 'h2'), false);
     assert.equal(materialPolicy.reconnectHashMatches(undefined, 'h2'), false);
+  });
+
+  check('material storage policy is scoped per account', () => {
+    const userA = 'policy-user-a';
+    const userB = 'policy-user-b';
+    storageScope.setStorageScope({ kind: 'user', userId: userA });
+    assert.equal(materialPolicy.saveDefaultMaterialPolicy({ syncBody: true, backupOriginal: true }), true);
+    assert.deepEqual(materialPolicy.loadDefaultMaterialPolicy(), { syncBody: true, backupOriginal: true });
+
+    // A different account starts from the local-first default, never A's choice.
+    storageScope.setStorageScope({ kind: 'user', userId: userB });
+    assert.deepEqual(materialPolicy.loadDefaultMaterialPolicy(), { syncBody: false, backupOriginal: false });
+
+    // A's stored policy is untouched by B.
+    storageScope.setStorageScope({ kind: 'user', userId: userA });
+    assert.deepEqual(materialPolicy.loadDefaultMaterialPolicy(), { syncBody: true, backupOriginal: true });
+
+    // The old shared key is only the legacy (pre-login) namespace.
+    localStorage.setItem('redcall_material_storage_policy_v1', JSON.stringify({ syncBody: true, backupOriginal: true }));
+    storageScope.setStorageScope({ kind: 'user', userId: 'policy-fresh-user' });
+    assert.deepEqual(
+      materialPolicy.loadDefaultMaterialPolicy(),
+      { syncBody: false, backupOriginal: false },
+      'shared legacy setting is not applied to signed-in accounts'
+    );
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  check('material policy save failure is reported, not hidden', () => {
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = () => { throw new Error('quota exceeded'); };
+    try {
+      storageScope.setStorageScope({ kind: 'user', userId: 'policy-fail-user' });
+      assert.equal(materialPolicy.saveDefaultMaterialPolicy({ syncBody: true, backupOriginal: false }), false);
+    } finally {
+      localStorage.setItem = realSetItem;
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+  });
+
+  check('original reconnect decision never auto-matches without identity', () => {
+    assert.equal(materialPolicy.decideOriginalReconnect('h1', 'h1'), 'accept');
+    assert.equal(materialPolicy.decideOriginalReconnect('h1', 'h2'), 'mismatch');
+    assert.equal(materialPolicy.decideOriginalReconnect(undefined, 'h2'), 'confirm-required');
+  });
+
+  check('restore plan never overwrites and reports conflicts/missing', () => {
+    const entries = [
+      { material: { id: 'new-1', title: 'N', subjectId: 's' }, body: { markdown: '# n' }, original: { contentType: 'application/pdf', hash: 'h-new', base64: 'eA==' } },
+      { material: { id: 'same-1', title: 'S', subjectId: 's' }, body: { markdown: '# same' } },
+      { material: { id: 'diff-1', title: 'D', subjectId: 's' }, body: { markdown: '# other' } },
+      { material: { id: 'meta-1', title: 'M', subjectId: 's' } },
+    ];
+    const plan = materialPolicy.planMaterialRestore(entries, [
+      { id: 'same-1', localBodyHash: cloudHash.materialContentHash({ markdown: '# same' }), localOriginalHash: null },
+      { id: 'diff-1', localBodyHash: cloudHash.materialContentHash({ markdown: '# local-different' }), localOriginalHash: null },
+    ]);
+    assert.ok(plan.toRestore.includes('new-1'), 'new entry is restorable');
+    assert.ok(plan.alreadyPresent.includes('same-1'), 'identical entry is skipped, not rewritten');
+    assert.ok(!plan.toRestore.includes('same-1'), 'identical entry is not rewritten');
+    assert.deepEqual(plan.conflicts.map((c) => c.id), ['diff-1'], 'changed content conflicts, never overwrites');
+    assert.ok(!plan.toRestore.includes('diff-1'));
+    assert.ok(plan.missingFiles.some((m) => m.id === 'meta-1'), 'metadata-only entry is reported');
+  });
+
+  check('today study digest shows top items and estimate only with real data', () => {
+    const item = (id, score, minutes, status = 'pending') => ({
+      id, subjectId: 's', subjectName: 'S', kind: 'recommended_review', assignedDate: '2026-10-05',
+      estimatedMinutes: minutes, isEstimatedTime: false, priorityScore: score, priorityReason: 'r',
+      status, snapshotTitle: id, snapshotDetail: '',
+    });
+    const summary = {
+      todayDate: '2026-10-05', todayAvailableMinutes: 60, todayAssignedMinutes: 40,
+      todayCompletedCount: 0, todayPendingCount: 3, todayUnassignedCount: 0, totalShortageMinutes: 0,
+      scopeRemainingBySubject: [],
+      days: [{
+        date: '2026-10-05', dayOfWeek: 1, dayLabel: 'd', availableMinutes: 60, isRestDay: false,
+        assignedMinutes: 40, unassignedItems: [],
+        items: [item('low', 10, 15), item('high', 90, 20), item('done', 50, 10, 'completed'), item('mid', 50, 0)],
+      }],
+    };
+    const digest = todayStudy.getTodayPendingItems(summary, 4);
+    assert.deepEqual(digest.items.map((i) => i.id), ['high', 'mid', 'low']);
+    assert.equal(digest.pendingCount, 3);
+    assert.equal(digest.estimateText, '예상 35분');
+
+    const empty = todayStudy.getTodayPendingItems(null);
+    assert.deepEqual(empty.items, []);
+    assert.equal(empty.estimateText, null, 'no fabricated estimate');
+    assert.equal(todayStudy.getTodayPendingItems({ days: [], todayDate: '2026-10-05' }).estimateText, null);
+
+    assert.deepEqual(todayStudy.resolvePrimaryCta({ id: 'mx', status: 'submitted' }, { id: 'p1' }), { kind: 'resume-mock', sessionId: 'mx' });
+    assert.deepEqual(todayStudy.resolvePrimaryCta(null, { id: 'p1' }), { kind: 'start-item', itemId: 'p1' });
+    assert.equal(todayStudy.resolvePrimaryCta(null, null), null);
+    assert.deepEqual(todayStudy.resolvePrimaryCta({ id: 'mx', status: 'recorded' }, { id: 'p1' }), { kind: 'start-item', itemId: 'p1' });
+  });
+
+  check('last evaluation date reflects real records or an explicit empty state', () => {
+    assert.equal(reviewStats.lastEvaluationAtISO([]), null);
+    assert.equal(reviewStats.lastEvaluationAtISO([{ events: [] }]), null);
+    assert.equal(reviewStats.lastEvaluationAtISO([{ events: [{ at: 'invalid' }] }]), null);
+    assert.equal(
+      reviewStats.lastEvaluationAtISO([{ events: [{ at: '2026-09-28T10:00:00+09:00' }] }, { events: [{ at: '2026-10-05T08:00:00Z' }] }]),
+      '2026-10-05T08:00:00.000Z'
+    );
+    assert.equal(reviewStats.formatEvaluationDate(null), '평가 기록 없음');
+    assert.equal(reviewStats.formatEvaluationDate('garbage'), '평가 기록 없음');
+    assert.ok(reviewStats.formatEvaluationDate('2026-09-28T10:00:00+09:00').includes('2026'), 'real date shown');
   });
 
   await checkAsync('material backup carries metadata + files without secrets and round-trips', async () => {

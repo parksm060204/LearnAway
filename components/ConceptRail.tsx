@@ -50,7 +50,6 @@ export function ConceptRail({
       {/* Rail Header with Table number and Sort buttons */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-2 border-b border-[#f1ede4]">
         <div className="flex items-center gap-2">
-          <span className="font-academic-mono text-xs font-bold text-[#827d73]">TABLE 1.0</span>
           <h2 className="text-xs sm:text-sm font-bold text-[#191817] font-academic-serif">
             과정 등록 개념 및 망각 지수 대조 레일
           </h2>
@@ -59,12 +58,13 @@ export function ConceptRail({
           </span>
         </div>
 
-        {/* Sort Buttons */}
-        <div className="flex items-center gap-1.5 text-xs self-end sm:self-auto">
-          <div className="flex items-center gap-1 text-[#827d73] text-[11px] font-academic-mono mr-1">
+        {/* Sort Buttons (auxiliary: folded) */}
+        <details className="self-end sm:self-auto text-xs">
+          <summary className="cursor-pointer list-none flex items-center gap-1 text-[11px] font-academic-mono text-[#827d73] hover:text-[#191817] px-2.5 py-1 border border-[#ded6c8] rounded-xs">
             <ArrowUpDown className="w-3 h-3" />
-            <span>SORT:</span>
-          </div>
+            <span>정렬</span>
+          </summary>
+          <div className="flex items-center gap-1.5 mt-1.5">
 
           <button
             onClick={() => onChangeSortMode('vulnerability')}
@@ -98,7 +98,8 @@ export function ConceptRail({
           >
             교재단원순
           </button>
-        </div>
+          </div>
+        </details>
       </div>
 
       {/* Cards Rail (Desktop: Grid 5 cols, Tablet: Scroll / wrap, Mobile: Horizontal scroll) */}

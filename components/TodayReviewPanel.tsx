@@ -88,7 +88,6 @@ export function TodayReviewPanel({
 
   return (
     <div
-      id="today-review-panel"
       className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 sm:p-5 shadow-2xs space-y-4"
     >
       {/* Panel Top: Priority Rank and Recommendation Status */}

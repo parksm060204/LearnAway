@@ -1,10 +1,11 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
-import { HardDrive, ShieldCheck, Info } from 'lucide-react';
+import { HardDrive, ShieldCheck, Info, AlertTriangle } from 'lucide-react';
 import type { MaterialStoragePolicy } from '../lib/types';
 import { loadDefaultMaterialPolicy, saveDefaultMaterialPolicy } from '../lib/materialPolicy';
 import { estimateLocalStorageUsage, requestPersistentStorage } from '../lib/materialStorage';
+import { subscribeStorageScope } from '../lib/storageScope';
 
 function formatBytes(value?: number): string {
   if (!value || value <= 0) return '0 B';
@@ -17,6 +18,18 @@ export function MaterialPolicySection() {
   const [policy, setPolicy] = useState<MaterialStoragePolicy>(() => loadDefaultMaterialPolicy());
   const [usage, setUsage] = useState<{ supported: boolean; usage?: number; quota?: number }>({ supported: false });
   const [persistState, setPersistState] = useState<'idle' | 'granted' | 'denied' | 'unsupported'>('idle');
+  const [saveError, setSaveError] = useState('');
+
+  // Re-read the account-scoped policy whenever the account (storage scope)
+  // changes, so another account's setting is never shown here. The initial
+  // useState value already reflects the scope active at mount.
+  useEffect(() => {
+    const unsubscribe = subscribeStorageScope(() => {
+      setPolicy(loadDefaultMaterialPolicy());
+      setSaveError('');
+    });
+    return unsubscribe;
+  }, []);
 
   useEffect(() => {
     void estimateLocalStorageUsage().then(setUsage);
@@ -24,7 +37,8 @@ export function MaterialPolicySection() {
 
   const update = (next: MaterialStoragePolicy) => {
     setPolicy(next);
-    saveDefaultMaterialPolicy(next);
+    const saved = saveDefaultMaterialPolicy(next);
+    setSaveError(saved ? '' : '설정을 이 기기에 저장하지 못했습니다. 다시 시도해 주세요.');
   };
   const syncBody = policy.syncBody;
   const backupOriginal = policy.backupOriginal;
@@ -63,6 +77,12 @@ export function MaterialPolicySection() {
         {!syncBody && !backupOriginal && (
           <p className="flex items-center gap-1.5 text-[10.5px] text-emerald-700">
             <ShieldCheck className="w-3.5 h-3.5" /> 로컬 전용 · 서버에는 메타데이터만 저장됩니다.
+          </p>
+        )}
+
+        {saveError && (
+          <p role="alert" className="flex items-center gap-1.5 p-2 bg-red-50 border border-red-200 text-red-800 rounded-xs text-[11px]">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0" /> {saveError}
           </p>
         )}
 
