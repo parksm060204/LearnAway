@@ -22,6 +22,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/learningMappers.ts', 'lib/cloud/learningPlan.ts', 'lib/cloud/learningRepository.ts',
   'lib/cloud/mergeLearning.ts', 'lib/cloud/learningOriginals.ts', 'lib/learningApproval.ts',
   'lib/cloud/historyMappers.ts', 'lib/cloud/historyMerge.ts', 'lib/cloud/historyRepository.ts',
+  'lib/cloud/historyMigration.ts',
   'lib/cloud/mockExamSync.ts', 'lib/cloud/pendingExamAnswers.ts', 'lib/cloud/draftPersistence.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
@@ -85,7 +86,7 @@ exports.requireApiUser = async () => {
   fs.mkdirSync(path.dirname(supabaseServerPath), { recursive: true });
   fs.writeFileSync(
     supabaseServerPath,
-    `exports.createClient = async () => { if (!globalThis.__fakeSupabaseClient) throw new Error('no fake supabase'); return globalThis.__fakeSupabaseClient; };`
+    `exports.createClient = async () => globalThis.__fakeSupabaseClient || { rpc: async () => ({ data: null, error: null }) };`
   );
   delete load.cache[supabaseServerPath];
 
@@ -103,6 +104,7 @@ exports.requireApiUser = async () => {
   const cloudHistoryMerge = load(path.join(output, 'lib/cloud/historyMerge.js'));
   const cloudHistoryRepo = load(path.join(output, 'lib/cloud/historyRepository.js'));
   const cloudMockExamSync = load(path.join(output, 'lib/cloud/mockExamSync.js'));
+  const historyMigration = load(path.join(output, 'lib/cloud/historyMigration.js'));
   const pendingAnswers = load(path.join(output, 'lib/cloud/pendingExamAnswers.js'));
   const cloudDraftPersistence = load(path.join(output, 'lib/cloud/draftPersistence.js'));
 
@@ -201,6 +203,9 @@ exports.requireApiUser = async () => {
 
   const { AI_CONFIG } = load(path.join(output, 'lib/aiConfig.js'));
   AI_CONFIG.apiKey = 'test-only-not-a-real-key';
+  // Route tests exercise the operator fallback; the dedicated policy test
+  // toggles this explicitly and restores it.
+  process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
   const aiClient = load(path.join(output, 'lib/aiClient.js'));
   const aiCredentials = load(path.join(output, 'lib/aiCredentials.js'));
   const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
@@ -403,10 +408,11 @@ exports.requireApiUser = async () => {
       rows.filter((row) => filters.every(([col, val]) => row[col] === val));
 
     function tableBuilder(table) {
-      const ctx = { op: 'select', payload: null, onConflict: null, ignoreDuplicates: false, filters: [], order: null };
+      const ctx = { op: 'select', payload: null, onConflict: null, ignoreDuplicates: false, filters: [], order: [], range: null };
       const builder = {
         select() { return builder; },
-        order(col, opts) { ctx.order = { col, opts }; return builder; },
+        order(col, opts) { ctx.order.push({ col, opts }); return builder; },
+        range(from, to) { ctx.range = { from, to }; return builder; },
         eq(col, val) { ctx.filters.push([col, val]); return builder; },
         update(payload) { ctx.op = 'update'; ctx.payload = payload; return builder; },
         upsert(payload, opts) {
@@ -427,11 +433,17 @@ exports.requireApiUser = async () => {
         try {
           if (ctx.op === 'select') {
             let result = matchFilters(rows, ctx.filters);
-            if (ctx.order) {
-              const { col, opts } = ctx.order;
-              const dir = opts && opts.ascending ? 1 : -1;
-              result = [...result].sort((a, b) => (a[col] < b[col] ? -1 : a[col] > b[col] ? 1 : 0) * dir);
+            if (ctx.order.length > 0) {
+              result = [...result].sort((a, b) => {
+                for (const { col, opts } of ctx.order) {
+                  const dir = opts && opts.ascending ? 1 : -1;
+                  if (a[col] < b[col]) return -1 * dir;
+                  if (a[col] > b[col]) return 1 * dir;
+                }
+                return 0;
+              });
             }
+            if (ctx.range) result = result.slice(ctx.range.from, ctx.range.to + 1);
             if (maybe === true) return { data: result[0] ? clone(result[0]) : null, error: null };
             if (maybe === false) {
               if (result.length === 0) return { data: null, error: { message: 'no rows', code: 'PGRST116' } };
@@ -3588,9 +3600,10 @@ exports.requireApiUser = async () => {
     assert.equal(aiCredentials.validateApiKeyInput(' k ').apiKey, 'k');
   });
 
-  await checkAsync('AI config resolver prefers the user key and never falls back on failure', async () => {
+  await checkAsync('credential resolver stops on lookup failure and gates operator fallback by policy', async () => {
     const savedConfig = { ...AI_CONFIG };
     const savedEncKey = process.env.AI_CREDENTIAL_ENCRYPTION_KEY;
+    const savedPolicy = process.env.AI_ALLOW_OPERATOR_FALLBACK;
     const encKey = Buffer.alloc(32, 9);
     process.env.AI_CREDENTIAL_ENCRYPTION_KEY = encKey.toString('base64');
     try {
@@ -3598,6 +3611,7 @@ exports.requireApiUser = async () => {
       Object.assign(AI_CONFIG, { provider: 'gemini', apiKey: 'operator-key', model: 'm', apiBase: 'https://x', minOutputTokens: 0, jsonMode: 'none' });
       const good = aiCredentials.encryptSecret('user-key-1234', encKey);
 
+      // Registered user key wins.
       await withFakeSupabase({
         user: { id: 'u1' },
         rpcResults: {
@@ -3611,7 +3625,8 @@ exports.requireApiUser = async () => {
         assert.equal(r.config.apiBase, 'https://factchat-cloud.mindlogic.ai/v1/gateway');
       });
 
-      // A present-but-corrupt user key is an error, NOT an operator fallback.
+      // Corrupt registered key -> credential_error even with operator policy ON.
+      process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
       await withFakeSupabase({
         user: { id: 'u1' },
         rpcResults: { get_ai_connection_secret: { data: { ciphertext: 'AAAA', iv: 'AAAA', tag: 'AAAA' }, error: null } },
@@ -3621,7 +3636,39 @@ exports.requireApiUser = async () => {
         assert.equal(r.code, 'credential_error');
       });
 
-      // No user connection -> operator key is allowed.
+      // Lookup failure (RPC error) -> lookup_failed, never operator.
+      await withFakeSupabase({
+        user: { id: 'u1' },
+        fail: { rpc: true, rpcMessage: 'database down' },
+      }, async () => {
+        const r = await aiCredentials.resolveAiConfigForUser('u1');
+        assert.equal(r.ok, false);
+        assert.equal(r.code, 'lookup_failed');
+      });
+
+      // Malformed response (row without ciphertext) -> lookup_failed, never operator.
+      await withFakeSupabase({
+        user: { id: 'u1' },
+        rpcResults: { get_ai_connection_secret: { data: { model: 'x' }, error: null } },
+      }, async () => {
+        const r = await aiCredentials.resolveAiConfigForUser('u1');
+        assert.equal(r.ok, false);
+        assert.equal(r.code, 'lookup_failed');
+      });
+
+      // Confirmed unregistered + policy OFF -> registration required (operator NOT used).
+      delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
+      await withFakeSupabase({
+        user: { id: 'u1' },
+        rpcResults: { get_ai_connection_secret: { data: null, error: null } },
+      }, async () => {
+        const r = await aiCredentials.resolveAiConfigForUser('u1');
+        assert.equal(r.ok, false);
+        assert.equal(r.code, 'no_credentials');
+      });
+
+      // Confirmed unregistered + explicit policy ON -> operator allowed.
+      process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
       await withFakeSupabase({
         user: { id: 'u1' },
         rpcResults: { get_ai_connection_secret: { data: null, error: null } },
@@ -3632,7 +3679,7 @@ exports.requireApiUser = async () => {
         assert.equal(r.config.apiKey, 'operator-key');
       });
 
-      // No user connection and no operator key -> registration required.
+      // No operator key + unregistered -> registration required.
       Object.assign(AI_CONFIG, { apiKey: '' });
       await withFakeSupabase({
         user: { id: 'u1' },
@@ -3642,11 +3689,267 @@ exports.requireApiUser = async () => {
         assert.equal(r.ok, false);
         assert.equal(r.code, 'no_credentials');
       });
+
+      // operatorFallbackAllowed parses policy values.
+      assert.equal(aiCredentials.operatorFallbackAllowed({}), false);
+      assert.equal(aiCredentials.operatorFallbackAllowed({ AI_ALLOW_OPERATOR_FALLBACK: 'true' }), true);
+      assert.equal(aiCredentials.operatorFallbackAllowed({ AI_ALLOW_OPERATOR_FALLBACK: '1' }), true);
+      assert.equal(aiCredentials.operatorFallbackAllowed({ AI_ALLOW_OPERATOR_FALLBACK: 'no' }), false);
     } finally {
       restoreAiConfig(savedConfig);
       if (savedEncKey === undefined) delete process.env.AI_CREDENTIAL_ENCRYPTION_KEY;
       else process.env.AI_CREDENTIAL_ENCRYPTION_KEY = savedEncKey;
+      if (savedPolicy === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
+      else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedPolicy;
     }
+  });
+
+  check('pending is unsaved only when it differs and matches the server version', () => {
+    const userId = 'pending-semantics';
+    const server = { id: 'pe2', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60, status: 'in_progress', selectedConceptIds: [], selectedTypes: [], problems: [], answers: { p1: 'server' }, evaluations: {} };
+    assert.equal(pendingAnswers.pendingIsUnsaved(server, null, 3), false);
+    pendingAnswers.savePendingExamAnswers(userId, { ...server }, 3);
+    assert.equal(pendingAnswers.pendingIsUnsaved(server, pendingAnswers.loadPendingExamAnswers(userId, 'pe2'), 3), false, 'identical answers are not unsaved');
+    pendingAnswers.savePendingExamAnswers(userId, { ...server, answers: { p1: 'typed' } }, 3);
+    assert.equal(pendingAnswers.pendingIsUnsaved(server, pendingAnswers.loadPendingExamAnswers(userId, 'pe2'), 3), true);
+    assert.equal(pendingAnswers.pendingIsUnsaved(server, pendingAnswers.loadPendingExamAnswers(userId, 'pe2'), 4), false, 'stale base version is not auto-applied');
+    assert.equal(pendingAnswers.pendingIsUnsaved(server, { sessionId: 'pe2', answers: { p1: 'typed' }, savedAt: '' }, 99), true, 'legacy pending is conservatively unsaved');
+    assert.equal(pendingAnswers.answerFieldsEqual({ answers: { a: '1' } }, { answers: { a: '1' } }), true);
+    assert.equal(pendingAnswers.answerFieldsEqual({ answers: { a: '1' } }, { answers: { a: '2' } }), false);
+  });
+
+  check('a successful autosave clears only the snapshot it saved', () => {
+    const saved = { id: 'pe3', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60, status: 'in_progress', selectedConceptIds: [], selectedTypes: [], problems: [], answers: { p1: 'first' }, evaluations: {} };
+    const newer = { ...saved, answers: { p1: 'first', p2: 'typed-during-request' } };
+    assert.equal(pendingAnswers.pendingAfterAutosave(saved, saved), 'clear');
+    assert.equal(pendingAnswers.pendingAfterAutosave(saved, newer), 'keep-current');
+    assert.equal(pendingAnswers.pendingAfterAutosave(saved, null), 'clear');
+  });
+
+  check('reconcile adopts the server snapshot and protects submitted answers', () => {
+    const local = { id: 'r1', status: 'in_progress', answers: { p1: 'local' }, evaluations: {} };
+    const submittedServer = { id: 'r1', status: 'submitted', answers: { p1: 'server-final' }, evaluations: {} };
+    const plan = cloudMockExamSync.planReconcile(local, submittedServer, 5, null);
+    assert.equal(plan.applyServer, true);
+    assert.equal(plan.unsaved, false);
+    assert.equal(plan.notify, true, 'different snapshot notifies');
+    assert.equal(plan.clearPending, false);
+
+    const same = cloudMockExamSync.planReconcile(submittedServer, submittedServer, 5, null);
+    assert.equal(same.notify, false, 'identical snapshot does not notify');
+
+    const pending = { sessionId: 'r1', answers: { p1: 'typed' }, baseVersion: 5, savedAt: '' };
+    const withPending = cloudMockExamSync.planReconcile(local, { id: 'r1', status: 'in_progress', answers: { p1: 'server' }, evaluations: {} }, 5, pending);
+    assert.equal(withPending.unsaved, true);
+    assert.equal(withPending.clearPending, false);
+
+    // Stale base version: preserved and flagged, never auto-applied or cleared.
+    const stale = cloudMockExamSync.planReconcile(local, { id: 'r1', status: 'in_progress', answers: { p1: 'server' }, evaluations: {} }, 9, pending);
+    assert.equal(stale.unsaved, true);
+    assert.equal(stale.stale, true);
+    assert.equal(stale.clearPending, false);
+
+    // Pending that no longer differs is safe to drop.
+    const samePending = cloudMockExamSync.planReconcile(local, { id: 'r1', status: 'in_progress', answers: { p1: 'typed' }, evaluations: {} }, 5, pending);
+    assert.equal(samePending.unsaved, false);
+    assert.equal(samePending.clearPending, true);
+  });
+
+  check('migration verification reports missing, conflicts, dangling refs and server-newer', () => {
+    const snap = {
+      attempts: [{ id: 'a1', subjectId: 's1', conceptId: 'c1', problemId: 'p1', problemVersion: 1, at: 't', calculatedScore: 80 }],
+      events: [{ event: { id: 'e1', conceptId: 'c1', attemptId: 'a1', kind: 'attempt', at: 't', resultScore: 80 }, subjectId: 's1' }],
+      planItems: [{ id: 'spi1', subjectId: 's1', status: 'completed', assignedDate: '2026-01-01', completedAttemptId: 'a1' }],
+      mockExams: [{ id: 'mk1', subjectId: 's1', status: 'in_progress', answers: { p1: 'x' } }],
+      subjectIds: new Set(['s1']), conceptIds: new Set(['c1']), problemIds: new Set(['p1']),
+    };
+    const clean = historyMigration.verifyMigratedHistory(snap, {
+      attempts: [{ ...snap.attempts[0] }],
+      events: [{ ...snap.events[0].event }],
+      planItems: [{ ...snap.planItems[0] }],
+      mockExams: [{ ...snap.mockExams[0] }],
+    });
+    assert.equal(clean.conflicts.length, 0);
+    assert.equal(clean.dangling.length, 0);
+    assert.equal(clean.missing.attempts + clean.missing.events + clean.missing.planItems + clean.missing.mockExams, 0);
+
+    const bad = historyMigration.verifyMigratedHistory(
+      { ...snap, attempts: [{ ...snap.attempts[0], problemId: 'pX' }] },
+      { attempts: [{ ...snap.attempts[0], calculatedScore: 10 }], events: [], planItems: [], mockExams: [] }
+    );
+    assert.equal(bad.missing.events, 1);
+    assert.equal(bad.missing.planItems, 1);
+    assert.equal(bad.missing.mockExams, 1);
+    assert.equal(bad.conflicts.length, 1, 'immutable attempt conflict');
+    assert.ok(bad.dangling.includes('attempt:a1:problem'), 'dangling reference reported');
+
+    const newer = historyMigration.verifyMigratedHistory(snap, {
+      attempts: [{ ...snap.attempts[0] }], events: [{ ...snap.events[0].event }],
+      planItems: [{ ...snap.planItems[0], completedAttemptId: 'a2' }],
+      mockExams: [{ ...snap.mockExams[0], status: 'submitted', answers: { p1: 'server' } }],
+    });
+    assert.equal(newer.conflicts.length, 0, 'server-newer mutable differences are not conflicts');
+    assert.equal(newer.serverNewer, 2, 'mutable differences are reported as server-newer');
+
+    // Immutable identity change is a conflict.
+    const immutableMock = historyMigration.verifyMigratedHistory(snap, {
+      attempts: [{ ...snap.attempts[0] }], events: [{ ...snap.events[0].event }],
+      planItems: [{ ...snap.planItems[0] }],
+      mockExams: [{ ...snap.mockExams[0], durationMinutes: 90 }],
+    });
+    assert.ok(immutableMock.conflicts.includes('mock:mk1:immutable'), 'mock immutable change conflicts');
+
+    const immutablePlan = historyMigration.verifyMigratedHistory(snap, {
+      attempts: [{ ...snap.attempts[0] }], events: [{ ...snap.events[0].event }],
+      planItems: [{ ...snap.planItems[0], round: 9 }],
+      mockExams: [{ ...snap.mockExams[0] }],
+    });
+    assert.ok(immutablePlan.conflicts.includes('plan:spi1:immutable'), 'plan immutable change conflicts');
+
+    // Server progress behind local progress is a conflict.
+    const behind = historyMigration.verifyMigratedHistory(snap, {
+      attempts: [{ ...snap.attempts[0] }], events: [{ ...snap.events[0].event }],
+      planItems: [{ ...snap.planItems[0], status: 'pending', completedAttemptId: null }],
+      mockExams: [{ ...snap.mockExams[0] }],
+    });
+    assert.ok(behind.conflicts.includes('plan:spi1:behind'), 'server behind local progress conflicts');
+
+    // `kind` is presentation metadata, not completion identity.
+    const kindOnly = historyMigration.verifyMigratedHistory(snap, {
+      attempts: [{ ...snap.attempts[0] }], events: [{ ...snap.events[0].event }],
+      planItems: [{ ...snap.planItems[0], kind: 'mock_exam' }],
+      mockExams: [{ ...snap.mockExams[0] }],
+    });
+    assert.equal(kindOnly.conflicts.length, 0, 'plan kind change is not a conflict');
+    assert.equal(kindOnly.serverNewer, 0, 'plan kind change alone is not server-newer');
+
+    // Same status but content differs: server updated-at decides which is newer.
+    const staleServer = historyMigration.verifyMigratedHistory(
+      { ...snap, capturedAt: '2026-06-01T00:00:00.000Z' },
+      {
+        attempts: [{ ...snap.attempts[0] }], events: [{ ...snap.events[0].event }],
+        planItems: [{ ...snap.planItems[0], completedAttemptId: 'a2', serverUpdatedAt: '2026-01-01T00:00:00.000Z' }],
+        mockExams: [{ ...snap.mockExams[0] }],
+      }
+    );
+    assert.ok(staleServer.conflicts.includes('plan:spi1:stale-server'), 'older differing server copy conflicts');
+
+    const newerServer = historyMigration.verifyMigratedHistory(
+      { ...snap, capturedAt: '2026-01-01T00:00:00.000Z' },
+      {
+        attempts: [{ ...snap.attempts[0] }], events: [{ ...snap.events[0].event }],
+        planItems: [{ ...snap.planItems[0], completedAttemptId: 'a2', serverUpdatedAt: '2026-07-01T00:00:00.000Z' }],
+        mockExams: [{ ...snap.mockExams[0] }],
+      }
+    );
+    assert.equal(newerServer.conflicts.length, 0);
+    assert.equal(newerServer.serverNewer, 1, 'newer differing server copy is server-newer');
+
+    // PostgREST returns timestamptz as +00:00; local ISO uses Z. Must compare equal.
+    const tzEquivalent = historyMigration.verifyMigratedHistory(
+      { ...snap, attempts: [{ ...snap.attempts[0], at: '2026-01-01T00:00:00.000Z' }] },
+      {
+        attempts: [{ ...snap.attempts[0], at: '2026-01-01T00:00:00+00:00' }],
+        events: [], planItems: [], mockExams: [],
+      }
+    );
+    assert.equal(tzEquivalent.conflicts.length, 0, 'Z vs +00:00 timestamps compare equal');
+  });
+
+  await checkAsync('migration reads every page', async () => {
+    const total = 1500;
+    let calls = 0;
+    const result = await historyMigration.collectAllPages(async ({ from, to }) => {
+      calls += 1;
+      const rows = [];
+      for (let i = from; i <= Math.min(to, total - 1); i++) rows.push({ id: `r${i}` });
+      return { ok: true, data: rows };
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.data.length, total);
+    assert.equal(calls, 2, 'two pages requested');
+  });
+
+  await checkAsync('migration verifies or blocks completion, and re-runs reset nothing', async () => {
+    const userId = 'mig-verify-1';
+    const markerKey = 'redcall_user_' + encodeURIComponent(userId) + '__history_migration_v1';
+    localStorage.removeItem(markerKey);
+    localStorage.removeItem('redcall_user_' + encodeURIComponent(userId) + '__history_migration_job_v1');
+
+    // Seed the user's local snapshot + references.
+    storageScope.setStorageScope({ kind: 'user', userId });
+    storage.saveStoredSubjects([{ id: 's1', name: 'S', code: '', timezone: 'Asia/Seoul' }]);
+    storage.saveStoredConcepts([{ id: 'c1', subjectId: 's1', title: 'C', events: [] }]);
+    storage.saveStoredProblems([{ id: 'p1', subjectId: 's1', conceptIds: ['c1'], title: 'P' }]);
+    storage.saveStoredAttempts([{ id: 'a1', subjectId: 's1', conceptId: 'c1', problemId: 'p1', at: '2026-01-01T00:00:00.000Z', answer: 'x', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 80, rubricResults: [], evaluatorFeedback: '' }]);
+    storage.saveStoredStudyPlanItems([]);
+    exams.saveMockExam({ id: 'mk1', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60, status: 'in_progress', selectedConceptIds: [], selectedTypes: [], problems: [], answers: { p1: 'local' }, evaluations: {} });
+    storageScope.setStorageScope({ kind: 'legacy' });
+
+    const submittedRow = { id: 'mk1', user_id: 'user-a', subject_id: 's1', status: 'submitted', duration_minutes: 60, created_at: 't', ends_at: 't2', submitted_at: 't3', version: 5, payload: { id: 'mk1', subjectId: 's1', status: 'submitted', answers: { p1: 'server' } }, updated_at: 't' };
+    const conflictingAttempt = { id: 'a1', user_id: 'user-a', subject_id: 's1', concept_id: 'c1', problem_id: 'p1', mock_exam_session_id: null, plan_item_id: null, attempt_origin: 'independent', problem_version: 1, at: '2026-01-01T00:00:00.000Z', calculated_score: 10, payload: {}, created_at: '', updated_at: '' };
+
+    // Run 1: conflicting immutable record on the server -> must NOT complete.
+    await withFakeSupabase({ user: { id: 'user-a' }, mock_exam_sessions: [submittedRow], attempts: [conflictingAttempt] }, async (client) => {
+      const result = await historyMigration.migrateLocalHistoryToCloud(userId, client);
+      assert.equal(result.ok, false);
+      assert.ok(result.conflicts >= 1, 'conflict detected');
+      assert.equal(localStorage.getItem(markerKey), null, 'no completion marker on conflict');
+      assert.equal(client.__state.mock_exam_sessions[0].status, 'submitted', 'submitted exam not reset');
+      assert.equal(client.__state.mock_exam_sessions[0].version, 5, 'submitted version not reset');
+    });
+
+    // Run 2: clean server -> completes, inserts exactly one attempt, keeps the submitted mock.
+    await withFakeSupabase({ user: { id: 'user-a' }, mock_exam_sessions: [submittedRow] }, async (client) => {
+      const result = await historyMigration.migrateLocalHistoryToCloud(userId, client);
+      assert.equal(result.ok, true, result.message);
+      assert.notEqual(localStorage.getItem(markerKey), null, 'completion marker written');
+      assert.equal(client.__state.attempts.length, 1);
+      assert.equal(client.__state.attempts[0].id, 'a1');
+      assert.equal(client.__state.mock_exam_sessions[0].status, 'submitted', 'server-newer mock preserved');
+      assert.equal(client.__state.mock_exam_sessions[0].version, 5);
+
+      // Run 3: idempotent; no duplicates.
+      const again = await historyMigration.migrateLocalHistoryToCloud(userId, client);
+      assert.equal(again.ok, true);
+      assert.equal(client.__state.attempts.length, 1, 'no duplicate on re-run');
+    });
+  });
+
+  await checkAsync('migration retry verifies the first captured origin, not the live cache', async () => {
+    const userId = 'mig-origin-1';
+    const b64 = encodeURIComponent(userId);
+    localStorage.removeItem('redcall_user_' + b64 + '__history_migration_v1');
+    localStorage.removeItem('redcall_user_' + b64 + '__history_migration_origin_v1');
+    localStorage.removeItem('redcall_user_' + b64 + '__history_migration_job_v1');
+
+    storageScope.setStorageScope({ kind: 'user', userId });
+    storage.saveStoredSubjects([{ id: 's1', name: 'S', code: '', timezone: 'Asia/Seoul' }]);
+    storage.saveStoredConcepts([{ id: 'c1', subjectId: 's1', title: 'C', events: [] }]);
+    storage.saveStoredProblems([{ id: 'p1', subjectId: 's1', conceptIds: ['c1'], title: 'P' }]);
+    storage.saveStoredAttempts([{ id: 'a1', subjectId: 's1', conceptId: 'c1', problemId: 'p1', at: '2026-01-01T00:00:00.000Z', answer: 'origin', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '' }]);
+    storage.saveStoredStudyPlanItems([]);
+    storageScope.setStorageScope({ kind: 'legacy' });
+
+    const conflictRow = { id: 'a1', user_id: 'user-a', subject_id: 's1', concept_id: 'c1', problem_id: 'p1', mock_exam_session_id: null, plan_item_id: null, attempt_origin: 'independent', problem_version: 1, at: '2026-01-01T00:00:00.000Z', calculated_score: 99, payload: {}, created_at: '', updated_at: '' };
+    await withFakeSupabase({ user: { id: 'user-a' }, attempts: [conflictRow] }, async (client) => {
+      const result = await historyMigration.migrateLocalHistoryToCloud(userId, client);
+      assert.equal(result.ok, false);
+      assert.notEqual(localStorage.getItem('redcall_user_' + b64 + '__history_migration_origin_v1'), null, 'origin captured on first attempt');
+    });
+
+    // Replace the live cache AFTER the origin was captured.
+    storageScope.setStorageScope({ kind: 'user', userId });
+    storage.saveStoredAttempts([{ id: 'a2', subjectId: 's1', conceptId: 'c1', problemId: 'p1', at: '2026-01-02T00:00:00.000Z', answer: 'cache-changed', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 10, rubricResults: [], evaluatorFeedback: '' }]);
+    storageScope.setStorageScope({ kind: 'legacy' });
+
+    await withFakeSupabase({ user: { id: 'user-a' } }, async (client) => {
+      const result = await historyMigration.migrateLocalHistoryToCloud(userId, client);
+      assert.equal(result.ok, true, result.message);
+      assert.equal(client.__state.attempts.length, 1);
+      assert.equal(client.__state.attempts[0].id, 'a1', 'origin id migrated, not the changed cache');
+      assert.equal(client.__state.attempts[0].calculated_score, 70, 'origin content migrated');
+    });
   });
 
   check('new users start empty and existing stored data survives reload', () => {

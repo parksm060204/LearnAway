@@ -146,56 +146,100 @@ export interface ConnectionSecretData {
   tag?: string;
 }
 
+/**
+ * Whether the operator's shared key may be used for users who have NOT
+ * registered their own. This is an explicit operational policy and is OFF by
+ * default; the user key always wins when present, and a failing user key is
+ * never replaced by the operator key.
+ */
+export function operatorFallbackAllowed(env: Record<string, string | undefined> = process.env): boolean {
+  const value = (env.AI_ALLOW_OPERATOR_FALLBACK || '').trim().toLowerCase();
+  return value === 'true' || value === '1' || value === 'yes';
+}
+
+/** Tri-state result of looking up the caller's stored connection. */
+export type ConnectionLookup =
+  | { status: 'registered'; secret: ConnectionSecretData }
+  | { status: 'unregistered' }
+  | { status: 'lookup_failed' };
+
 export type AiConfigResolution =
   | { ok: true; config: AiConfig; source: 'user' | 'operator' }
-  | { ok: false; code: 'no_credentials' | 'credential_error' | 'encryption_not_configured'; message: string };
+  | {
+      ok: false;
+      code: 'no_credentials' | 'lookup_failed' | 'credential_error' | 'encryption_not_configured';
+      message: string;
+    };
+
+/** Reads the caller's stored secret and distinguishes the three states. */
+export async function lookupConnectionSecret(userId?: string): Promise<ConnectionLookup> {
+  if (!userId) return { status: 'unregistered' };
+  try {
+    const { createClient } = await import('./supabase/server');
+    const supabase = await createClient();
+    const { data, error } = await supabase.rpc('get_ai_connection_secret');
+    if (error) return { status: 'lookup_failed' };
+    if (data === null || data === undefined) return { status: 'unregistered' };
+    const secret = data as ConnectionSecretData;
+    // A row that exists but is missing the encrypted payload is a malformed
+    // response, NOT "unregistered": it must never fall through to operator.
+    if (!secret || typeof secret !== 'object' || !secret.ciphertext) return { status: 'lookup_failed' };
+    return { status: 'registered', secret };
+  } catch {
+    return { status: 'lookup_failed' };
+  }
+}
 
 /**
  * Resolves the AI config for a request.
  *
  * Order:
  *  1. the user's registered connection (decrypted server-side);
- *  2. the operator's global key, ONLY when the user has no connection.
- * A present-but-unusable user connection is an error: we never silently switch
- * to the operator key (or any other paid provider).
+ *  2. the operator's global key, ONLY when the user is confirmed unregistered
+ *     AND the explicit policy (AI_ALLOW_OPERATOR_FALLBACK) permits it.
+ *
+ * A lookup failure, malformed response or decryption failure aborts the call:
+ * we never silently switch to the operator key (or any other paid provider).
  */
 export async function resolveAiConfigForUser(userId?: string): Promise<AiConfigResolution> {
-  if (userId) {
-    let secret: ConnectionSecretData | null = null;
-    try {
-      const { createClient } = await import('./supabase/server');
-      const supabase = await createClient();
-      const { data, error } = await supabase.rpc('get_ai_connection_secret');
-      if (!error) secret = (data ?? null) as ConnectionSecretData | null;
-    } catch {
-      secret = null;
+  const lookup = await lookupConnectionSecret(userId);
+
+  if (lookup.status === 'lookup_failed') {
+    return {
+      ok: false,
+      code: 'lookup_failed',
+      message: 'AI API 연결 정보를 조회하지 못했습니다. 잠시 후 다시 시도해 주세요.',
+    };
+  }
+
+  if (lookup.status === 'registered') {
+    const key = getEncryptionKey();
+    if (!key) {
+      return {
+        ok: false,
+        code: 'encryption_not_configured',
+        message: '서버 암호화 키(AI_CREDENTIAL_ENCRYPTION_KEY)가 설정되지 않아 저장된 API 연결을 사용할 수 없습니다.',
+      };
     }
-    if (secret && secret.ciphertext) {
-      const key = getEncryptionKey();
-      if (!key) {
-        return {
-          ok: false,
-          code: 'encryption_not_configured',
-          message: '서버 암호화 키(AI_CREDENTIAL_ENCRYPTION_KEY)가 설정되지 않아 저장된 API 연결을 사용할 수 없습니다.',
-        };
-      }
-      try {
-        const apiKey = decryptSecret(
-          { ciphertext: secret.ciphertext, iv: secret.iv || '', tag: secret.tag || '' },
-          key
-        );
-        return { ok: true, source: 'user', config: buildSchoolConfig(apiKey, secret.model) };
-      } catch {
-        return {
-          ok: false,
-          code: 'credential_error',
-          message: '저장된 API 키를 복호화하지 못했습니다. 설정에서 키를 다시 등록해 주세요.',
-        };
-      }
+    try {
+      const apiKey = decryptSecret(
+        { ciphertext: lookup.secret.ciphertext || '', iv: lookup.secret.iv || '', tag: lookup.secret.tag || '' },
+        key
+      );
+      return { ok: true, source: 'user', config: buildSchoolConfig(apiKey, lookup.secret.model) };
+    } catch {
+      return {
+        ok: false,
+        code: 'credential_error',
+        message: '저장된 API 키를 복호화하지 못했습니다. 설정에서 키를 다시 등록해 주세요.',
+      };
     }
   }
 
-  if (isAiConfigured()) return { ok: true, source: 'operator', config: AI_CONFIG };
+  // Confirmed unregistered: operator key only under an explicit policy.
+  if (isAiConfigured() && operatorFallbackAllowed()) {
+    return { ok: true, source: 'operator', config: AI_CONFIG };
+  }
   return {
     ok: false,
     code: 'no_credentials',

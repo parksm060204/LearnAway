@@ -3,6 +3,7 @@
 import type { Attempt, MockExamSession, ReviewEvent } from '../types';
 import { isSupabaseConfigured } from '../supabase/config';
 import { createClient } from '../supabase/client';
+import { pendingDiffersFrom, type PendingExamAnswers } from './pendingExamAnswers';
 import {
   getMockExamSession,
   saveMockExamGrading,
@@ -50,6 +51,63 @@ function sameContent(local: MockExamSession, server: MockExamSession): boolean {
     local.status === server.status &&
     JSON.stringify(local.answers ?? {}) === JSON.stringify(server.answers ?? {})
   );
+}
+
+/**
+ * Compares the full reconcile snapshot (status, answers, method-reason fields
+ * and evaluations). A server snapshot is applied as one consistent unit; this
+ * only decides whether anything actually changed for the user notification.
+ */
+export function examSnapshotEqual(a: MockExamSession, b: MockExamSession): boolean {
+  return (
+    a.status === b.status &&
+    JSON.stringify(a.answers ?? {}) === JSON.stringify(b.answers ?? {}) &&
+    JSON.stringify(a.reasons ?? {}) === JSON.stringify(b.reasons ?? {}) &&
+    JSON.stringify(a.isReasonNotApplicable ?? {}) === JSON.stringify(b.isReasonNotApplicable ?? {}) &&
+    JSON.stringify(a.reasonNotApplicableJustification ?? {}) ===
+      JSON.stringify(b.reasonNotApplicableJustification ?? {}) &&
+    JSON.stringify(a.evaluations ?? {}) === JSON.stringify(b.evaluations ?? {})
+  );
+}
+
+export interface ReconcilePlan {
+  /** The server snapshot should be adopted as the working copy. */
+  applyServer: true;
+  /** Real unsaved local changes exist and must be kept separately. */
+  unsaved: boolean;
+  /** The pending entry is based on a DIFFERENT server version (needs confirmation). */
+  stale: boolean;
+  /** The pending entry may be discarded without data loss. */
+  clearPending: boolean;
+  /** Whether to tell the user that the server copy changed. */
+  notify: boolean;
+}
+
+/**
+ * Decides what to do when the server snapshot arrives.
+ *
+ * Any pending entry that actually DIFFERS from the server is preserved
+ * (unsaved), regardless of its base version: answers based on an older server
+ * version are never merged or auto-saved without explicit user confirmation.
+ * Only a pending entry that no longer differs (or is absent) is safe to drop.
+ */
+export function planReconcile(
+  local: MockExamSession | null,
+  server: MockExamSession,
+  version: number,
+  pending: PendingExamAnswers | null
+): ReconcilePlan {
+  if (pending && pendingDiffersFrom(server, pending)) {
+    return {
+      applyServer: true,
+      unsaved: true,
+      stale: pending.baseVersion !== version,
+      clearPending: false,
+      notify: true,
+    };
+  }
+  const changed = !local || !examSnapshotEqual(local, server);
+  return { applyServer: true, unsaved: false, stale: false, clearPending: Boolean(pending), notify: changed };
 }
 
 /**

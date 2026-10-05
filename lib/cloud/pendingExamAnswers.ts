@@ -13,6 +13,8 @@ export interface PendingExamAnswers {
   reasons?: Record<string, string>;
   isReasonNotApplicable?: Record<string, boolean>;
   reasonNotApplicableJustification?: Record<string, string>;
+  /** Server version this unsaved snapshot is based on (undefined for legacy data). */
+  baseVersion?: number;
   savedAt: string;
 }
 
@@ -64,7 +66,11 @@ export function listPendingExamAnswers(userId: string): PendingExamAnswers[] {
 }
 
 /** Captures the answer-bearing fields of a session into the pending area. */
-export function savePendingExamAnswers(userId: string, session: MockExamSession): boolean {
+export function savePendingExamAnswers(
+  userId: string,
+  session: MockExamSession,
+  baseVersion?: number
+): boolean {
   if (!userId) return false;
   const all = readAll(userId);
   all[session.id] = {
@@ -75,9 +81,52 @@ export function savePendingExamAnswers(userId: string, session: MockExamSession)
     reasonNotApplicableJustification: session.reasonNotApplicableJustification
       ? { ...session.reasonNotApplicableJustification }
       : undefined,
+    baseVersion,
     savedAt: new Date().toISOString(),
   };
   return writeAll(userId, all);
+}
+
+/** Compares the answer-bearing fields of two sessions. */
+export function answerFieldsEqual(a: MockExamSession, b: MockExamSession): boolean {
+  return (
+    JSON.stringify(a.answers ?? {}) === JSON.stringify(b.answers ?? {}) &&
+    JSON.stringify(a.reasons ?? {}) === JSON.stringify(b.reasons ?? {}) &&
+    JSON.stringify(a.isReasonNotApplicable ?? {}) === JSON.stringify(b.isReasonNotApplicable ?? {}) &&
+    JSON.stringify(a.reasonNotApplicableJustification ?? {}) ===
+      JSON.stringify(b.reasonNotApplicableJustification ?? {})
+  );
+}
+
+/**
+ * True only when the pending snapshot represents a REAL unsaved change against
+ * the given server snapshot: it must actually differ, and either be stamped
+ * with the matching server version or have an unknown (legacy) base.
+ */
+export function pendingIsUnsaved(
+  server: MockExamSession,
+  pending: PendingExamAnswers | null,
+  serverVersion: number
+): boolean {
+  if (!pending) return false;
+  if (!pendingDiffersFrom(server, pending)) return false;
+  if (pending.baseVersion === undefined) return true;
+  return pending.baseVersion === serverVersion;
+}
+
+export type PendingAfterAutosave = 'clear' | 'keep-current';
+
+/**
+ * After a successful autosave of `target`, decide whether pending may be
+ * cleared. If newer input arrived while the request was in flight (current
+ * differs from the saved snapshot), the newer input MUST be preserved.
+ */
+export function pendingAfterAutosave(
+  target: MockExamSession,
+  current: MockExamSession | null
+): PendingAfterAutosave {
+  if (current && current.id === target.id && !answerFieldsEqual(current, target)) return 'keep-current';
+  return 'clear';
 }
 
 /** Only clears on explicit user confirmation, never on conflict resolution. */

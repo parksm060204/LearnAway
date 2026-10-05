@@ -601,6 +601,8 @@ export interface MockExamSession {
   reasonNotApplicableJustification?: Record<string, string>; // 문항별 해당 없음 사유
   /** Server-authoritative optimistic-lock version. Not part of the exam content. */
   serverVersion?: number;
+  /** Server-authoritative last-modified time (from the cloud row). */
+  serverUpdatedAt?: string;
 }
 
 export interface RetentionModelSettings {
@@ -795,6 +797,9 @@ export interface StudyPlanItem {
 
   // Rechallenge reservation linkage (rechallenge items):
   rechallengeId?: string;
+
+  /** Server-authoritative last-modified time (from the cloud row). */
+  serverUpdatedAt?: string;
 }
 
 export interface DailyStudyPlan {

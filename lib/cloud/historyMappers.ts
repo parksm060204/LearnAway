@@ -95,6 +95,7 @@ export function rowToStudyPlanItem(row: StudyPlanItemRow): StudyPlanItem {
     completedAttemptId: row.completed_attempt_id ?? undefined,
     completedEventId: row.completed_event_id ?? undefined,
     completedMockSessionId: row.completed_mock_session_id ?? undefined,
+    serverUpdatedAt: row.updated_at,
   } as StudyPlanItem;
 }
 
@@ -130,6 +131,7 @@ export function rowToMockExamSession(row: MockExamSessionRow): MockExamSession {
     endsAt: row.ends_at,
     submittedAt: row.submitted_at ?? undefined,
     serverVersion: Number(row.version ?? 1),
+    serverUpdatedAt: row.updated_at,
   } as MockExamSession;
 }
 

@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:regressions": "node scripts/test-regressions.mjs"
+    "test:regressions": "node scripts/test-regressions.mjs",
+    "test:suite": "node scripts/test-suite.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

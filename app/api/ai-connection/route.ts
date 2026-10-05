@@ -12,6 +12,7 @@ import {
   encryptSecret,
   getEncryptionKey,
   maskKey,
+  operatorFallbackAllowed,
   reasonToCode,
   selectAvailableModel,
   validateApiKeyInput,
@@ -37,18 +38,37 @@ interface SafeConnection {
   lastCheckedAt?: string | null;
 }
 
-async function readSafeConnection(supabase: Awaited<ReturnType<typeof createClient>>): Promise<SafeConnection> {
+type SafeConnectionRead =
+  | { state: 'registered'; connection: SafeConnection }
+  | { state: 'unregistered' }
+  | { state: 'lookup_failed' };
+
+/** Distinguishes registered / unregistered / lookup failure (never conflate). */
+async function readSafeConnection(
+  supabase: Awaited<ReturnType<typeof createClient>>
+): Promise<SafeConnectionRead> {
   const { data, error } = await supabase.from('ai_connections').select(SAFE_COLUMNS).maybeSingle();
-  if (error || !data) return { connected: false };
+  if (error) return { state: 'lookup_failed' };
+  if (!data) return { state: 'unregistered' };
   const row = data as { provider?: string; model?: string; key_hint?: string; status?: string; last_checked_at?: string | null };
   return {
-    connected: true,
-    provider: row.provider,
-    model: row.model,
-    keyHint: row.key_hint,
-    status: row.status,
-    lastCheckedAt: row.last_checked_at ?? null,
+    state: 'registered',
+    connection: {
+      connected: true,
+      provider: row.provider,
+      model: row.model,
+      keyHint: row.key_hint,
+      status: row.status,
+      lastCheckedAt: row.last_checked_at ?? null,
+    },
   };
+}
+
+async function currentSafeConnection(
+  supabase: Awaited<ReturnType<typeof createClient>>
+): Promise<SafeConnection> {
+  const read = await readSafeConnection(supabase);
+  return read.state === 'registered' ? read.connection : { connected: false };
 }
 
 async function loadStoredKey(supabase: Awaited<ReturnType<typeof createClient>>): Promise<string | null> {
@@ -71,18 +91,26 @@ export async function GET() {
   if (!auth.ok) return auth.response;
   try {
     const supabase = await createClient();
-    const connection = await readSafeConnection(supabase);
+    const read = await readSafeConnection(supabase);
+    if (read.state === 'lookup_failed') {
+      // A read failure must never look like "not registered".
+      return NextResponse.json(
+        { success: false, errorCode: 'LOOKUP_FAILED', error: '연결 상태를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.' },
+        { status: 502 }
+      );
+    }
+    const connection = read.state === 'registered' ? read.connection : { connected: false };
     return NextResponse.json({
       success: true,
       ...connection,
-      operatorFallback: isAiConfigured(),
+      operatorFallback: operatorFallbackAllowed() && isAiConfigured(),
       encryptionConfigured: Boolean(getEncryptionKey()),
       defaultModel: DEFAULT_SCHOOL_MODEL,
     });
   } catch (error) {
     return NextResponse.json(
-      { success: false, error: error instanceof Error ? error.message : '연결 상태를 확인하지 못했습니다.' },
-      { status: 500 }
+      { success: false, errorCode: 'LOOKUP_FAILED', error: error instanceof Error ? error.message : '연결 상태를 확인하지 못했습니다.' },
+      { status: 502 }
     );
   }
 }
@@ -197,7 +225,7 @@ export async function PUT(req: NextRequest) {
       if (error) throw new Error(error.message);
     }
 
-    const connection = await readSafeConnection(supabase);
+    const connection = await currentSafeConnection(supabase);
     return NextResponse.json({ success: true, ...connection, models: check.modelIds ?? [] });
   } catch (error) {
     return NextResponse.json(
