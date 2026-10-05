@@ -48,6 +48,43 @@ const ORIGINAL_STORE_NAME = 'material_originals';
 // Keys are namespaced by scope so two accounts never share a cached body.
 const memoryCache = new Map<string, MaterialContent>();
 
+/**
+ * Ids (scope::material) whose body is confirmed DURABLY persisted in that
+ * scope's IndexedDB (transaction complete, or read back from IndexedDB).
+ * A memory-cache presence is NOT persistence and never marks this set, so
+ * callers can safely strip duplicated local copies only for confirmed ids.
+ */
+const persistedBodyIds = new Set<string>();
+
+function markBodyPersisted(scopeId: string, materialId: string): void {
+  persistedBodyIds.add(`${scopeId}::${materialId}`);
+}
+
+function unmarkBodyPersisted(scopeId: string, materialId: string): void {
+  persistedBodyIds.delete(`${scopeId}::${materialId}`);
+}
+
+/** True when the CURRENT scope has a durably persisted body for this material. */
+export function isMaterialBodyPersisted(materialId: string): boolean {
+  return persistedBodyIds.has(`${getStorageScopeId()}::${materialId}`);
+}
+
+/**
+ * Withdraws a durability mark, e.g. when a post-write read-back verification
+ * fails. Callers must then keep any local duplicate until the move is retried.
+ */
+export function unmarkMaterialBodyPersistedInScope(scopeId: string, materialId: string): void {
+  unmarkBodyPersisted(scopeId, materialId);
+}
+
+/** @internal Clears persistence marks for the CURRENT scope (full reset). */
+function clearBodyPersistenceMarksForCurrentScope(): void {
+  const prefix = `${getStorageScopeId()}::`;
+  for (const key of Array.from(persistedBodyIds)) {
+    if (key.startsWith(prefix)) persistedBodyIds.delete(key);
+  }
+}
+
 function scopeIdToDbName(scopeId: string): string {
   return scopeId === 'shared' ? LEGACY_DB_NAME : `${LEGACY_DB_NAME}_${scopeId}`;
 }
@@ -440,6 +477,24 @@ export async function saveMaterialContent(
     pages?: MaterialPage[];
   }
 ): Promise<MaterialSaveResult> {
+  return saveMaterialContentInScope(getStorageScopeId(), materialId, content);
+}
+
+/**
+ * Scope-pinned save: the target database is resolved from the EXPLICIT scope
+ * id, so a global account change mid-flight can never redirect the write into
+ * another account's store.
+ */
+export async function saveMaterialContentInScope(
+  scopeId: string,
+  materialId: string,
+  content: {
+    markdown: string;
+    rawText?: string;
+    pages?: MaterialPage[];
+  }
+): Promise<MaterialSaveResult> {
+  const key = `${scopeId}::${materialId}`;
   const item: MaterialContent = {
     materialId,
     markdown: content.markdown,
@@ -449,9 +504,9 @@ export async function saveMaterialContent(
   };
 
   // Always update memory cache so the current session sees the latest content.
-  memoryCache.set(cacheKey(materialId), item);
+  memoryCache.set(key, item);
 
-  const db = await openDB();
+  const db = await openDBByName(scopeIdToDbName(scopeId));
   if (!db) {
     return {
       persisted: false,
@@ -472,8 +527,10 @@ export async function saveMaterialContent(
     try {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       // Transaction completion — not just request success — is the durability signal.
-      tx.oncomplete = () =>
+      tx.oncomplete = () => {
+        markBodyPersisted(scopeId, materialId);
         finish({ persisted: true, storage: 'indexeddb', updatedAt: item.updatedAt });
+      };
       tx.onerror = () =>
         finish({
           persisted: false,
@@ -505,10 +562,32 @@ export async function saveMaterialContent(
  * Loads content, distinguishing absence from storage failure.
  */
 export async function loadMaterialContentResult(materialId: string): Promise<MaterialLoadResult> {
-  // Memory cache first (always authoritative for the current session).
-  const cached = memoryCache.get(cacheKey(materialId));
-  if (cached) {
-    return { status: 'found', storage: 'memory', content: cached };
+  return loadMaterialContentInScope(getStorageScopeId(), materialId);
+}
+
+export interface MaterialLoadOptions {
+  /**
+   * Skip the memory cache and read IndexedDB directly. Verification paths MUST
+   * use this: a memory-cache hit is not proof that the value was persisted.
+   */
+  skipMemoryCache?: boolean;
+}
+
+/**
+ * Scope-pinned load. Reads (and durability-marks) the EXPLICIT scope's store.
+ */
+export async function loadMaterialContentInScope(
+  scopeId: string,
+  materialId: string,
+  options: MaterialLoadOptions = {}
+): Promise<MaterialLoadResult> {
+  const key = `${scopeId}::${materialId}`;
+
+  if (!options.skipMemoryCache) {
+    const cached = memoryCache.get(key);
+    if (cached) {
+      return { status: 'found', storage: 'memory', content: cached };
+    }
   }
 
   if (!isIndexedDBAvailable()) {
@@ -516,7 +595,7 @@ export async function loadMaterialContentResult(materialId: string): Promise<Mat
     return { status: 'missing' };
   }
 
-  const db = await openDB();
+  const db = await openDBByName(scopeIdToDbName(scopeId));
   if (!db) {
     return { status: 'error', error: 'IndexedDB를 열 수 없습니다.' };
   }
@@ -529,7 +608,8 @@ export async function loadMaterialContentResult(materialId: string): Promise<Mat
       req.onsuccess = () => {
         const result = req.result as MaterialContent | undefined;
         if (result) {
-          memoryCache.set(cacheKey(materialId), result);
+          memoryCache.set(key, result);
+          markBodyPersisted(scopeId, materialId);
           resolve({ status: 'found', storage: 'indexeddb', content: result });
         } else {
           resolve({ status: 'missing' });
@@ -564,50 +644,15 @@ export async function loadMaterialContent(materialId: string): Promise<MaterialC
  */
 export async function loadMaterialContentFromScope(
   scopeId: string,
-  materialId: string
+  materialId: string,
+  options: MaterialLoadOptions = {}
 ): Promise<MaterialLoadResult> {
-  const key = `${scopeId}::${materialId}`;
-  const cached = memoryCache.get(key);
-  if (cached) {
-    return { status: 'found', storage: 'memory', content: cached };
-  }
-
-  if (!isIndexedDBAvailable()) {
-    return { status: 'missing' };
-  }
-
-  const db = await openDBByName(scopeIdToDbName(scopeId));
-  if (!db) {
-    return { status: 'error', error: 'IndexedDB를 열 수 없습니다.' };
-  }
-
-  return new Promise<MaterialLoadResult>((resolve) => {
-    try {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).get(materialId);
-      req.onsuccess = () => {
-        const result = req.result as MaterialContent | undefined;
-        if (result) {
-          memoryCache.set(key, result);
-          resolve({ status: 'found', storage: 'indexeddb', content: result });
-        } else {
-          resolve({ status: 'missing' });
-        }
-      };
-      req.onerror = () => {
-        resolve({ status: 'error', error: req.error?.message || 'IndexedDB 읽기에 실패했습니다.' });
-      };
-    } catch (err) {
-      resolve({
-        status: 'error',
-        error: err instanceof Error ? err.message : 'IndexedDB 읽기 중 오류가 발생했습니다.',
-      });
-    }
-  });
+  return loadMaterialContentInScope(scopeId, materialId, options);
 }
 
 export async function deleteMaterialContent(materialId: string): Promise<MaterialDeleteResult> {
   const hadMemory = memoryCache.delete(cacheKey(materialId));
+  unmarkBodyPersisted(getStorageScopeId(), materialId);
 
   if (!isIndexedDBAvailable()) {
     return { deleted: hadMemory, storage: hadMemory ? 'memory' : 'none' };
@@ -648,6 +693,7 @@ export async function deleteMaterialContent(materialId: string): Promise<Materia
  */
 export async function clearAllMaterialContent(): Promise<MaterialDeleteResult> {
   memoryCache.clear();
+  clearBodyPersistenceMarksForCurrentScope();
 
   if (!isIndexedDBAvailable()) {
     return { deleted: true, storage: 'memory' };
@@ -786,6 +832,17 @@ export async function saveMaterialOriginal(
   contentType: string,
   knownHash?: string
 ): Promise<OriginalSaveResult> {
+  return saveMaterialOriginalInScope(getStorageScopeId(), materialId, blob, contentType, knownHash);
+}
+
+/** Scope-pinned original save: the target store comes from the explicit scope. */
+export async function saveMaterialOriginalInScope(
+  scopeId: string,
+  materialId: string,
+  blob: Blob,
+  contentType: string,
+  knownHash?: string
+): Promise<OriginalSaveResult> {
   const updatedAt = new Date().toISOString();
   let data: ArrayBuffer;
   try {
@@ -796,7 +853,7 @@ export async function saveMaterialOriginal(
   const hash = knownHash || (await hashBlob(blob));
   const record: MaterialOriginalRecord = { materialId, data, contentType, size: data.byteLength, hash, updatedAt };
 
-  const db = await openDB();
+  const db = await openDBByName(scopeIdToDbName(scopeId));
   if (!db) {
     return { persisted: false, storage: 'none', hash, size: record.size, updatedAt, error: '브라우저 IndexedDB를 사용할 수 없어 원본을 이 기기에 보관하지 못했습니다.' };
   }
@@ -812,8 +869,16 @@ export async function saveMaterialOriginal(
 }
 
 export async function loadMaterialOriginal(materialId: string): Promise<OriginalLoadResult> {
+  return loadMaterialOriginalInScope(getStorageScopeId(), materialId);
+}
+
+/** Scope-pinned original load: verification reads the same explicit store. */
+export async function loadMaterialOriginalInScope(
+  scopeId: string,
+  materialId: string
+): Promise<OriginalLoadResult> {
   if (!isIndexedDBAvailable()) return { status: 'missing' };
-  const db = await openDB();
+  const db = await openDBByName(scopeIdToDbName(scopeId));
   if (!db) return { status: 'error', error: 'IndexedDB를 열 수 없습니다.' };
   const result = await readOriginal(db, materialId);
   if (result.status === 'missing') return { status: 'missing' };

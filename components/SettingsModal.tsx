@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import type { Material, RetentionModelSettings } from '../lib/types';
+import type { Material, RetentionModelSettings, Subject } from '../lib/types';
 import { DEFAULT_RETENTION_SETTINGS } from '../lib/retentionModel';
 import { X, Settings, RotateCcw, Check, Info } from 'lucide-react';
 import { AiConnectionSection } from './AiConnectionSection';
@@ -15,7 +15,8 @@ interface SettingsModalProps {
   onSaveSettings: (settings: RetentionModelSettings) => void;
   onResetData: () => void;
   materials: Material[];
-  onRestoreMaterials: (restored: Material[]) => void;
+  subjects: Subject[];
+  onRestoreMaterials: (restored: Material[]) => boolean | Promise<boolean>;
   migrationBlocks: MigrationUiBlock[];
 }
 
@@ -26,6 +27,7 @@ export function SettingsModal({
   onSaveSettings,
   onResetData,
   materials,
+  subjects,
   onRestoreMaterials,
   migrationBlocks,
 }: SettingsModalProps) {
@@ -189,6 +191,7 @@ export function SettingsModal({
           <DataManagementSection
             migrations={migrationBlocks}
             materials={materials}
+            subjects={subjects}
             onRestoreMaterials={onRestoreMaterials}
           />
         </div>

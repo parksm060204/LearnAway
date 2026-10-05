@@ -73,6 +73,20 @@ export function scopedStorageKey(baseKey: string): string {
   return `redcall_${baseKey}`;
 }
 
+/**
+ * Builds the same key as scopedStorageKey() but for an EXPLICIT scope id, so a
+ * long-running job that captured its scope at start keeps reading and writing
+ * the account it started in even when the global scope changes mid-run.
+ * Scope ids are `u_<encodeURIComponent(userId)>` (or the legacy 'shared').
+ */
+export function scopedStorageKeyForScopeId(scopeId: string, baseKey: string): string {
+  if (scopeId === LEGACY_SCOPE_ID) return `${LEGACY_KEY_PREFIX}${baseKey}`;
+  if (!scopeId.startsWith('u_')) {
+    throw new Error(`알 수 없는 저장소 스코프입니다: ${scopeId}`);
+  }
+  return `${USER_KEY_PREFIX}${scopeId.slice(2)}__${baseKey}`;
+}
+
 /** The full localStorage prefix for the active scope. */
 export function getScopedStoragePrefix(): string {
   if (currentScope.kind === 'user') {

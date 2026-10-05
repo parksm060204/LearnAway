@@ -90,6 +90,9 @@ export interface Material {
   storagePolicy?: MaterialStoragePolicy;
   originalHash?: string; // hash of the original file (identity / reconnect)
   fileSize?: number;     // original file size in bytes
+  // Local-only body identity (hash of the converted markdown). Used to verify a
+  // reconnected .md file; never sent to the server (not in the upsert mapping).
+  bodyHash?: string;
 }
 
 export interface MaterialStoragePolicy {

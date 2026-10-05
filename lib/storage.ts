@@ -40,7 +40,16 @@ import { addDaysToDate } from './dateUtils';
 import { computeMarkdownHash } from './markdownUtils';
 import { completeRechallengeReservation } from './logicSession';
 import {
+  isMaterialBodyPersisted,
+  loadMaterialContentInScope,
+  saveMaterialContentInScope,
+  unmarkMaterialBodyPersistedInScope,
+} from './materialStorage';
+import { materialContentHash } from './cloud/hash';
+import {
+  getStorageScopeId,
   scopedStorageKey,
+  scopedStorageKeyForScopeId,
   isKeyInActiveScope,
   getStorageScope,
   getScopedStoragePrefix,
@@ -240,24 +249,383 @@ export function saveActiveSubjectId(id: string): void {
 
 export function loadStoredMaterials(): Material[] {
   const loaded = safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, []);
-  return loaded.map((m) => ({
-    ...m,
-    status: m.status || (m.isConverted ? 'ready' : 'converting'),
-    isDemo: m.isDemo ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
-    hasAiConcepts: m.hasAiConcepts ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
-    hasAiProblems: m.hasAiProblems ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
-  }));
+  const deletedIds = deletedMaterialMarkerIds();
+  const registry = readBodyHashRegistry();
+  return (Array.isArray(loaded) ? loaded : [])
+    // An explicitly deleted id never comes back through any read path, even if
+    // a stale wholesale list save managed to write it before being filtered.
+    .filter((m) => !(m && deletedIds.has(m.id)))
+    .map((m) => ({
+      ...m,
+      status: m.status || (m.isConverted ? 'ready' : 'converting'),
+      isDemo: m.isDemo ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
+      hasAiConcepts: m.hasAiConcepts ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
+      hasAiProblems: m.hasAiProblems ?? (m.id.startsWith('mat-econ') || m.id.startsWith('mat-cs')),
+      // The body-hash registry is the maintained local source for this local-only
+      // field: it survives cloud metadata refreshes that replace this list. The
+      // hash is merged ONLY when the recorded identity still matches this record.
+      bodyHash: mergeStoredBodyHash(registry, m),
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// Explicit deletion ledger (account-scoped).
+//
+// A material deleted on this device is recorded here so that a LATER wholesale
+// list save (e.g. a cloud snapshot that was read before the delete committed)
+// cannot resurrect it. A stale snapshot save is filtered out by material id;
+// a fresh authoritative load that shows the id again clears the marker,
+// because then the material legitimately exists on the server once more.
+// ---------------------------------------------------------------------------
+
+const DELETED_MATERIAL_IDS_KEY = 'deleted_material_ids_v1';
+
+interface DeletedMaterialMarker {
+  deletedAt: string;
+}
+
+function readDeletedMaterialMarkers(): Record<string, DeletedMaterialMarker> {
+  return safeGetItem<Record<string, DeletedMaterialMarker>>(DELETED_MATERIAL_IDS_KEY, {});
+}
+
+function writeDeletedMaterialMarkers(registry: Record<string, DeletedMaterialMarker>): boolean {
+  safeSetItem(DELETED_MATERIAL_IDS_KEY, registry);
+  const readBack = safeGetItem<Record<string, DeletedMaterialMarker>>(DELETED_MATERIAL_IDS_KEY, {});
+  return JSON.stringify(readBack) === JSON.stringify(registry);
+}
+
+function deletedMaterialMarkerIds(): Set<string> {
+  return new Set(Object.keys(readDeletedMaterialMarkers()));
+}
+
+/** Records an explicitly deleted material so later saves cannot resurrect it. */
+export function markMaterialDeleted(materialId: string): void {
+  if (!materialId) return;
+  const registry = readDeletedMaterialMarkers();
+  registry[materialId] = { deletedAt: new Date().toISOString() };
+  writeDeletedMaterialMarkers(registry);
+}
+
+/** Clears the marker when the material legitimately exists again (explicit restore, re-upload). */
+export function clearDeletedMaterialMarker(materialId: string): void {
+  if (!materialId) return;
+  const registry = readDeletedMaterialMarkers();
+  if (registry[materialId] === undefined) return;
+  delete registry[materialId];
+  writeDeletedMaterialMarkers(registry);
+}
+
+/**
+ * Reconciles the deletion ledger against a freshly loaded, authoritative server
+ * list. Markers whose delete committed BEFORE the load started are cleared when
+ * the ids are visible again (a legitimate server-side re-add); markers from a
+ * delete committed DURING or after the load stay, because that snapshot may be
+ * stale. Returns the ids that remain explicitly deleted and must be excluded
+ * from wholesale saves and server-derived UI state.
+ */
+export function reconcileDeletedMaterialMarkers(
+  visibleServerIds: string[],
+  loadStartedAt: string
+): Set<string> {
+  const registry = readDeletedMaterialMarkers();
+  for (const id of visibleServerIds) {
+    const marker = registry[id];
+    if (marker && marker.deletedAt <= loadStartedAt) {
+      delete registry[id];
+    }
+  }
+  writeDeletedMaterialMarkers(registry);
+  return new Set(Object.keys(registry));
+}
+
+// ---------------------------------------------------------------------------
+// Local body-hash registry (account-scoped, never sent to the server).
+//
+// bodyHash identifies the converted markdown of a material so a reconnected
+// .md file can be verified. Because cloud metadata refreshes replace the
+// materials list with server rows (which cannot carry this local-only field),
+// the hash lives in its own account-scoped record and is merged on load.
+// The registry ALSO stores the material identity (subjectId/kind) recorded at
+// the time, so an old hash is never merged into a record whose identity changed.
+// ---------------------------------------------------------------------------
+
+const MATERIAL_BODY_HASHES_KEY = 'material_body_hashes_v1';
+
+export interface MaterialHashIdentity {
+  subjectId?: string;
+  kind?: string;
+}
+
+interface StoredMaterialBodyHash extends MaterialHashIdentity {
+  hash: string;
+}
+
+function readBodyHashRegistry(): Record<string, StoredMaterialBodyHash> {
+  return safeGetItem<Record<string, StoredMaterialBodyHash>>(MATERIAL_BODY_HASHES_KEY, {});
+}
+
+function writeBodyHashRegistry(registry: Record<string, StoredMaterialBodyHash>): boolean {
+  safeSetItem(MATERIAL_BODY_HASHES_KEY, registry);
+  const readBack = safeGetItem<Record<string, StoredMaterialBodyHash>>(MATERIAL_BODY_HASHES_KEY, {});
+  return JSON.stringify(readBack) === JSON.stringify(registry);
+}
+
+function storedHashIdentityMatches(
+  record: StoredMaterialBodyHash,
+  identity?: MaterialHashIdentity
+): boolean {
+  if (!identity) return true;
+  if (record.subjectId !== undefined && record.subjectId !== identity.subjectId) return false;
+  if (record.kind !== undefined && record.kind !== identity.kind) return false;
+  return true;
+}
+
+function mergeStoredBodyHash(
+  registry: Record<string, StoredMaterialBodyHash>,
+  material: Material
+): string | undefined {
+  const record = registry[material.id];
+  if (!record) return material.bodyHash;
+  if (!storedHashIdentityMatches(record, { subjectId: material.subjectId, kind: material.kind })) {
+    // A different material identity with the same id: never merge the old hash.
+    return material.bodyHash;
+  }
+  return record.hash;
+}
+
+/**
+ * Records the verified hash of a material's current body (with its identity).
+ * Returns false when the write could not be persisted — callers must not treat
+ * a failed record as saved.
+ */
+export function recordMaterialBodyHash(
+  materialId: string,
+  hash: string,
+  identity?: MaterialHashIdentity
+): boolean {
+  if (!materialId || !hash) return false;
+  const registry = readBodyHashRegistry();
+  registry[materialId] = identity
+    ? { hash, subjectId: identity.subjectId, kind: identity.kind }
+    : { hash };
+  return writeBodyHashRegistry(registry);
+}
+
+export function getStoredMaterialBodyHash(
+  materialId: string,
+  identity?: MaterialHashIdentity
+): string | undefined {
+  const record = readBodyHashRegistry()[materialId];
+  if (!record || !storedHashIdentityMatches(record, identity)) return undefined;
+  return record.hash;
+}
+
+export function removeStoredMaterialBodyHash(materialId: string): void {
+  const registry = readBodyHashRegistry();
+  if (registry[materialId] === undefined) return;
+  delete registry[materialId];
+  writeBodyHashRegistry(registry);
+}
+
+function hasEmbeddedMaterialBody(m: Material | undefined): boolean {
+  return Boolean(
+    m && (m.parsedMarkdown !== undefined || m.rawText !== undefined || m.pages !== undefined)
+  );
+}
+
+/**
+ * Persists the material metadata list. localStorage keeps METADATA ONLY, with
+ * ONE exception that protects the last persistent copy of a body: when the
+ * CURRENTLY stored record still carries embedded body fields that have not
+ * been durably moved into IndexedDB (migration failed or not yet run), those
+ * fields are KEPT (or re-attached when the caller's copy already lost them).
+ * A memory-cache presence never counts as persistence here.
+ */
+function persistMaterialsMetadata(materials: Material[], verify: boolean): boolean {
+  // An id explicitly deleted on this device is NEVER written back, no matter
+  // what the input list (e.g. a stale server snapshot) carries.
+  const deletedIds = deletedMaterialMarkerIds();
+  const currentById = new Map<string, Material>(
+    (safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, []) || [])
+      .filter((m) => m && typeof m.id === 'string')
+      .map((m) => [m.id, m])
+  );
+
+  const light = materials
+    .filter((m) => !deletedIds.has(m.id))
+    .map((m) => {
+      const copy: Material = { ...m };
+      const current = currentById.get(m.id);
+      if (hasEmbeddedMaterialBody(current) && !isMaterialBodyPersisted(m.id)) {
+        copy.parsedMarkdown =
+          typeof m.parsedMarkdown === 'string' ? m.parsedMarkdown : current!.parsedMarkdown;
+        copy.rawText = m.rawText ?? current!.rawText;
+        copy.pages = m.pages ?? current!.pages;
+        return copy;
+      }
+      delete copy.parsedMarkdown;
+      delete copy.rawText;
+      delete copy.pages;
+      return copy;
+    });
+
+  safeSetItem(STORAGE_KEYS.MATERIALS, light);
+  if (!verify) return true;
+  const readBack = safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, []);
+  if (!Array.isArray(readBack) || readBack.length !== light.length) return false;
+  return readBack.every((m, i) => JSON.stringify(m) === JSON.stringify(light[i]));
 }
 
 export function saveStoredMaterials(materials: Material[]): void {
-  // Decouple storage: strip heavy rawText and pages from localStorage
-  const lightMaterials = materials.map((m) => {
-    const rest: Material = { ...m };
-    delete rest.pages;
-    delete rest.rawText;
-    return rest;
+  persistMaterialsMetadata(materials, false);
+}
+
+/**
+ * Saves material metadata and verifies the persisted value by reading it back.
+ * Used by restore paths so a failed metadata write is never reported as a
+ * restored material.
+ */
+export function saveStoredMaterialsVerified(materials: Material[]): boolean {
+  return persistMaterialsMetadata(materials, true);
+}
+
+export interface MaterialBodyMigrationResult {
+  attempted: number;
+  migrated: number;
+  ok: boolean;
+  failedIds: string[];
+  error?: string;
+}
+
+/**
+ * Moves bodies still embedded in the localStorage materials list into IndexedDB.
+ *
+ * Recovery contract:
+ *  - Every body is written to IndexedDB AND verified by reading the persisted
+ *    value back (memory cache bypassed) before localStorage is touched.
+ *  - localStorage is rewritten per item: only VERIFIED bodies are stripped from
+ *    the metadata; failed items keep their embedded body as the last persistent
+ *    copy and are retried on the next run.
+ *  - The scope is pinned from the start, so an account change mid-run cannot
+ *    redirect reads, writes, or the localStorage rewrite to another account.
+ */
+export async function migrateStoredMaterialBodies(
+  options: { scopeId?: string } = {}
+): Promise<MaterialBodyMigrationResult> {
+  const scopeId = options.scopeId ?? getStorageScopeId();
+  const materialsKey = scopedStorageKeyForScopeId(scopeId, STORAGE_KEYS.MATERIALS);
+
+  let raw: Material[];
+  try {
+    const text = localStorage.getItem(materialsKey);
+    raw = text === null ? [] : JSON.parse(text) as Material[];
+  } catch {
+    raw = safeGetItem<Material[]>(STORAGE_KEYS.MATERIALS, []);
+  }
+  if (!Array.isArray(raw)) {
+    return { attempted: 0, migrated: 0, ok: false, failedIds: [], error: '자료 메타데이터를 읽지 못했습니다.' };
+  }
+  const withBodies = raw.filter(hasEmbeddedMaterialBody);
+  if (withBodies.length === 0) {
+    return { attempted: 0, migrated: 0, ok: true, failedIds: [] };
+  }
+
+  const migratedIds: string[] = [];
+  const failedIds: string[] = [];
+  for (const material of withBodies) {
+    const content = {
+      markdown: typeof material.parsedMarkdown === 'string' ? material.parsedMarkdown : '',
+      rawText: material.rawText,
+      pages: material.pages,
+    };
+    const saved = await saveMaterialContentInScope(scopeId, material.id, content);
+    if (!saved.persisted) {
+      failedIds.push(material.id);
+      continue;
+    }
+    // Read the PERSISTED value back (memory cache bypassed) before trusting it.
+    const verify = await loadMaterialContentInScope(scopeId, material.id, { skipMemoryCache: true });
+    if (verify.status !== 'found' || materialContentHash(verify.content) !== materialContentHash(content)) {
+      // The write did not survive intact: withdraw the durability mark so
+      // later metadata saves keep the localStorage copy.
+      unmarkMaterialBodyPersistedInScope(scopeId, material.id);
+      failedIds.push(material.id);
+      continue;
+    }
+    migratedIds.push(material.id);
+  }
+
+  // Strip embedded bodies ONLY for the verified items; failed items keep theirs.
+  const migratedSet = new Set(migratedIds);
+  const updated = raw.map((m) => {
+    if (!m || !migratedSet.has(m.id)) return m;
+    const light: Material = { ...m };
+    delete light.parsedMarkdown;
+    delete light.rawText;
+    delete light.pages;
+    return light;
   });
-  safeSetItem(STORAGE_KEYS.MATERIALS, lightMaterials);
+  safeSetItemRaw(materialsKey, JSON.stringify(updated));
+
+  const check = safeGetRaw(materialsKey);
+  const writeVerified = (() => {
+    if (check === null) return false;
+    try {
+      const parsed = JSON.parse(check) as Material[];
+      if (!Array.isArray(parsed) || parsed.length !== updated.length) return false;
+      return parsed.every(
+        (m, i) =>
+          (migratedSet.has(m.id) && !hasEmbeddedMaterialBody(m)) ||
+          (!migratedSet.has(m.id) && JSON.stringify(m) === JSON.stringify(updated[i]))
+      );
+    } catch {
+      return false;
+    }
+  })();
+
+  if (!writeVerified) {
+    return {
+      attempted: withBodies.length,
+      migrated: migratedIds.length,
+      ok: false,
+      failedIds,
+      error: 'localStorage 본문 정리를 검증하지 못했습니다. 원본은 보존되었으며 다음 실행에 다시 시도됩니다.',
+    };
+  }
+
+  if (failedIds.length > 0) {
+    return {
+      attempted: withBodies.length,
+      migrated: migratedIds.length,
+      ok: false,
+      failedIds,
+      error: '일부 자료 본문을 IndexedDB로 옮기지 못했습니다. 해당 자료의 localStorage 본문은 보존되었으며 다음 실행에 다시 시도됩니다.',
+    };
+  }
+  return { attempted: withBodies.length, migrated: migratedIds.length, ok: true, failedIds: [] };
+}
+
+function safeGetRaw(key: string): string | null {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      return localStorage.getItem(key);
+    }
+    return inMemoryStore[key] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function safeSetItemRaw(key: string, value: string): void {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.setItem(key, value);
+    } else {
+      inMemoryStore[key] = value;
+    }
+  } catch (e) {
+    console.error(`Failed to write localStorage key ${key}`, e);
+  }
 }
 
 export function loadStoredConcepts(referenceDate: Date = new Date()): Concept[] {
@@ -1331,6 +1699,8 @@ export function resetToInitialDemoData(): void {
   safeRemoveItem(STORAGE_KEYS.CURRENT_SUBJECT_ID);
   safeRemoveItem(STORAGE_KEYS.SUBJECTS);
   safeRemoveItem(STORAGE_KEYS.MATERIALS);
+  safeRemoveItem(MATERIAL_BODY_HASHES_KEY);
+  safeRemoveItem(DELETED_MATERIAL_IDS_KEY);
   safeRemoveItem(STORAGE_KEYS.CONCEPTS);
   safeRemoveItem(STORAGE_KEYS.CONCEPT_DRAFTS);
   safeRemoveItem(STORAGE_KEYS.PROBLEMS);

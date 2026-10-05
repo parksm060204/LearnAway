@@ -11,7 +11,7 @@ const load = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
-  'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts',
+  'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts', 'lib/materialRestore.ts',
   'lib/todayStudy.ts', 'lib/reviewStats.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
@@ -114,6 +114,7 @@ exports.requireApiUser = async () => {
   const validation = load(path.join(output, 'lib/evaluationValidation.js'));
   const matStorage = load(path.join(output, 'lib/materialStorage.js'));
   const materialPolicy = load(path.join(output, 'lib/materialPolicy.js'));
+  const materialRestore = load(path.join(output, 'lib/materialRestore.js'));
   const todayStudy = load(path.join(output, 'lib/todayStudy.js'));
   const reviewStats = load(path.join(output, 'lib/reviewStats.js'));
   const problemSources = load(path.join(output, 'lib/problemSources.js'));
@@ -1047,6 +1048,752 @@ exports.requireApiUser = async () => {
     }
     assert.equal(materialPolicy.parseMaterialBackup('{bad json').ok, false);
     assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify({ hello: 'world' })).ok, false);
+  });
+
+  // ---- Material backup / restore hardening ----
+
+  const restoreEntry = (id, overrides = {}, materialOverrides = {}) => ({
+    material: {
+      id, subjectId: 's1', kind: 'pdf', title: id, sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', ...materialOverrides,
+    },
+    ...overrides,
+  });
+
+  const makeRestoreIo = (overrides = {}) => {
+    const writtenMetadata = [];
+    const io = {
+      getMaterials: () => overrides.materials || [],
+      loadBodyResult: (id) => matStorage.loadMaterialContentResult(id),
+      loadOriginalResult: (id) => matStorage.loadMaterialOriginal(id),
+      saveBody: (id, content) => matStorage.saveMaterialContent(id, content),
+      saveOriginal: (id, blob, contentType, knownHash) => matStorage.saveMaterialOriginal(id, blob, contentType, knownHash),
+      persistMetadata: async (added) => {
+        if (overrides.failMetadata) return false;
+        writtenMetadata.push(...added);
+        return true;
+      },
+      getScopeId: () => (overrides.getScopeId ? overrides.getScopeId() : storageScope.getStorageScopeId()),
+      knownSubjectIds: overrides.knownSubjectIds || ['s1'],
+      subjectOverride: overrides.subjectOverride,
+      ...(overrides.ioOverrides || {}),
+    };
+    return { io, writtenMetadata };
+  };
+
+  await checkAsync('metadata-only backup entries restore metadata and file-only ids recover their metadata', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-meta' });
+      // A body exists locally but its metadata is gone (file-only material).
+      await matStorage.saveMaterialContent('m-fileonly', { markdown: '# kept body' });
+      const entries = [
+        restoreEntry('m-metaonly', {}, { status: 'ready' }),
+        restoreEntry('m-fileonly', { body: { markdown: '# kept body' } }),
+      ];
+      const { io, writtenMetadata } = makeRestoreIo();
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.ok(outcome.restored.includes('m-metaonly'), 'metadata-only entry is restored');
+      assert.ok(outcome.restored.includes('m-fileonly'), 'file-only entry recovers its metadata');
+      assert.equal(outcome.failed.length, 0, JSON.stringify(outcome.failed));
+      assert.equal(writtenMetadata.length, 2);
+      assert.deepEqual(
+        outcome.missing.find((m) => m.id === 'm-metaonly').which,
+        ['body', 'original'],
+        'metadata-only entry is marked as needing file links'
+      );
+      // The existing local body was NOT rewritten.
+      const body = await matStorage.loadMaterialContentResult('m-fileonly');
+      assert.equal(body.content.markdown, '# kept body');
+    });
+  });
+
+  await checkAsync('a body or original read failure blocks the restore write and asks for a retry', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-readfail' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      const dbs = fake.__databases.get('redcall_materials_db_u_restore-readfail');
+      dbs.get('material_contents').set('m-rf', { materialId: 'm-rf', markdown: '# local body', updatedAt: 't' });
+      fake.__failure.get.add('m-rf');
+
+      const entries = [
+        restoreEntry('m-rf', { body: { markdown: '# backup body' } }),
+        restoreEntry('m-ok', { body: { markdown: '# healthy' } }),
+      ];
+      const { io } = makeRestoreIo();
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+
+      assert.ok(!outcome.restored.includes('m-rf'), 'the errored material is not restored');
+      assert.ok(outcome.restored.includes('m-ok'), 'unrelated entries still restore');
+      assert.ok(
+        outcome.failed.some((f) => f.id === 'm-rf' && f.reason.includes('다시 시도')),
+        'the failure asks for a retry'
+      );
+      assert.equal(
+        dbs.get('material_contents').get('m-rf').markdown,
+        '# local body',
+        'the existing body was not overwritten after a read failure'
+      );
+    });
+  });
+
+  await checkAsync('same-id metadata and file conflicts preserve the existing records', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-conflict' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      const dbs = fake.__databases.get('redcall_materials_db_u_restore-conflict');
+      dbs.get('material_contents').set('m-c', { materialId: 'm-c', markdown: '# local body', updatedAt: 't' });
+      const localMaterials = [restoreEntry('m-c').material];
+
+      // Metadata identity conflict: same id, different subject and kind.
+      const identityEntries = [restoreEntry('m-c', { body: { markdown: '# backup' } }, { subjectId: 's2', kind: 'transcript' })];
+      const identity = makeRestoreIo({ materials: localMaterials });
+      const identityOutcome = await materialRestore.executeMaterialRestore(identityEntries, identity.io);
+      assert.deepEqual(identityOutcome.restored, []);
+      assert.equal(identityOutcome.conflicts.length, 1);
+      assert.equal(identity.writtenMetadata.length, 0, 'conflicting metadata is not written');
+
+      // File content conflict: same id, different body hash.
+      const fileEntries = [restoreEntry('m-c', { body: { markdown: '# backup body' } })];
+      const file = makeRestoreIo({ materials: localMaterials });
+      const fileOutcome = await materialRestore.executeMaterialRestore(fileEntries, file.io);
+      assert.ok(!fileOutcome.restored.includes('m-c'));
+      assert.ok(fileOutcome.conflicts.some((c) => c.id === 'm-c'));
+      assert.equal(dbs.get('material_contents').get('m-c').markdown, '# local body', 'existing body preserved');
+      assert.equal(file.writtenMetadata.length, 0);
+    });
+  });
+
+  await checkAsync('a metadata save failure is never reported as a restored material', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-metafail' });
+      const entries = [restoreEntry('m-pf', { body: { markdown: '# x' } })];
+      const { io } = makeRestoreIo({ failMetadata: true });
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.deepEqual(outcome.restored, []);
+      assert.equal(outcome.metadataPersisted, false);
+      assert.ok(outcome.failed.some((f) => f.id === 'm-pf' && f.reason.includes('메타데이터 저장에 실패')));
+    });
+  });
+
+  await checkAsync('an account switch mid-restore stops all further writes', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-switch' });
+      let scopeSamples = 0;
+      const { io } = makeRestoreIo({
+        getScopeId: () => {
+          scopeSamples += 1;
+          // The start sample and the first entry still match; from the second
+          // entry onward the account has changed.
+          return scopeSamples <= 2 ? 'u_restore-switch' : 'u_other-account';
+        },
+      });
+      const entries = [
+        restoreEntry('m-s1', { body: { markdown: '# one' } }),
+        restoreEntry('m-s2', { body: { markdown: '# two' } }),
+      ];
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.equal(outcome.aborted, true);
+      assert.deepEqual(outcome.restored, [], 'unpersisted metadata is never reported restored');
+      const dbs = fake.__databases.get('redcall_materials_db_u_restore-switch');
+      assert.ok(dbs && dbs.get('material_contents').has('m-s1'), 'the first entry was already written');
+      assert.ok(!dbs.get('material_contents').has('m-s2'), 'no write after the account switch');
+      assert.ok(outcome.failed.some((f) => f.id === 'm-s2' && f.reason.includes('계정이 변경')));
+      const otherDb = fake.__databases.get('redcall_materials_db_u_other-account');
+      assert.ok(!otherDb || !otherDb.get('material_contents') || otherDb.get('material_contents').size === 0, 'the other account area stays untouched');
+    });
+  });
+
+  await checkAsync('restore re-checks file state after planning and skips a newly appeared conflict', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-recheck' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      const dbs = fake.__databases.get('redcall_materials_db_u_restore-recheck');
+      const entries = [restoreEntry('m-rc', { body: { markdown: '# backup' } })];
+      // The planning read sees no local body; a different body appears just
+      // before the write would happen (the first write-time re-check).
+      let mrcReads = 0;
+      const { io } = makeRestoreIo({
+        ioOverrides: {
+          loadBodyResult: async (id) => {
+            if (id === 'm-rc') {
+              mrcReads += 1;
+              if (mrcReads === 2) {
+                dbs.get('material_contents').set('m-rc', { materialId: 'm-rc', markdown: '# appeared', updatedAt: 't' });
+              }
+            }
+            return matStorage.loadMaterialContentResult(id);
+          },
+        },
+      });
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      assert.ok(!outcome.restored.includes('m-rc'));
+      assert.ok(outcome.conflicts.some((c) => c.id === 'm-rc'), 'the newly appeared conflict is reported');
+      assert.equal(dbs.get('material_contents').get('m-rc').markdown, '# appeared', 'existing content kept');
+    });
+  });
+
+  check('restore plan asks for a subject when the backup subject is unknown', () => {
+    const entries = [restoreEntry('m-sub', { body: { markdown: '# x' } }, { subjectId: 'unknown-s' })];
+    const plan = materialPolicy.planMaterialRestore(entries, [], { knownSubjectIds: ['s1'] });
+    assert.deepEqual(plan.needsSubjectChoice.map((n) => n.id), ['m-sub']);
+    assert.ok(!plan.toRestore.includes('m-sub'));
+
+    // After the user picks a target subject, the remapped entry restores.
+    const remapped = [{ ...entries[0], material: { ...entries[0].material, subjectId: 's1' } }];
+    const plan2 = materialPolicy.planMaterialRestore(remapped, [], { knownSubjectIds: ['s1'] });
+    assert.ok(plan2.toRestore.includes('m-sub'));
+  });
+
+  await checkAsync('backup build records read failures and metadata-embedded bodies', async () => {
+    const base = restoreEntry('m-build').material;
+    const failed = await materialPolicy.buildMaterialBackup([base], {
+      loadBody: async () => ({ status: 'error', error: 'IndexedDB 읽기 실패' }),
+      loadOriginal: async () => ({ status: 'missing' }),
+    });
+    assert.equal(failed.materials[0].fileState.body, 'error', 'read failure is recorded, not swallowed');
+    assert.equal(failed.materials[0].fileError.body, 'IndexedDB 읽기 실패');
+    assert.equal(failed.materials[0].body, undefined);
+
+    const embedded = await materialPolicy.buildMaterialBackup(
+      [{ ...base, parsedMarkdown: '# embedded', rawText: 'raw' }],
+      { loadBody: async () => ({ status: 'missing' }), loadOriginal: async () => ({ status: 'missing' }) }
+    );
+    assert.equal(embedded.materials[0].body.markdown, '# embedded', 'metadata-embedded body backs up the material');
+    assert.equal(embedded.materials[0].fileState.body, 'included');
+  });
+
+  check('backup completeness reports absent and unreadable files per material', () => {
+    const backup = {
+      version: 2,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      materials: [
+        {
+          material: restoreEntry('bk-a', {}, { originalHash: 'oh_x' }).material,
+          body: { markdown: '# a' },
+          fileState: { body: 'included', original: 'absent' },
+        },
+        {
+          material: restoreEntry('bk-b', {}, { kind: 'transcript' }).material,
+          fileState: { body: 'error', original: 'absent' },
+          fileError: { body: 'IndexedDB 읽기 실패' },
+        },
+        {
+          material: restoreEntry('bk-c', {}, { kind: 'transcript' }).material,
+          body: { markdown: '# c' },
+          fileState: { body: 'included', original: 'absent' },
+        },
+      ],
+    };
+    const summary = materialPolicy.summarizeBackupCompleteness(backup);
+    assert.equal(summary.complete, false);
+    assert.ok(
+      summary.issues.some((i) => i.id === 'bk-a' && i.which === 'original' && i.state === 'absent'),
+      'a pdf with known original identity but no file is reported missing'
+    );
+    assert.ok(
+      summary.issues.some((i) => i.id === 'bk-b' && i.which === 'body' && i.state === 'error'),
+      'a read failure is reported as such'
+    );
+    assert.ok(!summary.issues.some((i) => i.id === 'bk-b' && i.which === 'original'), 'a transcript never expected an original');
+    assert.ok(!summary.issues.some((i) => i.id === 'bk-c'), 'files that never existed are not issues');
+    assert.equal(summary.materialsWithIssues, 2);
+  });
+
+  check('lecture content mentioning Authorization or access_token imports normally', () => {
+    const backup = {
+      version: 2,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      materials: [
+        restoreEntry('m-auth', { body: { markdown: '# HTTP Authorization 헤더와 access_token 갱신 흐름' } }, {
+          kind: 'transcript',
+          title: 'Authorization 헤더와 access_token',
+        }),
+      ],
+    };
+    const parsed = materialPolicy.parseMaterialBackup(JSON.stringify(backup));
+    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.error);
+    if (parsed.ok) {
+      assert.equal(materialPolicy.backupContainsSecrets(parsed.backup), false, 'lecture wording is not a credential');
+    }
+  });
+
+  check('allowlisted export strips credential-shaped and unknown fields on import', () => {
+    const material = restoreEntry('m-strip').material;
+    const projected = materialPolicy.materialBackupMetadata({
+      ...material,
+      parsedMarkdown: '# body',
+      apiKey: 'sk-should-never-appear',
+      accessToken: 'should-never-appear',
+    });
+    assert.equal(projected.parsedMarkdown, undefined);
+    assert.equal(projected.apiKey, undefined, 'only allowlisted fields are exported');
+    assert.equal(projected.accessToken, undefined);
+
+    const tainted = { version: 2, materials: [{ material: { ...material, apiKey: 'sk-test' } }] };
+    const parsed = materialPolicy.parseMaterialBackup(JSON.stringify(tainted));
+    assert.equal(parsed.ok, true, 'unknown fields are dropped instead of being stored');
+    if (parsed.ok) {
+      assert.equal('apiKey' in parsed.backup.materials[0].material, false);
+      assert.equal(materialPolicy.backupContainsSecrets(parsed.backup), false);
+    }
+  });
+
+  check('malformed backup structures are rejected before any write', () => {
+    const validMaterial = restoreEntry('m-v').material;
+    const cases = [
+      JSON.stringify({ version: 1, materials: [{}] }),
+      JSON.stringify({ version: 1, materials: [{ material: { id: 'a' } }] }),
+      JSON.stringify({ version: 1, materials: [{ material: validMaterial }, { material: { ...validMaterial, title: 'dup' } }] }),
+      JSON.stringify({ version: 3, materials: [] }),
+      JSON.stringify({ version: 2, materials: [{ material: validMaterial, original: { contentType: 'application/pdf', hash: 'oh_x', base64: '!!!' } }] }),
+      JSON.stringify({ version: 2, materials: [{ material: validMaterial, body: { markdown: 42 } }] }),
+      JSON.stringify({ version: 2, materials: [{ material: validMaterial, body: { markdown: 'x', pages: [{ pageNumber: 0, markdown: 'p', hasText: true }] } }] }),
+      JSON.stringify({ version: 2, materials: [{ material: { ...validMaterial, fileSize: 3 }, original: { contentType: 'application/pdf', hash: 'oh_x', base64: materialPolicy.bytesToBase64(new Uint8Array([1, 2])) } }] }),
+    ];
+    for (const text of cases) {
+      const parsed = materialPolicy.parseMaterialBackup(text);
+      assert.equal(parsed.ok, false, `expected rejection: ${text}`);
+    }
+  });
+
+  await checkAsync('original hash mismatch is rejected before any write', async () => {
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const realHash = await matStorage.hashBlob(new Blob([bytes], { type: 'application/pdf' }));
+    const base64 = materialPolicy.bytesToBase64(bytes);
+    const backup = {
+      version: 2,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      materials: [restoreEntry('m-hash', { original: { contentType: 'application/pdf', hash: realHash, base64 } })],
+    };
+    assert.equal((await materialPolicy.verifyBackupOriginalHashes(backup)).ok, true);
+
+    const tampered = structuredClone(backup);
+    tampered.materials[0].original.hash = 'oh_deadbeef';
+    const verification = await materialPolicy.verifyBackupOriginalHashes(tampered);
+    assert.equal(verification.ok, false);
+    assert.deepEqual(verification.mismatched.map((m) => m.id), ['m-hash']);
+
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'restore-hash' });
+      const { io } = makeRestoreIo();
+      const outcome = await materialRestore.executeMaterialRestore(tampered.materials, io);
+      assert.deepEqual(outcome.restored, []);
+      assert.ok(outcome.failed.some((f) => f.id === 'm-hash' && f.reason.includes('해시')));
+      assert.equal((await matStorage.loadMaterialOriginal('m-hash')).status, 'missing', 'nothing was written');
+    });
+  });
+
+  await checkAsync('v1 backups stay readable while unsupported versions are refused', async () => {
+    const v1 = {
+      version: 1,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      materials: [restoreEntry('m-v1', { body: { markdown: '# v1 body' } })],
+    };
+    const parsed = materialPolicy.parseMaterialBackup(JSON.stringify(v1));
+    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.error);
+    if (parsed.ok) {
+      assert.equal(parsed.backup.materials[0].body.markdown, '# v1 body');
+    }
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify({ version: 0, materials: [] })).ok, false);
+    assert.equal(
+      materialPolicy.parseMaterialBackup(JSON.stringify({ version: 3, materials: [] })).ok,
+      false,
+      'unknown versions are never reinterpreted as the current version'
+    );
+  });
+
+  await checkAsync('embedded localStorage bodies move to IndexedDB and are stripped only after verification', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'body-mig' });
+      const key = 'redcall_user_body-mig__materials_v1';
+      const raw = [{
+        id: 'm-emb', subjectId: 's1', kind: 'pdf', title: 'T', status: 'ready', isConverted: true,
+        uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# embedded body',
+      }];
+      localStorage.setItem(key, JSON.stringify(raw));
+      const before = localStorage.getItem(key);
+
+      const result = await storage.migrateStoredMaterialBodies();
+      assert.equal(result.ok, true, result.error ?? '');
+      assert.equal(result.migrated, 1);
+
+      const after = JSON.parse(localStorage.getItem(key));
+      assert.equal(after[0].parsedMarkdown, undefined, 'localStorage keeps metadata only after a verified move');
+      assert.equal(after[0].id, 'm-emb', 'metadata fields survive');
+      const loaded = await matStorage.loadMaterialContentResult('m-emb');
+      assert.equal(loaded.status, 'found');
+      assert.equal(loaded.content.markdown, '# embedded body');
+      assert.ok(localStorage.getItem(key) !== before, 'the stored value changed only after success');
+
+      // Re-running is a no-op.
+      const again = await storage.migrateStoredMaterialBodies();
+      assert.equal(again.ok, true);
+      assert.equal(again.attempted, 0);
+    });
+  });
+
+  await checkAsync('a failed IndexedDB write keeps the localStorage body for retry', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'body-mig-fail' });
+      const key = 'redcall_user_body-mig-fail__materials_v1';
+      localStorage.setItem(key, JSON.stringify([{
+        id: 'm-emb2', subjectId: 's1', kind: 'pdf', title: 'T', status: 'ready', isConverted: true,
+        uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# keep me',
+      }]));
+
+      fake.__failure.put.add('m-emb2');
+      const result = await storage.migrateStoredMaterialBodies();
+      assert.equal(result.ok, false);
+      assert.deepEqual(result.failedIds, ['m-emb2']);
+
+      const raw = JSON.parse(localStorage.getItem(key));
+      assert.equal(raw[0].parsedMarkdown, '# keep me', 'the original body is preserved for retry');
+    });
+  });
+
+  await checkAsync('metadata-only saves never persist bodies into localStorage', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'save-light' });
+    storage.saveStoredMaterials([{
+      id: 'm-light', subjectId: 's1', kind: 'pdf', title: 'T', status: 'ready', isConverted: true,
+      uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# heavy body', rawText: 'raw', pages: [],
+    }]);
+    const raw = JSON.parse(localStorage.getItem('redcall_user_save-light__materials_v1'));
+    assert.equal(raw[0].parsedMarkdown, undefined);
+    assert.equal(raw[0].rawText, undefined);
+    assert.equal(raw[0].pages, undefined);
+    assert.equal(raw[0].title, 'T');
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  // ---- Boundary 1: export and import share one limit source ----
+
+  const tinyLimits = { fileBytes: 1e9, textChars: 1e9, materials: 3, bodyTextChars: 50, originalBase64Chars: 24 };
+
+  const makeSmallEntry = (id) => restoreEntry(id, { body: { markdown: 'x'.repeat(40) } });
+
+  check('per-entry caps are enforced identically on export and import', () => {
+    const atOriginalCap = {
+      version: 2,
+      materials: [restoreEntry('m-at', { original: { contentType: 'application/pdf', hash: 'oh_x', base64: materialPolicy.bytesToBase64(new Uint8Array(18)) } })],
+    };
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(atOriginalCap), tinyLimits).ok, true);
+    assert.deepEqual(materialPolicy.findBackupLimitViolations(atOriginalCap, tinyLimits), []);
+
+    const overOriginalCap = structuredClone(atOriginalCap);
+    overOriginalCap.materials[0].original.base64 = materialPolicy.bytesToBase64(new Uint8Array(19));
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(overOriginalCap), tinyLimits).ok, false);
+    assert.equal(materialPolicy.findBackupLimitViolations(overOriginalCap, tinyLimits).length, 1);
+
+    const bodyAtCap = { version: 2, materials: [makeSmallEntry('m-b')] };
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(bodyAtCap), tinyLimits).ok, true);
+    const bodyOverCap = { version: 2, materials: [restoreEntry('m-b', { body: { markdown: 'x'.repeat(51) } })] };
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(bodyOverCap), tinyLimits).ok, false);
+    assert.equal(materialPolicy.findBackupLimitViolations(bodyOverCap, tinyLimits).length, 1);
+  });
+
+  check('the total serialized size limit matches exactly between export and import', () => {
+    const backup = { version: 2, materials: [makeSmallEntry('m1'), makeSmallEntry('m2'), makeSmallEntry('m3')] };
+    const exactLimits = {
+      fileBytes: 1e9, textChars: JSON.stringify(backup).length,
+      materials: 100, bodyTextChars: 1e9, originalBase64Chars: 1e9,
+    };
+    assert.deepEqual(materialPolicy.findBackupLimitViolations(backup, exactLimits), []);
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(backup), exactLimits).ok, true);
+
+    const tightened = { ...exactLimits, textChars: exactLimits.textChars - 1 };
+    assert.ok(
+      materialPolicy.findBackupLimitViolations(backup, tightened).some((v) => v.id === null && /전체/.test(v.reason)),
+      'a one-char-over total is refused with a reason before download'
+    );
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(backup), tightened).ok, false);
+  });
+
+  check('the entry-count limit is shared by export and import', () => {
+    const backup = { version: 2, materials: [makeSmallEntry('a'), makeSmallEntry('b'), makeSmallEntry('c'), makeSmallEntry('d')] };
+    assert.ok(materialPolicy.findBackupLimitViolations(backup, tinyLimits).some((v) => v.id === null && /자료 수/.test(v.reason)));
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(backup), tinyLimits).ok, false);
+  });
+
+  await checkAsync('export fails fast on an oversized original and round-trips at the boundary', async () => {
+    await assert.rejects(
+      materialPolicy.buildMaterialBackup([restoreEntry('m-big').material], {
+        loadBody: async () => ({ status: 'missing' }),
+        loadOriginal: async () => ({ status: 'found', original: { contentType: 'application/pdf', hash: 'oh_x', data: new Uint8Array(19) } }),
+      }, tinyLimits),
+      /원본 파일이 처리 가능한 크기/
+    );
+    const atBoundary = await materialPolicy.buildMaterialBackup([restoreEntry('m-ok').material], {
+      loadBody: async () => ({ status: 'missing' }),
+      loadOriginal: async () => ({ status: 'found', original: { contentType: 'application/pdf', hash: 'oh_x', data: new Uint8Array(18) } }),
+    }, tinyLimits);
+    assert.equal(atBoundary.materials[0].fileState.original, 'included');
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify(atBoundary), tinyLimits).ok, true, 'an exported boundary backup re-imports under the same limits');
+  });
+
+  // ---- Boundary 2: failed body migration keeps the localStorage original ----
+
+  await checkAsync('a stored-then-corrupted body fails verification and keeps the local copy', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'mig-corrupt' });
+      const key = 'redcall_user_mig-corrupt__materials_v1';
+      localStorage.setItem(key, JSON.stringify([{
+        id: 'm-cor', subjectId: 's1', kind: 'pdf', title: 'T', status: 'ready', isConverted: true,
+        uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# original',
+      }]));
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      fake.__failure.corruptPut.add('m-cor');
+
+      const result = await storage.migrateStoredMaterialBodies();
+      assert.equal(result.ok, false);
+      assert.deepEqual(result.failedIds, ['m-cor']);
+      const raw = JSON.parse(localStorage.getItem(key));
+      assert.equal(raw[0].parsedMarkdown, '# original', 'the memory cache did not stand in for persistence');
+    });
+  });
+
+  await checkAsync('a failed body migration survives later saves, replacement lists and reload', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'mig-keep' });
+      const key = 'redcall_user_mig-keep__materials_v1';
+      localStorage.setItem(key, JSON.stringify([
+        { id: 'm-stay', subjectId: 's1', kind: 'pdf', title: 'Stay', status: 'ready', isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# keep this body' },
+        { id: 'm-go', subjectId: 's1', kind: 'pdf', title: 'Go', status: 'ready', isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# move this body' },
+      ]));
+      fake.__failure.put.add('m-stay');
+
+      // ①②: migration succeeds only for the healthy item.
+      const first = await storage.migrateStoredMaterialBodies();
+      assert.equal(first.ok, false);
+      assert.deepEqual(first.failedIds, ['m-stay']);
+      assert.equal(first.migrated, 1);
+      let raw = JSON.parse(localStorage.getItem(key));
+      assert.equal(raw.find((m) => m.id === 'm-stay').parsedMarkdown, '# keep this body', 'failed item keeps its embedded body');
+      assert.equal(raw.find((m) => m.id === 'm-go').parsedMarkdown, undefined, 'only the verified item is stripped');
+
+      // ③: another material is added through the normal save path.
+      storage.saveStoredMaterials([
+        ...storage.loadStoredMaterials(),
+        { id: 'm-new', subjectId: 's1', kind: 'pdf', title: 'New', status: 'ready', isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z' },
+      ]);
+      raw = JSON.parse(localStorage.getItem(key));
+      assert.equal(raw.find((m) => m.id === 'm-stay').parsedMarkdown, '# keep this body', 'a later metadata save must not strip the un-migrated body');
+      assert.ok(raw.some((m) => m.id === 'm-new'));
+
+      // ④⑤: a reload re-reads the preserved body from the stored metadata.
+      const reloaded = storage.loadStoredMaterials();
+      assert.equal(reloaded.find((m) => m.id === 'm-stay').parsedMarkdown, '# keep this body');
+
+      // Retry once the storage failure is gone: the item migrates, is
+      // stripped, and stays stripped afterwards.
+      fake.__failure.put.delete('m-stay');
+      const retry = await storage.migrateStoredMaterialBodies();
+      assert.equal(retry.ok, true, retry.error ?? '');
+      storage.saveStoredMaterials(storage.loadStoredMaterials());
+      raw = JSON.parse(localStorage.getItem(key));
+      assert.equal(raw.find((m) => m.id === 'm-stay').parsedMarkdown, undefined);
+      const body = await matStorage.loadMaterialContentResult('m-stay');
+      assert.equal(body.status, 'found');
+      assert.equal(body.content.markdown, '# keep this body');
+    });
+  });
+
+  await checkAsync('a wholesale metadata list replacement re-attaches an un-migrated body', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'mig-refresh' });
+      const key = 'redcall_user_mig-refresh__materials_v1';
+      localStorage.setItem(key, JSON.stringify([{
+        id: 'm-hold', subjectId: 's1', kind: 'pdf', title: 'Hold', status: 'ready', isConverted: true,
+        uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# hold me',
+      }]));
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      fake.__failure.put.add('m-hold');
+      const migration = await storage.migrateStoredMaterialBodies();
+      assert.equal(migration.ok, false);
+
+      // A cloud refresh saves a metadata-only server list for the same ids.
+      storage.saveStoredMaterials([{
+        id: 'm-hold', subjectId: 's1', kind: 'pdf', title: 'Hold (server)', status: 'ready',
+        isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+      }]);
+      const raw = JSON.parse(localStorage.getItem(key));
+      assert.equal(raw[0].parsedMarkdown, '# hold me', 'the last persistent copy survives the list replacement');
+      assert.equal(raw[0].title, 'Hold (server)', 'metadata fields still take the new values');
+    });
+  });
+
+  // ---- Boundary 3: async work stays inside the account it started in ----
+
+  await checkAsync('pinned-scope restore keeps writes and metadata inside the starting account during a mid-run switch', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'pin-a' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      storageScope.setStorageScope({ kind: 'user', userId: 'pin-b' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      storageScope.setStorageScope({ kind: 'user', userId: 'pin-a' });
+
+      const entries = [restoreEntry('m-pin', { body: { markdown: '# pinned' } })];
+      let bodyReads = 0;
+      const io = {
+        getMaterials: () => [],
+        // The write-time re-check is where the account flips.
+        loadBodyResult: async (id) => {
+          bodyReads += 1;
+          if (bodyReads === 2) storageScope.setStorageScope({ kind: 'user', userId: 'pin-b' });
+          return matStorage.loadMaterialContentInScope('u_pin-a', id, { skipMemoryCache: true });
+        },
+        loadOriginalResult: (id) => matStorage.loadMaterialOriginalInScope('u_pin-a', id),
+        saveBody: (id, content) => matStorage.saveMaterialContentInScope('u_pin-a', id, content),
+        saveOriginal: (id, blob, contentType, knownHash) => matStorage.saveMaterialOriginalInScope('u_pin-a', id, blob, contentType, knownHash),
+        persistMetadata: async () => storageScope.getStorageScopeId() === 'u_pin-a',
+        getScopeId: () => storageScope.getStorageScopeId(),
+        knownSubjectIds: ['s1'],
+      };
+      const outcome = await materialRestore.executeMaterialRestore(entries, io);
+      const dbA = fake.__databases.get('redcall_materials_db_u_pin-a');
+      const dbB = fake.__databases.get('redcall_materials_db_u_pin-b');
+      assert.equal(dbA.get('material_contents').get('m-pin').markdown, '# pinned', 'the in-flight write finished in the ORIGINAL account');
+      assert.ok(!dbB.get('material_contents').has('m-pin'), 'nothing leaked into the new account store');
+      assert.ok(!outcome.restored.includes('m-pin'), 'an unapplied outcome is not reported restored');
+      assert.equal(outcome.aborted, true);
+      assert.ok(outcome.failed.some((f) => f.id === 'm-pin' && f.reason.includes('계정이 변경')));
+    });
+  });
+
+  await checkAsync('an account switch before any write prevents all writes and metadata', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'flip-early' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      let scopeCalls = 0;
+      let metadataAsked = false;
+      const io = {
+        getMaterials: () => [],
+        loadBodyResult: (id) => matStorage.loadMaterialContentInScope('u_flip-early', id, { skipMemoryCache: true }),
+        loadOriginalResult: (id) => matStorage.loadMaterialOriginalInScope('u_flip-early', id),
+        saveBody: (id, content) => matStorage.saveMaterialContentInScope('u_flip-early', id, content),
+        saveOriginal: (id, blob, contentType, knownHash) => matStorage.saveMaterialOriginalInScope('u_flip-early', id, blob, contentType, knownHash),
+        persistMetadata: async () => { metadataAsked = true; return true; },
+        getScopeId: () => {
+          scopeCalls += 1;
+          return scopeCalls <= 1 ? 'u_flip-early' : 'u_flip-other';
+        },
+        knownSubjectIds: ['s1'],
+      };
+      const outcome = await materialRestore.executeMaterialRestore([restoreEntry('m-early', { body: { markdown: '# x' } })], io);
+      assert.equal(outcome.aborted, true);
+      assert.deepEqual(outcome.restored, []);
+      assert.equal(metadataAsked, false, 'metadata is never applied after the switch');
+      const db = fake.__databases.get('redcall_materials_db_u_flip-early');
+      assert.ok(db && !db.get('material_contents').has('m-early'));
+    });
+  });
+
+  await checkAsync('restore verification reads the persisted value, not the memory cache', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'verify-corrupt' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      fake.__failure.corruptPut.add('m-cv');
+      const io = {
+        getMaterials: () => [],
+        loadBodyResult: (id) => matStorage.loadMaterialContentInScope('u_verify-corrupt', id, { skipMemoryCache: true }),
+        loadOriginalResult: (id) => matStorage.loadMaterialOriginalInScope('u_verify-corrupt', id),
+        saveBody: (id, content) => matStorage.saveMaterialContentInScope('u_verify-corrupt', id, content),
+        saveOriginal: (id, blob, contentType, knownHash) => matStorage.saveMaterialOriginalInScope('u_verify-corrupt', id, blob, contentType, knownHash),
+        persistMetadata: async () => true,
+        getScopeId: () => storageScope.getStorageScopeId(),
+        knownSubjectIds: ['s1'],
+      };
+      const outcome = await materialRestore.executeMaterialRestore([restoreEntry('m-cv', { body: { markdown: '# good' } })], io);
+      assert.ok(!outcome.restored.includes('m-cv'));
+      assert.ok(outcome.failed.some((f) => f.id === 'm-cv' && f.reason.includes('본문 읽기 검증')));
+    });
+  });
+
+  await checkAsync('body migration stays inside the explicitly pinned scope', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'mig-pin-a' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+      storageScope.setStorageScope({ kind: 'user', userId: 'mig-pin-b' });
+      await matStorage.saveMaterialContent('warm', { markdown: 'warm' });
+
+      const keyA = 'redcall_user_mig-pin-a__materials_v1';
+      localStorage.setItem(keyA, JSON.stringify([{
+        id: 'm-pinmig', subjectId: 's1', kind: 'pdf', title: 'T', status: 'ready', isConverted: true,
+        uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# migrate me',
+      }]));
+      localStorage.setItem('redcall_user_mig-pin-b__materials_v1', JSON.stringify([{
+        id: 'other-b', subjectId: 's1', kind: 'pdf', title: 'B', status: 'ready', isConverted: true,
+        uploadedAt: '2026-01-01T00:00:00.000Z',
+      }]));
+
+      // The migration runs pinned to account A even though B is active.
+      const result = await storage.migrateStoredMaterialBodies({ scopeId: 'u_mig-pin-a' });
+      assert.equal(result.ok, true, result.error ?? '');
+      const rawA = JSON.parse(localStorage.getItem(keyA));
+      assert.equal(rawA[0].parsedMarkdown, undefined);
+      const dbA = fake.__databases.get('redcall_materials_db_u_mig-pin-a');
+      assert.equal(dbA.get('material_contents').get('m-pinmig').markdown, '# migrate me');
+      assert.equal(
+        JSON.parse(localStorage.getItem('redcall_user_mig-pin-b__materials_v1'))[0].id,
+        'other-b',
+        'the active account records are untouched'
+      );
+      const dbB = fake.__databases.get('redcall_materials_db_u_mig-pin-b');
+      assert.ok(dbB && !dbB.get('material_contents').has('m-pinmig'));
+    });
+  });
+
+  // ---- Boundary 4: the local body hash registry ----
+
+  await checkAsync('the local body hash registry survives metadata replacement and reload', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'hash-keep' });
+    assert.equal(storage.recordMaterialBodyHash('m-bh', 'h1'), true, 'the hash record is persisted and verified');
+    const baseMaterial = { id: 'm-bh', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready', isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z' };
+    storage.saveStoredMaterials([baseMaterial]);
+    assert.equal(storage.loadStoredMaterials()[0].bodyHash, 'h1', 'the registry re-attaches the hash after the list is replaced');
+    assert.equal(storage.getStoredMaterialBodyHash('m-bh'), 'h1');
+    assert.equal(materialPolicy.reconnectHashMatches(storage.getStoredMaterialBodyHash('m-bh'), 'h1'), true);
+    assert.equal(materialPolicy.reconnectHashMatches(storage.getStoredMaterialBodyHash('m-bh'), 'h2'), false, 'a different candidate file is refused');
+    assert.equal(storage.recordMaterialBodyHash('m-bh', 'h2'), true, 'a legitimate body change updates the hash');
+    assert.equal(storage.getStoredMaterialBodyHash('m-bh'), 'h2');
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('a failed hash record is not reported saved and hashes stay per account', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'hash-fail' });
+    const registryKey = 'redcall_user_hash-fail__material_body_hashes_v1';
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = (key, value) => {
+      if (key === registryKey) throw new Error('quota exceeded');
+      realSetItem(key, value);
+    };
+    let recorded;
+    try {
+      recorded = storage.recordMaterialBodyHash('m-f', 'h9');
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+    assert.equal(recorded, false, 'the new hash is never reported as saved');
+    assert.equal(storage.getStoredMaterialBodyHash('m-f'), undefined);
+
+    storage.recordMaterialBodyHash('m-f', 'h9');
+    storageScope.setStorageScope({ kind: 'user', userId: 'hash-other' });
+    assert.equal(storage.getStoredMaterialBodyHash('m-f'), undefined, 'another account cannot read the hash');
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('the local body hash is never uploaded to the server', async () => {
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const material = {
+        id: 'mat-bh', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+        isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+        bodyHash: 'h_local_only', storagePolicy: { syncBody: false, backupOriginal: false },
+      };
+      const result = await cloudMaterials.writeMaterialMetadata({ material, bodySynced: false, originalBackedUp: false });
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      const row = client.__state.materials.find((m) => m.id === 'mat-bh');
+      assert.ok(!('body_hash' in row), 'no body_hash column is written');
+      assert.ok(!JSON.stringify(row).includes('h_local_only'), 'the local hash value is not part of any server write');
+    });
   });
 
   await checkAsync('a local original is stored, verified, reconnected by hash and deleted', async () => {

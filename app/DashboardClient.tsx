@@ -4,6 +4,7 @@ import React, { useState, useEffect, useMemo, useRef, useSyncExternalStore } fro
 import {
   Subject,
   Material,
+  MaterialPage,
   Concept,
   ConceptDraft,
   Problem,
@@ -22,6 +23,7 @@ import {
   DEFAULT_PERSONALIZATION_SETTINGS,
   RechallengeReservation,
 } from '../lib/types';
+import { INITIAL_MATERIALS } from '../lib/initialData';
 import {
   loadStoredSubjects,
   saveStoredSubjects,
@@ -29,6 +31,8 @@ import {
   saveActiveSubjectId,
   loadStoredMaterials,
   saveStoredMaterials,
+  saveStoredMaterialsVerified,
+  migrateStoredMaterialBodies,
   loadStoredConcepts,
   saveStoredConcepts,
   loadStoredConceptDrafts,
@@ -153,11 +157,26 @@ import {
   clearAllMaterialContent,
   deleteMaterialContent,
   deleteMaterialOriginal,
+  loadMaterialContentResult,
   loadMaterialContent,
+  loadMaterialContentInScope,
+  loadMaterialOriginalInScope,
   saveMaterialContent,
+  saveMaterialContentInScope,
+  saveMaterialOriginalInScope,
   saveMaterialOriginal,
   hashBlob,
 } from '../lib/materialStorage';
+import { computeMarkdownHash } from '../lib/markdownUtils';
+import {
+  getStoredMaterialBodyHash,
+  recordMaterialBodyHash,
+  removeStoredMaterialBodyHash,
+  markMaterialDeleted,
+  clearDeletedMaterialMarker,
+  reconcileDeletedMaterialMarkers,
+  type MaterialHashIdentity,
+} from '../lib/storage';
 import { loadDefaultMaterialPolicy } from '../lib/materialPolicy';
 import { loadCloudLibrary } from '../lib/cloud/library';
 import { upsertSubject } from '../lib/cloud/subjectsRepository';
@@ -185,7 +204,7 @@ import {
   LearningMigrationState,
 } from '../lib/cloud/learningMigration';
 import { applyMaterialEditToProblems } from '../lib/problemFreshness';
-import { setStorageScope } from '../lib/storageScope';
+import { setStorageScope, getStorageScopeId } from '../lib/storageScope';
 import {
   getLegacyImportState,
   importLegacyData,
@@ -329,6 +348,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   // and is never silently replaced by an empty list or local cache.
   useEffect(() => {
     let cancelled = false;
+    // Captured BEFORE the server query: a material deleted while this load was
+    // in flight must not be resurrected by its (stale) snapshot. The snapshot
+    // was taken before the deletion committed, so marker timestamps recorded
+    // after this moment stay in the deletion ledger.
+    const loadStartedAt = new Date().toISOString();
 
     loadCloudLibrary()
       .then(async (result) => {
@@ -352,20 +376,35 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           }
         }
 
+        // A id visible in this authoritative load re-exists on the server only
+        // when its delete committed BEFORE this load started.
+        const stillDeletedIds = reconcileDeletedMaterialMarkers(
+          result.data.materials.map((m) => m.id),
+          loadStartedAt
+        );
+        const keptMaterials = result.data.materials.filter((m) => !stillDeletedIds.has(m.id));
+
         // Mirror the server library into the local cache for offline reads.
         saveStoredSubjects(result.data.subjects);
-        saveStoredMaterials(result.data.materials);
-        for (const material of result.data.materials) {
+        saveStoredMaterials(keptMaterials);
+        for (const material of keptMaterials) {
           if (
             material.parsedMarkdown !== undefined ||
             material.rawText !== undefined ||
             material.pages !== undefined
           ) {
-            await saveMaterialContent(material.id, {
+            const saved = await saveMaterialContent(material.id, {
               markdown: material.parsedMarkdown ?? '',
               rawText: material.rawText,
               pages: material.pages,
             });
+            // The downloaded body is this material's legitimate current body;
+            // keep the local identity hash in step with it (only after the
+            // durable save succeeded, never on a failed write).
+            if (saved.persisted) {
+              const identity: MaterialHashIdentity = { subjectId: material.subjectId, kind: material.kind };
+              recordMaterialBodyHash(material.id, computeMarkdownHash(material.parsedMarkdown ?? ''), identity);
+            }
           }
         }
         if (cancelled) return;
@@ -474,7 +513,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         markServerCache(currentUser.id);
 
         setSubjects(result.data.subjects);
-        setMaterials(result.data.materials);
+        setMaterials(keptMaterials);
         setCloudOriginalPaths(result.data.originalPathByMaterialId);
         setActiveSubjectId((prev) =>
           result.data.subjects.some((s) => s.id === prev)
@@ -760,7 +799,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   // Local-only relink: connect a file on this device to metadata-only material.
   // Never uploads to the server; material id, concept/problem links and history
   // are preserved because the material record itself is not replaced.
+  // The storage scope is pinned at the start: the file is written to (and
+  // verified against) the account the reconnect started in, and an account
+  // change stops the flow before touching UI or metadata of another account.
   const handleReconnectOriginal = async (material: Material, file: File): Promise<boolean> => {
+    const pinnedScopeId = getStorageScopeId();
     let hash = '';
     try {
       hash = await hashBlob(file);
@@ -778,10 +821,22 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       );
       if (!ok) return false;
     }
-    const saved = await saveMaterialOriginal(material.id, file, file.type || 'application/pdf');
+    if (getStorageScopeId() !== pinnedScopeId) {
+      return false;
+    }
+    const saved = await saveMaterialOriginalInScope(pinnedScopeId, material.id, file, file.type || 'application/pdf');
     if (!saved.persisted) {
       showToast(`원본 저장 실패: ${saved.error}. 다시 시도해 주세요.`);
       return false;
+    }
+    const verify = await loadMaterialOriginalInScope(pinnedScopeId, material.id);
+    if (verify.status !== 'found' || verify.hash !== saved.hash) {
+      showToast('원본 저장을 검증하지 못했습니다. 다시 시도해 주세요.');
+      return false;
+    }
+    // A late result must never be applied to another account's UI or records.
+    if (getStorageScopeId() !== pinnedScopeId) {
+      return true;
     }
     const updated = materials.map((m) =>
       m.id === material.id ? { ...m, originalHash: m.originalHash ?? saved.hash, fileSize: saved.size } : m
@@ -789,8 +844,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     setMaterials(updated);
     saveStoredMaterials(updated);
     // If the body is still missing, guide the next supported action.
-    const body = await loadMaterialContent(material.id);
-    if (!body?.markdown) {
+    const body = await loadMaterialContentInScope(pinnedScopeId, material.id);
+    const hasBody = body.status === 'found' && Boolean(body.content.markdown);
+    if (!hasBody) {
       showToast('원본이 이 기기에 연결되었습니다. 변환 본문(MD)도 없으니 "본문 다시 연결"을 누르거나 자료를 다시 변환해 주세요.');
     } else {
       showToast('원본이 이 기기에 다시 연결되었습니다.');
@@ -798,7 +854,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     return true;
   };
 
+  // Local-only relink of a converted Markdown body. Verifies the file against
+  // the stored body identity (bodyHash; local registry survives cloud metadata
+  // refreshes) when present; asks for explicit confirmation when the material
+  // carries no identity. Never uploads to the server: the body goes to
+  // IndexedDB and localStorage keeps metadata only. The storage scope is
+  // pinned at the start for the same reason as the original relink above.
   const handleReconnectBody = async (material: Material, file: File): Promise<boolean> => {
+    const pinnedScopeId = getStorageScopeId();
     let text = '';
     try {
       text = await file.text();
@@ -810,15 +873,53 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       showToast('빈 파일입니다. 변환된 Markdown 파일을 선택해 주세요.');
       return false;
     }
-    const saved = await saveMaterialContent(material.id, { markdown: text });
+    const candidateHash = computeMarkdownHash(text);
+    // Same hash rule for the stored identity and the candidate file.
+    const expectedHash = material.bodyHash ?? getStoredMaterialBodyHash(material.id);
+    if (expectedHash) {
+      if (expectedHash !== candidateHash) {
+        showToast('선택한 파일의 내용이 이 자료의 본문 식별 정보와 일치하지 않습니다. 기존 자료는 그대로 유지됩니다.');
+        return false;
+      }
+    } else if (
+      !window.confirm(
+        '이 자료에는 본문 식별 정보가 없어 자동 확인할 수 없습니다. 선택한 파일을 이 자료의 본문으로 연결할까요?'
+      )
+    ) {
+      return false;
+    }
+    if (getStorageScopeId() !== pinnedScopeId) {
+      return false;
+    }
+    const saved = await saveMaterialContentInScope(pinnedScopeId, material.id, { markdown: text });
     if (!saved.persisted) {
       showToast(`본문 저장 실패: ${saved.error}. 다시 시도해 주세요.`);
       return false;
     }
-    const updated = materials.map((m) => (m.id === material.id ? { ...m, parsedMarkdown: text } : m));
+    const verify = await loadMaterialContentInScope(pinnedScopeId, material.id, { skipMemoryCache: true });
+    if (verify.status !== 'found' || verify.content.markdown !== text) {
+      showToast('본문 저장을 검증하지 못했습니다. 다시 시도해 주세요.');
+      return false;
+    }
+    // The saved body belongs to the ORIGINAL account's storage; applying the
+    // metadata/UI is only safe while still on that account.
+    if (getStorageScopeId() !== pinnedScopeId) {
+      return true;
+    }
+    const hashRecorded = recordMaterialBodyHash(material.id, candidateHash, {
+      subjectId: material.subjectId,
+      kind: material.kind,
+    });
+    const updated = materials.map((m) =>
+      m.id === material.id ? { ...m, parsedMarkdown: text, bodyHash: candidateHash } : m
+    );
     setMaterials(updated);
     saveStoredMaterials(updated);
-    showToast('변환 본문(Markdown)이 이 기기에 다시 연결되었습니다.');
+    if (hashRecorded) {
+      showToast('변환 본문(Markdown)이 이 기기에 다시 연결되었습니다.');
+    } else {
+      showToast('본문은 연결되었지만 본문 식별 정보 저장에 실패했습니다. 다시 연결할 때 다시 확인해 주세요.');
+    }
     return true;
   };
 
@@ -887,6 +988,58 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       }
     }
     }
+
+    // localStorage keeps material metadata only; bodies live in IndexedDB.
+    // 1) Move bodies still embedded in the stored metadata into IndexedDB
+    //    (verified; the original localStorage value is preserved on failure).
+    // 2) Hydrate the in-memory metadata with bodies from IndexedDB so screens
+    //    keep working without ever writing bodies back into localStorage.
+    // 3) Demo materials whose body is nowhere locally are re-seeded from the
+    //    initial dataset (verified write; memory fallback otherwise).
+    void (async () => {
+      try {
+        const migration = await migrateStoredMaterialBodies();
+        if (!migration.ok && migration.attempted > 0) {
+          showToast(
+            '일부 자료 본문의 로컬 이관이 완료되지 않았습니다. 기존 본문은 보존되었으며 다음 실행에 다시 시도됩니다.'
+          );
+        }
+        const bodyByMaterialId = new Map<string, { markdown: string; rawText?: string; pages?: MaterialPage[] }>();
+        const stored = loadStoredMaterials();
+        const demoById = new Map(INITIAL_MATERIALS.map((m) => [m.id, m]));
+        for (const material of stored) {
+          if (material.parsedMarkdown !== undefined) continue;
+          const result = await loadMaterialContentResult(material.id);
+          if (result.status === 'found') {
+            bodyByMaterialId.set(material.id, {
+              markdown: result.content.markdown,
+              rawText: result.content.rawText,
+              pages: result.content.pages,
+            });
+            continue;
+          }
+          if (material.isDemo) {
+            const demo = demoById.get(material.id);
+            if (demo && typeof demo.parsedMarkdown === 'string') {
+              const content = { markdown: demo.parsedMarkdown, rawText: demo.rawText, pages: demo.pages };
+              bodyByMaterialId.set(material.id, content);
+              await saveMaterialContent(material.id, content);
+            }
+          }
+        }
+        if (bodyByMaterialId.size > 0) {
+          setMaterials((prev) =>
+            prev.map((m) => {
+              const body = bodyByMaterialId.get(m.id);
+              if (!body || m.parsedMarkdown !== undefined) return m;
+              return { ...m, parsedMarkdown: body.markdown, rawText: m.rawText ?? body.rawText, pages: m.pages ?? body.pages };
+            })
+          );
+        }
+      } catch {
+        // Hydration is best-effort; the metadata-only view stays usable.
+      }
+    })();
   }
 
   // Report initialization to the splash once the first data load settles.
@@ -1070,15 +1223,35 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     [activeMockSession, todayDigest]
   );
 
-  const handleRestoreMaterials = (restored: Material[]) => {
+  // Restores material metadata from a backup. The persistence is verified by
+  // reading it back; a failed metadata save is reported so the caller never
+  // shows a failed restore as success. The backup's local body identity hash
+  // is recorded only after the metadata persistence is verified.
+  const handleRestoreMaterials = async (restored: Material[]): Promise<boolean> => {
     const byId = new Map(materials.map((m) => [m.id, m]));
     for (const material of restored) {
       if (!byId.has(material.id)) byId.set(material.id, material);
+      // An explicit restore is a user-approved resurrection: clear any deletion
+      // marker so the restore is not silently filtered out.
+      clearDeletedMaterialMarker(material.id);
     }
     const updated = Array.from(byId.values());
     setMaterials(updated);
-    saveStoredMaterials(updated);
-    showToast(`백업에서 자료 ${restored.length}건의 메타데이터를 복원했습니다.`);
+    const persisted = saveStoredMaterialsVerified(updated);
+    if (persisted) {
+      for (const material of restored) {
+        if (material.bodyHash) {
+          recordMaterialBodyHash(material.id, material.bodyHash, {
+            subjectId: material.subjectId,
+            kind: material.kind,
+          });
+        }
+      }
+      showToast(`백업에서 자료 ${restored.length}건의 메타데이터를 복원했습니다.`);
+    } else {
+      showToast('복원한 자료 메타데이터 저장에 실패했습니다. 다시 시도해 주세요.');
+    }
+    return persisted;
   };
 
   const migrationBlocks: MigrationUiBlock[] = (() => {
@@ -1305,6 +1478,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       showToast(`자료 본문을 이 기기에 저장하지 못했습니다: ${bodySave.error}`);
       return false;
     }
+    if (content.markdown) {
+      recordMaterialBodyHash(newMat.id, computeMarkdownHash(content.markdown), {
+        subjectId: newMat.subjectId,
+        kind: newMat.kind,
+      });
+      clearDeletedMaterialMarker(newMat.id);
+    }
 
     // 2. Local original (IndexedDB) when a file was provided.
     let originalHash = newMat.originalHash;
@@ -1322,7 +1502,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       originalHash = savedOriginal.hash;
       fileSize = savedOriginal.size;
     }
-    const materialToStore: Material = { ...newMat, storagePolicy: policy, originalHash, fileSize };
+    const materialToStore: Material = {
+      ...newMat,
+      storagePolicy: policy,
+      originalHash,
+      fileSize,
+      bodyHash: newMat.bodyHash ?? (content.markdown ? computeMarkdownHash(content.markdown) : undefined),
+    };
+    clearDeletedMaterialMarker(newMat.id);
 
     // 3. Cloud: metadata-only unless the policy explicitly opts in.
     const uploadBody = policy.syncBody;
@@ -2772,9 +2959,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             showToast(`자료 삭제 실패: ${result.error}`);
             return;
           }
+          // Ledger the explicit deletion BEFORE any local save, so no later
+          // wholesale list save (or stale snapshot) can resurrect this material.
+          markMaterialDeleted(materialId);
           const updated = materials.filter((m) => m.id !== materialId);
           setMaterials(updated);
           saveStoredMaterials(updated);
+          removeStoredMaterialBodyHash(materialId);
           // Local body + original removal is separate from the metadata delete.
           const bodyCleanup = await deleteMaterialContent(materialId);
           const originalCleanup = await deleteMaterialOriginal(materialId);
@@ -3008,6 +3199,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }}
         onResetData={handleResetData}
         materials={materials}
+        subjects={subjects}
         onRestoreMaterials={handleRestoreMaterials}
         migrationBlocks={migrationBlocks}
       />

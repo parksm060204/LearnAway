@@ -3,6 +3,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Material, MaterialPage, Subject } from '../lib/types';
 import { loadMaterialContentResult, saveMaterialContent } from '../lib/materialStorage';
+import { recordMaterialBodyHash } from '../lib/storage';
+import { computeMarkdownHash } from '../lib/markdownUtils';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import {
   X,
@@ -132,11 +134,18 @@ export function MaterialEditorModal({
         rawText,
         pages,
       });
+      // Record the body identity ONLY after a durable save succeeded; a failed
+      // save must not leave a hash that claims a body that is not persisted.
+      if (result.persisted) {
+        recordMaterialBodyHash(material.id, computeMarkdownHash(markdown));
+      }
 
-      // 2. Update lightweight material metadata
+      // 2. Update lightweight material metadata (the body identity hash is
+      // metadata, not the body itself).
       const updatedMaterial: Material = {
         ...material,
         parsedMarkdown: markdown,
+        bodyHash: computeMarkdownHash(markdown),
         lastEditedAt: new Date().toISOString(),
         isConverted: true,
         // If it was failed, allow user manual edit to promote it to needs_review or ready

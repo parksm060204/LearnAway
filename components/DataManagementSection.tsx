@@ -2,23 +2,28 @@
 
 import React, { useRef, useState } from 'react';
 import { Database, Download, Upload, CheckCircle2, DatabaseBackup } from 'lucide-react';
-import type { Material } from '../lib/types';
+import type { Material, Subject } from '../lib/types';
 import {
-  loadMaterialContent,
+  loadMaterialContentResult,
   loadMaterialOriginal,
-  saveMaterialContent,
-  saveMaterialOriginal,
+  loadMaterialContentInScope,
+  loadMaterialOriginalInScope,
+  saveMaterialContentInScope,
+  saveMaterialOriginalInScope,
 } from '../lib/materialStorage';
 import {
-  MATERIAL_BACKUP_VERSION,
+  MATERIAL_BACKUP_LIMITS,
   backupContainsSecrets,
-  base64ToBytes,
   buildMaterialBackup,
+  findBackupLimitViolations,
+  materialBackupBlobParts,
   parseMaterialBackup,
-  planMaterialRestore,
-  type MaterialBackupEntry,
+  summarizeBackupCompleteness,
+  verifyBackupOriginalHashes,
+  type MaterialBackupFile,
 } from '../lib/materialPolicy';
-import { materialContentHash } from '../lib/cloud/hash';
+import { executeMaterialRestore } from '../lib/materialRestore';
+import { getStorageScopeId } from '../lib/storageScope';
 
 export interface MigrationUiBlock {
   key: string;
@@ -35,15 +40,18 @@ export interface MigrationUiBlock {
 interface DataManagementSectionProps {
   migrations: MigrationUiBlock[];
   materials: Material[];
-  onRestoreMaterials: (restored: Material[]) => void;
+  subjects: Subject[];
+  /** Persists restored metadata; must resolve false when the save is unverified. */
+  onRestoreMaterials: (restored: Material[]) => boolean | Promise<boolean>;
 }
 
 interface ExportResult {
   total: number;
   withFiles: number;
-  missing: Array<{ id: string; title: string }>;
+  issues: Array<{ id: string; title: string; which: 'body' | 'original'; state: 'absent' | 'error'; message?: string }>;
   complete: boolean;
   error?: string;
+  limitViolations?: Array<{ id: string | null; title: string | null; reason: string }>;
 }
 
 interface ImportResult {
@@ -51,16 +59,33 @@ interface ImportResult {
   skippedExisting: string[];
   conflicts: Array<{ id: string; title: string; reason: string }>;
   failed: Array<{ id: string; title: string; reason: string }>;
-  missing: Array<{ id: string; title: string }>;
-  error?: string;
+  missing: Array<{ id: string; title: string; which: Array<'body' | 'original'> }>;
+  aborted: boolean;
 }
 
-export function DataManagementSection({ migrations, materials, onRestoreMaterials }: DataManagementSectionProps) {
+interface PendingSubjectChoice {
+  backup: MaterialBackupFile;
+  unknownSubjectIds: string[];
+  choices: Record<string, string>;
+}
+
+const WHICH_LABELS: Record<'body' | 'original', string> = {
+  body: '본문',
+  original: '원본',
+};
+
+export function DataManagementSection({
+  migrations,
+  materials,
+  subjects,
+  onRestoreMaterials,
+}: DataManagementSectionProps) {
   const [exportBusy, setExportBusy] = useState(false);
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
   const [importBusy, setImportBusy] = useState(false);
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const [importError, setImportError] = useState('');
+  const [pendingSubjectChoice, setPendingSubjectChoice] = useState<PendingSubjectChoice | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const pendingMigrations = migrations.filter((m) => m.pending);
@@ -72,24 +97,51 @@ export function DataManagementSection({ migrations, materials, onRestoreMaterial
     try {
       const backup = await buildMaterialBackup(materials, {
         loadBody: async (id) => {
-          const result = await loadMaterialContent(id);
-          return result ? { markdown: result.markdown, rawText: result.rawText, pages: result.pages } : null;
+          const result = await loadMaterialContentResult(id);
+          if (result.status === 'found') {
+            return {
+              status: 'found' as const,
+              body: { markdown: result.content.markdown, rawText: result.content.rawText, pages: result.content.pages },
+            };
+          }
+          if (result.status === 'missing') return { status: 'missing' as const };
+          return { status: 'error' as const, error: result.error };
         },
         loadOriginal: async (id) => {
           const result = await loadMaterialOriginal(id);
-          if (result.status !== 'found') return null;
-          return {
-            contentType: result.contentType,
-            hash: result.hash,
-            data: new Uint8Array(await result.blob.arrayBuffer()),
-          };
+          if (result.status === 'found') {
+            return {
+              status: 'found' as const,
+              original: {
+                contentType: result.contentType,
+                hash: result.hash,
+                data: new Uint8Array(await result.blob.arrayBuffer()),
+              },
+            };
+          }
+          if (result.status === 'missing') return { status: 'missing' as const };
+          return { status: 'error' as const, error: result.error };
         },
       });
-      const missing = backup.materials
-        .filter((entry) => !entry.body && !entry.original)
-        .map((entry) => ({ id: entry.material.id, title: entry.material.title }));
-      const text = JSON.stringify(backup);
-      const blob = new Blob([text], { type: 'application/json' });
+      const summary = summarizeBackupCompleteness(backup);
+      // Enforce the SAME limits the import parser uses, BEFORE serializing the
+      // whole backup (a download that import would refuse is never produced,
+      // and the tab does not spend memory stringifying an oversized backup).
+      const limitViolations = findBackupLimitViolations(backup);
+      if (limitViolations.length > 0) {
+        setExportResult({
+          total: backup.materials.length,
+          withFiles: 0,
+          issues: summary.issues,
+          complete: false,
+          error: `백업 파일이 처리 가능한 크기를 초과해 내보내기를 중단했습니다. ${limitViolations.map((v) => v.reason).join(' ')}`,
+          limitViolations,
+        });
+        return;
+      }
+      // Serialize as SEPARATE parts so the download never materializes the
+      // whole file in one extra string on top of the built entries.
+      const blob = new Blob(materialBackupBlobParts(backup), { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -101,15 +153,15 @@ export function DataManagementSection({ migrations, materials, onRestoreMaterial
       URL.revokeObjectURL(url);
       setExportResult({
         total: backup.materials.length,
-        withFiles: backup.materials.length - missing.length,
-        missing,
-        complete: missing.length === 0,
+        withFiles: backup.materials.length - summary.materialsWithIssues,
+        issues: summary.issues,
+        complete: summary.complete,
       });
     } catch (error) {
       setExportResult({
         total: 0,
         withFiles: 0,
-        missing: [],
+        issues: [],
         complete: false,
         error: error instanceof Error ? error.message : '백업 내보내기에 실패했습니다.',
       });
@@ -118,71 +170,35 @@ export function DataManagementSection({ migrations, materials, onRestoreMaterial
     }
   };
 
-  const executeRestore = async (entries: MaterialBackupEntry[]): Promise<void> => {
-    const existing: Array<{ id: string; localBodyHash: string | null; localOriginalHash: string | null }> = [];
-    for (const entry of entries) {
-      let localBodyHash: string | null = null;
-      let localOriginalHash: string | null = null;
-      try {
-        const body = await loadMaterialContent(entry.material.id);
-        if (body) localBodyHash = materialContentHash({ markdown: body.markdown, rawText: body.rawText, pages: body.pages });
-      } catch {
-        localBodyHash = null;
-      }
-      try {
-        const original = await loadMaterialOriginal(entry.material.id);
-        if (original.status === 'found') localOriginalHash = original.hash;
-      } catch {
-        localOriginalHash = null;
-      }
-      existing.push({ id: entry.material.id, localBodyHash, localOriginalHash });
-    }
-
-    const plan = planMaterialRestore(entries, existing);
-    const restored: string[] = [];
-    const failed: Array<{ id: string; title: string; reason: string }> = [];
-    const addedMetadata: Material[] = [];
-
-    for (const id of plan.toRestore) {
-      const entry = entries.find((e) => e.material.id === id);
-      if (!entry) continue;
-      try {
-        if (entry.body) {
-          const savedBody = await saveMaterialContent(id, {
-            markdown: entry.body.markdown,
-            rawText: entry.body.rawText,
-            pages: entry.body.pages,
-          });
-          if (!savedBody.persisted) throw new Error(savedBody.error);
-          const verifyBody = await loadMaterialContent(id);
-          if (!verifyBody || materialContentHash({ markdown: verifyBody.markdown, rawText: verifyBody.rawText, pages: verifyBody.pages }) !== materialContentHash(entry.body)) {
-            throw new Error('본문 읽기 검증에 실패했습니다.');
-          }
-        }
-        if (entry.original) {
-          const bytes = base64ToBytes(entry.original.base64);
-          const blob = new Blob([bytes], { type: entry.original.contentType || 'application/pdf' });
-          const savedOriginal = await saveMaterialOriginal(id, blob, entry.original.contentType || 'application/pdf');
-          if (!savedOriginal.persisted) throw new Error(savedOriginal.error);
-          const verifyOriginal = await loadMaterialOriginal(id);
-          if (verifyOriginal.status !== 'found' || verifyOriginal.hash !== entry.original.hash) {
-            throw new Error('원본 읽기 검증에 실패했습니다.');
-          }
-        }
-        restored.push(id);
-        if (!materials.some((m) => m.id === id)) addedMetadata.push(entry.material);
-      } catch (error) {
-        failed.push({ id, title: entry.material.title, reason: error instanceof Error ? error.message : '복원에 실패했습니다.' });
-      }
-    }
-
-    if (addedMetadata.length > 0) onRestoreMaterials(addedMetadata);
+  const runRestore = async (backup: MaterialBackupFile, subjectOverride?: Record<string, string>) => {
+    // Pin the storage scope for the whole run: every read, write and
+    // verification goes to the account the restore started in, even if the
+    // global account changes mid-flight. The scope check below then stops
+    // starting NEW writes after a switch, and the metadata callback refuses to
+    // touch another account's records or UI.
+    const pinnedScopeId = getStorageScopeId();
+    const outcome = await executeMaterialRestore(backup.materials, {
+      getMaterials: () => materials,
+      loadBodyResult: (id) => loadMaterialContentInScope(pinnedScopeId, id, { skipMemoryCache: true }),
+      loadOriginalResult: (id) => loadMaterialOriginalInScope(pinnedScopeId, id),
+      saveBody: (id, content) => saveMaterialContentInScope(pinnedScopeId, id, content),
+      saveOriginal: (id, blob, contentType, knownHash) =>
+        saveMaterialOriginalInScope(pinnedScopeId, id, blob, contentType, knownHash),
+      persistMetadata: async (added) => {
+        if (getStorageScopeId() !== pinnedScopeId) return false;
+        return onRestoreMaterials(added);
+      },
+      getScopeId: () => getStorageScopeId(),
+      knownSubjectIds: subjects.map((s) => s.id),
+      subjectOverride,
+    });
     setImportResult({
-      restored,
-      skippedExisting: plan.alreadyPresent,
-      conflicts: plan.conflicts,
-      failed,
-      missing: plan.missingFiles,
+      restored: outcome.restored,
+      skippedExisting: outcome.skippedExisting,
+      conflicts: outcome.conflicts,
+      failed: outcome.failed,
+      missing: outcome.missing,
+      aborted: outcome.aborted,
     });
   };
 
@@ -191,21 +207,58 @@ export function DataManagementSection({ migrations, materials, onRestoreMaterial
     setImportBusy(true);
     setImportError('');
     setImportResult(null);
+    setPendingSubjectChoice(null);
     try {
+      if (file.size > MATERIAL_BACKUP_LIMITS.fileBytes) {
+        setImportError('백업 파일이 처리 가능한 크기를 초과했습니다.');
+        return;
+      }
       const parsed = parseMaterialBackup(await file.text());
       if (!parsed.ok) {
         setImportError(parsed.error);
         return;
       }
-      if (parsed.backup.version !== MATERIAL_BACKUP_VERSION) {
-        setImportError(`지원하지 않는 백업 버전입니다 (지원: v${MATERIAL_BACKUP_VERSION}, 파일: v${parsed.backup.version}).`);
-        return;
-      }
       if (backupContainsSecrets(parsed.backup)) {
-        setImportError('백업에 인증 정보가 포함되어 있어 가져오기를 중단했습니다.');
+        setImportError('백업에 인증 정보로 보이는 필드가 포함되어 있어 가져오기를 중단했습니다.');
         return;
       }
-      await executeRestore(parsed.backup.materials);
+      const hashes = await verifyBackupOriginalHashes(parsed.backup);
+      if (!hashes.ok) {
+        setImportError(
+          `원본 해시가 일치하지 않아 가져오기를 중단했습니다: ${hashes.mismatched.map((m) => m.title).join(', ')}`
+        );
+        return;
+      }
+      const unknownSubjectIds = Array.from(
+        new Set(parsed.backup.materials.map((entry) => entry.material.subjectId))
+      ).filter((subjectId) => !subjects.some((s) => s.id === subjectId));
+      if (unknownSubjectIds.length > 0) {
+        if (subjects.length === 0) {
+          setImportError('복원 대상 과목이 없습니다. 먼저 과목을 만든 뒤 가져오기를 다시 시도해 주세요.');
+          return;
+        }
+        setPendingSubjectChoice({
+          backup: parsed.backup,
+          unknownSubjectIds,
+          choices: Object.fromEntries(unknownSubjectIds.map((id) => [id, subjects[0].id])),
+        });
+        return;
+      }
+      await runRestore(parsed.backup);
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : '백업을 가져오지 못했습니다.');
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const confirmSubjectChoice = async () => {
+    if (!pendingSubjectChoice || importBusy) return;
+    setImportBusy(true);
+    setImportError('');
+    try {
+      await runRestore(pendingSubjectChoice.backup, pendingSubjectChoice.choices);
+      setPendingSubjectChoice(null);
     } catch (error) {
       setImportError(error instanceof Error ? error.message : '백업을 가져오지 못했습니다.');
     } finally {
@@ -307,10 +360,23 @@ export function DataManagementSection({ migrations, materials, onRestoreMaterial
                     ? `백업 완료: ${exportResult.withFiles}/${exportResult.total}건 (파일 포함)`
                     : `부분 백업: ${exportResult.withFiles}/${exportResult.total}건에 파일 포함 — 완전한 백업이 아닙니다`}
               </p>
-              {exportResult.missing.length > 0 && (
+              {exportResult.limitViolations && exportResult.limitViolations.length > 0 && (
                 <ul className="list-disc pl-4 space-y-0.5">
-                  {exportResult.missing.map((m) => (
-                    <li key={m.id}>파일 없음: {m.title} ({m.id})</li>
+                  {exportResult.limitViolations.map((violation, index) => (
+                    <li key={`${violation.id ?? 'backup'}-${index}`}>
+                      {violation.title ? `${violation.title} (${violation.id})` : '백업 전체'} — {violation.reason}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {exportResult.issues.length > 0 && (
+                <ul className="list-disc pl-4 space-y-0.5">
+                  {exportResult.issues.map((issue) => (
+                    <li key={`${issue.id}-${issue.which}`}>
+                      {issue.which === 'body' ? '본문' : '원본'}{' '}
+                      {issue.state === 'error' ? '읽기 실패' : '없음'}: {issue.title} ({issue.id})
+                      {issue.message ? ` — ${issue.message}` : ''}
+                    </li>
                   ))}
                 </ul>
               )}
@@ -323,12 +389,62 @@ export function DataManagementSection({ migrations, materials, onRestoreMaterial
             </p>
           )}
 
+          {pendingSubjectChoice && (
+            <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-xs text-[11px] space-y-2" role="group" aria-label="복원 대상 과목 선택">
+              <p className="font-semibold text-amber-900">
+                백업의 일부 과목이 이 계정에 없습니다. 해당 자료를 복원할 과목을 선택해 주세요.
+              </p>
+              {pendingSubjectChoice.unknownSubjectIds.map((subjectId) => (
+                <div key={subjectId} className="flex flex-col gap-1">
+                  <label htmlFor={`restore-subject-${subjectId}`} className="font-semibold text-[#191817]">
+                    백업 과목 ID: {subjectId}
+                  </label>
+                  <select
+                    id={`restore-subject-${subjectId}`}
+                    value={pendingSubjectChoice.choices[subjectId] ?? subjects[0]?.id ?? ''}
+                    onChange={(e) =>
+                      setPendingSubjectChoice((prev) =>
+                        prev ? { ...prev, choices: { ...prev.choices, [subjectId]: e.target.value } } : prev
+                      )
+                    }
+                    className="w-full p-1.5 border border-[#ded6c8] rounded-xs bg-white text-[#191817]"
+                  >
+                    {subjects.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name} ({s.code})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={confirmSubjectChoice}
+                  disabled={importBusy}
+                  className="px-3 py-1.5 bg-[#191817] text-white font-bold rounded-xs hover:bg-[#33302b] transition-colors disabled:opacity-60"
+                >
+                  {importBusy ? '복원 중...' : '선택 완료 후 복원'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPendingSubjectChoice(null)}
+                  disabled={importBusy}
+                  className="px-3 py-1.5 border border-[#c8c2b5] bg-white text-[#57544e] rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
+                >
+                  취소
+                </button>
+              </div>
+            </div>
+          )}
+
           {importResult && (
             <div className="p-2.5 bg-[#faf8f4] border border-[#ded6c8] rounded-xs text-[11px] space-y-1" role="status">
               <p className="font-semibold text-[#191817]">
                 복원 {importResult.restored.length}건 · 기존 유지 {importResult.skippedExisting.length}건
                 {importResult.conflicts.length > 0 && ` · 충돌 ${importResult.conflicts.length}건(건너뜀)`}
                 {importResult.failed.length > 0 && ` · 실패 ${importResult.failed.length}건`}
+                {importResult.aborted && ' · 계정 변경으로 중단됨'}
               </p>
               {importResult.conflicts.length > 0 && (
                 <ul className="list-disc pl-4 space-y-0.5 text-amber-900">
@@ -347,9 +463,14 @@ export function DataManagementSection({ migrations, materials, onRestoreMaterial
               {importResult.missing.length > 0 && (
                 <ul className="list-disc pl-4 space-y-0.5 text-[#57544e]">
                   {importResult.missing.map((m) => (
-                    <li key={m.id}>파일 없음(메타데이터만): {m.title}</li>
+                    <li key={m.id}>
+                      파일 연결 필요: {m.title} ({m.which.map((w) => WHICH_LABELS[w]).join('·')})
+                    </li>
                   ))}
                 </ul>
+              )}
+              {importResult.failed.length > 0 && (
+                <p className="text-[#57544e]">같은 백업 파일로 다시 가져오면 성공한 항목은 건너뛰고 남은 항목만 이어서 복원합니다.</p>
               )}
             </div>
           )}
