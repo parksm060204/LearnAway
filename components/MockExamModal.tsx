@@ -143,6 +143,18 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
     setSession(next);
   };
 
+  // Persists an unsaved snapshot to the device FIRST, so a closed tab or a late
+  // server response can never lose what the user typed. Returns whether the
+  // device actually stored it.
+  const persistPending = (target: MockExamSession, baseVersion: number): boolean => {
+    if (!userId) return true;
+    const ok = savePendingExamAnswers(userId, target, baseVersion);
+    if (!ok) {
+      setSyncNotice('미저장 답안을 이 기기에 보존하지 못했습니다. 창을 닫지 말고 다시 시도해 주세요.');
+    }
+    return ok;
+  };
+
   const runAutosave = (target: MockExamSession, token: number) => {
     if (token !== opTokenRef.current) return Promise.resolve();
     setSaveState('saving');
@@ -165,14 +177,16 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
           }
         }
       } else if (result.code === 'stale' || result.code === 'locked') {
-        if (userId) savePendingExamAnswers(userId, target, serverVersionRef.current);
+        // Preserve the LATEST input, never the older request's snapshot.
+        persistPending(sessionRef.current ?? target, serverVersionRef.current);
         setPendingAvailable(true);
         setSyncBlocked(true);
         setSaveState('conflict');
       } else if (result.code === 'not_configured') {
         setSaveState('idle');
       } else {
-        if (userId) savePendingExamAnswers(userId, target, serverVersionRef.current);
+        // Preserve the LATEST input, never the older request's snapshot.
+        persistPending(sessionRef.current ?? target, serverVersionRef.current);
         setPendingAvailable(true);
         setSaveState('error');
         setSaveMessage('서버 자동 저장에 실패했습니다. 답안은 이 기기에 보존되며 다시 시도할 수 있습니다.');
@@ -226,6 +240,8 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
     setSession(updated);
     const token = opTokenRef.current;
     if (updated.status === 'in_progress' && !syncBlocked) {
+      // Preserve the edit BEFORE scheduling the debounced server save.
+      persistPending(updated, serverVersionRef.current);
       scheduleAutosave(updated);
     } else if (updated.status === 'graded' || updated.status === 'recorded') {
       enqueue(() => runGrading(updated, updated.status === 'recorded' ? 'recorded' : 'graded', token));
@@ -267,6 +283,10 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
           if (!previous || previous.status !== 'in_progress') return previous;
           const submitted = expireMockExam(previous, tick);
           saveMockExam(submitted);
+          // Preserve the submitted answers so a failed/expired submit is not lost.
+          if (userId && !savePendingExamAnswers(userId, submitted, serverVersionRef.current)) {
+            setSyncNotice('미저장 답안을 이 기기에 보존하지 못했습니다. 창을 닫지 말고 다시 시도해 주세요.');
+          }
           const token = opTokenRef.current;
           enqueue(async () => {
             if (token !== opTokenRef.current) return;
@@ -276,9 +296,13 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
               serverVersionRef.current = result.version;
               setSaveState('saved');
             } else if (result.code === 'stale' || result.code === 'locked') {
+              if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
+              setPendingAvailable(true);
               setSyncBlocked(true);
               setSaveState('conflict');
             } else if (result.code !== 'not_configured') {
+              if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
+              setPendingAvailable(true);
               setSaveState('error');
               setSaveMessage('제출을 서버에 저장하지 못했습니다. 다시 시도해 주세요.');
             }
@@ -288,7 +312,7 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
       }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [isOpen, session?.status, session?.endsAt]);
+  }, [isOpen, session?.status, session?.endsAt, userId]);
 
   // On open (or session change) reconcile with the server. The server snapshot
   // (answers + version + status + evaluations) is applied as ONE unit. Local
@@ -496,6 +520,8 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
       : { ...checked, status: 'submitted' as const, submittedAt: new Date().toISOString() };
     saveMockExam(submitted);
     setSession(submitted);
+    // Preserve the submitted answers before the request so a failure/close is safe.
+    persistPending(submitted, serverVersionRef.current);
     // Cancel any debounced autosave, then enqueue submit AFTER in-flight saves
     // (the chain is FIFO) so the latest answers are what gets submitted.
     flushAutosaveTimer();
@@ -520,14 +546,14 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
           }
         }
       } else if (result.code === 'stale' || result.code === 'locked') {
-        if (userId) savePendingExamAnswers(userId, submitted, serverVersionRef.current);
+        persistPending(sessionRef.current ?? submitted, serverVersionRef.current);
         setPendingAvailable(true);
         setSyncBlocked(true);
         setSaveState('conflict');
       } else if (result.code === 'not_configured') {
         setSaveState('idle');
       } else {
-        if (userId) savePendingExamAnswers(userId, submitted, serverVersionRef.current);
+        persistPending(sessionRef.current ?? submitted, serverVersionRef.current);
         setPendingAvailable(true);
         setSaveState('error');
         setSaveMessage('제출을 서버에 저장하지 못했습니다. 로컬에 보존되며 다시 시도할 수 있습니다.');

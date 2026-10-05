@@ -71,6 +71,10 @@ export function materialBaseUpsert(
   | 'is_demo'
   | 'uploaded_at'
   | 'last_edited_at'
+  | 'sync_body'
+  | 'backup_original'
+  | 'original_hash'
+  | 'file_size'
 > {
   return {
     id: material.id,
@@ -90,6 +94,11 @@ export function materialBaseUpsert(
     is_demo: material.isDemo ?? false,
     uploaded_at: material.uploadedAt,
     last_edited_at: material.lastEditedAt ?? null,
+    // Legacy materials (no explicit policy) keep the previous behaviour.
+    sync_body: material.storagePolicy?.syncBody ?? true,
+    backup_original: material.storagePolicy?.backupOriginal ?? true,
+    original_hash: material.originalHash ?? null,
+    file_size: material.fileSize ?? null,
   };
 }
 
@@ -115,6 +124,12 @@ export function rowToMaterial(row: MaterialRow, content?: CloudMaterialContent):
     speakers: row.speakers ?? undefined,
     hasAiConcepts: row.has_ai_concepts,
     hasAiProblems: row.has_ai_problems,
+    storagePolicy: {
+      syncBody: row.sync_body ?? true,
+      backupOriginal: row.backup_original ?? true,
+    },
+    originalHash: row.original_hash ?? undefined,
+    fileSize: row.file_size ?? undefined,
   };
 }
 

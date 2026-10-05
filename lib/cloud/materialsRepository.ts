@@ -1,7 +1,7 @@
 'use client';
 
 import { createClient } from '../supabase/client';
-import type { Material, MaterialKind } from '../types';
+import type { Material, MaterialKind, MaterialStoragePolicy } from '../types';
 import { materialContentHash } from './hash';
 import { materialBaseUpsert, materialObjectPaths } from './mappers';
 import type { CloudMaterialContent, MaterialRow, RepoResult } from './types';
@@ -180,6 +180,77 @@ export interface MaterialWriteInput {
   content: CloudMaterialContent;
   original?: { blob: Blob; contentType: string } | null;
   jobId?: string;
+  /** Defaults to the legacy behaviour (sync body + back up original). */
+  policy?: MaterialStoragePolicy;
+}
+
+const LEGACY_WRITE_POLICY: MaterialStoragePolicy = { syncBody: true, backupOriginal: true };
+
+export interface MaterialMetadataInput {
+  material: Material;
+  bodySynced?: boolean;
+  originalBackedUp?: boolean;
+}
+
+/**
+ * Metadata-only cloud write for a local-first material: stores the learning
+ * link (id/owner/subject/title/kind/hashes/policy) WITHOUT uploading the body or
+ * the original. Never touches an existing row's paths, version or sync state.
+ */
+export async function writeMaterialMetadata(
+  input: MaterialMetadataInput
+): Promise<RepoResult<MaterialRow>> {
+  try {
+    const supabase = createClient();
+    const userId = await getCurrentUserId(supabase);
+    if (!userId) return repoError('로그인이 필요합니다.');
+
+    const base = materialBaseUpsert(input.material);
+    const existingResult = await supabase
+      .from('materials')
+      .select('*')
+      .eq('id', input.material.id)
+      .maybeSingle();
+    if (existingResult.error) return repoError(existingResult.error.message);
+    const existing = (existingResult.data as MaterialRow | null) ?? null;
+
+    if (!existing) {
+      const inserted = await supabase
+        .from('materials')
+        .upsert(
+          {
+            ...base,
+            version: 0,
+            upload_state: 'ready',
+            upload_error: null,
+            content_hash: null,
+            body_synced: input.bodySynced ?? false,
+            original_backed_up: input.originalBackedUp ?? false,
+            original_path: null,
+            markdown_path: null,
+            pages_path: null,
+            transcript_path: null,
+          },
+          { onConflict: 'id,user_id' }
+        )
+        .select('*')
+        .single();
+      if (inserted.error) return repoError(inserted.error.message);
+      return repoOk(inserted.data as MaterialRow);
+    }
+
+    // Metadata-only update: never touch version, paths or sync state.
+    const updated = await supabase
+      .from('materials')
+      .update(base)
+      .eq('id', input.material.id)
+      .select('*')
+      .single();
+    if (updated.error) return repoError(updated.error.message);
+    return repoOk(updated.data as MaterialRow);
+  } catch (error) {
+    return repoError(toMessage(error, '자료 메타데이터를 저장하지 못했습니다.'));
+  }
 }
 
 export interface MaterialWriteResult {
@@ -212,6 +283,9 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
 
     const { material, content } = input;
     const kind = material.kind as MaterialKind;
+    const policy = input.policy ?? LEGACY_WRITE_POLICY;
+    const syncBody = policy.syncBody;
+    const backupOriginal = policy.backupOriginal;
 
     const existingResult = await supabase
       .from('materials')
@@ -234,10 +308,12 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
 
     const paths = materialObjectPaths(userId, material.id, jobId, kind);
     const contentHash = materialContentHash(content);
-    const pagesProvided = content.pages !== undefined;
-    // Never lose an existing original when no replacement file is provided.
+    // Only upload what the policy allows; anything not selected is never sent.
+    const pagesProvided = syncBody && content.pages !== undefined;
+    const shouldUploadOriginal = Boolean(input.original) && backupOriginal;
+    // Never lose an existing original when it is not being replaced/disabled.
     const pendingOriginalPath = input.original
-      ? paths.original
+      ? (backupOriginal ? paths.original : existing?.original_path ?? existing?.pending_original_path ?? null)
       : existing?.original_path ?? existing?.pending_original_path ?? null;
 
     const pending = {
@@ -247,9 +323,9 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
       pending_upload_error: null,
       pending_content_hash: null,
       pending_original_path: pendingOriginalPath,
-      pending_markdown_path: paths.markdown,
+      pending_markdown_path: syncBody ? paths.markdown : null,
       pending_pages_path: pagesProvided ? paths.pages : null,
-      pending_transcript_path: content.rawText ? paths.transcript : null,
+      pending_transcript_path: syncBody && content.rawText ? paths.transcript : null,
     };
 
     if (!existing) {
@@ -305,44 +381,46 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
       return repoError(message);
     };
 
-    const mdUpload = await uploadText(supabase, paths.markdown, content.markdown ?? '', 'text/markdown');
-    if (!mdUpload.ok) return fail(mdUpload.error);
-    if (content.rawText) {
-      const trUpload = await uploadText(supabase, paths.transcript, content.rawText, 'text/plain');
-      if (!trUpload.ok) return fail(trUpload.error);
+    if (syncBody) {
+      const mdUpload = await uploadText(supabase, paths.markdown, content.markdown ?? '', 'text/markdown');
+      if (!mdUpload.ok) return fail(mdUpload.error);
+      if (content.rawText) {
+        const trUpload = await uploadText(supabase, paths.transcript, content.rawText, 'text/plain');
+        if (!trUpload.ok) return fail(trUpload.error);
+      }
+      if (pagesProvided) {
+        // An empty array is stored (not dropped) so read-back and hash agree.
+        const pgUpload = await uploadText(
+          supabase,
+          paths.pages,
+          JSON.stringify(content.pages ?? []),
+          'application/json'
+        );
+        if (!pgUpload.ok) return fail(pgUpload.error);
+      }
+
+      // Verify bodies by downloading them back and recomputing the hash.
+      const verifyRow = {
+        ...(existing ?? {}),
+        id: material.id,
+        markdown_path: paths.markdown,
+        pages_path: pagesProvided ? paths.pages : null,
+        transcript_path: content.rawText ? paths.transcript : null,
+      } as MaterialRow;
+      const verify = await downloadMaterialContent(verifyRow);
+      if (!verify.ok) return fail(`본문 검증 실패: ${verify.error}`);
+      if (materialContentHash(verify.data) !== contentHash) {
+        return fail('저장된 본문이 원본과 일치하지 않습니다.');
+      }
     }
-    if (pagesProvided) {
-      // An empty array is stored (not dropped) so read-back and hash agree.
-      const pgUpload = await uploadText(
-        supabase,
-        paths.pages,
-        JSON.stringify(content.pages ?? []),
-        'application/json'
-      );
-      if (!pgUpload.ok) return fail(pgUpload.error);
-    }
-    if (input.original) {
+    if (shouldUploadOriginal) {
       const ogUpload = await uploadBlob(
         supabase,
         paths.original,
-        input.original.blob,
-        input.original.contentType
+        input.original!.blob,
+        input.original!.contentType
       );
       if (!ogUpload.ok) return fail(ogUpload.error);
-    }
-
-    // Verify bodies by downloading them back and recomputing the hash.
-    const verifyRow = {
-      ...(existing ?? {}),
-      id: material.id,
-      markdown_path: paths.markdown,
-      pages_path: pagesProvided ? paths.pages : null,
-      transcript_path: content.rawText ? paths.transcript : null,
-    } as MaterialRow;
-    const verify = await downloadMaterialContent(verifyRow);
-    if (!verify.ok) return fail(`본문 검증 실패: ${verify.error}`);
-    if (materialContentHash(verify.data) !== contentHash) {
-      return fail('저장된 본문이 원본과 일치하지 않습니다.');
     }
 
     // Activate only if this job still owns the pending slot AND the active
@@ -355,9 +433,12 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
         upload_error: null,
         content_hash: contentHash,
         original_path: pendingOriginalPath,
-        markdown_path: paths.markdown,
-        pages_path: pagesProvided ? paths.pages : null,
-        transcript_path: content.rawText ? paths.transcript : null,
+        // Preserve an existing cloud body when it is not being re-synced.
+        markdown_path: syncBody ? paths.markdown : existing?.markdown_path ?? null,
+        pages_path: pagesProvided ? paths.pages : existing?.pages_path ?? null,
+        transcript_path: syncBody && content.rawText ? paths.transcript : existing?.transcript_path ?? null,
+        body_synced: syncBody || Boolean(existing?.markdown_path),
+        original_backed_up: Boolean(pendingOriginalPath),
         // Cloud upload completion is separate from conversion status.
         status: material.status,
         is_converted: material.isConverted ?? material.status === 'ready',

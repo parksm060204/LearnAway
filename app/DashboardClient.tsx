@@ -149,14 +149,19 @@ import { calculateDDay, toSeoulDateString, addDaysToDate } from '../lib/dateUtil
 import {
   clearAllMaterialContent,
   deleteMaterialContent,
+  deleteMaterialOriginal,
+  loadMaterialContent,
   saveMaterialContent,
+  saveMaterialOriginal,
 } from '../lib/materialStorage';
+import { loadDefaultMaterialPolicy } from '../lib/materialPolicy';
 import { loadCloudLibrary } from '../lib/cloud/library';
 import { upsertSubject } from '../lib/cloud/subjectsRepository';
 import {
   createMaterialSignedUrl,
   deleteMaterial,
   writeMaterial,
+  writeMaterialMetadata,
 } from '../lib/cloud/materialsRepository';
 import {
   getCloudMigrationState,
@@ -1114,42 +1119,89 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     showToast('과목 시험 정보가 성공적으로 갱신되었습니다.');
   };
 
-  // Material Add Handler — uploads original + body to Storage and metadata to DB.
-  // Returns true only after the server confirms, so the upload modal can keep
-  // the form open on failure.
+  // Material Add Handler — LOCAL-FIRST by default.
+  //  1. body -> IndexedDB, original -> IndexedDB (verified)
+  //  2. cloud metadata-only, unless the policy opts into body sync / original backup
+  // Returns true only after the local saves AND the cloud metadata write succeed.
   const handleAddMaterial = async (
     newMat: Material,
     originalFile?: File,
     jobId?: string
   ): Promise<boolean> => {
+    const policy = newMat.storagePolicy ?? loadDefaultMaterialPolicy();
     const content = {
       markdown: newMat.parsedMarkdown ?? '',
       rawText: newMat.rawText,
       pages: newMat.pages,
     };
-    const result = await writeMaterial({
-      material: newMat,
-      content,
-      original: originalFile
-        ? { blob: originalFile, contentType: originalFile.type || 'application/pdf' }
-        : null,
-      jobId,
-    });
-    if (!result.ok) {
-      showToast(`자료 서버 저장 실패: ${result.error}`);
+
+    // 1. Local body (IndexedDB) — a core part of the local-first policy.
+    const bodySave = await saveMaterialContent(newMat.id, content);
+    if (!bodySave.persisted) {
+      showToast(`자료 본문을 이 기기에 저장하지 못했습니다: ${bodySave.error}`);
       return false;
     }
-    const updated = [newMat, ...materials];
+
+    // 2. Local original (IndexedDB) when a file was provided.
+    let originalHash = newMat.originalHash;
+    let fileSize = newMat.fileSize;
+    if (originalFile) {
+      const savedOriginal = await saveMaterialOriginal(
+        newMat.id,
+        originalFile,
+        originalFile.type || 'application/pdf'
+      );
+      if (!savedOriginal.persisted) {
+        showToast(`원본 파일을 이 기기에 저장하지 못했습니다: ${savedOriginal.error}`);
+        return false;
+      }
+      originalHash = savedOriginal.hash;
+      fileSize = savedOriginal.size;
+    }
+    const materialToStore: Material = { ...newMat, storagePolicy: policy, originalHash, fileSize };
+
+    // 3. Cloud: metadata-only unless the policy explicitly opts in.
+    const uploadBody = policy.syncBody;
+    const uploadOriginal = policy.backupOriginal && Boolean(originalFile);
+    const result = uploadBody || uploadOriginal
+      ? await writeMaterial({
+          material: materialToStore,
+          content,
+          original: uploadOriginal
+            ? { blob: originalFile as File, contentType: originalFile!.type || 'application/pdf' }
+            : null,
+          jobId,
+          policy,
+        })
+      : await writeMaterialMetadata({ material: materialToStore, bodySynced: false, originalBackedUp: false });
+    if (!result.ok) {
+      showToast(`자료 서버 등록 실패: ${result.error}`);
+      return false;
+    }
+
+    const updated = [materialToStore, ...materials];
     setMaterials(updated);
     saveStoredMaterials(updated);
-    showToast(`자료 [${newMat.title}]가 서버에 등록되었습니다.`);
+    showToast(
+      uploadBody || uploadOriginal
+        ? `자료 [${newMat.title}]가 이 기기와 서버에 저장되었습니다.`
+        : `자료 [${newMat.title}]가 이 기기에 저장되었습니다. (서버에는 연결 메타데이터만 저장)`
+    );
     return true;
   };
 
   // Stage 2: AI Concept Analysis Handler
   const handleTriggerAiAnalysis = async (targetMaterial: Material) => {
-    if (!targetMaterial.parsedMarkdown || !targetMaterial.parsedMarkdown.trim()) {
-      showToast('검토 및 저장된 Markdown 내용이 없습니다. 먼저 자료를 저장해주세요.');
+    // Hydrate the body from this device's IndexedDB when the local cache lacks it
+    // (e.g. metadata-only on another device). Missing content = reconnect needed,
+    // never corruption.
+    let markdown = targetMaterial.parsedMarkdown;
+    if (!markdown || !markdown.trim()) {
+      const loaded = await loadMaterialContent(targetMaterial.id);
+      markdown = loaded?.markdown;
+    }
+    if (!markdown || !markdown.trim()) {
+      showToast('이 기기에 자료 본문이 없습니다. 자료 화면에서 파일을 다시 연결해 주세요.');
       return;
     }
     if (targetMaterial.status !== 'ready') {
@@ -1168,7 +1220,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           materialId: targetMaterial.id,
           subjectId: targetMaterial.subjectId,
           domain: activeSubject?.domain || 'mathematics',
-          markdown: targetMaterial.parsedMarkdown,
+          markdown,
           sourceRefs: targetMaterial.sourceRefs || [],
           materialTitle: targetMaterial.title,
         }),
@@ -2670,11 +2722,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           const updated = materials.filter((m) => m.id !== materialId);
           setMaterials(updated);
           saveStoredMaterials(updated);
-          const localCleanup = await deleteMaterialContent(materialId);
+          // Local body + original removal is separate from the metadata delete.
+          const bodyCleanup = await deleteMaterialContent(materialId);
+          const originalCleanup = await deleteMaterialOriginal(materialId);
+          const localCleanupOk = bodyCleanup.deleted && originalCleanup.deleted;
           showToast(
-            localCleanup.deleted
-              ? '자료와 저장된 본문이 삭제되었습니다.'
-              : `서버에서는 삭제됐지만 브라우저 캐시 정리에 실패했습니다. (${localCleanup.error || '알 수 없는 오류'})`
+            localCleanupOk
+              ? '자료와 이 기기에 저장된 본문·원본이 삭제되었습니다.'
+              : `서버에서는 삭제됐지만 이 기기 파일 정리에 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '알 수 없는 오류'})`
           );
         }}
         onOpenConceptReview={(mat) => {

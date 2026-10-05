@@ -40,8 +40,9 @@ export interface MaterialDeleteResult {
 }
 
 const LEGACY_DB_NAME = 'redcall_materials_db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'material_contents';
+const ORIGINAL_STORE_NAME = 'material_originals';
 
 // In-memory cache for fast synchronous access and environments without IndexedDB.
 // Keys are namespaced by scope so two accounts never share a cached body.
@@ -76,6 +77,9 @@ function openDBByName(dbName: string): Promise<IDBDatabase | null> {
         const db = (event.target as IDBOpenDBRequest).result;
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           db.createObjectStore(STORE_NAME, { keyPath: 'materialId' });
+        }
+        if (!db.objectStoreNames.contains(ORIGINAL_STORE_NAME)) {
+          db.createObjectStore(ORIGINAL_STORE_NAME, { keyPath: 'materialId' });
         }
       };
 
@@ -388,6 +392,23 @@ export function isMaterialImportVerified(result: MaterialImportResult): boolean 
   return result.verified && result.failed === 0 && !result.error;
 }
 
+/** Ids of material bodies stored locally in the current scope (presence only). */
+export async function listMaterialContentIds(): Promise<string[] | null> {
+  if (!isIndexedDBAvailable()) return [];
+  const db = await openDB();
+  if (!db) return null;
+  return new Promise<string[] | null>((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const req = tx.objectStore(STORE_NAME).getAllKeys();
+      req.onsuccess = () => resolve((req.result as IDBValidKey[]).map(String));
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 /** Raw list of material ids in a scope, used to verify an import. */
 export async function listMaterialIdsInScope(scopeId: string): Promise<string[] | null> {
   const dbName = scopeId === 'shared' ? LEGACY_DB_NAME : `${LEGACY_DB_NAME}_${scopeId}`;
@@ -666,4 +687,219 @@ export async function clearAllMaterialContent(): Promise<MaterialDeleteResult> {
  */
 export function getCachedMaterialContent(materialId: string): MaterialContent | null {
   return memoryCache.get(cacheKey(materialId)) || null;
+}
+
+// ---------------------------------------------------------------------------
+// Local originals (PDF / source files) — local-first, IndexedDB only.
+// Stored as ArrayBuffer (portable + structured-cloneable) and re-verified on
+// read-back. A failed persist is NEVER reported as success.
+// ---------------------------------------------------------------------------
+
+export interface MaterialOriginalRecord {
+  materialId: string;
+  data: ArrayBuffer;
+  contentType: string;
+  size: number;
+  hash: string;
+  updatedAt: string;
+}
+
+export type OriginalSaveResult =
+  | { persisted: true; storage: 'indexeddb'; hash: string; size: number; updatedAt: string }
+  | { persisted: false; storage: 'none'; hash: string; size: number; updatedAt: string; error: string };
+
+export type OriginalLoadResult =
+  | { status: 'found'; storage: 'indexeddb'; blob: Blob; contentType: string; hash: string; size: number; updatedAt: string }
+  | { status: 'missing' }
+  | { status: 'error'; error: string };
+
+/** SHA-256 of a Blob (hex, prefixed) with a byte-level FNV fallback. */
+export async function hashBlob(blob: Blob): Promise<string> {
+  let buffer: ArrayBuffer;
+  try {
+    buffer = await blob.arrayBuffer();
+  } catch {
+    return `oh_unreadable_l${blob.size}`;
+  }
+  if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.digest === 'function') {
+    try {
+      const digest = await crypto.subtle.digest('SHA-256', buffer);
+      return 'oh_' + Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+      // fall through to FNV
+    }
+  }
+  const bytes = new Uint8Array(buffer);
+  let h = 2166136261;
+  for (let i = 0; i < bytes.length; i += 1) {
+    h ^= bytes[i];
+    h = Math.imul(h, 16777619);
+  }
+  return `oh_${(h >>> 0).toString(16).padStart(8, '0')}_l${bytes.length}`;
+}
+
+type OriginalRead =
+  | { status: 'found'; record: MaterialOriginalRecord }
+  | { status: 'missing' }
+  | { status: 'error' };
+
+function readOriginal(db: IDBDatabase, materialId: string): Promise<OriginalRead> {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(ORIGINAL_STORE_NAME, 'readonly');
+      const req = tx.objectStore(ORIGINAL_STORE_NAME).get(materialId);
+      req.onsuccess = () => {
+        const result = req.result as MaterialOriginalRecord | undefined;
+        resolve(result ? { status: 'found', record: result } : { status: 'missing' });
+      };
+      req.onerror = () => resolve({ status: 'error' });
+    } catch {
+      resolve({ status: 'error' });
+    }
+  });
+}
+
+function writeOriginal(db: IDBDatabase, record: MaterialOriginalRecord): Promise<'ok' | 'error' | 'abort'> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: 'ok' | 'error' | 'abort') => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    try {
+      const tx = db.transaction(ORIGINAL_STORE_NAME, 'readwrite');
+      tx.oncomplete = () => finish('ok');
+      tx.onerror = () => finish('error');
+      tx.onabort = () => finish('abort');
+      tx.objectStore(ORIGINAL_STORE_NAME).put(record);
+    } catch {
+      finish('error');
+    }
+  });
+}
+
+/** Persists a local original and verifies it by reading it back. */
+export async function saveMaterialOriginal(
+  materialId: string,
+  blob: Blob,
+  contentType: string,
+  knownHash?: string
+): Promise<OriginalSaveResult> {
+  const updatedAt = new Date().toISOString();
+  let data: ArrayBuffer;
+  try {
+    data = await blob.arrayBuffer();
+  } catch {
+    return { persisted: false, storage: 'none', hash: knownHash ?? '', size: blob.size, updatedAt, error: '원본 파일을 읽지 못했습니다.' };
+  }
+  const hash = knownHash || (await hashBlob(blob));
+  const record: MaterialOriginalRecord = { materialId, data, contentType, size: data.byteLength, hash, updatedAt };
+
+  const db = await openDB();
+  if (!db) {
+    return { persisted: false, storage: 'none', hash, size: record.size, updatedAt, error: '브라우저 IndexedDB를 사용할 수 없어 원본을 이 기기에 보관하지 못했습니다.' };
+  }
+  const write = await writeOriginal(db, record);
+  if (write !== 'ok') {
+    return { persisted: false, storage: 'none', hash, size: record.size, updatedAt, error: write === 'abort' ? '원본 저장 트랜잭션이 중단되었습니다.' : '원본 저장에 실패했습니다.' };
+  }
+  const verify = await readOriginal(db, materialId);
+  if (verify.status !== 'found' || verify.record.hash !== hash || verify.record.size !== record.size) {
+    return { persisted: false, storage: 'none', hash, size: record.size, updatedAt, error: '원본 저장을 검증하지 못했습니다.' };
+  }
+  return { persisted: true, storage: 'indexeddb', hash, size: record.size, updatedAt };
+}
+
+export async function loadMaterialOriginal(materialId: string): Promise<OriginalLoadResult> {
+  if (!isIndexedDBAvailable()) return { status: 'missing' };
+  const db = await openDB();
+  if (!db) return { status: 'error', error: 'IndexedDB를 열 수 없습니다.' };
+  const result = await readOriginal(db, materialId);
+  if (result.status === 'missing') return { status: 'missing' };
+  if (result.status === 'error') return { status: 'error', error: 'IndexedDB 읽기에 실패했습니다.' };
+  const record = result.record;
+  return {
+    status: 'found',
+    storage: 'indexeddb',
+    blob: new Blob([record.data], { type: record.contentType }),
+    contentType: record.contentType,
+    hash: record.hash,
+    size: record.size,
+    updatedAt: record.updatedAt,
+  };
+}
+
+export async function deleteMaterialOriginal(materialId: string): Promise<MaterialDeleteResult> {
+  if (!isIndexedDBAvailable()) return { deleted: true, storage: 'none' };
+  const db = await openDB();
+  if (!db) return { deleted: false, storage: 'none', error: 'IndexedDB를 열 수 없습니다.' };
+  return new Promise<MaterialDeleteResult>((resolve) => {
+    let settled = false;
+    const finish = (result: MaterialDeleteResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    try {
+      const tx = db.transaction(ORIGINAL_STORE_NAME, 'readwrite');
+      tx.oncomplete = () => finish({ deleted: true, storage: 'indexeddb' });
+      tx.onerror = () => finish({ deleted: false, storage: 'none', error: tx.error?.message });
+      tx.objectStore(ORIGINAL_STORE_NAME).delete(materialId);
+    } catch (err) {
+      finish({ deleted: false, storage: 'none', error: err instanceof Error ? err.message : '원본 삭제 중 오류가 발생했습니다.' });
+    }
+  });
+}
+
+/** Ids of originals stored locally (current scope), for reconnect/backup. */
+export async function listMaterialOriginalIds(): Promise<string[] | null> {
+  if (!isIndexedDBAvailable()) return [];
+  const db = await openDB();
+  if (!db) return null;
+  return new Promise<string[] | null>((resolve) => {
+    try {
+      const tx = db.transaction(ORIGINAL_STORE_NAME, 'readonly');
+      const req = tx.objectStore(ORIGINAL_STORE_NAME).getAllKeys();
+      req.onsuccess = () => resolve((req.result as IDBValidKey[]).map(String));
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Storage usage + persistence
+// ---------------------------------------------------------------------------
+
+export interface LocalStorageEstimate {
+  supported: boolean;
+  usage?: number;
+  quota?: number;
+}
+
+export async function estimateLocalStorageUsage(): Promise<LocalStorageEstimate> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.estimate) {
+      const { usage, quota } = await navigator.storage.estimate();
+      return { supported: true, usage, quota };
+    }
+  } catch {
+    // ignore
+  }
+  return { supported: false };
+}
+
+/** Requests persistent storage when supported; the result is never guaranteed. */
+export async function requestPersistentStorage(): Promise<'granted' | 'denied' | 'unsupported'> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.persist) {
+      const granted = await navigator.storage.persist();
+      return granted ? 'granted' : 'denied';
+    }
+  } catch {
+    // ignore
+  }
+  return 'unsupported';
 }

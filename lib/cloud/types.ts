@@ -41,6 +41,13 @@ export interface MaterialRow {
   upload_error: string | null;
   version: number;
   content_hash: string | null;
+  // Storage policy + actual sync state (see migration 9).
+  sync_body: boolean;
+  backup_original: boolean;
+  body_synced: boolean;
+  original_backed_up: boolean;
+  original_hash: string | null;
+  file_size: number | null;
   original_path: string | null;
   markdown_path: string | null;
   pages_path: string | null;

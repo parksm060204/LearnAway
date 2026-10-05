@@ -1,7 +1,9 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Material, Subject } from '../lib/types';
+import { listMaterialContentIds, listMaterialOriginalIds } from '../lib/materialStorage';
+import { deriveMaterialStorageState } from '../lib/materialPolicy';
 import {
   X,
   Plus,
@@ -51,6 +53,24 @@ export function MaterialsListModal({
   isAnalyzing = false,
 }: MaterialsListModalProps) {
   const [filterKind, setFilterKind] = useState<'all' | 'pdf' | 'transcript' | 'user' | 'demo'>('all');
+  const [bodyIds, setBodyIds] = useState<Set<string>>(new Set());
+  const [originalIds, setOriginalIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void Promise.all([listMaterialContentIds(), listMaterialOriginalIds()]).then(([bodies, originals]) => {
+        if (cancelled) return;
+        setBodyIds(new Set(bodies ?? []));
+        setOriginalIds(new Set(originals ?? []));
+      });
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [isOpen, materials]);
 
   if (!isOpen) return null;
 
@@ -188,6 +208,12 @@ export function MaterialsListModal({
               {filteredMaterials.map((mat) => {
                 const matDrafts = drafts.filter((d) => d.materialId === mat.id);
                 const approvedDrafts = matDrafts.filter((d) => d.isApproved).length;
+                const storageState = deriveMaterialStorageState({
+                  material: mat,
+                  hasLocalBody: bodyIds.has(mat.id),
+                  hasLocalOriginal: originalIds.has(mat.id),
+                  bodySynced: Boolean(mat.storagePolicy?.syncBody && mat.parsedMarkdown) || Boolean(!mat.storagePolicy && mat.parsedMarkdown),
+                });
 
                 return (
                   <div
@@ -275,6 +301,19 @@ export function MaterialsListModal({
                             })}
                           </span>
                         </div>
+
+                        {storageState.labels.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1">
+                            {storageState.labels.map((label) => (
+                              <span
+                                key={label}
+                                className="text-[10px] font-academic-mono text-[#57544e] bg-white border border-[#ded6c8] px-1.5 py-0.5 rounded"
+                              >
+                                {label}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -289,7 +328,7 @@ export function MaterialsListModal({
                           <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
                           <span>개념 초안 ({matDrafts.length}건)</span>
                         </button>
-                      ) : mat.isConverted && mat.parsedMarkdown ? (
+                      ) : mat.isConverted ? (
                         <button
                           onClick={() => onTriggerAnalysis && onTriggerAnalysis(mat)}
                           disabled={isAnalyzing}

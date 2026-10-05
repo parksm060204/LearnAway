@@ -5,6 +5,7 @@ import { RetentionModelSettings } from '../lib/types';
 import { DEFAULT_RETENTION_SETTINGS } from '../lib/retentionModel';
 import { X, Settings, RotateCcw, Check, Info } from 'lucide-react';
 import { AiConnectionSection } from './AiConnectionSection';
+import { MaterialPolicySection } from './MaterialPolicySection';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -175,8 +176,9 @@ export function SettingsModal({
         </form>
 
         {/* My AI API connection */}
-        <div className="px-5 pb-5">
+        <div className="px-5 pb-5 space-y-4">
           <AiConnectionSection />
+          <MaterialPolicySection />
         </div>
       </div>
     </div>

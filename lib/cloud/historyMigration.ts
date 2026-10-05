@@ -216,26 +216,66 @@ function deserializeOrigin(raw: StoredOrigin): MigrationSnapshot {
   };
 }
 
+export type OriginResult =
+  | { ok: true; snapshot: MigrationSnapshot }
+  | { ok: false; error: string };
+
 /**
  * Returns the FIRST captured snapshot and preserves it across retries. A retry
  * verifies the original originals, NOT whatever the live cache currently holds
  * (which the server sync may have replaced in the meantime).
+ *
+ * The capture is only usable after it has been WRITTEN and READ BACK. A read,
+ * write, parse or shape failure is reported so the caller aborts instead of
+ * uploading, and a corrupted origin is never silently replaced by the cache.
  */
-function readOrigin(storage: Storage, userId: string): MigrationSnapshot {
+function readOrigin(storage: Storage, userId: string): OriginResult {
   const key = userBaseKey(userId, ORIGIN_BASE);
+
+  let raw: string | null = null;
   try {
-    const raw = storage.getItem(key);
-    if (raw) return deserializeOrigin(JSON.parse(raw) as StoredOrigin);
+    raw = storage.getItem(key);
   } catch {
-    // corrupted origin -> capture a fresh one below
+    return { ok: false, error: '원본 스냅샷 저장소를 읽을 수 없습니다.' };
   }
+
+  if (raw !== null) {
+    let parsed: StoredOrigin;
+    try {
+      parsed = JSON.parse(raw) as StoredOrigin;
+    } catch {
+      return { ok: false, error: '보존된 원본 스냅샷이 손상되었습니다. 현재 캐시로 자동 교체하지 않습니다.' };
+    }
+    if (
+      !parsed ||
+      !Array.isArray(parsed.attempts) ||
+      !Array.isArray(parsed.events) ||
+      !Array.isArray(parsed.planItems) ||
+      !Array.isArray(parsed.mockExams)
+    ) {
+      return { ok: false, error: '보존된 원본 스냅샷 형식이 올바르지 않습니다.' };
+    }
+    return { ok: true, snapshot: deserializeOrigin(parsed) };
+  }
+
+  // First attempt: capture, write, then verify the write BEFORE uploading.
   const fresh = readLocal(userId);
+  const serialized = JSON.stringify(serializeOrigin(fresh));
   try {
-    storage.setItem(key, JSON.stringify(serializeOrigin(fresh)));
+    storage.setItem(key, serialized);
   } catch {
-    // best effort; the in-memory snapshot is still used for this run
+    return { ok: false, error: '원본 스냅샷을 저장하지 못했습니다. 이관을 시작하지 않습니다.' };
   }
-  return fresh;
+  let verify: string | null = null;
+  try {
+    verify = storage.getItem(key);
+  } catch {
+    verify = null;
+  }
+  if (verify !== serialized) {
+    return { ok: false, error: '원본 스냅샷 저장을 검증하지 못했습니다. 이관을 시작하지 않습니다.' };
+  }
+  return { ok: true, snapshot: fresh };
 }
 
 type PageResult<T> = { ok: true; data: T[] } | { ok: false; error: string };
@@ -285,6 +325,170 @@ function timeMs(value?: string): number | string {
   return Number.isFinite(parsed) ? parsed : value;
 }
 
+/** Deterministic serialization with sorted object keys (independent of order). */
+function stableStringify(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+}
+
+/**
+ * Recursively normalizes ISO-looking timestamps to epoch ms so `Z` and `+00:00`
+ * representations compare equal, while real content differences are preserved.
+ */
+function normalizeDeep(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return /^\d{4}-\d{2}-\d{2}T/.test(value) ? timeMs(value) : value;
+  }
+  if (Array.isArray(value)) return value.map(normalizeDeep);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = normalizeDeep(entry);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Order-independent, timestamp-normalized content signature. */
+function contentSignature(value: unknown): string {
+  return stableStringify(normalizeDeep(value));
+}
+
+/**
+ * Immutable COMPLETION IDENTITY of a plan item: subject/concept/problem/round
+ * only. `kind` is presentation metadata and may legitimately change without
+ * losing the completion linkage, so it is intentionally NOT part of identity.
+ */
+function planImmutableSignature(p: StudyPlanItem): string {
+  return JSON.stringify([p.subjectId, p.round ?? null, p.conceptId ?? null, p.problemId ?? null]);
+}
+
+/**
+ * Frozen mock-exam definition: subject/scope plus the ORDERED problem snapshot
+ * (id, version, prompt, model answer, rubric). A difference here means the exam
+ * definition changed and must not be treated as "server newer".
+ */
+function mockImmutableSignature(s: MockExamSession): string {
+  return contentSignature({
+    subjectId: s.subjectId,
+    durationMinutes: s.durationMinutes,
+    createdAt: s.createdAt,
+    endsAt: s.endsAt,
+    selectedConceptIds: sorted(s.selectedConceptIds),
+    selectedTypes: sorted(s.selectedTypes),
+    problems: (s.problems ?? []).map((p) => ({
+      id: p.id,
+      version: p.version ?? 1,
+      type: p.type,
+      title: p.title,
+      promptText: p.promptText,
+      modelAnswer: p.modelAnswer,
+      rubric: p.rubric,
+    })),
+  });
+}
+
+/**
+ * Attempt content: the full immutable record (answer, snapshots, rubric result,
+ * evaluation). Same id with any difference is a real conflict, not a pass.
+ */
+function attemptSignature(a: Attempt): string {
+  return contentSignature({
+    subjectId: a.subjectId,
+    conceptId: a.conceptId,
+    conceptIds: sorted(a.conceptIds),
+    problemId: a.problemId,
+    problemVersion: a.problemVersion ?? 1,
+    at: a.at,
+    answer: a.answer,
+    confidence: a.confidence,
+    errorType: a.errorType,
+    hintCount: a.hintCount,
+    reasoningNotes: a.reasoningNotes,
+    calculatedScore: a.calculatedScore,
+    rubricResults: a.rubricResults,
+    evaluatorFeedback: a.evaluatorFeedback,
+    strengths: a.strengths,
+    criticalImprovements: a.criticalImprovements,
+    staticAnalysisNotice: a.staticAnalysisNotice,
+    needsReview: a.needsReview,
+    isAiEvaluated: a.isAiEvaluated,
+    problemTitleSnapshot: a.problemTitleSnapshot,
+    problemPromptSnapshot: a.problemPromptSnapshot,
+    modelAnswerSnapshot: a.modelAnswerSnapshot,
+    rubricSnapshot: a.rubricSnapshot,
+    mockExamSessionId: a.mockExamSessionId,
+    planItemId: a.planItemId,
+    attemptOrigin: a.attemptOrigin ?? 'independent',
+    solvingReason: a.solvingReason,
+    isReasonNotApplicable: a.isReasonNotApplicable,
+    reasonNotApplicableJustification: a.reasonNotApplicableJustification,
+    methodSelectionDiagnosis: a.methodSelectionDiagnosis,
+    logicSessionId: a.logicSessionId,
+    sourceAttemptId: a.sourceAttemptId,
+  });
+}
+
+/** ReviewEvent meaningful fields + linkage. */
+function eventSignature(e: ReviewEvent): string {
+  return contentSignature({
+    conceptId: e.conceptId,
+    attemptId: e.attemptId,
+    kind: e.kind,
+    at: e.at,
+    resultScore: e.resultScore,
+    confidence: e.confidence,
+    errorType: e.errorType,
+    hintCount: e.hintCount,
+    notes: e.notes,
+    title: e.title,
+    sourceRef: e.sourceRef,
+    evaluationSummary: e.evaluationSummary,
+    rubricScores: e.rubricScores,
+    strengths: e.strengths,
+    criticalImprovements: e.criticalImprovements,
+    needsReview: e.needsReview,
+  });
+}
+
+/** Mutable plan content used to detect that the server copy is newer. */
+function planSignature(p: StudyPlanItem): string {
+  return JSON.stringify([p.status, p.assignedDate, p.completedAttemptId ?? null]);
+}
+
+/** Mutable mock-exam results (answers / evaluations / recorded linkage). */
+function mockResultsSignature(s: MockExamSession): string {
+  return contentSignature({
+    status: s.status,
+    answers: s.answers,
+    evaluations: s.evaluations,
+    recordedAttemptIds: sorted(s.recordedAttemptIds),
+    submittedAt: s.submittedAt,
+    reasons: s.reasons,
+    isReasonNotApplicable: s.isReasonNotApplicable,
+    reasonNotApplicableJustification: s.reasonNotApplicableJustification,
+  });
+}
+
+/** Local graded/recorded results that are missing from the server copy. */
+function missingMockResults(local: MockExamSession, server: MockExamSession): string[] {
+  const missing: string[] = [];
+  const serverEvals = server.evaluations ?? {};
+  for (const key of Object.keys(local.evaluations ?? {})) {
+    if (!serverEvals[key]) missing.push(`eval:${key}`);
+  }
+  const recorded = new Set(server.recordedAttemptIds ?? []);
+  for (const id of local.recordedAttemptIds ?? []) {
+    if (!recorded.has(id)) missing.push(`recorded:${id}`);
+  }
+  return missing;
+}
+
 /**
  * Which copy of a same-status mutable record is newer. Falls back to
  * "server newer" (non-blocking) when timestamps are unavailable.
@@ -298,40 +502,6 @@ function contentVerdict(
   const captured = Date.parse(capturedAt);
   if (!Number.isFinite(server) || !Number.isFinite(captured)) return 'server_newer';
   return server >= captured ? 'server_newer' : 'local_newer';
-}
-
-/**
- * Immutable COMPLETION IDENTITY of a plan item: subject/concept/problem/round
- * only. `kind` is presentation metadata and may legitimately change without
- * losing the completion linkage, so it is intentionally NOT part of identity.
- */
-function planImmutableSignature(p: StudyPlanItem): string {
-  return JSON.stringify([p.subjectId, p.round ?? null, p.conceptId ?? null, p.problemId ?? null]);
-}
-function mockImmutableSignature(s: MockExamSession): string {
-  return JSON.stringify([
-    s.subjectId,
-    s.durationMinutes,
-    timeMs(s.createdAt),
-    timeMs(s.endsAt),
-    sorted(s.selectedConceptIds),
-    sorted(s.selectedTypes),
-    sorted((s.problems ?? []).map((p) => p.id)),
-  ]);
-}
-
-// Mutable content used only to detect that the server copy is newer.
-function attemptSignature(a: Attempt): string {
-  return JSON.stringify([a.subjectId, a.conceptId, a.problemId, a.problemVersion ?? 1, timeMs(a.at), a.calculatedScore]);
-}
-function eventSignature(e: ReviewEvent): string {
-  return JSON.stringify([e.conceptId, e.attemptId ?? null, e.kind, timeMs(e.at), e.resultScore]);
-}
-function planSignature(p: StudyPlanItem): string {
-  return JSON.stringify([p.status, p.assignedDate, p.completedAttemptId ?? null]);
-}
-function mockSignature(s: MockExamSession): string {
-  return JSON.stringify([s.status, s.answers ?? {}]);
 }
 
 /** Local records whose subject/concept/problem reference cannot be resolved. */
@@ -428,7 +598,12 @@ export function verifyMigratedHistory(
       conflicts.push(`mock:${m.id}:behind`);
       continue;
     }
-    if (mockSignature(s) !== mockSignature(m)) {
+    // A graded/recorded local result must not be MISSING from the server copy.
+    if (localRank >= MOCK_STATUS_RANK.graded && missingMockResults(m, s).length > 0) {
+      conflicts.push(`mock:${m.id}:results`);
+      continue;
+    }
+    if (mockResultsSignature(s) !== mockResultsSignature(m)) {
       if (contentVerdict(s.serverUpdatedAt, snapshot.capturedAt) === 'server_newer') serverNewer += 1;
       else conflicts.push(`mock:${m.id}:stale-server`);
     }
@@ -466,9 +641,15 @@ export async function migrateLocalHistoryToCloud(
     return { ok: false, partial: false, uploaded: zero, message: '완료 표시를 확인하지 못했습니다.' };
   }
 
-  // The snapshot is captured ONCE (on the first attempt) and preserved; every
-  // retry verifies that original, never a cache the server may have replaced.
-  const local = readOrigin(storage, userId);
+  // The snapshot is captured ONCE (on the first attempt), written and read back
+  // before upload; every retry verifies that original. If the origin cannot be
+  // stored or verified, abort WITHOUT uploading.
+  const originResult = readOrigin(storage, userId);
+  if (!originResult.ok) {
+    writeJob(storage, userId, { startedAt: new Date().toISOString(), steps: { origin: 'failed', upload: 'pending', verify: 'pending' }, failures: [originResult.error] });
+    return { ok: false, partial: false, uploaded: zero, message: `이관 중단: ${originResult.error}` };
+  }
+  const local = originResult.snapshot;
   const empty =
     local.attempts.length === 0 &&
     local.events.length === 0 &&

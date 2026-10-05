@@ -11,7 +11,7 @@ const load = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
-  'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts',
+  'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
   'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/aiClient.ts', 'lib/aiCredentials.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
@@ -112,6 +112,7 @@ exports.requireApiUser = async () => {
   const exams = load(path.join(output, 'lib/mockExam.js'));
   const validation = load(path.join(output, 'lib/evaluationValidation.js'));
   const matStorage = load(path.join(output, 'lib/materialStorage.js'));
+  const materialPolicy = load(path.join(output, 'lib/materialPolicy.js'));
   const problemSources = load(path.join(output, 'lib/problemSources.js'));
   const problemFreshness = load(path.join(output, 'lib/problemFreshness.js'));
   const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
@@ -873,6 +874,170 @@ exports.requireApiUser = async () => {
       matStorage.materialContentFingerprint({ markdown: '# a', pages: [] }),
       'absent pages differ from an empty page array'
     );
+  });
+
+  check('material storage policy defaults to local-first and derives labels', () => {
+    assert.deepEqual(materialPolicy.DEFAULT_MATERIAL_POLICY, { syncBody: false, backupOriginal: false });
+    assert.deepEqual(materialPolicy.materialPolicyOf({}), { syncBody: true, backupOriginal: true }, 'legacy materials keep synced behaviour');
+
+    const localKept = materialPolicy.deriveMaterialStorageState({
+      material: { storagePolicy: materialPolicy.DEFAULT_MATERIAL_POLICY },
+      hasLocalBody: true,
+      hasLocalOriginal: true,
+    });
+    assert.equal(localKept.state, 'local_kept');
+    assert.ok(localKept.labels.includes('이 기기에 보관됨'));
+
+    const needsLink = materialPolicy.deriveMaterialStorageState({
+      material: {}, hasLocalBody: false, hasLocalOriginal: false, bodySynced: false,
+    });
+    assert.equal(needsLink.needsLink, true);
+    assert.equal(needsLink.state, 'needs_link');
+    assert.ok(needsLink.labels.includes('이 기기에서 파일 연결 필요'));
+
+    const synced = materialPolicy.deriveMaterialStorageState({
+      material: {}, hasLocalBody: false, hasLocalOriginal: false, bodySynced: true, originalBackedUp: true,
+    });
+    assert.equal(synced.state, 'synced');
+    assert.ok(synced.labels.includes('본문 동기화됨'));
+    assert.ok(synced.labels.includes('원본 백업됨'));
+
+    const failed = materialPolicy.deriveMaterialStorageState({
+      material: {}, hasLocalBody: true, hasLocalOriginal: false, saveFailed: true,
+    });
+    assert.equal(failed.state, 'save_failed');
+
+    assert.equal(materialPolicy.reconnectHashMatches('h1', 'h1'), true);
+    assert.equal(materialPolicy.reconnectHashMatches('h1', 'h2'), false);
+    assert.equal(materialPolicy.reconnectHashMatches(undefined, 'h2'), false);
+  });
+
+  await checkAsync('material backup carries metadata + files without secrets and round-trips', async () => {
+    const materials = [{
+      id: 'm1', subjectId: 's1', title: 'T', kind: 'pdf', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# secret body',
+      storagePolicy: materialPolicy.DEFAULT_MATERIAL_POLICY,
+    }];
+    const backup = await materialPolicy.buildMaterialBackup(materials, {
+      loadBody: async () => ({ markdown: '# secret body' }),
+      loadOriginal: async () => ({ contentType: 'application/pdf', hash: 'h1', data: new Uint8Array([1, 2, 3]) }),
+    });
+    assert.equal(backup.materials.length, 1);
+    assert.equal(backup.materials[0].material.parsedMarkdown, undefined, 'metadata copy strips the body');
+    assert.equal(backup.materials[0].body.markdown, '# secret body');
+    assert.ok(backup.materials[0].original.base64);
+    assert.equal(materialPolicy.backupContainsSecrets(backup), false, 'backup never carries credentials');
+
+    const parsed = materialPolicy.parseMaterialBackup(JSON.stringify(backup));
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) {
+      const restored = materialPolicy.base64ToBytes(parsed.backup.materials[0].original.base64);
+      assert.deepEqual(Array.from(restored), [1, 2, 3]);
+    }
+    assert.equal(materialPolicy.parseMaterialBackup('{bad json').ok, false);
+    assert.equal(materialPolicy.parseMaterialBackup(JSON.stringify({ hello: 'world' })).ok, false);
+  });
+
+  await checkAsync('a local original is stored, verified, reconnected by hash and deleted', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'orig-user' });
+      const blob = new Blob([new Uint8Array([1, 2, 3, 4, 5])], { type: 'application/pdf' });
+      const hash = await matStorage.hashBlob(blob);
+      assert.ok(hash.startsWith('oh_'));
+
+      const saved = await matStorage.saveMaterialOriginal('m-1', blob, 'application/pdf');
+      assert.equal(saved.persisted, true, saved.persisted ? '' : saved.error);
+      assert.equal(saved.hash, hash);
+
+      const loaded = await matStorage.loadMaterialOriginal('m-1');
+      assert.equal(loaded.status, 'found');
+      assert.equal(loaded.hash, hash);
+      assert.equal(loaded.size, 5);
+      assert.equal(materialPolicy.reconnectHashMatches(hash, loaded.hash), true);
+
+      const ids = await matStorage.listMaterialOriginalIds();
+      assert.ok(ids.includes('m-1'));
+
+      const deleted = await matStorage.deleteMaterialOriginal('m-1');
+      assert.equal(deleted.deleted, true);
+      assert.equal((await matStorage.loadMaterialOriginal('m-1')).status, 'missing');
+    });
+  });
+
+  await checkAsync('a failed local original save is never reported as success', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'orig-fail' });
+      fake.__failure.put.add('m-fail');
+      const blob = new Blob([new Uint8Array([9, 9, 9])], { type: 'application/pdf' });
+      const saved = await matStorage.saveMaterialOriginal('m-fail', blob, 'application/pdf');
+      assert.equal(saved.persisted, false);
+      assert.ok(saved.error);
+    });
+  });
+
+  await checkAsync('metadata-only writes are local-first and never touch existing cloud files', async () => {
+    const baseMaterial = {
+      id: 'mat-1', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+      storagePolicy: { syncBody: false, backupOriginal: false },
+    };
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const result = await cloudMaterials.writeMaterialMetadata({ material: baseMaterial, bodySynced: false, originalBackedUp: false });
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      const row = client.__state.materials.find((m) => m.id === 'mat-1');
+      assert.equal(row.sync_body, false);
+      assert.equal(row.backup_original, false);
+      assert.equal(row.body_synced, false);
+      assert.equal(row.original_backed_up, false);
+      assert.equal(row.markdown_path, null);
+      assert.equal(row.original_path, null);
+      assert.equal(client.__state.objects.size, 0, 'no Storage upload for local-first metadata');
+    });
+
+    const existingRow = {
+      id: 'mat-2', user_id: 'u1', subject_id: 's1', kind: 'pdf', title: 'T', source_refs: '', status: 'ready',
+      status_message: null, is_converted: true, upload_state: 'ready', upload_error: null, version: 3,
+      content_hash: 'h', body_synced: true, original_backed_up: true, original_hash: null, file_size: null,
+      original_path: 'u1/mat-2/v3/original.pdf', markdown_path: 'u1/mat-2/v3/markdown.md', pages_path: null,
+      transcript_path: null, page_count: null, duration_minutes: null, speaker_count: null, speakers: [],
+      has_ai_concepts: false, has_ai_problems: false, is_demo: false, uploaded_at: '2026-01-01T00:00:00.000Z',
+      last_edited_at: null, pending_job_id: null, pending_version: null, pending_upload_state: null,
+      pending_upload_error: null, pending_content_hash: null, pending_original_path: null, pending_markdown_path: null,
+      pending_pages_path: null, pending_transcript_path: null, sync_body: false, backup_original: false,
+      created_at: '', updated_at: '',
+    };
+    await withFakeSupabase({ user: { id: 'u1' }, materials: [existingRow] }, async (client) => {
+      const result = await cloudMaterials.writeMaterialMetadata({ material: { ...baseMaterial, id: 'mat-2', title: 'renamed' } });
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      const row = client.__state.materials.find((m) => m.id === 'mat-2');
+      assert.equal(row.version, 3, 'version unchanged by metadata write');
+      assert.equal(row.markdown_path, 'u1/mat-2/v3/markdown.md', 'existing cloud body preserved');
+      assert.equal(row.body_synced, true, 'sync state preserved');
+      assert.equal(row.title, 'renamed');
+    });
+  });
+
+  await checkAsync('policy-off write uploads neither body nor original', async () => {
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const material = {
+        id: 'mat-off', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+        isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+        storagePolicy: { syncBody: false, backupOriginal: false },
+      };
+      const blob = new Blob(['pdf-bytes'], { type: 'application/pdf' });
+      const result = await cloudMaterials.writeMaterial({
+        material,
+        content: { markdown: '# body' },
+        original: { blob, contentType: 'application/pdf' },
+        policy: { syncBody: false, backupOriginal: false },
+      });
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      assert.equal(client.__state.objects.size, 0, 'no Storage upload when both policies are off');
+      const row = client.__state.materials.find((m) => m.id === 'mat-off');
+      assert.equal(row.body_synced, false);
+      assert.equal(row.original_backed_up, false);
+      assert.equal(row.version, 1);
+    });
   });
 
   check('cloud content hash ignores updatedAt and detects different bodies', () => {
@@ -3856,6 +4021,46 @@ exports.requireApiUser = async () => {
     assert.equal(tzEquivalent.conflicts.length, 0, 'Z vs +00:00 timestamps compare equal');
   });
 
+  check('migration deep comparison rejects answer, version, rubric and evaluation differences', () => {
+    const attempt = {
+      id: 'a1', subjectId: 's1', conceptId: 'c1', problemId: 'p1', problemVersion: 1,
+      at: '2026-01-01T00:00:00.000Z', answer: 'A', calculatedScore: 80,
+      problemPromptSnapshot: 'Q', modelAnswerSnapshot: 'M',
+      rubricSnapshot: [{ criterionId: 'r1', label: 'L', maxScore: 100 }],
+      rubricResults: [{ criterionId: 'r1', score: 80, evidenceQuote: 'A' }],
+      strengths: 'S', criticalImprovements: 'C', needsReview: false, isAiEvaluated: true,
+      methodSelectionDiagnosis: { summary: 'ok' },
+    };
+    const event = { id: 'e1', conceptId: 'c1', attemptId: 'a1', kind: 'attempt', at: '2026-01-01T00:00:00.000Z', resultScore: 80, notes: 'N', sourceRef: 'S', rubricScores: [{ criterionId: 'r1', score: 80 }] };
+    const problem = { id: 'p1', type: 'essay_descriptive', title: 'T', promptText: 'Q', modelAnswer: 'M', rubric: [{ id: 'r1', maxScore: 100 }], version: 1 };
+    const mock = { id: 'mk1', subjectId: 's1', durationMinutes: 60, createdAt: '2026-01-01T00:00:00.000Z', endsAt: '2026-01-01T01:00:00.000Z', selectedConceptIds: ['c1'], selectedTypes: ['essay_descriptive'], problems: [problem], answers: { p1: 'x' }, evaluations: {}, status: 'in_progress' };
+    const snapshot = {
+      attempts: [attempt], events: [{ event, subjectId: 's1' }], planItems: [], mockExams: [mock],
+      subjectIds: new Set(['s1']), conceptIds: new Set(['c1']), problemIds: new Set(['p1']),
+      capturedAt: '2026-02-01T00:00:00.000Z',
+    };
+    const server = () => ({
+      attempts: [{ ...attempt }], events: [{ ...event }], planItems: [], mockExams: [{ ...mock, problems: [{ ...problem }] }],
+    });
+
+    const clean = historyMigration.verifyMigratedHistory(snapshot, server());
+    assert.equal(clean.conflicts.length, 0, 'identical deep content passes');
+    assert.equal(clean.missing.attempts + clean.missing.events + clean.missing.mockExams, 0);
+
+    assert.equal(historyMigration.verifyMigratedHistory({ ...snapshot, attempts: [{ ...attempt, answer: 'B' }] }, server()).conflicts.length, 1, 'answer change conflicts');
+    assert.equal(historyMigration.verifyMigratedHistory({ ...snapshot, attempts: [{ ...attempt, problemVersion: 2 }] }, server()).conflicts.length, 1, 'problem version change conflicts');
+    assert.equal(historyMigration.verifyMigratedHistory({ ...snapshot, attempts: [{ ...attempt, rubricSnapshot: [{ criterionId: 'r1', label: 'L', maxScore: 90 }] }] }, server()).conflicts.length, 1, 'rubric change conflicts');
+    assert.equal(historyMigration.verifyMigratedHistory({ ...snapshot, attempts: [{ ...attempt, rubricResults: [{ criterionId: 'r1', score: 10 }] }] }, server()).conflicts.length, 1, 'evaluation result change conflicts');
+    assert.equal(historyMigration.verifyMigratedHistory({ ...snapshot, events: [{ event: { ...event, notes: 'CHANGED' }, subjectId: 's1' }] }, server()).conflicts.length, 1, 'review event change conflicts');
+
+    const mockServerVersion = { ...server(), mockExams: [{ ...mock, problems: [{ ...problem, version: 2 }] }] };
+    assert.ok(historyMigration.verifyMigratedHistory(snapshot, mockServerVersion).conflicts.includes('mock:mk1:immutable'), 'mock problem version change conflicts');
+
+    const gradedSnapshot = { ...snapshot, mockExams: [{ ...mock, status: 'graded', evaluations: { p1: { calculatedScore: 80 } } }] };
+    const gradedServer = { ...server(), mockExams: [{ ...mock, status: 'graded', evaluations: {} }] };
+    assert.ok(historyMigration.verifyMigratedHistory(gradedSnapshot, gradedServer).conflicts.includes('mock:mk1:results'), 'missing server evaluation conflicts');
+  });
+
   await checkAsync('migration reads every page', async () => {
     const total = 1500;
     let calls = 0;
@@ -3949,6 +4154,62 @@ exports.requireApiUser = async () => {
       assert.equal(client.__state.attempts.length, 1);
       assert.equal(client.__state.attempts[0].id, 'a1', 'origin id migrated, not the changed cache');
       assert.equal(client.__state.attempts[0].calculated_score, 70, 'origin content migrated');
+    });
+  });
+
+  await checkAsync('migration aborts when the origin snapshot cannot be saved', async () => {
+    const userId = 'mig-origin-savefail';
+    const b64 = encodeURIComponent(userId);
+    const originKey = 'redcall_user_' + b64 + '__history_migration_origin_v1';
+    localStorage.removeItem('redcall_user_' + b64 + '__history_migration_v1');
+    localStorage.removeItem(originKey);
+    localStorage.removeItem('redcall_user_' + b64 + '__history_migration_job_v1');
+    storageScope.setStorageScope({ kind: 'user', userId });
+    storage.saveStoredSubjects([{ id: 's1', name: 'S', code: '', timezone: 'Asia/Seoul' }]);
+    storage.saveStoredConcepts([{ id: 'c1', subjectId: 's1', title: 'C', events: [] }]);
+    storage.saveStoredProblems([{ id: 'p1', subjectId: 's1', conceptIds: ['c1'], title: 'P' }]);
+    storage.saveStoredAttempts([{ id: 'a1', subjectId: 's1', conceptId: 'c1', problemId: 'p1', at: '2026-01-01T00:00:00.000Z', answer: 'x', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '' }]);
+    storage.saveStoredStudyPlanItems([]);
+    storageScope.setStorageScope({ kind: 'legacy' });
+
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = (key, value) => {
+      if (key === originKey) throw new Error('simulated origin write failure');
+      realSetItem(key, value);
+    };
+    try {
+      await withFakeSupabase({ user: { id: 'user-a' } }, async (client) => {
+        const result = await historyMigration.migrateLocalHistoryToCloud(userId, client);
+        assert.equal(result.ok, false);
+        assert.match(result.message, /원본 스냅샷/);
+        assert.equal((client.__state.attempts ?? []).length, 0, 'upload must not start without a saved/verified origin');
+      });
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+  });
+
+  await checkAsync('migration does not recapture a corrupted origin', async () => {
+    const userId = 'mig-origin-corrupt';
+    const b64 = encodeURIComponent(userId);
+    const originKey = 'redcall_user_' + b64 + '__history_migration_origin_v1';
+    localStorage.removeItem('redcall_user_' + b64 + '__history_migration_v1');
+    localStorage.removeItem('redcall_user_' + b64 + '__history_migration_job_v1');
+    storageScope.setStorageScope({ kind: 'user', userId });
+    storage.saveStoredSubjects([{ id: 's1', name: 'S', code: '', timezone: 'Asia/Seoul' }]);
+    storage.saveStoredConcepts([{ id: 'c1', subjectId: 's1', title: 'C', events: [] }]);
+    storage.saveStoredProblems([{ id: 'p1', subjectId: 's1', conceptIds: ['c1'], title: 'P' }]);
+    storage.saveStoredAttempts([{ id: 'a1', subjectId: 's1', conceptId: 'c1', problemId: 'p1', at: '2026-01-01T00:00:00.000Z', answer: 'x', confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 70, rubricResults: [], evaluatorFeedback: '' }]);
+    storage.saveStoredStudyPlanItems([]);
+    storageScope.setStorageScope({ kind: 'legacy' });
+
+    localStorage.setItem(originKey, '{not valid json');
+    await withFakeSupabase({ user: { id: 'user-a' } }, async (client) => {
+      const result = await historyMigration.migrateLocalHistoryToCloud(userId, client);
+      assert.equal(result.ok, false);
+      assert.match(result.message, /손상/);
+      assert.equal(localStorage.getItem(originKey), '{not valid json', 'corrupted origin is not replaced by the live cache');
+      assert.equal((client.__state.attempts ?? []).length, 0, 'no upload with a corrupted origin');
     });
   });
 

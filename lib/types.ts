@@ -85,6 +85,18 @@ export interface Material {
   speakers?: string[];
   hasAiConcepts?: boolean; // AI 개념 추출 완료 여부 (false면 'AI 개념 미추출')
   hasAiProblems?: boolean; // AI 문제 생성 완료 여부 (false면 'AI 문제 미생성')
+  // Local-first storage policy + identity. Missing policy on a legacy material
+  // means "keep the existing behaviour" (treated as already synced).
+  storagePolicy?: MaterialStoragePolicy;
+  originalHash?: string; // hash of the original file (identity / reconnect)
+  fileSize?: number;     // original file size in bytes
+}
+
+export interface MaterialStoragePolicy {
+  /** Upload the converted body (markdown/rawText/pages) to Cloud Storage. */
+  syncBody: boolean;
+  /** Back up the original PDF to Cloud Storage. */
+  backupOriginal: boolean;
 }
 
 export interface RubricCriterion {
