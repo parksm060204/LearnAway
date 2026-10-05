@@ -39,6 +39,7 @@ import {
   saveStoredProblemDrafts,
   updateProblemDraft,
   loadStoredAttempts,
+  saveStoredAttempts,
   loadStoredSettings,
   saveStoredSettings,
   recordAttemptAndUpdateConcept,
@@ -54,6 +55,7 @@ import {
   loadStoredStudyPlanSettings,
   saveStoredStudyPlanSettings,
   loadStoredStudyPlanItems,
+  saveStoredStudyPlanItems,
   postponeStudyPlanItem,
   skipStudyPlanItem,
   loadStoredPersonalizationSettings,
@@ -87,12 +89,27 @@ import {
   markLearningServerCache,
 } from '../lib/cloud/learningOriginals';
 import {
+  listAttempts,
+  listReviewEvents,
+  listStudyPlanItems,
+  getStudyPlanSettings,
+  listMockExamSessions,
+  submitAttempt as submitAttemptCloud,
+} from '../lib/cloud/historyRepository';
+import { mergeById as mergeHistoryById, mergeEventsIntoConcepts } from '../lib/cloud/historyMerge';
+import {
+  getHistoryMigrationState,
+  migrateLocalHistoryToCloud,
+  declineHistoryMigration,
+  HistoryMigrationState,
+} from '../lib/cloud/historyMigration';
+import {
   DEFAULT_RETENTION_SETTINGS,
   rankConceptsForReview,
 } from '../lib/retentionModel';
 import { generateStudyPlan } from '../lib/studyPlan';
 import { computeCorrectionState, getEffectiveIntervalMultiplier } from '../lib/personalization';
-import { loadMockExams } from '../lib/mockExam';
+import { loadMockExams, saveMockExam } from '../lib/mockExam';
 import {
   loadRechallengeReservations,
   saveRechallengeReservation,
@@ -164,6 +181,7 @@ import {
   LegacyImportState,
 } from '../lib/legacyImport';
 import { createClient as createBrowserSupabaseClient } from '../lib/supabase/client';
+import { isSupabaseConfigured } from '../lib/supabase/config';
 import type { AppUser } from '../lib/auth/types';
 import type { AuthChangeEvent, Session } from '@supabase/supabase-js';
 import { reportAppReady, reportAppError } from '../lib/appReadiness';
@@ -271,6 +289,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [cloudMigrationState, setCloudMigrationState] = useState<CloudMigrationState | null>(null);
   const [isMigratingCloud, setIsMigratingCloud] = useState(false);
   const [learningMigrationState, setLearningMigrationState] = useState<LearningMigrationState | null>(null);
+  const [historyMigrationState, setHistoryMigrationState] = useState<HistoryMigrationState | null>(null);
+  const [isMigratingHistory, setIsMigratingHistory] = useState(false);
   const [isMigratingLearning, setIsMigratingLearning] = useState(false);
   const [cloudOriginalPaths, setCloudOriginalPaths] = useState<Record<string, string>>({});
   // Ensures a single full-page handoff when the session changes (this tab or another).
@@ -387,6 +407,53 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         setConceptDrafts(mergedConceptDrafts);
         setProblemDrafts(mergedProblemDrafts);
 
+        // Load server learning history (attempts / review events / plans / mock exams).
+        const [serverAttempts, serverEvents, serverPlans, serverSettings, serverMock] =
+          await Promise.all([
+            listAttempts(supabase),
+            listReviewEvents(supabase),
+            listStudyPlanItems(supabase),
+            getStudyPlanSettings(supabase),
+            listMockExamSessions(supabase),
+          ]);
+        if (cancelled) return;
+        const historyError = [serverAttempts, serverEvents, serverPlans, serverMock].find((r) => !r.ok);
+        if (historyError && !historyError.ok) {
+          setCloudStatus('error');
+          setCloudError(`학습 이력을 불러오지 못했습니다. ${historyError.error}`);
+          return;
+        }
+        const conceptsWithHistory = mergeEventsIntoConcepts(
+          mergedConcepts,
+          serverEvents.ok ? serverEvents.data : [],
+          loadStoredSettings(),
+          new Date()
+        );
+        const mergedAttempts = mergeHistoryById(
+          serverAttempts.ok ? serverAttempts.data : [],
+          loadStoredAttempts()
+        );
+        const mergedPlans = mergeHistoryById(
+          serverPlans.ok ? serverPlans.data : [],
+          loadStoredStudyPlanItems()
+        );
+        const mergedMockExams = mergeHistoryById(
+          serverMock.ok ? serverMock.data : [],
+          loadMockExams()
+        );
+        setAllConcepts(conceptsWithHistory);
+        saveStoredConcepts(conceptsWithHistory);
+        setAttempts(mergedAttempts);
+        saveStoredAttempts(mergedAttempts);
+        setStudyPlanItems(mergedPlans);
+        saveStoredStudyPlanItems(mergedPlans);
+        for (const examSession of mergedMockExams) saveMockExam(examSession);
+        setMockExams(mergedMockExams);
+        if (serverSettings.ok && serverSettings.data) {
+          setStudyPlanSettings(serverSettings.data);
+          saveStoredStudyPlanSettings(serverSettings.data);
+        }
+
         // Record that the live scope now holds the server cache, so a later
         // load does not merge server records back into the migration originals.
         markServerCache(currentUser.id);
@@ -401,6 +468,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         );
         setCloudMigrationState(getCloudMigrationState(currentUser.id));
         setLearningMigrationState(getLearningMigrationState(currentUser.id));
+        setHistoryMigrationState(getHistoryMigrationState(currentUser.id));
         setCloudStatus('ready');
       })
       .catch((error) => {
@@ -616,6 +684,28 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const handleDeclineLearning = () => {
     declineLearningMigration(currentUser.id);
     setLearningMigrationState((prev) => (prev ? { ...prev, declined: true } : prev));
+  };
+
+  // One-time migration of local learning history (attempts / reviews / plans / mock exams).
+  const handleMigrateHistory = async () => {
+    if (isMigratingHistory) return;
+    setIsMigratingHistory(true);
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const result = await migrateLocalHistoryToCloud(currentUser.id, supabase);
+      showToast(result.message);
+      if (result.ok) {
+        setHistoryMigrationState((prev) => (prev ? { ...prev, imported: true } : prev));
+        reloadCloudLibrary();
+      }
+    } finally {
+      setIsMigratingHistory(false);
+    }
+  };
+
+  const handleDeclineHistory = () => {
+    declineHistoryMigration(currentUser.id);
+    setHistoryMigrationState((prev) => (prev ? { ...prev, declined: true } : prev));
   };
 
   // Original files are private: open them through a short-lived signed URL.
@@ -1496,6 +1586,29 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       setSelectedEventId(newEvent.id);
     }
 
+    // Server sync (idempotent by attempt id). Local persistence already holds
+    // the result, but a server failure is surfaced, never reported as success.
+    const syncEvent = updatedConcept?.events.find((e) => e.attemptId === attempt.id);
+    if (syncEvent && isSupabaseConfigured()) {
+      void (async () => {
+        try {
+          const supabase = createBrowserSupabaseClient();
+          const submitted = await submitAttemptCloud(
+            supabase,
+            attempt,
+            syncEvent,
+            attempt.planItemId ?? null,
+            null
+          );
+          if (!submitted.ok) {
+            showToast(`풀이는 로컬에 저장됐지만 서버 저장에 실패했습니다: ${submitted.error}`);
+          }
+        } catch (e) {
+          showToast(`풀이 서버 저장 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+        }
+      })();
+    }
+
     // A plan linkage conflict/missing target takes precedence: the record is saved
     // but the plan link must be resolved by the user (no blind retry loop).
     if (result.status === 'link_conflict' || result.status === 'target_missing' || result.status === 'retryable_failure') {
@@ -2179,6 +2292,39 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                   type="button"
                   onClick={handleDeclineLearning}
                   disabled={isMigratingLearning}
+                  className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
+                >
+                  나중에
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+      {historyMigrationState &&
+        historyMigrationState.hasLocalData &&
+        !historyMigrationState.imported &&
+        !historyMigrationState.declined && (
+          <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
+            <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+              <div className="text-xs text-[#57544e] leading-relaxed">
+                <span className="font-bold text-[#191817]">로컬 풀이·복습·계획·모의시험 이력을 클라우드로 이전할 수 있습니다.</span>{' '}
+                이전하면 다른 기기에서도 기존 풀이 기록과 진행 중인 모의시험을 이어갈 수 있습니다. 로컬
+                원본은 서버 반영이 검증될 때까지 그대로 보존됩니다.
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleMigrateHistory}
+                  disabled={isMigratingHistory}
+                  className="text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {isMigratingHistory ? '이전 중...' : '학습 이력 이전'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeclineHistory}
+                  disabled={isMigratingHistory}
                   className="text-xs text-[#57544e] border border-[#c8c2b5] bg-white px-3 py-1.5 rounded-xs hover:bg-[#faf8f4] transition-colors disabled:opacity-60"
                 >
                   나중에

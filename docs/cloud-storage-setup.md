@@ -32,6 +32,8 @@
 - `supabase/migrations/20260101000002_ids_and_pending_uploads.sql` — ID 정책(text + 사용자별 PK), pending 업로드 컬럼, `deleting` 상태
 - `supabase/migrations/20260101000003_version_and_job_paths.sql` — `version >= 0`, `pending_version > 0`, pending job 인덱스
 - `supabase/migrations/20260101000004_learning_content.sql` — 개념·개념 초안·문제·문제 초안·문제-개념 연결·불변 문제 버전 + RLS + 승인 RPC
+- `supabase/migrations/20260101000005_approval_integrity.sql` — 승인 무결성 보강(중복 승인·범위 검증)
+- `supabase/migrations/20260101000006_learning_history.sql` — 풀이·복습 이벤트·학습 계획·모의시험 세션 + RLS + 트랜잭션 RPC
 
 ### 학습 콘텐츠(개념·문제) 저장
 - `concepts`, `concept_drafts`, `problems`, `problem_drafts`는 각 행에 인덱스용 키 컬럼과 함께
@@ -44,7 +46,18 @@
   (`approved_*_id`). 클라이언트 검증만으로 승인 무결성을 확보하지 않습니다.
 - AI 분석/생성 결과는 `generation_job_id`로 식별되는 결정적 초안 ID로 서버에 저장됩니다.
   저장만 실패하면 `POST /api/persist-drafts`로 **AI 재호출 없이** 다시 저장할 수 있습니다.
-- 답안·모의시험·복습 이력은 이번 단계에서도 로컬에 남습니다.
+### 학습 이력(풀이·복습·계획·모의시험) 저장
+- `attempts`, `review_events`, `study_plan_settings`, `study_plan_items`,
+  `mock_exam_sessions`는 각 행에 인덱스용 키 컬럼과 함께 전체 앱 객체를 담는 `payload jsonb`를 저장합니다.
+  서버 컬럼(ID·과목·개념·문제·점수·버전·상태)이 화면에 표시되는 **권위 값**이며, 오래된 payload는 덮어씁니다.
+- 기록은 RPC로 **단일 트랜잭션·멱등** 처리합니다:
+  - `submit_attempt` — 풀이 + 복습 이벤트 + (선택) 계획 완료를 한 번에 저장. 재시도해도 중복 생성되지 않습니다.
+  - `save_mock_exam_answers` — `version`으로 낙관적 잠금. 진행 중이 아닌 세션은 잠깁니다.
+  - `submit_mock_exam` — 최종 제출(멱등).
+- 클라이언트는 로그인 후 서버 이력을 내려받아 **ID 기준으로 병합**하고, 아직 서버에 없는
+  로컬 전용 기록은 보존합니다. 복습 이벤트는 개념별 점수·상태를 다시 계산합니다.
+- 최초 1회, 로컬 학습 이력을 `migrateLocalHistoryToCloud`로 이전할 수 있습니다(유형별 재개 가능,
+  검증은 서버 재조회로 확인, 읽기 실패를 "없음"으로 간주하지 않음). 로컬 원본은 검증 전까지 보존됩니다.
 
 ### 방법 A — Supabase CLI
 ```bash

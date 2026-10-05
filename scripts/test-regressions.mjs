@@ -21,6 +21,8 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/migrationOriginals.ts', 'lib/cloud/localMigration.ts',
   'lib/cloud/learningMappers.ts', 'lib/cloud/learningPlan.ts', 'lib/cloud/learningRepository.ts',
   'lib/cloud/mergeLearning.ts', 'lib/cloud/learningOriginals.ts', 'lib/learningApproval.ts',
+  'lib/cloud/historyMappers.ts', 'lib/cloud/historyMerge.ts', 'lib/cloud/historyRepository.ts',
+  'lib/cloud/mockExamSync.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -88,6 +90,10 @@ exports.requireApiUser = async () => {
   const cloudMerge = load(path.join(output, 'lib/cloud/mergeLearning.js'));
   const cloudLearningOriginals = load(path.join(output, 'lib/cloud/learningOriginals.js'));
   const learningApproval = load(path.join(output, 'lib/learningApproval.js'));
+  const cloudHistoryMappers = load(path.join(output, 'lib/cloud/historyMappers.js'));
+  const cloudHistoryMerge = load(path.join(output, 'lib/cloud/historyMerge.js'));
+  const cloudHistoryRepo = load(path.join(output, 'lib/cloud/historyRepository.js'));
+  const cloudMockExamSync = load(path.join(output, 'lib/cloud/mockExamSync.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
   const exams = load(path.join(output, 'lib/mockExam.js'));
@@ -1582,6 +1588,150 @@ exports.requireApiUser = async () => {
       assert.equal(result.data.id, 'c1');
       assert.equal(result.data.title, 'server-title');
     });
+  });
+
+  // ---- Cloud learning history (attempts / reviews / plans / mock exams) ----
+  const retention = load(path.join(output, 'lib/retentionModel.js'));
+
+  check('history mappers read authoritative columns over stale payload', () => {
+    const attemptRow = cloudHistoryMappers.rowToAttempt({
+      id: 'a1', user_id: 'u1', subject_id: 's1', concept_id: 'c1', problem_id: 'p1',
+      mock_exam_session_id: null, plan_item_id: 'spi-1', attempt_origin: 'independent',
+      problem_version: 3, at: '2026-01-01T00:00:00.000Z', calculated_score: 77,
+      payload: { id: 'a1', conceptId: 'stale', calculatedScore: 10, problemVersion: 1 },
+      created_at: '', updated_at: '',
+    });
+    assert.equal(attemptRow.conceptId, 'c1');
+    assert.equal(attemptRow.problemId, 'p1');
+    assert.equal(attemptRow.problemVersion, 3);
+    assert.equal(attemptRow.calculatedScore, 77);
+    assert.equal(attemptRow.planItemId, 'spi-1');
+
+    const eventRow = cloudHistoryMappers.rowToReviewEvent({
+      id: 'e1', user_id: 'u1', subject_id: 's1', concept_id: 'c1', attempt_id: 'a1',
+      kind: 'attempt', at: '2026-01-01T00:00:00.000Z', result_score: 77,
+      payload: { id: 'e1', conceptId: 'stale', resultScore: 0 }, created_at: '',
+    });
+    assert.equal(eventRow.conceptId, 'c1');
+    assert.equal(eventRow.attemptId, 'a1');
+    assert.equal(eventRow.resultScore, 77);
+  });
+
+  check('history merge keeps local-only rows and prefers server copies', () => {
+    const merged = cloudHistoryMerge.mergeById(
+      [{ id: 'a1', answer: 'server' }, { id: 'a2', answer: 'server' }],
+      [{ id: 'a1', answer: 'local' }, { id: 'a3', answer: 'local' }]
+    );
+    assert.deepEqual(merged.map((x) => x.id), ['a1', 'a2', 'a3']);
+    assert.equal(merged.find((x) => x.id === 'a1').answer, 'server');
+    assert.equal(merged.find((x) => x.id === 'a3').answer, 'local');
+  });
+
+  check('server review events merge into concepts and dedupe by attempt', () => {
+    const baseConcept = {
+      id: 'c1', subjectId: 's1', title: 'A',
+      events: [{ id: 'e0', conceptId: 'c1', attemptId: 'a0', at: '2026-01-01T00:00:00.000Z', kind: 'attempt', resultScore: 90, title: '', sourceRef: '' }],
+      currentScore: 0, status: 'unstudied', exerciseCount: 1, isLearned: false,
+    };
+    const events = [
+      { id: 'e1', conceptId: 'c1', attemptId: 'a1', at: '2026-01-02T00:00:00.000Z', kind: 'attempt', resultScore: 40, title: '', sourceRef: '' },
+      { id: 'e1-dupe', conceptId: 'c1', attemptId: 'a1', at: '2026-01-03T00:00:00.000Z', kind: 'attempt', resultScore: 40, title: '', sourceRef: '' },
+      { id: 'e-other', conceptId: 'c2', attemptId: 'a9', at: '2026-01-02T00:00:00.000Z', kind: 'attempt', resultScore: 100, title: '', sourceRef: '' },
+    ];
+    const out = cloudHistoryMerge.mergeEventsIntoConcepts(
+      [baseConcept], events, retention.DEFAULT_RETENTION_SETTINGS, new Date('2026-01-04T00:00:00.000Z')
+    );
+    assert.equal(out[0].events.length, 2, 'duplicate attempt deduped and other concept ignored');
+    assert.equal(out[0].events.find((e) => e.attemptId === 'a1').resultScore, 40);
+    assert.ok(out[0].currentScore > 0);
+    assert.equal(out[0].isLearned, true);
+  });
+
+  const historyAttempt = {
+    id: 'a1', subjectId: 's1', conceptId: 'c1', problemId: 'p1', at: 't', answer: 'x',
+    confidence: 3, errorType: 'none', hintCount: 0, reasoningNotes: '', calculatedScore: 80,
+    rubricResults: [], evaluatorFeedback: '',
+  };
+  const historyEvent = {
+    id: 'e1', conceptId: 'c1', at: 't', dayOffset: 0, kind: 'attempt', title: '', resultScore: 80,
+    sourceRef: '', attemptId: 'a1',
+  };
+
+  await checkAsync('submitAttempt calls the transactional RPC and maps its outcome', async () => {
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      rpcResult: { attemptId: 'a1', attemptInserted: true, eventInserted: true, planStatus: 'PLAN_ITEM_COMPLETED' },
+    }, async (client) => {
+      const result = await cloudHistoryRepo.submitAttempt(client, historyAttempt, historyEvent, 'spi-1', 2);
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
+      assert.equal(result.data.planStatus, 'PLAN_ITEM_COMPLETED');
+      const call = client.__state.rpcCalls.find((c) => c.name === 'submit_attempt');
+      assert.ok(call, 'submit_attempt RPC invoked');
+      assert.equal(call.params.p_plan_item_id, 'spi-1');
+      assert.equal(call.params.p_plan_round, 2);
+    });
+  });
+
+  await checkAsync('submitAttempt surfaces scope mismatch instead of reporting success', async () => {
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      fail: { rpc: true, rpcMessage: 'CONCEPT_SCOPE_MISMATCH: concept not owned' },
+    }, async (client) => {
+      const result = await cloudHistoryRepo.submitAttempt(client, historyAttempt, historyEvent, null, null);
+      assert.equal(result.ok, false);
+      assert.match(result.error, /^concept_scope:/);
+    });
+  });
+
+  await checkAsync('mock exam autosave maps version and reports lock/stale conflicts', async () => {
+    const session = {
+      id: 'exam-1', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60,
+      status: 'in_progress', selectedConceptIds: [], selectedTypes: [], problems: [], answers: {}, evaluations: {},
+    };
+    await withFakeSupabase({ user: { id: 'u1' }, rpcResult: { version: 5 } }, async (client) => {
+      const saved = await cloudHistoryRepo.saveMockExamAnswers(client, session, 4);
+      assert.equal(saved.ok, true, saved.ok ? '' : saved.error);
+      assert.equal(saved.data, 5);
+      assert.equal(
+        client.__state.rpcCalls.find((c) => c.name === 'save_mock_exam_answers').params.p_expected_version,
+        4
+      );
+    });
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      fail: { rpc: true, rpcMessage: 'MOCK_SESSION_STALE: version mismatch' },
+    }, async (client) => {
+      const saved = await cloudHistoryRepo.saveMockExamAnswers(client, session, 4);
+      assert.equal(saved.ok, false);
+      assert.match(saved.error, /^stale:/);
+    });
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      fail: { rpc: true, rpcMessage: 'MOCK_SESSION_LOCKED: submitted' },
+    }, async (client) => {
+      const saved = await cloudHistoryRepo.saveMockExamAnswers(client, session, 4);
+      assert.equal(saved.ok, false);
+      assert.match(saved.error, /^locked:/);
+    });
+  });
+
+  await checkAsync('mock exam sync is a safe no-op when Supabase is not configured', async () => {
+    const session = {
+      id: 'exam-2', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60,
+      status: 'in_progress', selectedConceptIds: [], selectedTypes: [], problems: [], answers: {}, evaluations: {},
+    };
+    const created = await cloudMockExamSync.createMockExamOnServer(session);
+    assert.equal(created.ok, false);
+    assert.equal(created.code, 'not_configured');
+    const saved = await cloudMockExamSync.autosaveMockExam(session, 1);
+    assert.equal(saved.ok, false);
+    assert.equal(saved.code, 'not_configured');
+    const submitted = await cloudMockExamSync.submitMockExamOnServer(session, 1);
+    assert.equal(submitted.ok, false);
+    assert.equal(submitted.code, 'not_configured');
+    const fetched = await cloudMockExamSync.fetchMockExamFromServer('exam-2');
+    assert.equal(fetched.ok, false);
+    assert.equal(fetched.code, 'not_configured');
   });
 
   check('material import is never verified when a copy write failed', () => {
