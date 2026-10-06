@@ -1296,6 +1296,149 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     [activeMockSession, todayDigest]
   );
 
+  /**
+   * Applies the local + server side effects of a material body edit.
+   *
+   * Shared by a normal server save and by the response-loss recovery
+   * (`already_saved`) path so the material metadata, the linked problems'
+   * stale/review flags, the concepts/drafts review state and the server
+   * reflection ALWAYS run — never skipped just because the body was already
+   * stored on the server.
+   *
+   * Idempotent: re-running only re-applies the same flags. Past attempt and
+   * mock-exam snapshots are never touched. A late response from another account
+   * is dropped (scope guard).
+   */
+  const applyMaterialEditSideEffects = async (
+    updatedMat: Material,
+    scopeAtStart: string
+  ): Promise<{
+    outdatedIds: string[];
+    reviewIds: string[];
+    affectedConceptsCount: number;
+    serverReflectionFailed: number;
+  }> => {
+    const { updatedProblems: newProblems, outdatedIds, reviewIds } = applyMaterialEditToProblems(
+      allProblems,
+      updatedMat,
+      allConcepts
+    );
+    const newHash = computeMarkdownHash(updatedMat.parsedMarkdown || '');
+    let affectedConceptsCount = 0;
+    const newConcepts = allConcepts.map((c) => {
+      if (c.subjectId === updatedMat.subjectId && c.materialIds.includes(updatedMat.id)) {
+        affectedConceptsCount++;
+        return {
+          ...c,
+          needsSourceReview: true,
+          sourceEvidence: c.sourceEvidence
+            ? {
+                ...c.sourceEvidence,
+                verified: false,
+                verificationNote: '근거 자료 본문이 수정되어 재검토가 필요합니다.',
+              }
+            : undefined,
+        };
+      }
+      return c;
+    });
+    let affectedDraftsCount = 0;
+    const newDrafts = conceptDrafts.map((d) => {
+      if (d.materialId === updatedMat.id && d.sourceMarkdownHash !== newHash) {
+        affectedDraftsCount++;
+        return { ...d, needsSourceReview: true };
+      }
+      return d;
+    });
+
+    // A late response must never write to another account's storage or UI.
+    if (getStorageScopeId() !== scopeAtStart) {
+      return { outdatedIds: [], reviewIds: [], affectedConceptsCount: 0, serverReflectionFailed: 0 };
+    }
+
+    const updated = materials.map((m) => (m.id === updatedMat.id ? updatedMat : m));
+    setMaterials(updated);
+    saveStoredMaterials(updated);
+    setEditingMaterial(updatedMat);
+    setAllProblems(newProblems);
+    saveStoredProblems(newProblems);
+    if (affectedConceptsCount > 0) {
+      setAllConcepts(newConcepts);
+      saveStoredConcepts(newConcepts);
+    }
+    if (affectedDraftsCount > 0) {
+      setConceptDrafts(newDrafts);
+      saveStoredConceptDrafts(newDrafts);
+    }
+
+    // Persist the affected review flags to Supabase (best-effort). A failure is
+    // reported as a partial result, never hidden.
+    let serverReflectionFailed = 0;
+    if (currentUser && isSupabaseConfigured()) {
+      const supabase = createBrowserSupabaseClient();
+      const outdatedOrReview = [...outdatedIds, ...reviewIds]
+        .map((pid) => newProblems.find((p) => p.id === pid))
+        .filter((p): p is Problem => Boolean(p));
+      const affectedConceptRows = newConcepts.filter(
+        (c) => c.subjectId === updatedMat.subjectId && c.materialIds.includes(updatedMat.id)
+      );
+      const affectedDraftRows = newDrafts.filter(
+        (d) => d.materialId === updatedMat.id && d.needsSourceReview
+      );
+      const results = await Promise.all([
+        ...outdatedOrReview.map(async (prob) => {
+          const r = await updateProblemQuality(supabase, prob.id, {
+            isOutdated: prob.isOutdated,
+            needsSourceReview: prob.needsSourceReview,
+            payload: prob as unknown as Record<string, unknown>,
+          });
+          return r.ok;
+        }),
+        ...affectedConceptRows.map(async (c) => {
+          const r = await supabase.from('concepts').update({ payload: c as unknown as Record<string, unknown> }).eq('id', c.id);
+          return !r.error;
+        }),
+        ...affectedDraftRows.map(async (d) => {
+          const r = await supabase.from('concept_drafts').update({ payload: d as unknown as Record<string, unknown> }).eq('id', d.id);
+          return !r.error;
+        }),
+      ]);
+      serverReflectionFailed = results.filter((ok) => !ok).length;
+    }
+
+    return { outdatedIds, reviewIds, affectedConceptsCount, serverReflectionFailed };
+  };
+
+  // Composes the single user-facing toast for a material edit outcome.
+  const showMaterialEditToast = (
+    title: string,
+    effects: { outdatedIds: string[]; reviewIds: string[]; affectedConceptsCount: number; serverReflectionFailed: number },
+    mode: 'saved' | 'recovered' | 'local' | 'fallback'
+  ) => {
+    const parts: string[] = [];
+    if (effects.affectedConceptsCount > 0) parts.push(`개념 ${effects.affectedConceptsCount}건`);
+    if (effects.outdatedIds.length > 0) parts.push(`구버전 문제 ${effects.outdatedIds.length}건`);
+    if (effects.reviewIds.length > 0) parts.push(`확인 필요 문제 ${effects.reviewIds.length}건`);
+
+    let message: string;
+    if (parts.length > 0) {
+      const prefix = mode === 'recovered' ? '[응답 유실 복구] ' : mode === 'local' ? '로컬 전용 수정: ' : '';
+      message = `${prefix}[${title}] 수정으로 연관 ${parts.join(', ')}을 검토 필요 상태로 표시했습니다.`;
+    } else if (mode === 'local') {
+      message = `[${title}] 로컬 전용 자료 내용이 저장되었습니다.`;
+    } else if (mode === 'fallback') {
+      message = `[${title}] 수정 내용이 저장되었으나 서버 마이그레이션 9 미적용으로 일부 정책/해시는 서버에 저장되지 않았습니다.`;
+    } else if (mode === 'recovered') {
+      message = `[${title}] 이전 서버 저장을 확인해 복구했습니다. (재업로드·버전 증가 없음)`;
+    } else {
+      message = `[${title}] 수정 내용이 서버에 저장되었습니다.`;
+    }
+    if (effects.serverReflectionFailed > 0) {
+      message += ` 일부 검토 상태를 서버에 반영하지 못했습니다(${effects.serverReflectionFailed}건) — 다시 저장하면 반영됩니다.`;
+    }
+    showToast(message);
+  };
+
   // Restores material metadata from a backup. The persistence is verified by
   // reading it back; a failed metadata save is reported so the caller never
   // shows a failed restore as success. The backup's local body identity hash
@@ -3469,106 +3612,57 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         subject={activeSubject}
         draftCount={editingMaterial ? conceptDrafts.filter((d) => d.materialId === editingMaterial.id).length : 0}
         onSave={async (updatedMat, updatedContent): Promise<MaterialServerSaveResult> => {
+          const scopeAtStart = getStorageScopeId();
           const contentForSave = {
             markdown: updatedContent.markdown,
             rawText: updatedMat.rawText,
             pages: updatedContent.pages,
           };
           const contentHash = materialContentHash(contentForSave);
+
           if (isLocalOnlyMaterial(updatedMat.id)) {
-            const updated = materials.map((m) =>
-              m.id === updatedMat.id ? updatedMat : m
-            );
-            setMaterials(updated);
-            saveStoredMaterials(updated);
-            setEditingMaterial(updatedMat);
-
-            const { updatedProblems: newProblems, outdatedIds, reviewIds } = applyMaterialEditToProblems(
-              allProblems,
-              updatedMat,
-              allConcepts
-            );
-            setAllProblems(newProblems);
-            saveStoredProblems(newProblems);
-
-            const newHash = computeMarkdownHash(updatedMat.parsedMarkdown || '');
-            let affectedConceptsCount = 0;
-            const newConcepts = allConcepts.map((c) => {
-              if (c.subjectId === updatedMat.subjectId && c.materialIds.includes(updatedMat.id)) {
-                affectedConceptsCount++;
-                return {
-                  ...c,
-                  needsSourceReview: true,
-                  sourceEvidence: c.sourceEvidence
-                    ? {
-                        ...c.sourceEvidence,
-                        verified: false,
-                        verificationNote: '근거 자료 본문이 수정되어 재검토가 필요합니다.',
-                      }
-                    : undefined,
-                };
-              }
-              return c;
-            });
-            if (affectedConceptsCount > 0) {
-              setAllConcepts(newConcepts);
-              saveStoredConcepts(newConcepts);
-            }
-
-            let affectedDraftsCount = 0;
-            const newDrafts = conceptDrafts.map((d) => {
-              if (d.materialId === updatedMat.id && d.sourceMarkdownHash !== newHash) {
-                affectedDraftsCount++;
-                return {
-                  ...d,
-                  needsSourceReview: true,
-                };
-              }
-              return d;
-            });
-            if (affectedDraftsCount > 0) {
-              setConceptDrafts(newDrafts);
-              saveStoredConceptDrafts(newDrafts);
-            }
-
-            if (outdatedIds.length > 0 || reviewIds.length > 0 || affectedConceptsCount > 0) {
-              const parts: string[] = [];
-              if (affectedConceptsCount > 0) parts.push(`개념 ${affectedConceptsCount}건`);
-              if (outdatedIds.length > 0) parts.push(`구버전 문제 ${outdatedIds.length}건`);
-              if (reviewIds.length > 0) parts.push(`확인 필요 문제 ${reviewIds.length}건`);
-              showToast(
-                `[${updatedMat.title}] 로컬 수정으로 연관 ${parts.join(', ')}을 검토 필요 상태로 표시했습니다.`
-              );
-            } else {
-              showToast(`[${updatedMat.title}] 로컬 전용 자료 내용이 저장되었습니다.`);
-            }
-
+            const effects = await applyMaterialEditSideEffects(updatedMat, scopeAtStart);
             // Local-only material: the body sync state never claims the server.
             recordMaterialSyncState(updatedMat.id, {
               localBodyHash: contentHash,
               status: 'not_required',
             });
-
+            showMaterialEditToast(updatedMat.title, effects, 'local');
             return { status: 'not_required' };
           }
 
-          // Response-loss recovery: if a previous save of THIS exact content is
-          // on record, ask the SERVER whether it already has that body instead
-          // of uploading again (no version bump, no duplicate job).
+          const syncBody = materialPolicyOf(updatedMat).syncBody;
           const previousSave = getMaterialServerSaveRecord(updatedMat.id);
-          if (previousSave && previousSave.contentHash === contentHash) {
+          const retryingSameContent = Boolean(previousSave && previousSave.contentHash === contentHash);
+
+          // Response-loss recovery: if a previous save of THIS exact content is
+          // on record, ask the SERVER what it stored before uploading again.
+          if (retryingSameContent) {
             const probe = await getMaterialServerBodyHash(updatedMat.id);
             const verdict = evaluateMaterialServerRetry(previousSave, contentHash, {
               ok: probe.ok,
               hasBody: probe.ok ? probe.data.hasBody : undefined,
               hash: probe.ok ? probe.data.hash : null,
+              version: probe.ok ? probe.data.version : undefined,
             });
             if (verdict === 'already_saved') {
-              recordMaterialSyncState(updatedMat.id, {
-                serverBodyHash: contentHash,
-                serverHasBody: true,
-                status: 'confirmed',
+              // The server already holds this exact body: recover WITHOUT a new
+              // upload/version bump, but run the SAME post-processing as a save.
+              recordMaterialServerSave(updatedMat.id, {
+                contentHash,
+                baseHash: previousSave?.baseHash ?? null,
+                baseVersion: previousSave?.baseVersion,
+                syncBody,
+                jobId: previousSave?.jobId ?? null,
               });
+              recordMaterialSyncState(
+                updatedMat.id,
+                syncBody
+                  ? { serverBodyHash: contentHash, serverHasBody: true, status: 'confirmed' }
+                  : { status: 'not_required' }
+              );
+              const effects = await applyMaterialEditSideEffects(updatedMat, scopeAtStart);
+              showMaterialEditToast(updatedMat.title, effects, 'recovered');
               return { status: 'already_saved' };
             }
             if (verdict === 'conflict') {
@@ -3579,18 +3673,29 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               showToast('이전 서버 저장 여부를 확인하지 못했습니다. 네트워크를 확인한 뒤 다시 시도해 주세요.');
               return { status: 'failed', error: '이전 서버 저장 여부를 확인하지 못했습니다. 다시 시도해 주세요.' };
             }
-            // no_record: the earlier write did not reach the server — a normal
-            // new write may proceed.
+            // 'retry_same_job' | 'no_record': the earlier request did not land —
+            // a (re)write may proceed below, reusing the same job id when known.
           }
 
-          // Persist a new version to the server before updating local state.
-          // The retry record is written BEFORE the request so a lost success
-          // response can be recovered by probing the server on the next retry.
-          recordMaterialServerSave(updatedMat.id, contentHash);
+          // Capture the server state BEFORE the attempt so a lost response can be
+          // recognized as "server unchanged" (baseHash/baseVersion) on retry.
+          const probeBefore = await getMaterialServerBodyHash(updatedMat.id);
+          const baseHash = probeBefore.ok ? probeBefore.data.hash : previousSave?.baseHash ?? null;
+          const baseVersion = probeBefore.ok ? probeBefore.data.version : previousSave?.baseVersion ?? 0;
+          const reuseJobId = retryingSameContent ? previousSave?.jobId ?? undefined : undefined;
+          recordMaterialServerSave(updatedMat.id, {
+            contentHash,
+            baseHash,
+            baseVersion,
+            syncBody,
+            jobId: reuseJobId ?? null,
+          });
+
           const writeResult = await writeMaterial({
             material: updatedMat,
             content: contentForSave,
             policy: materialPolicyOf(updatedMat),
+            jobId: reuseJobId,
           });
           if (!writeResult.ok) {
             // The request may have actually reached the server (response loss).
@@ -3600,119 +3705,27 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             showToast(`자료 수정 저장 실패: ${writeResult.error}`);
             return { status: 'failed', error: writeResult.error };
           }
-
-          if (materialPolicyOf(updatedMat).syncBody) {
-            // The server confirmed THIS body (read-back hash verification was
-            // performed inside writeMaterial).
-            recordMaterialSyncState(updatedMat.id, {
-              serverBodyHash: contentHash,
-              serverHasBody: true,
-              status: 'confirmed',
-            });
-          } else {
-            // syncBody off: only metadata was written; never claim body sync.
-            recordMaterialSyncState(updatedMat.id, { status: 'not_required' });
-          }
-
-          const updated = materials.map((m) =>
-            m.id === updatedMat.id ? updatedMat : m
-          );
-          setMaterials(updated);
-          saveStoredMaterials(updated);
-          setEditingMaterial(updatedMat);
-
-          // Mark ONLY problems that actually referenced the edited material as outdated.
-          // Problems with per-material hashes are compared per material; legacy problems
-          // without per-material hashes are flagged as "needs source review" (not auto-outdated).
-          const { updatedProblems: newProblems, outdatedIds, reviewIds } = applyMaterialEditToProblems(
-            allProblems,
-            updatedMat,
-            allConcepts
-          );
-          setAllProblems(newProblems);
-          saveStoredProblems(newProblems);
-
-          // Mark concepts and concept drafts linked to this material as needing review
-          const newHash = computeMarkdownHash(updatedMat.parsedMarkdown || '');
-          let affectedConceptsCount = 0;
-          const newConcepts = allConcepts.map((c) => {
-            if (c.subjectId === updatedMat.subjectId && c.materialIds.includes(updatedMat.id)) {
-              affectedConceptsCount++;
-              return {
-                ...c,
-                needsSourceReview: true,
-                sourceEvidence: c.sourceEvidence
-                  ? {
-                      ...c.sourceEvidence,
-                      verified: false,
-                      verificationNote: '근거 자료 본문이 수정되어 재검토가 필요합니다.',
-                    }
-                  : undefined,
-              };
-            }
-            return c;
+          // Remember the job id the write actually used so a retry reuses it.
+          recordMaterialServerSave(updatedMat.id, {
+            contentHash,
+            baseHash,
+            baseVersion,
+            syncBody,
+            jobId: writeResult.data.jobId ?? reuseJobId ?? null,
           });
-          if (affectedConceptsCount > 0) {
-            setAllConcepts(newConcepts);
-            saveStoredConcepts(newConcepts);
-          }
+          recordMaterialSyncState(
+            updatedMat.id,
+            syncBody
+              ? { serverBodyHash: contentHash, serverHasBody: true, status: 'confirmed' }
+              : { status: 'not_required' }
+          );
 
-          let affectedDraftsCount = 0;
-          const newDrafts = conceptDrafts.map((d) => {
-            if (d.materialId === updatedMat.id && d.sourceMarkdownHash !== newHash) {
-              affectedDraftsCount++;
-              return {
-                ...d,
-                needsSourceReview: true,
-              };
-            }
-            return d;
-          });
-          if (affectedDraftsCount > 0) {
-            setConceptDrafts(newDrafts);
-            saveStoredConceptDrafts(newDrafts);
-          }
-
-          // Persist affected source review flags to Supabase so it survives reload / other devices
-          if (currentUser && isSupabaseConfigured()) {
-            const supabase = createBrowserSupabaseClient();
-            for (const pid of [...outdatedIds, ...reviewIds]) {
-              const prob = newProblems.find((p) => p.id === pid);
-              if (prob) {
-                void updateProblemQuality(supabase, prob.id, {
-                  isOutdated: prob.isOutdated,
-                  needsSourceReview: prob.needsSourceReview,
-                  payload: prob as unknown as Record<string, unknown>,
-                });
-              }
-            }
-            for (const c of newConcepts) {
-              if (c.subjectId === updatedMat.subjectId && c.materialIds.includes(updatedMat.id)) {
-                void supabase.from('concepts').update({ payload: c as unknown as Record<string, unknown> }).eq('id', c.id);
-              }
-            }
-            for (const d of newDrafts) {
-              if (d.materialId === updatedMat.id && d.needsSourceReview) {
-                void supabase.from('concept_drafts').update({ payload: d as unknown as Record<string, unknown> }).eq('id', d.id);
-              }
-            }
-          }
-
-          if (outdatedIds.length > 0 || reviewIds.length > 0 || affectedConceptsCount > 0) {
-            const parts: string[] = [];
-            if (affectedConceptsCount > 0) parts.push(`개념 ${affectedConceptsCount}건`);
-            if (outdatedIds.length > 0) parts.push(`구버전 문제 ${outdatedIds.length}건`);
-            if (reviewIds.length > 0) parts.push(`확인 필요 문제 ${reviewIds.length}건`);
-            showToast(
-              `[${updatedMat.title}] 수정으로 연관 ${parts.join(', ')}을 검토 필요 상태로 표시했습니다.`
-            );
-          } else {
-            showToast(
-              writeResult.data?.fallbackUsed
-                ? `[${updatedMat.title}] 수정 내용이 저장되었으나 서버 마이그레이션 9 미적용으로 일부 정책/해시는 서버에 저장되지 않았습니다.`
-                : `[${updatedMat.title}] 수정 내용이 서버에 저장되었습니다.`
-            );
-          }
+          const effects = await applyMaterialEditSideEffects(updatedMat, scopeAtStart);
+          showMaterialEditToast(
+            updatedMat.title,
+            effects,
+            writeResult.data?.fallbackUsed ? 'fallback' : 'saved'
+          );
           return { status: 'saved', fallbackUsed: writeResult.data?.fallbackUsed };
         }}
         onOpenConceptReview={(mat) => {

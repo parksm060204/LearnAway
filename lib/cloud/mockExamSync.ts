@@ -111,6 +111,56 @@ export function planReconcile(
 }
 
 /**
+ * Optimum answer-identity comparison for an expired exam opened by URL: the
+ * answer-bearing fields only (status/evaluations are separate).
+ */
+export function examAnswersEqual(a: MockExamSession, b: MockExamSession): boolean {
+  return (
+    JSON.stringify(a.answers ?? {}) === JSON.stringify(b.answers ?? {}) &&
+    JSON.stringify(a.reasons ?? {}) === JSON.stringify(b.reasons ?? {}) &&
+    JSON.stringify(a.isReasonNotApplicable ?? {}) === JSON.stringify(b.isReasonNotApplicable ?? {}) &&
+    JSON.stringify(a.reasonNotApplicableJustification ?? {}) ===
+      JSON.stringify(b.reasonNotApplicableJustification ?? {})
+  );
+}
+
+export interface ExpiredOpenPlan {
+  /** The server already holds a terminal state: never submit over it. */
+  serverTerminal: boolean;
+  /** The local expired answers differ from the server snapshot: explicit choice required. */
+  conflict: boolean;
+}
+
+/**
+ * Decides what an expired exam opened via URL means. The local and server
+ * snapshots are compared as whole units; a differing local answer set is a
+ * conflict that must be resolved explicitly, never overwritten by a plain
+ * "submit".
+ */
+export function planExpiredOpen(local: MockExamSession, server: MockExamSession): ExpiredOpenPlan {
+  const serverTerminal = server.status !== 'in_progress';
+  return { serverTerminal, conflict: !serverTerminal && !examAnswersEqual(local, server) };
+}
+
+export type ExpiredSubmitDecision =
+  | { action: 'blocked_conflict' }
+  | { action: 'submit'; expectedVersion: number };
+
+/**
+ * A plain submit decision for an expired exam. While a conflict is unresolved
+ * it is BLOCKED (the user must compare and choose first); otherwise it submits
+ * using the server version confirmed at the time of comparison (so a server
+ * change in between is caught as stale).
+ */
+export function decideExpiredSubmit(
+  plan: ExpiredOpenPlan,
+  serverVersion: number
+): ExpiredSubmitDecision {
+  if (plan.conflict || plan.serverTerminal) return { action: 'blocked_conflict' };
+  return { action: 'submit', expectedVersion: serverVersion };
+}
+
+/**
  * Creates a mock exam on the server insert-only. If the id already exists the
  * server row is returned: identical content is an idempotent success, differing
  * content is a `conflict` (never overwritten). Retries/migration cannot reset a

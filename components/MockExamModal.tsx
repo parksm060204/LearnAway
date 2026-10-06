@@ -17,7 +17,9 @@ import { loadStoredSettings, recordAttemptAndUpdateConcept } from '../lib/storag
 import {
   autosaveMockExam,
   createMockExamOnServer,
+  decideExpiredSubmit,
   fetchMockExamFromServer,
+  planExpiredOpen,
   planReconcile,
   saveMockExamGradingOnServer,
   submitExamAttemptOnServer,
@@ -140,6 +142,11 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
   const [saveMessage, setSaveMessage] = useState('');
   const [pendingAvailable, setPendingAvailable] = useState(false);
   const [pendingStale, setPendingStale] = useState(false);
+  // A conflict between the local expired answers and a newer server snapshot
+  // (URL deep link). While true, a plain submit is BLOCKED until the user
+  // explicitly compares and chooses.
+  const [expiredConflict, setExpiredConflict] = useState(false);
+  const [serverSnapshot, setServerSnapshot] = useState<MockExamSession | null>(null);
   // Server-authoritative version guard for optimistic autosave/submit.
   const serverVersionRef = useRef(1);
   const autosaveTimerRef = useRef<number | null>(null);
@@ -371,17 +378,27 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         return;
       }
       const server = result.session;
-      // A stale exam opened via URL must NOT be auto-submitted: keep the local
-      // expired (submitted) copy, do NOT adopt the server's in_progress state,
-      // and offer an explicit '저장된 답안으로 제출' action instead.
+      // A stale exam opened via URL must NOT be auto-submitted. Keep the local
+      // expired (submitted) copy, treat the server answers+version+status as one
+      // snapshot, and require an EXPLICIT comparison/choice when the local
+      // answers differ from the server's (never let a plain submit overwrite).
       if (deferExpiredSubmit && local && local.status === 'submitted' && server.status === 'in_progress') {
+        const openPlan = planExpiredOpen(local, server);
+        // The version confirmed at comparison time: an explicit submit uses it,
+        // so a later server change is caught as stale (re-conflict).
         serverVersionRef.current = result.version;
+        setServerSnapshot(server);
+        setExpiredConflict(openPlan.conflict);
         setSyncBlocked(true);
         setSyncNotice(
-          '만료된 시험이 서버에는 아직 진행 중으로 남아 있습니다. "저장된 답안으로 제출"을 눌러 마감 처리하거나, 목록으로 돌아가세요.'
+          openPlan.conflict
+            ? '서버에 더 최신 답안이 있습니다. 비교 후 선택해야 하며, 비교 없이 제출하면 서버 답안을 덮어쓰지 않습니다.'
+            : '만료된 시험이 서버에는 아직 진행 중으로 남아 있습니다. "저장된 답안으로 제출"을 눌러 마감 처리하세요.'
         );
         return;
       }
+      setExpiredConflict(false);
+      setServerSnapshot(null);
       const pending = userId ? loadPendingExamAnswers(userId, server.id) : null;
       const plan = planReconcile(local, server, result.version, pending);
       serverVersionRef.current = result.version;
@@ -468,6 +485,31 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
     setPendingAvailable(true);
     setSyncNotice('이 기기의 미저장 답안을 복구했습니다. 서버 저장을 다시 시도합니다.');
     scheduleAutosave(merged);
+  };
+
+  // Explicit choice: adopt the SERVER answers (recommended). Never overwrites
+  // the server; the local expired copy is preserved separately until submit.
+  const adoptServerSnapshot = () => {
+    if (!serverSnapshot) return;
+    applySnapshot(serverSnapshot);
+    setExpiredConflict(false);
+    setServerSnapshot(null);
+    setSyncBlocked(false);
+    setSaveState('saved');
+    setSyncNotice('서버의 최신 답안을 적용했습니다. 이 시험은 아직 진행 중 상태입니다.');
+  };
+
+  // Explicit choice: submit the LOCAL expired answers, using the server version
+  // confirmed at comparison time. A server change in between is caught as stale
+  // (the submit returns conflict instead of overwriting).
+  const submitLocalExpiredAnswers = () => {
+    const local = sessionRef.current;
+    if (!local) return;
+    setExpiredConflict(false);
+    setServerSnapshot(null);
+    setSyncNotice('선택한 만료 답안을 제출합니다. (확인된 서버 버전 기준)');
+    persistPending(local, serverVersionRef.current);
+    enqueueSubmitSession(local);
   };
   const current = session?.problems[index];
   const remaining = session ? Math.max(0, Math.ceil((new Date(session.endsAt).getTime() - now) / 1000)) : 0;
@@ -814,6 +856,46 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
             </button>
           </div>
         )}
+        {expiredConflict && serverSnapshot && session && (
+          <div role="alert" className="p-3 bg-red-50 border border-red-300 text-red-900 text-xs space-y-2">
+            <p className="font-bold">
+              서버에 더 최신 답안이 있습니다. 비교 후 명시적으로 선택해야 하며, 단순 제출로는 서버 답안을 덮어쓰지 않습니다.
+            </p>
+            <ul className="space-y-1">
+              {session.problems.map((p) => {
+                const mine = session.answers[p.id]?.trim() || '미응답';
+                const srv = serverSnapshot.answers[p.id]?.trim() || '미응답';
+                const differ = mine !== srv;
+                return (
+                  <li key={p.id} className="border-t border-red-200 pt-1">
+                    <strong>{p.title}</strong>
+                    <div>내 만료 답안: {mine.slice(0, 60)}{mine.length > 60 ? '…' : ''}</div>
+                    <div className={differ ? 'text-red-700' : ''}>
+                      서버 답안: {srv.slice(0, 60)}{srv.length > 60 ? '…' : ''}{differ ? ' (다름)' : ' (동일)'}
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={adoptServerSnapshot}
+                className="border border-red-400 bg-white px-3 py-1 font-bold"
+              >
+                서버 답안 사용 (권장)
+              </button>
+              <button
+                type="button"
+                onClick={submitLocalExpiredAnswers}
+                disabled={busy}
+                className="bg-[#c52828] text-white px-3 py-1 font-bold disabled:opacity-50"
+              >
+                내 만료 답안으로 제출
+              </button>
+            </div>
+          </div>
+        )}
         {resumeDecision === 'ask' ? (
           <div className="space-y-3" role="group" aria-label="모의시험 이어풀기 선택">
             <p className="text-[#57544e]">
@@ -1055,10 +1137,28 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
             )}
           </section>}
           {session.status === 'in_progress' && <button onClick={submitExam} className="bg-[#c52828] text-white px-4 py-2">시험 제출</button>}
-          {examOpenPolicy(session, deferExpiredSubmit) === 'expired_manual' && saveState !== 'saved' && (
+          {examOpenPolicy(session, deferExpiredSubmit) === 'expired_manual' && saveState !== 'saved' && expiredConflict && (
             <button
+              type="button"
+              onClick={() =>
+                setSyncNotice('서버와 다른 답안이 있어 자동 제출하지 않습니다. 위 비교 영역에서 "서버 답안 사용" 또는 "내 만료 답안으로 제출"을 선택해 주세요.')
+              }
+              disabled={busy}
+              className="bg-amber-700 text-white px-4 py-2 disabled:opacity-50"
+            >
+              제출 보류 · 서버 답안과 비교 필요
+            </button>
+          )}
+          {examOpenPolicy(session, deferExpiredSubmit) === 'expired_manual' && saveState !== 'saved' && !expiredConflict && (
+            <button
+              type="button"
               onClick={() => {
-                persistPending(session, serverVersionRef.current);
+                const decision = decideExpiredSubmit(
+                  { serverTerminal: false, conflict: false },
+                  serverVersionRef.current
+                );
+                if (decision.action !== 'submit') return;
+                persistPending(session, decision.expectedVersion);
                 enqueueSubmitSession(session);
               }}
               disabled={busy}

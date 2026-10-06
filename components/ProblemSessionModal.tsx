@@ -17,9 +17,13 @@ import { ProblemReportModal } from './ProblemReportModal';
 import { AttemptSaveStatus } from '../lib/storage';
 import {
   clearPracticeAnswerDraft,
-  draftMatchesProblem,
   hasPracticeDraftContent,
-  loadPracticeAnswerDraft,
+  listOtherTabPracticeDrafts,
+  listPracticeAnswerDraftsForProblem,
+  loadPracticeAnswerDraftForTab,
+  refreshPracticeTabLease,
+  releasePracticeTabLease,
+  resolvePracticeTabId,
   savePracticeAnswerDraft,
   type PracticeAnswerDraft,
 } from '../lib/practiceAnswerDraft';
@@ -94,15 +98,27 @@ export function ProblemSessionModal({
   onOpenSourceModal,
   onReportProblem,
 }: ProblemSessionModalProps) {
-  // Resolve a device draft ONCE at mount (useState initializer). The parent
-  // keys this component by subject/problem/version, so a refresh restores the
-  // unsaved answer here without a setState-in-effect cascade.
+  // Stable per-tab identifier (sessionStorage): a refresh restores THIS tab's
+  // own draft; a duplicated tab forks a new id instead of colliding.
+  const [tabId] = useState(() => resolvePracticeTabId());
+
+  // Resolve THIS tab's draft for this exact problem + version ONCE at mount.
+  // A different tab's (or an older version's) draft is NEVER auto-applied; it is
+  // exposed below as an explicit recovery choice.
   const [initialDraft] = useState<PracticeAnswerDraft | null>(() => {
     if (!userId) return null;
-    const candidate = loadPracticeAnswerDraft(userId, problem.id);
+    const candidate = loadPracticeAnswerDraftForTab(userId, problem.id, problem.version || 1, tabId);
     if (!candidate) return null;
-    if (!draftMatchesProblem(candidate, problem.id, problem.version || 1)) return null;
     return hasPracticeDraftContent(candidate) ? candidate : null;
+  });
+  // Recoverable drafts owned by other tabs / older problem versions.
+  const [recoverableDrafts, setRecoverableDrafts] = useState<PracticeAnswerDraft[]>(() => {
+    if (!userId) return [];
+    const otherTabs = listOtherTabPracticeDrafts(userId, problem.id, problem.version || 1, tabId);
+    const olderOrNewerVersions = listPracticeAnswerDraftsForProblem(userId, problem.id).filter(
+      (d) => d.problemVersion !== (problem.version || 1)
+    );
+    return [...otherTabs, ...olderOrNewerVersions];
   });
 
   const [answerText, setAnswerText] = useState(initialDraft?.answerText ?? '');
@@ -124,10 +140,7 @@ export function ProblemSessionModal({
   // Unsaved answer recovery notice (captured at mount with the draft itself).
   const [restoredDraftAt] = useState<string | null>(initialDraft?.savedAt ?? null);
   const [draftSaveFailed, setDraftSaveFailed] = useState(false);
-  // Per-tab identifier: two tabs on the same problem keep separate drafts.
-  const [tabId] = useState(
-    () => `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-  );
+  const [recoveryNotice, setRecoveryNotice] = useState('');
   const draftTimerRef = useRef<number | null>(null);
   const draftSnapshotRef = useRef<PracticeAnswerDraft | null>(null);
   // Once the attempt is durably recorded, later unmount flushes must not
@@ -139,6 +152,7 @@ export function ProblemSessionModal({
   const buildDraft = (): PracticeAnswerDraft => ({
     problemId: problem.id,
     problemVersion,
+    tabId,
     answerText,
     revealedHints,
     confidence,
@@ -152,10 +166,27 @@ export function ProblemSessionModal({
 
   const persistDraftNow = (): boolean => {
     const draft = draftSnapshotRef.current;
-    if (!draft || !hasPracticeDraftContent(draft)) return true;
-    const ok = savePracticeAnswerDraft(userId, tabId, draft);
+    if (!draft) return true;
+    // Always persist (even an emptied answer) so a cleared answer is not
+    // resurrected by a refresh.
+    const ok = savePracticeAnswerDraft(userId, draft);
+    if (ok) refreshPracticeTabLease(tabId);
     setDraftSaveFailed(!ok);
     return ok;
+  };
+
+  // Applies an explicitly chosen draft (another tab / older version).
+  const applyRecoveredDraft = (draft: PracticeAnswerDraft) => {
+    setAnswerText(draft.answerText);
+    setRevealedHints(Array.isArray(draft.revealedHints) ? draft.revealedHints : []);
+    setConfidence(typeof draft.confidence === 'number' ? draft.confidence : 3);
+    setErrorType(draft.errorType || 'none');
+    setReasoningNotes(draft.reasoningNotes || '');
+    setSolvingReason(draft.solvingReason || '');
+    setIsReasonNotApplicable(Boolean(draft.isReasonNotApplicable));
+    setReasonNotApplicableJustification(draft.reasonNotApplicableJustification || '');
+    setRecoverableDrafts((prev) => prev.filter((d) => d !== draft));
+    setRecoveryNotice('선택한 답안을 이 탭으로 복구했습니다. 저장하면 현재 문제 버전 기준으로 반영됩니다.');
   };
 
   // Autosave the unsaved input (debounced), so a refresh or tab move never
@@ -168,8 +199,8 @@ export function ProblemSessionModal({
     if (draftTimerRef.current !== null) window.clearTimeout(draftTimerRef.current);
     draftTimerRef.current = window.setTimeout(() => {
       draftTimerRef.current = null;
-      if (!hasPracticeDraftContent(draft)) return;
-      const ok = savePracticeAnswerDraft(userId, tabId, draft);
+      const ok = savePracticeAnswerDraft(userId, draft);
+      if (ok) refreshPracticeTabLease(tabId);
       setDraftSaveFailed(!ok);
     }, 500);
     return () => {
@@ -195,20 +226,26 @@ export function ProblemSessionModal({
   ]);
 
   // pagehide fires on refresh and tab close even when React never unmounts:
-  // flush the last input synchronously (localStorage.setItem is sync).
+  // flush the last input synchronously (localStorage.setItem is sync) and release
+  // the tab lease so a refresh of THIS tab keeps its identity (a still-live
+  // duplicated tab does not, so it forks a new id instead of colliding).
   useEffect(() => {
     if (!userId) return;
     const flush = () => {
       if (recordSucceededRef.current) return;
       persistDraftNow();
     };
+    const onPageHide = () => {
+      flush();
+      releasePracticeTabLease(tabId);
+    };
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') flush();
     };
-    window.addEventListener('pagehide', flush);
+    window.addEventListener('pagehide', onPageHide);
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
-      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('pagehide', onPageHide);
       document.removeEventListener('visibilitychange', onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -461,7 +498,7 @@ export function ProblemSessionModal({
         draftTimerRef.current = null;
       }
       if (userId) {
-        clearPracticeAnswerDraft(userId, problem.id, buildDraft());
+        clearPracticeAnswerDraft(userId, problem.id, problemVersion, tabId, buildDraft());
       }
       onClose();
     } catch (cause) {
@@ -738,10 +775,46 @@ export function ProblemSessionModal({
               >
                 <RotateCcw className="w-3.5 h-3.5 shrink-0" />
                 <span>
-                  이 기기에 임시 보존된 답안을 불러왔습니다 (저장 시각:{' '}
+                  이 탭에 임시 보존된 답안을 불러왔습니다 (저장 시각:{' '}
                   {new Date(restoredDraftAt).toLocaleString('ko-KR')}). 제출하면 기록으로 확정됩니다.
                 </span>
               </div>
+            )}
+
+            {recoverableDrafts.length > 0 && (
+              <div
+                role="group"
+                aria-label="다른 탭 또는 이전 버전의 미저장 답안 복구"
+                className="p-2.5 bg-indigo-50 border border-indigo-200 text-indigo-900 rounded-xs text-[11px] space-y-2"
+              >
+                <p className="font-semibold">
+                  다른 탭/이전 버전에 저장된 미저장 답안이 {recoverableDrafts.length}건 있습니다.
+                  각 항목은 선택해야만 이 탭으로 복구되며, 자동으로 적용되지 않습니다.
+                </p>
+                <ul className="space-y-1">
+                  {recoverableDrafts.map((draft, i) => (
+                    <li key={`${draft.problemVersion}-${draft.tabId}-${i}`} className="flex items-center justify-between gap-2">
+                      <span className="truncate">
+                        [v{draft.problemVersion}] {draft.tabId.slice(0, 10)} ·{' '}
+                        {new Date(draft.savedAt).toLocaleString('ko-KR')} ·{' '}
+                        {draft.answerText.trim().slice(0, 30) || '(입력 없음)'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => applyRecoveredDraft(draft)}
+                        className="shrink-0 border border-indigo-300 bg-white px-2 py-0.5 font-bold"
+                      >
+                        이 답안 복구
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {recoveryNotice && (
+              <p role="status" className="p-2 bg-[#faf8f4] border border-[#e2ded6] text-[11px] text-[#57544e]">
+                {recoveryNotice}
+              </p>
             )}
 
             {/* Input Section 1: Solution & Conclusion */}

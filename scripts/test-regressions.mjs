@@ -46,6 +46,17 @@ async function run() {
     get length() { return data.size; },
   };
   window.localStorage = localStorage;
+  // sessionStorage shim: per-tab draft identity (survives refresh within a tab).
+  const sessionData = new Map();
+  global.sessionStorage = {
+    getItem: (key) => (sessionData.has(key) ? sessionData.get(key) : null),
+    setItem: (key, value) => { sessionData.set(key, String(value)); },
+    removeItem: (key) => { sessionData.delete(key); },
+    clear: () => { sessionData.clear(); },
+    key: (index) => Array.from(sessionData.keys())[index] ?? null,
+    get length() { return sessionData.size; },
+  };
+  window.sessionStorage = sessionStorage;
 
   // --- Auth gate mock ------------------------------------------------------
   // Production route handlers verify the user on the server with no bypass.
@@ -5801,99 +5812,141 @@ exports.requireApiUser = async () => {
     assert.ok(identityFailed.notes.some((n) => n.includes('본문 식별 정보')));
   });
 
-  await checkAsync('Stage 2: practiceAnswerDraft preserves, restores and clears unsaved answers safely (per tab)', async () => {
+  await checkAsync('Stage 2: practiceAnswerDraft restores each tab its OWN draft and never auto-applies another tab', async () => {
     const userId = 'practice-draft-user';
     const otherUser = 'practice-draft-other';
     const tabA = 'tab-A';
     const tabB = 'tab-B';
-    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraft(userId, 'p1'), null);
 
-    const draft = {
-      problemId: 'p1',
-      problemVersion: 3,
-      answerText: '중간까지 푼 답안',
-      revealedHints: [0, 2],
-      confidence: 4,
-      errorType: 'none',
-      reasoningNotes: '메모',
-      solvingReason: '정규분포 근사',
-      isReasonNotApplicable: false,
-      reasonNotApplicableJustification: '',
-      savedAt: '2026-01-01T00:00:00.000Z',
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p1', 3, tabA), null);
+
+    const base = {
+      problemId: 'p1', problemVersion: 3, tabId: tabA,
+      answerText: 'A 탭 중간 답안', revealedHints: [0, 2], confidence: 4, errorType: 'none',
+      reasoningNotes: '메모', solvingReason: '정규분포 근사', isReasonNotApplicable: false,
+      reasonNotApplicableJustification: '', savedAt: '2026-01-01T00:00:00.000Z',
     };
-    assert.equal(practiceAnswerDraft.hasPracticeDraftContent(draft), true);
-    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, tabA, draft), true, 'verified device write');
-    const loaded = practiceAnswerDraft.loadPracticeAnswerDraft(userId, 'p1');
-    assert.equal(loaded.answerText, '중간까지 푼 답안');
-    assert.deepEqual(loaded.revealedHints, [0, 2]);
+    assert.equal(practiceAnswerDraft.hasPracticeDraftContent(base), true);
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, base), true, 'verified device write');
 
-    // Account isolation: another user never sees this draft.
-    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraft(otherUser, 'p1'), null);
+    // A tab restores ONLY its own draft after a reload (same sessionStorage id).
+    const reloadA = practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p1', 3, tabA);
+    assert.equal(reloadA.answerText, 'A 탭 중간 답안');
+    assert.deepEqual(reloadA.revealedHints, [0, 2]);
+    // A fresh/other tab has no OWN draft and never auto-gets A's.
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p1', 3, tabB), null);
+    // The other tab's draft is offered for EXPLICIT recovery only.
+    const recoverable = practiceAnswerDraft.listOtherTabPracticeDrafts(userId, 'p1', 3, tabB);
+    assert.deepEqual(recoverable.map((d) => d.tabId), [tabA]);
 
-    // Two tabs never overwrite each other: each tab keeps its own draft, and
-    // the LATEST one (by savedAt) is what a fresh tab restores.
-    const tabBDraft = { ...draft, answerText: 'B 탭 입력', savedAt: '2026-01-01T00:10:00.000Z' };
-    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, tabB, tabBDraft), true);
-    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraft(userId, 'p1').answerText, 'B 탭 입력');
-    assert.deepEqual(
-      practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1').map((d) => d.answerText).sort(),
-      ['B 탭 입력', '중간까지 푼 답안'].sort(),
-      'both tabs drafts coexist'
-    );
+    // Account isolation.
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(otherUser, 'p1', 3, tabA), null);
 
-    // Identity: version match is required for restore.
-    assert.equal(practiceAnswerDraft.draftMatchesProblem(loaded, 'p1', 3), true);
-    assert.equal(practiceAnswerDraft.draftMatchesProblem(loaded, 'p1', 4), false, 'a newer problem version is not silently restored');
-    assert.equal(practiceAnswerDraft.draftMatchesProblem(loaded, 'p2', 3), false);
+    // B tab saves its own draft WITHOUT losing A's (per-entry keys, no RMW).
+    const draftB = { ...base, tabId: tabB, answerText: 'B 탭 답안', savedAt: '2026-01-01T00:10:00.000Z' };
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, draftB), true);
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p1', 3, tabA).answerText, 'A 탭 중간 답안');
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p1', 3, tabB).answerText, 'B 탭 답안');
+    assert.equal(practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1', 3).length, 2, 'both tabs coexist (no lost update)');
 
-    // An empty draft carries no content and is not stored as meaningful input.
+    // Version identity: another version's draft is NOT auto-applied, but kept.
+    const v4 = { ...base, problemVersion: 4, answerText: 'v4 답안', savedAt: '2026-01-01T00:20:00.000Z' };
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, v4), true);
     assert.equal(
-      practiceAnswerDraft.hasPracticeDraftContent({
-        ...draft,
-        answerText: '',
-        reasoningNotes: '',
-        solvingReason: '',
-        reasonNotApplicableJustification: '',
-        revealedHints: [],
-      }),
-      false
+      practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p1', 3, tabA).answerText,
+      'A 탭 중간 답안',
+      'v3 tab keeps its own v3 draft'
     );
+    assert.ok(
+      practiceAnswerDraft.listPracticeAnswerDraftsForProblem(userId, 'p1').some((d) => d.problemVersion === 4),
+      'the v4 draft is preserved for explicit recovery'
+    );
+  });
 
-    // Recording tab A's attempt clears ONLY the matching draft; tab B's newer
-    // draft survives so it is never silently discarded.
-    assert.equal(practiceAnswerDraft.clearPracticeAnswerDraft(userId, 'p1', draft), true);
-    const remaining = practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1');
-    assert.deepEqual(remaining.map((d) => d.answerText), ['B 탭 입력']);
+  await checkAsync('Stage 2: clearing every answer is persisted so a refresh does not resurrect it', async () => {
+    const userId = 'practice-draft-clear';
+    const tab = 'tab-clear';
+    const draft = {
+      problemId: 'p2', problemVersion: 1, tabId: tab,
+      answerText: '처음 입력한 답안', revealedHints: [0], confidence: 3, errorType: 'none',
+      reasoningNotes: '메모', solvingReason: '', isReasonNotApplicable: false,
+      reasonNotApplicableJustification: '', savedAt: '2026-01-01T00:00:00.000Z',
+    };
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, draft), true);
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p2', 1, tab).answerText, '처음 입력한 답안');
 
-    // A DIFFERENT draft stored for the recorded content is kept, not cleared.
-    const newer = { ...draft, answerText: '이후에 추가로 입력한 내용', savedAt: '2026-01-01T00:20:00.000Z' };
-    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, tabA, newer), true);
-    assert.equal(practiceAnswerDraft.clearPracticeAnswerDraft(userId, 'p1', draft), true, 'non-matching content stays');
+    // The user clears everything -> an EMPTY draft is still persisted.
+    const cleared = { ...draft, answerText: '', revealedHints: [], reasoningNotes: '', solvingReason: '' };
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, cleared), true);
+    const reloaded = practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p2', 1, tab);
+    assert.equal(reloaded.answerText, '', 'the cleared state survives a reload');
+    assert.equal(practiceAnswerDraft.hasPracticeDraftContent(reloaded), false);
+  });
+
+  await checkAsync('Stage 2: recording one tab keeps the other tabs unsaved drafts', async () => {
+    const userId = 'practice-draft-record';
+    const draftA = {
+      problemId: 'p3', problemVersion: 1, tabId: 'tab-A',
+      answerText: '제출할 답안', revealedHints: [], confidence: 3, errorType: 'none',
+      reasoningNotes: '', solvingReason: '', isReasonNotApplicable: false,
+      reasonNotApplicableJustification: '', savedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const draftB = { ...draftA, tabId: 'tab-B', answerText: 'B 탭 미저장', savedAt: '2026-01-01T00:05:00.000Z' };
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, draftA), true);
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, draftB), true);
+
+    // Tab A records its attempt: only A's matching draft is cleared.
+    assert.equal(practiceAnswerDraft.clearPracticeAnswerDraft(userId, 'p3', 1, 'tab-A', draftA), true);
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p3', 1, 'tab-A'), null);
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p3', 1, 'tab-B').answerText, 'B 탭 미저장');
+
+    // A non-matching stored draft is never cleared (newer input preserved).
+    const newer = { ...draftB, answerText: 'B 탭 이후 입력', savedAt: '2026-01-01T00:10:00.000Z' };
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, newer), true);
     assert.equal(
-      practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1').some((d) => d.answerText === '이후에 추가로 입력한 내용'),
-      true
+      practiceAnswerDraft.clearPracticeAnswerDraft(userId, 'p3', 1, 'tab-B', draftB),
+      false,
+      'a different stored draft is kept'
     );
-    // Clearing succeeds for the exact recorded content.
-    assert.equal(practiceAnswerDraft.clearPracticeAnswerDraft(userId, 'p1', newer), true);
-    assert.equal(
-      practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1').some((d) => d.answerText === '이후에 추가로 입력한 내용'),
-      false
-    );
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p3', 1, 'tab-B').answerText, 'B 탭 이후 입력');
+  });
+
+  check('Stage 2: resolvePracticeTabId keeps a refreshed tab id but forks a duplicated tab', () => {
+    sessionStorage.clear();
+    for (const key of Array.from(data.keys())) {
+      if (key.startsWith('redcall_practice_tab_leases_v1') || key.startsWith('redcall_practice_tab_id_v1')) data.delete(key);
+    }
+    const first = practiceAnswerDraft.resolvePracticeTabId(1000);
+    // A refresh fires pagehide -> the lease is released, so the same tab keeps its id.
+    practiceAnswerDraft.releasePracticeTabLease(first);
+    const afterRefresh = practiceAnswerDraft.resolvePracticeTabId(2000);
+    assert.equal(afterRefresh, first, 'same tab keeps its id across refresh');
+
+    // A duplicated tab copies sessionStorage but the original tab is still live:
+    // a fresh lease owned by a different nonce makes the duplicate FORK.
+    const duplicate = practiceAnswerDraft.resolvePracticeTabId(3000);
+    assert.notEqual(duplicate, first, 'a duplicated tab forks a new id instead of colliding');
+
+    // The lease heartbeat can be refreshed so it stays owned during editing.
+    practiceAnswerDraft.refreshPracticeTabLease(first, 4000);
+    const stillOwned = practiceAnswerDraft.resolvePracticeTabId(4000);
+    assert.notEqual(stillOwned, first, 'the original id is still live-owned, so a second page forks');
   });
 
   await checkAsync('Stage 2: practiceAnswerDraft reports a failed device write instead of claiming success', async () => {
     const userId = 'practice-draft-fail';
-    const key = 'redcall_user_' + encodeURIComponent(userId) + '__practice_answer_drafts_v1';
+    const entryPrefix = 'redcall_user_' + encodeURIComponent(userId) + '__practice_answer_drafts_v1__';
     const realSetItem = localStorage.setItem.bind(localStorage);
     localStorage.setItem = (k, v) => {
-      if (k === key) throw new Error('quota exceeded');
+      if (k.startsWith(entryPrefix)) throw new Error('quota exceeded');
       realSetItem(k, v);
     };
     let saved;
     try {
-      saved = practiceAnswerDraft.savePracticeAnswerDraft(userId, 'tab-1', {
+      saved = practiceAnswerDraft.savePracticeAnswerDraft(userId, {
         problemId: 'p1',
         problemVersion: 1,
+        tabId: 'tab-1',
         answerText: 'x',
         revealedHints: [],
         confidence: 3,
@@ -5908,7 +5961,7 @@ exports.requireApiUser = async () => {
       localStorage.setItem = realSetItem;
     }
     assert.equal(saved, false, 'an unpersisted draft is never reported as saved');
-    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraft(userId, 'p1'), null);
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p1', 1, 'tab-1'), null);
   });
 
   await checkAsync('Stage 2: an unverified body hash never rejects the real body and recovers from storage', async () => {
@@ -6096,6 +6149,133 @@ exports.requireApiUser = async () => {
     storage.markMaterialDeleted('m-2');
     assert.equal(storage.isMaterialSaveFailed('m-2'), false);
     storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  check('Stage 2: an unchanged server during a retry is retryable, not a permanent conflict', () => {
+    const prior = { contentHash: 'h2', baseHash: 'h0', baseVersion: 3, syncBody: true, jobId: 'job-1' };
+    // Same content, server still holds the pre-attempt body: the request did
+    // NOT land -> safe to redo the SAME job.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h2', { ok: true, hasBody: true, hash: 'h0', version: 3 }),
+      'retry_same_job'
+    );
+    // Server confirms the target body -> already saved, never re-uploaded.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h2', { ok: true, hasBody: true, hash: 'h2', version: 4 }),
+      'already_saved'
+    );
+    // A body that matches NEITHER the base nor the target belongs to another
+    // operation -> conflict, never overwritten.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h2', { ok: true, hasBody: true, hash: 'hX', version: 4 }),
+      'conflict'
+    );
+    // Server body removed after the attempt -> someone deleted it -> conflict.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h2', { ok: true, hasBody: false, hash: null, version: 3 }),
+      'conflict'
+    );
+    // Different content is a different save, not a retry.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h3', { ok: true, hasBody: true, hash: 'h0', version: 3 }),
+      'no_record'
+    );
+  });
+
+  check('Stage 2: metadata-only save retries are judged by version, not by body hash', () => {
+    const prior = { contentHash: 'h-meta', baseHash: 'h0', baseVersion: 7, syncBody: false, jobId: 'job-9' };
+    // Version advanced: the metadata write landed.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h-meta', { ok: true, hasBody: false, hash: null, version: 8 }),
+      'already_saved'
+    );
+    // Version unchanged: the request did not land -> redo the same job.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h-meta', { ok: true, hasBody: false, hash: null, version: 7 }),
+      'retry_same_job'
+    );
+    // A body hash on the server tells nothing about a metadata-only write.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h-meta', { ok: true, hasBody: true, hash: 'h-other', version: 7 }),
+      'retry_same_job',
+      'version equality rules metadata writes'
+    );
+    // Without a version, an unknown lookup failure still stops the retry.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h-meta', { ok: true }),
+      'unknown'
+    );
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h-meta', { ok: false }),
+      'unknown'
+    );
+  });
+
+  check('Stage 2: server-save retry records carry job/base info and stay compatible', () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'retry-full' });
+    assert.equal(
+      storage.recordMaterialServerSave('m-full', { contentHash: 'h2', baseHash: 'h0', baseVersion: 3, syncBody: true, jobId: 'job-1' }),
+      true
+    );
+    const record = storage.getMaterialServerSaveRecord('m-full');
+    assert.equal(record.contentHash, 'h2');
+    assert.equal(record.baseHash, 'h0');
+    assert.equal(record.baseVersion, 3);
+    assert.equal(record.jobId, 'job-1');
+    // A later partial update merges instead of dropping the retry identity.
+    assert.equal(storage.recordMaterialServerSave('m-full', { contentHash: 'h2' }), true);
+    const merged = storage.getMaterialServerSaveRecord('m-full');
+    assert.equal(merged.baseHash, 'h0', 'retry identity survives partial updates');
+    assert.equal(merged.jobId, 'job-1');
+    // Legacy string writes still work and read back.
+    assert.equal(storage.recordMaterialServerSave('m-legacy', 'hash-old'), true);
+    assert.equal(storage.getMaterialServerSaveRecord('m-legacy').contentHash, 'hash-old');
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  check('Stage 2: an expired exam URL open requires an explicit choice before any submit', () => {
+    // Local v1/answers A, server v2/answers B.
+    const localExpired = { id: 'x1', status: 'submitted', answers: { p1: 'A' }, reasons: {}, evaluations: {} };
+    const serverNewer = { id: 'x1', status: 'in_progress', answers: { p1: 'B' }, reasons: {}, evaluations: {} };
+    const plan = cloudMockExamSync.planExpiredOpen(localExpired, serverNewer);
+    assert.equal(plan.serverTerminal, false);
+    assert.equal(plan.conflict, true, 'different answers are a conflict, never auto-submitted');
+
+    // A plain click must NOT submit over the server snapshot.
+    assert.deepEqual(cloudMockExamSync.decideExpiredSubmit(plan, 5), { action: 'blocked_conflict' });
+
+    // Identical answers are safe to submit with the confirmed version.
+    const sameLocal = { id: 'x1', status: 'submitted', answers: { p1: 'B' }, reasons: {}, evaluations: {} };
+    const samePlan = cloudMockExamSync.planExpiredOpen(sameLocal, serverNewer);
+    assert.equal(samePlan.conflict, false);
+    assert.deepEqual(cloudMockExamSync.decideExpiredSubmit(samePlan, 5), { action: 'submit', expectedVersion: 5 });
+  });
+
+  check('Stage 2: an already terminal server exam is adopted, never overwritten', () => {
+    const localExpired = { id: 'x1', status: 'submitted', answers: { p1: 'A' }, reasons: {}, evaluations: {} };
+    const serverSubmitted = { id: 'x1', status: 'submitted', answers: { p1: 'B' }, reasons: {}, evaluations: {} };
+    const plan = cloudMockExamSync.planExpiredOpen(localExpired, serverSubmitted);
+    assert.equal(plan.serverTerminal, true);
+    assert.deepEqual(cloudMockExamSync.decideExpiredSubmit(plan, 7), { action: 'blocked_conflict' });
+  });
+
+  await checkAsync('Stage 2: an explicit choice submits with the confirmed version, and a later server change re-conflicts', async () => {
+    const submitted = {
+      id: 'exam-x', subjectId: 's1', createdAt: 't', endsAt: 't2', durationMinutes: 60,
+      status: 'submitted', selectedConceptIds: [], selectedTypes: [], problems: [],
+      answers: { p1: 'A' }, evaluations: {},
+    };
+    await withConfigured({ user: { id: 'u1' } }, async (client) => {
+      // No impl: the fake echoes defaults; fail with stale to simulate a server
+      // that moved to v3 after the user compared at v2.
+      client.__state.fail = { rpc: true, rpcMessage: 'MOCK_SESSION_STALE: expected 2, got 3' };
+      const stale = await cloudMockExamSync.submitMockExamOnServer(submitted, 2);
+      assert.equal(stale.ok, false);
+      assert.equal(stale.code, 'stale', 'submit with a superseded version conflicts instead of overwriting');
+      const recorded = client.__state.rpcCalls.filter((c) => c.name === 'submit_mock_exam');
+      assert.equal(recorded.length, 1);
+      assert.equal(recorded[0].params.p_expected_version, 2, 'the confirmed version is carried to the server');
+    });
   });
 
   check('Stage 2: exam deep links resolve to the exam own subject and settings tab round-trips', () => {

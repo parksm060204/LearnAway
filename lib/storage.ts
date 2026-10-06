@@ -514,10 +514,23 @@ export function clearMaterialSyncState(materialId: string): void {
 const MATERIAL_SERVER_SAVE_KEY = 'material_server_saves_v1';
 
 export interface MaterialServerSaveRecord {
-  /** materialContentHash of the content that the (possibly lost) save confirmed. */
+  /** materialContentHash of the content that the (possibly lost) save targeted. */
   contentHash: string;
+  /** Server body hash BEFORE the attempt (undefined only for a legacy record). */
+  baseHash?: string | null;
+  /** Server row version BEFORE the attempt. */
+  baseVersion?: number;
+  /** Whether the policy syncs the body (false = metadata-only write). */
+  syncBody?: boolean;
+  /** Job id of the attempt, so the SAME job can be re-run safely. */
+  jobId?: string | null;
   confirmedAt: string;
 }
+
+/** Accepts either the legacy content hash string or the full retry record. */
+export type MaterialServerSaveInput =
+  | string
+  | Omit<MaterialServerSaveRecord, 'confirmedAt'>;
 
 function readMaterialServerSaves(): Record<string, MaterialServerSaveRecord> {
   return safeGetItem<Record<string, MaterialServerSaveRecord>>(MATERIAL_SERVER_SAVE_KEY, {});
@@ -529,10 +542,13 @@ function writeMaterialServerSaves(registry: Record<string, MaterialServerSaveRec
   return JSON.stringify(readBack) === JSON.stringify(registry);
 }
 
-export function recordMaterialServerSave(materialId: string, contentHash: string): boolean {
-  if (!materialId || !contentHash) return false;
+export function recordMaterialServerSave(materialId: string, input: MaterialServerSaveInput): boolean {
+  if (!materialId) return false;
+  const partial = typeof input === 'string' ? { contentHash: input } : input;
+  if (!partial.contentHash) return false;
   const registry = readMaterialServerSaves();
-  registry[materialId] = { contentHash, confirmedAt: new Date().toISOString() };
+  // Merge over any previous record so a partial update never drops retry info.
+  registry[materialId] = { ...registry[materialId], ...partial, confirmedAt: new Date().toISOString() };
   return writeMaterialServerSaves(registry);
 }
 

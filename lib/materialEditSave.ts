@@ -50,30 +50,81 @@ export interface MaterialEditSaveOutcome {
   message: string;
 }
 
-export type MaterialServerRetryVerdict = 'no_record' | 'already_saved' | 'conflict' | 'unknown';
+export type MaterialServerRetryVerdict =
+  | 'no_record'
+  | 'already_saved'
+  | 'retry_same_job'
+  | 'conflict'
+  | 'unknown';
+
+/** Identity of the previous save attempt, persisted so a reload can recover it. */
+export interface MaterialServerRetryRecord {
+  /** materialContentHash of the content the previous attempt tried to write. */
+  contentHash: string;
+  /** Server body hash BEFORE the attempt (undefined for a legacy record). */
+  baseHash?: string | null;
+  /** Server row version BEFORE the attempt. */
+  baseVersion?: number;
+  /** Whether the policy syncs the body (false = metadata-only write). */
+  syncBody?: boolean;
+  /** Job id of the attempt, so the SAME job can be re-run safely. */
+  jobId?: string | null;
+}
+
+export interface MaterialServerProbe {
+  ok: boolean;
+  hasBody?: boolean;
+  hash?: string | null;
+  /** Server row version at probe time (used for metadata-only writes). */
+  version?: number;
+}
 
 /**
- * Response-loss recovery rule. A retry of the SAME content checks the server
- * state by content hash:
- *  - no matching previous save record -> a normal new write may proceed,
- *  - server confirms the exact hash -> the write is ALREADY saved (only the
- *    remaining local steps may be retried; never upload again / bump version),
- *  - server body exists but differs -> the content changed later: conflict,
- *  - server lookup FAILED -> 'unknown': never treated as "not saved yet".
+ * Response-loss recovery rule. A retry of the SAME content asks the SERVER what
+ * it actually stored, and distinguishes "unchanged since the attempt" from
+ * "someone else changed it":
+ *  - no matching previous record -> a normal new write may proceed,
+ *  - server already holds the target body -> 'already_saved' (never re-upload),
+ *  - server still holds the pre-attempt body (baseHash) -> the earlier request
+ *    did NOT land: 'retry_same_job' (safe to redo the SAME job),
+ *  - server holds neither -> another operation changed it: 'conflict',
+ *  - lookup FAILED -> 'unknown': never treated as "not saved yet",
+ *  - metadata-only write (syncBody false): confirmed by the row VERSION, never
+ *    by a body hash.
  */
 export function evaluateMaterialServerRetry(
-  record: { contentHash: string } | undefined,
+  record: MaterialServerRetryRecord | undefined,
   currentContentHash: string,
-  server: { ok: boolean; hasBody?: boolean; hash?: string | null }
+  server: MaterialServerProbe
 ): MaterialServerRetryVerdict {
   if (!record || record.contentHash !== currentContentHash) return 'no_record';
   // A lookup FAILURE is never interpreted as "not saved": the retry must stop.
   if (!server.ok) return 'unknown';
+
+  // Metadata-only write: the server version is the only signal.
+  if (record.syncBody === false) {
+    if (server.version === undefined || record.baseVersion === undefined) return 'unknown';
+    if (server.version > record.baseVersion) return 'already_saved';
+    if (server.version === record.baseVersion) return 'retry_same_job';
+    return 'conflict';
+  }
+
+  // Body-sync write: the server body hash is the signal.
   if (server.hasBody && server.hash === currentContentHash) return 'already_saved';
-  if (server.hasBody && server.hash !== currentContentHash) return 'conflict';
-  // The server genuinely stores no such body: the earlier write did not land,
-  // so a normal new write may proceed.
-  return 'no_record';
+  if (server.hasBody) {
+    if (record.baseHash !== undefined && server.hash === record.baseHash) return 'retry_same_job';
+    return 'conflict';
+  }
+  // No body on the server.
+  if (record.baseHash !== undefined && record.baseHash !== null) {
+    // The server used to have a body and now has none: someone removed it.
+    return 'conflict';
+  }
+  if (record.baseHash === undefined) {
+    // Legacy record without a base: cannot prove it is unchanged.
+    return 'no_record';
+  }
+  return 'retry_same_job';
 }
 
 export function evaluateMaterialEditSave(input: MaterialEditSaveInput): MaterialEditSaveOutcome {  const succeeded: string[] = [];
