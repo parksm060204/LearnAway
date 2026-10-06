@@ -171,6 +171,30 @@ export async function downloadMaterialContent(
   }
 }
 
+/**
+ * Reads the SERVER's current body for one material and returns its content
+ * hash. A lookup failure is reported as an error — callers must never treat it
+ * as "no body" or "not saved".
+ */
+export async function getMaterialServerBodyHash(
+  materialId: string
+): Promise<RepoResult<{ hash: string | null; hasBody: boolean }>> {
+  try {
+    const rows = await listMaterialRows();
+    if (!rows.ok) return rows;
+    const row = rows.data.find((r) => r.id === materialId);
+    if (!row) return repoOk({ hash: null, hasBody: false });
+    if (!row.markdown_path && !row.transcript_path && !row.pages_path) {
+      return repoOk({ hash: null, hasBody: false });
+    }
+    const content = await downloadMaterialContent(row);
+    if (!content.ok) return content;
+    return repoOk({ hash: materialContentHash(content.data), hasBody: true });
+  } catch (error) {
+    return repoError(toMessage(error, '서버 본문을 확인하지 못했습니다.'));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------

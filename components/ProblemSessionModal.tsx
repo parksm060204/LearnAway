@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Concept,
   Problem,
@@ -15,6 +15,14 @@ import { MathFormula } from './MathFormula';
 import { AcademicMathView } from './AcademicMathView';
 import { ProblemReportModal } from './ProblemReportModal';
 import { AttemptSaveStatus } from '../lib/storage';
+import {
+  clearPracticeAnswerDraft,
+  draftMatchesProblem,
+  hasPracticeDraftContent,
+  loadPracticeAnswerDraft,
+  savePracticeAnswerDraft,
+  type PracticeAnswerDraft,
+} from '../lib/practiceAnswerDraft';
 import {
   X,
   Lightbulb,
@@ -52,6 +60,8 @@ interface ProblemSessionModalProps {
   subject: Subject;
   concept: Concept;
   problem: Problem;
+  /** Owner account: unsaved answers are preserved per account + problem. */
+  userId?: string;
   onSubmitAttempt: (attempt: Attempt) => {
     partial: boolean;
     status: AttemptSaveStatus;
@@ -77,23 +87,141 @@ export function ProblemSessionModal({
   subject,
   concept,
   problem,
+  userId = '',
   onSubmitAttempt,
   rechallengeReservationId,
   planItemId,
   onOpenSourceModal,
   onReportProblem,
 }: ProblemSessionModalProps) {
-  const [answerText, setAnswerText] = useState('');
+  // Resolve a device draft ONCE at mount (useState initializer). The parent
+  // keys this component by subject/problem/version, so a refresh restores the
+  // unsaved answer here without a setState-in-effect cascade.
+  const [initialDraft] = useState<PracticeAnswerDraft | null>(() => {
+    if (!userId) return null;
+    const candidate = loadPracticeAnswerDraft(userId, problem.id);
+    if (!candidate) return null;
+    if (!draftMatchesProblem(candidate, problem.id, problem.version || 1)) return null;
+    return hasPracticeDraftContent(candidate) ? candidate : null;
+  });
+
+  const [answerText, setAnswerText] = useState(initialDraft?.answerText ?? '');
   const [activeTab, setActiveTab] = useState<'editor' | 'preview'>('editor');
-  const [revealedHints, setRevealedHints] = useState<number[]>([]);
-  const [confidence, setConfidence] = useState<number>(3);
-  const [errorType, setErrorType] = useState<ErrorType>('none');
-  const [reasoningNotes, setReasoningNotes] = useState('');
+  const [revealedHints, setRevealedHints] = useState<number[]>(initialDraft?.revealedHints ?? []);
+  const [confidence, setConfidence] = useState<number>(initialDraft?.confidence ?? 3);
+  const [errorType, setErrorType] = useState<ErrorType>(initialDraft?.errorType ?? 'none');
+  const [reasoningNotes, setReasoningNotes] = useState(initialDraft?.reasoningNotes ?? '');
 
   // Stage 8: Method selection reason input state
-  const [solvingReason, setSolvingReason] = useState('');
-  const [isReasonNotApplicable, setIsReasonNotApplicable] = useState(false);
-  const [reasonNotApplicableJustification, setReasonNotApplicableJustification] = useState('');
+  const [solvingReason, setSolvingReason] = useState(initialDraft?.solvingReason ?? '');
+  const [isReasonNotApplicable, setIsReasonNotApplicable] = useState(
+    Boolean(initialDraft?.isReasonNotApplicable)
+  );
+  const [reasonNotApplicableJustification, setReasonNotApplicableJustification] = useState(
+    initialDraft?.reasonNotApplicableJustification ?? ''
+  );
+
+  // Unsaved answer recovery notice (captured at mount with the draft itself).
+  const [restoredDraftAt] = useState<string | null>(initialDraft?.savedAt ?? null);
+  const [draftSaveFailed, setDraftSaveFailed] = useState(false);
+  // Per-tab identifier: two tabs on the same problem keep separate drafts.
+  const [tabId] = useState(
+    () => `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  );
+  const draftTimerRef = useRef<number | null>(null);
+  const draftSnapshotRef = useRef<PracticeAnswerDraft | null>(null);
+  // Once the attempt is durably recorded, later unmount flushes must not
+  // re-create the draft that was just cleared.
+  const recordSucceededRef = useRef(false);
+
+  const problemVersion = problem.version || 1;
+
+  const buildDraft = (): PracticeAnswerDraft => ({
+    problemId: problem.id,
+    problemVersion,
+    answerText,
+    revealedHints,
+    confidence,
+    errorType,
+    reasoningNotes,
+    solvingReason,
+    isReasonNotApplicable,
+    reasonNotApplicableJustification,
+    savedAt: new Date().toISOString(),
+  });
+
+  const persistDraftNow = (): boolean => {
+    const draft = draftSnapshotRef.current;
+    if (!draft || !hasPracticeDraftContent(draft)) return true;
+    const ok = savePracticeAnswerDraft(userId, tabId, draft);
+    setDraftSaveFailed(!ok);
+    return ok;
+  };
+
+  // Autosave the unsaved input (debounced), so a refresh or tab move never
+  // loses typed content. The unmount callback is NOT assumed to run on browser
+  // termination: pagehide/visibilitychange flush the last snapshot immediately.
+  useEffect(() => {
+    if (!isOpen || !userId) return;
+    const draft = buildDraft();
+    draftSnapshotRef.current = draft;
+    if (draftTimerRef.current !== null) window.clearTimeout(draftTimerRef.current);
+    draftTimerRef.current = window.setTimeout(() => {
+      draftTimerRef.current = null;
+      if (!hasPracticeDraftContent(draft)) return;
+      const ok = savePracticeAnswerDraft(userId, tabId, draft);
+      setDraftSaveFailed(!ok);
+    }, 500);
+    return () => {
+      if (draftTimerRef.current !== null) {
+        window.clearTimeout(draftTimerRef.current);
+        draftTimerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    isOpen,
+    userId,
+    problem.id,
+    tabId,
+    answerText,
+    revealedHints,
+    confidence,
+    errorType,
+    reasoningNotes,
+    solvingReason,
+    isReasonNotApplicable,
+    reasonNotApplicableJustification,
+  ]);
+
+  // pagehide fires on refresh and tab close even when React never unmounts:
+  // flush the last input synchronously (localStorage.setItem is sync).
+  useEffect(() => {
+    if (!userId) return;
+    const flush = () => {
+      if (recordSucceededRef.current) return;
+      persistDraftNow();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, tabId]);
+
+  // Flush the last snapshot when the editor unmounts.
+  useEffect(() => {
+    return () => {
+      if (recordSucceededRef.current) return;
+      persistDraftNow();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, tabId]);
 
   // Stage 4: AI Evaluation State
   const [isEvaluating, setIsEvaluating] = useState(false);
@@ -324,6 +452,16 @@ export function ProblemSessionModal({
         });
         setIsSubmitting(false);
         return;
+      }
+      // The attempt + review event are durably recorded: clear the device draft
+      // ONLY when the stored draft still matches the recorded content.
+      recordSucceededRef.current = true;
+      if (draftTimerRef.current !== null) {
+        window.clearTimeout(draftTimerRef.current);
+        draftTimerRef.current = null;
+      }
+      if (userId) {
+        clearPracticeAnswerDraft(userId, problem.id, buildDraft());
       }
       onClose();
     } catch (cause) {
@@ -581,6 +719,31 @@ export function ProblemSessionModal({
 
           {/* Dual Input Workspace Area: 1. Solution & Conclusion, 2. Method Selection Reason */}
           <div className="space-y-4">
+            {draftSaveFailed && (
+              <div
+                role="alert"
+                className="flex items-center gap-2 p-2.5 bg-red-50 border border-red-200 text-red-800 rounded-xs text-[11px]"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>
+                  임시 보존에 실패했습니다. 입력은 그대로 유지되며, 저장 공간을 확인한 뒤 다시 시도해 주세요.
+                </span>
+              </div>
+            )}
+
+            {restoredDraftAt && (
+              <div
+                role="status"
+                className="flex items-center gap-2 p-2.5 bg-amber-50 border border-amber-300 text-amber-900 rounded-xs text-[11px]"
+              >
+                <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                <span>
+                  이 기기에 임시 보존된 답안을 불러왔습니다 (저장 시각:{' '}
+                  {new Date(restoredDraftAt).toLocaleString('ko-KR')}). 제출하면 기록으로 확정됩니다.
+                </span>
+              </div>
+            )}
+
             {/* Input Section 1: Solution & Conclusion */}
             <div className="space-y-2">
               <div className="flex items-center justify-between">
@@ -1179,9 +1342,14 @@ export function ProblemSessionModal({
   return (
     <>
       {isPage ? (
-        modalBody
+        <div role="region" aria-label="문제 풀이 전용 작업 화면">{modalBody}</div>
       ) : (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="문제 풀이"
+          className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto"
+        >
           {modalBody}
         </div>
       )}

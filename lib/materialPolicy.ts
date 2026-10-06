@@ -1,4 +1,5 @@
 import type { Material, MaterialPage, MaterialStoragePolicy } from './types';
+import type { MaterialSyncStateRecord } from './storage';
 import { scopedStorageKey } from './storageScope';
 import { materialContentHash } from './cloud/hash';
 import { hashBlob } from './materialStorage';
@@ -95,6 +96,61 @@ export interface MaterialStorageStateInput {
   originalBackedUp?: boolean;
   /** A local save (body or original) failed and needs a retry. */
   saveFailed?: boolean;
+  /**
+   * The server-confirmed sync record. When provided it REPLACES the bodySynced
+   * heuristic: '본문 동기화됨' is claimed only for a confirmed, hash-equal body.
+   */
+  syncState?: MaterialSyncStateRecord;
+}
+
+export type MaterialBodySyncState = 'local_only' | 'confirmed' | 'pending' | 'failed' | 'unknown';
+
+export interface MaterialBodySyncDerivation {
+  state: MaterialBodySyncState;
+  /** Korean label for the current state, or null when no sync claim is made. */
+  label: string | null;
+  /** True only when the CURRENT body is confirmed stored on the server. */
+  synced: boolean;
+}
+
+/**
+ * THE single rule for body-sync status, shared by list / editor / settings:
+ *  - local-only or syncBody:false -> no sync claim ('이 기기에 보관됨' only),
+ *  - failed -> '본문 동기화 실패 · 재시도 필요',
+ *  - confirmed ONLY when the server body hash equals the hash of the body last
+ *    written on THIS device (a different server version is NOT confirmed),
+ *  - otherwise pending/unknown; a lookup that never happened or failed is
+ *    '서버 상태 미확인' / '동기화 대기', never '동기화 완료'.
+ */
+export function deriveMaterialBodySyncState(
+  material: Pick<Material, 'storagePolicy'>,
+  record: MaterialSyncStateRecord | undefined,
+  hasLocalBody: boolean
+): MaterialBodySyncDerivation {
+  const policy = materialPolicyOf(material);
+  if (!policy.syncBody || record?.status === 'not_required') {
+    return { state: 'local_only', label: null, synced: false };
+  }
+  if (record?.status === 'failed') {
+    return { state: 'failed', label: '본문 동기화 실패 · 재시도 필요', synced: false };
+  }
+  if (
+    record?.status === 'confirmed' &&
+    record.serverBodyHash !== undefined &&
+    record.localBodyHash !== undefined &&
+    record.serverBodyHash === record.localBodyHash
+  ) {
+    return { state: 'confirmed', label: '본문 동기화됨', synced: true };
+  }
+  if (record && (record.status === 'pending' || (record.serverHasBody && record.localBodyHash !== undefined))) {
+    return { state: 'pending', label: '동기화 대기 (서버 미반영/이전 버전)', synced: false };
+  }
+  if (record && record.localBodyHash !== undefined) {
+    // This device wrote a body but no server state is known for it yet.
+    return { state: 'pending', label: '동기화 대기', synced: false };
+  }
+  void hasLocalBody;
+  return { state: 'unknown', label: '서버 상태 미확인', synced: false };
 }
 
 export interface MaterialStorageState {
@@ -119,18 +175,33 @@ export interface MaterialStorageState {
 export function deriveMaterialStorageState(input: MaterialStorageStateInput): MaterialStorageState {
   const policy = materialPolicyOf(input.material);
   const local = { body: input.hasLocalBody, original: input.hasLocalOriginal };
-  const cloud = { body: Boolean(input.bodySynced), original: Boolean(input.originalBackedUp) };
+  // A server-confirmed record (hash-equal) is authoritative; otherwise fall
+  // back to the explicit boolean (legacy callers) — settings/local presence
+  // alone never counts as synced.
+  const bodySync = input.syncState
+    ? deriveMaterialBodySyncState(input.material, input.syncState, input.hasLocalBody)
+    : undefined;
+  const cloud = {
+    body: bodySync ? bodySync.synced : Boolean(input.bodySynced),
+    original: Boolean(input.originalBackedUp),
+  };
 
   const needsLink = !local.body && !cloud.body;
   const labels: string[] = [];
   if (input.saveFailed) labels.push('저장 실패 · 재시도 필요');
+  else if (bodySync?.state === 'failed') labels.push('본문 동기화 실패 · 재시도 필요');
   if (local.body || local.original) labels.push('이 기기에 보관됨');
-  if (cloud.body) labels.push('본문 동기화됨');
+  if (bodySync) {
+    if (bodySync.label) labels.push(bodySync.label);
+  } else if (cloud.body) {
+    labels.push('본문 동기화됨');
+  }
   if (cloud.original) labels.push('원본 백업됨');
   if (needsLink) labels.push('이 기기에서 파일 연결 필요');
 
   let state: MaterialLinkState;
   if (input.saveFailed) state = 'save_failed';
+  else if (bodySync?.state === 'failed') state = 'save_failed';
   else if (needsLink) state = 'needs_link';
   else if (cloud.body && cloud.original) state = 'synced';
   else if (cloud.body) state = 'body_synced';

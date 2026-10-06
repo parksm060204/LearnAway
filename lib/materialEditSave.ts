@@ -23,7 +23,7 @@ export type ServerSaveStatus =
 export type LocalSaveStatus = 'saved' | 'failed' | 'skipped';
 
 export interface MaterialServerSaveResult {
-  status: 'saved' | 'not_required' | 'failed';
+  status: 'saved' | 'already_saved' | 'not_required' | 'failed';
   error?: string;
   /** Server saved, but migration 9 is missing so policy/hash columns were not stored. */
   fallbackUsed?: boolean;
@@ -35,6 +35,8 @@ export interface MaterialEditSaveInput {
   serverFallbackUsed?: boolean;
   local: LocalSaveStatus;
   localError?: string;
+  /** The body was saved but its identity hash could not be persisted. */
+  identityRecordFailed?: boolean;
 }
 
 export interface MaterialEditSaveOutcome {
@@ -48,8 +50,33 @@ export interface MaterialEditSaveOutcome {
   message: string;
 }
 
-export function evaluateMaterialEditSave(input: MaterialEditSaveInput): MaterialEditSaveOutcome {
-  const succeeded: string[] = [];
+export type MaterialServerRetryVerdict = 'no_record' | 'already_saved' | 'conflict' | 'unknown';
+
+/**
+ * Response-loss recovery rule. A retry of the SAME content checks the server
+ * state by content hash:
+ *  - no matching previous save record -> a normal new write may proceed,
+ *  - server confirms the exact hash -> the write is ALREADY saved (only the
+ *    remaining local steps may be retried; never upload again / bump version),
+ *  - server body exists but differs -> the content changed later: conflict,
+ *  - server lookup FAILED -> 'unknown': never treated as "not saved yet".
+ */
+export function evaluateMaterialServerRetry(
+  record: { contentHash: string } | undefined,
+  currentContentHash: string,
+  server: { ok: boolean; hasBody?: boolean; hash?: string | null }
+): MaterialServerRetryVerdict {
+  if (!record || record.contentHash !== currentContentHash) return 'no_record';
+  // A lookup FAILURE is never interpreted as "not saved": the retry must stop.
+  if (!server.ok) return 'unknown';
+  if (server.hasBody && server.hash === currentContentHash) return 'already_saved';
+  if (server.hasBody && server.hash !== currentContentHash) return 'conflict';
+  // The server genuinely stores no such body: the earlier write did not land,
+  // so a normal new write may proceed.
+  return 'no_record';
+}
+
+export function evaluateMaterialEditSave(input: MaterialEditSaveInput): MaterialEditSaveOutcome {  const succeeded: string[] = [];
   const failed: string[] = [];
   const notes: string[] = [];
 
@@ -69,6 +96,10 @@ export function evaluateMaterialEditSave(input: MaterialEditSaveInput): Material
 
   if (serverOk && input.serverFallbackUsed) {
     notes.push('서버 마이그레이션 9가 적용되지 않아 저장 정책과 원본 식별 정보는 서버에 저장되지 않았습니다.');
+  }
+
+  if (input.local === 'saved' && input.identityRecordFailed) {
+    notes.push('본문은 이 기기에 저장됐지만 본문 식별 정보(해시)를 저장하지 못했습니다. 저장된 본문에서 재계산을 시도했으며 실패 시 "재검증 필요"로 표시해 재연결 때 오래된 해시로 거부하지 않습니다.');
   }
 
   const canClose = failed.length === 0;

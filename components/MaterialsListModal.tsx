@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Material, Subject } from '../lib/types';
 import { listMaterialContentIds, listMaterialOriginalIds } from '../lib/materialStorage';
+import { getMaterialSyncState, isMaterialSaveFailed } from '../lib/storage';
 import { deriveMaterialStorageState } from '../lib/materialPolicy';
 import {
   X,
@@ -239,11 +240,9 @@ export function MaterialsListModal({
                   material: mat,
                   hasLocalBody: bodyIds.has(mat.id),
                   hasLocalOriginal: originalIds.has(mat.id),
-                  // The body may be in IndexedDB (persistent) or still only in
-                  // the in-memory metadata (legacy/failed migration fallback).
-                  bodySynced:
-                    (Boolean(mat.storagePolicy?.syncBody) || !mat.storagePolicy) &&
-                    (bodyIds.has(mat.id) || Boolean(mat.parsedMarkdown)),
+                  originalBackedUp: hasOriginal ? hasOriginal(mat.id) : originalIds.has(mat.id),
+                  saveFailed: isMaterialSaveFailed(mat.id),
+                  syncState: getMaterialSyncState(mat.id),
                 });
 
                 return (

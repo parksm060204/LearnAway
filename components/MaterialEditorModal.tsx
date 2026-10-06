@@ -3,7 +3,17 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Material, MaterialPage, Subject } from '../lib/types';
 import { loadMaterialContentResult, saveMaterialContentInScope } from '../lib/materialStorage';
-import { recordMaterialBodyHash } from '../lib/storage';
+import {
+  clearMaterialSaveFailed,
+  getMaterialSyncState,
+  markMaterialBodyHashUnverified,
+  markMaterialSaveFailed,
+  recordMaterialBodyHash,
+  recordMaterialSyncState,
+  refreshMaterialBodyHashFromStoredBody,
+} from '../lib/storage';
+import { deriveMaterialBodySyncState, materialPolicyOf } from '../lib/materialPolicy';
+import { materialContentHash } from '../lib/cloud/hash';
 import { computeMarkdownHash } from '../lib/markdownUtils';
 import { getStorageScopeId, subscribeStorageScope } from '../lib/storageScope';
 import {
@@ -99,7 +109,7 @@ export function MaterialEditorModal({
   const savingRef = useRef(false);
   // Last server step confirmed for an exact body hash: a retry then performs
   // only the failed part and never repeats a confirmed write.
-  const serverStepRef = useRef<{ hash: string; status: 'saved' | 'not_required'; fallbackUsed: boolean } | null>(null);
+  const serverStepRef = useRef<{ hash: string; status: 'saved' | 'already_saved' | 'not_required'; fallbackUsed: boolean } | null>(null);
   const markdownRef = useRef('');
   const baselineRef = useRef<string | null>(null);
   const materialRef = useRef(material);
@@ -205,6 +215,9 @@ export function MaterialEditorModal({
 
   if (!isOpen || !material) return null;
 
+  // Same sync-status rule as the material list (server-confirmed, hash-equal).
+  const bodySync = deriveMaterialBodySyncState(material, getMaterialSyncState(material.id), true);
+
   const totalPages = pages.length > 0 ? pages.length : (material.pageCount || 1);
   const currentPageData = pages.find((p) => p.pageNumber === currentPage);
 
@@ -291,6 +304,7 @@ export function MaterialEditorModal({
       // server rejected the edit so the stored body is never replaced by it.
       let local: LocalSaveStatus = 'skipped';
       let localError: string | undefined;
+      let identityRecordFailed = false;
       if (server !== 'failed') {
         const written = await saveMaterialContentInScope(pinned, material.id, {
           markdown: savedMarkdown,
@@ -299,12 +313,39 @@ export function MaterialEditorModal({
         });
         if (written.persisted) {
           local = 'saved';
+          const bodyContentHash = materialContentHash({
+            markdown: savedMarkdown,
+            rawText: savedRaw,
+            pages: savedPages,
+          });
+          // Keep the sync record in step with the body this device now stores.
+          const syncBodyEnabled = materialPolicyOf(material).syncBody;
+          recordMaterialSyncState(material.id, {
+            localBodyHash: bodyContentHash,
+            status: server === 'not_required' || !syncBodyEnabled ? 'not_required' : 'confirmed',
+          });
           // Identity hash only after a durable save, and only in the same account.
           if (scopeUnchanged()) {
-            recordMaterialBodyHash(material.id, savedHash, {
+            const hashRecorded = recordMaterialBodyHash(material.id, savedHash, {
               subjectId: material.subjectId,
               kind: material.kind,
             });
+            if (!hashRecorded) {
+              // The body IS saved; recover the identity from the persisted body.
+              // If that also fails, mark it unverified so the OLD hash can never
+              // reject this real body later.
+              const recovered = await refreshMaterialBodyHashFromStoredBody(material.id, {
+                subjectId: material.subjectId,
+                kind: material.kind,
+              });
+              identityRecordFailed = !recovered;
+              if (!recovered) {
+                markMaterialBodyHashUnverified(material.id, {
+                  subjectId: material.subjectId,
+                  kind: material.kind,
+                });
+              }
+            }
           }
         } else {
           local = 'failed';
@@ -318,6 +359,7 @@ export function MaterialEditorModal({
         serverFallbackUsed: fallbackUsed,
         local,
         localError,
+        identityRecordFailed,
       });
 
       // A failed required save must not lose the typed text: also keep it as a device draft.
@@ -343,9 +385,13 @@ export function MaterialEditorModal({
         setBaseline(savedMarkdown);
         setSaveSuccessMsg(`저장 완료 (${now})`);
         setDraftPrompt(null);
+        // A fully successful save clears any earlier failure marker.
+        clearMaterialSaveFailed(material.id);
         // The saved body now supersedes any draft (best effort; a leftover is harmless).
         void deleteMaterialDraftInScope(pinned, material.id);
       } else {
+        // Surface the real state on the material list: never claim synced.
+        markMaterialSaveFailed(material.id, finalOutcome.message);
         setSaveWarning('저장 문제 발생 · 아래 안내 확인');
       }
       return finalOutcome;
@@ -714,6 +760,12 @@ export function MaterialEditorModal({
             <span className="text-[#c8c2b5]">|</span>
             <span className="font-academic-mono text-[11px] text-[#57544e]">
               출처: <strong>{material.sourceRefs}</strong>
+            </span>
+            <span className="text-[#c8c2b5]">|</span>
+            {/* Same sync rule as the material list: only a server-confirmed,
+                hash-equal body is shown as synced. */}
+            <span className={`font-academic-mono text-[11px] ${bodySync.label ? (bodySync.synced ? 'text-emerald-700' : bodySync.state === 'failed' ? 'text-red-700' : 'text-amber-800') : 'text-[#827d73]'}`}>
+              {bodySync.label ?? '로컬 전용 자료'}
             </span>
             {material.lastEditedAt && (
               <>

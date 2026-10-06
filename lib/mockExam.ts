@@ -91,3 +91,19 @@ export function getExamScore(session: MockExamSession): number | null {
   return Math.round(session.problems.reduce((sum, problem) =>
     sum + (session.evaluations[problem.id]?.calculatedScore ?? 0), 0) / session.problems.length);
 }
+
+export type ExamOpenPolicy = 'running' | 'expired_manual';
+
+/**
+ * Opening a stale exam through a direct URL must NOT trigger a new submit by
+ * itself: the deadline policy applies to a session that was ALREADY running,
+ * while a URL-open of an expired session offers an explicit '저장된 답안으로
+ * 제출' action instead.
+ */
+export function examOpenPolicy(
+  session: MockExamSession | null,
+  deferExpiredSubmit: boolean
+): ExamOpenPolicy {
+  if (!session || session.status !== 'submitted' || !deferExpiredSubmit) return 'running';
+  return 'expired_manual';
+}

@@ -304,8 +304,11 @@ export function markMaterialDeleted(materialId: string): void {
   const registry = readDeletedMaterialMarkers();
   registry[materialId] = { deletedAt: new Date().toISOString() };
   writeDeletedMaterialMarkers(registry);
-  // A deleted material is no longer local-only.
+  // A deleted material is no longer local-only and has no pending save state.
   clearLocalOnlyMaterialMarker(materialId);
+  clearMaterialSaveFailed(materialId);
+  clearMaterialSyncState(materialId);
+  clearMaterialServerSaveRecord(materialId);
 }
 
 /** Clears the marker when the material legitimately exists again (explicit restore, re-upload). */
@@ -387,6 +390,165 @@ export function isLocalOnlyMaterial(materialId: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Material edit save-failure markers (account-scoped).
+//
+// A failed/partial edit save (server or device) is recorded here so the
+// material list can show the real "저장 실패 · 재시도 필요" state instead of
+// claiming a synced body. Cleared when a later save completes or the material
+// is deleted / the data is reset.
+// ---------------------------------------------------------------------------
+
+const MATERIAL_SAVE_FAILURE_KEY = 'material_save_failures_v1';
+
+export interface MaterialSaveFailure {
+  failedAt: string;
+  message: string;
+}
+
+function readMaterialSaveFailures(): Record<string, MaterialSaveFailure> {
+  return safeGetItem<Record<string, MaterialSaveFailure>>(MATERIAL_SAVE_FAILURE_KEY, {});
+}
+
+function writeMaterialSaveFailures(registry: Record<string, MaterialSaveFailure>): boolean {
+  safeSetItem(MATERIAL_SAVE_FAILURE_KEY, registry);
+  const readBack = safeGetItem<Record<string, MaterialSaveFailure>>(MATERIAL_SAVE_FAILURE_KEY, {});
+  return JSON.stringify(readBack) === JSON.stringify(registry);
+}
+
+/** Records that the material's latest edit save did not fully complete. */
+export function markMaterialSaveFailed(materialId: string, message: string): void {
+  if (!materialId) return;
+  const registry = readMaterialSaveFailures();
+  registry[materialId] = { failedAt: new Date().toISOString(), message };
+  writeMaterialSaveFailures(registry);
+}
+
+/** Clears the failure marker after a fully successful save (or delete/reset). */
+export function clearMaterialSaveFailed(materialId: string): void {
+  if (!materialId) return;
+  const registry = readMaterialSaveFailures();
+  if (registry[materialId] === undefined) return;
+  delete registry[materialId];
+  writeMaterialSaveFailures(registry);
+}
+
+export function isMaterialSaveFailed(materialId: string): boolean {
+  return readMaterialSaveFailures()[materialId] !== undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Material body sync-state registry (account-scoped).
+//
+// '본문 동기화됨' is claimed ONLY when the server CONFIRMED a body whose hash
+// equals the hash of the body last written to THIS device. Settings alone
+// (syncBody), mere local presence, or a server body of a different version are
+// never enough. A failed server lookup is never recorded as confirmed/absent.
+// ---------------------------------------------------------------------------
+
+const MATERIAL_SYNC_STATE_KEY = 'material_sync_states_v1';
+
+export type MaterialSyncStatus = 'confirmed' | 'pending' | 'failed' | 'unknown' | 'not_required';
+
+export interface MaterialSyncStateRecord {
+  /** Body hash (materialContentHash) the SERVER confirmed for this material. */
+  serverBodyHash?: string;
+  /** Body hash (materialContentHash) of the body as last written to this device. */
+  localBodyHash?: string;
+  /** True when the server row stores a body (any version). */
+  serverHasBody: boolean;
+  status: MaterialSyncStatus;
+  updatedAt: string;
+}
+
+function readMaterialSyncStates(): Record<string, MaterialSyncStateRecord> {
+  return safeGetItem<Record<string, MaterialSyncStateRecord>>(MATERIAL_SYNC_STATE_KEY, {});
+}
+
+function writeMaterialSyncStates(registry: Record<string, MaterialSyncStateRecord>): boolean {
+  safeSetItem(MATERIAL_SYNC_STATE_KEY, registry);
+  const readBack = safeGetItem<Record<string, MaterialSyncStateRecord>>(MATERIAL_SYNC_STATE_KEY, {});
+  return JSON.stringify(readBack) === JSON.stringify(registry);
+}
+
+/** Merges a partial update into the per-material sync-state record. */
+export function recordMaterialSyncState(
+  materialId: string,
+  patch: Partial<Omit<MaterialSyncStateRecord, 'updatedAt'>> & { status: MaterialSyncStatus }
+): void {
+  if (!materialId) return;
+  const registry = readMaterialSyncStates();
+  const previous = registry[materialId];
+  const next: MaterialSyncStateRecord = {
+    serverHasBody: patch.serverHasBody ?? previous?.serverHasBody ?? false,
+    status: patch.status,
+    updatedAt: new Date().toISOString(),
+  };
+  if (patch.serverBodyHash !== undefined) next.serverBodyHash = patch.serverBodyHash;
+  else if (previous?.serverBodyHash !== undefined) next.serverBodyHash = previous.serverBodyHash;
+  if (patch.localBodyHash !== undefined) next.localBodyHash = patch.localBodyHash;
+  else if (previous?.localBodyHash !== undefined) next.localBodyHash = previous.localBodyHash;
+  registry[materialId] = next;
+  writeMaterialSyncStates(registry);
+}
+
+export function getMaterialSyncState(materialId: string): MaterialSyncStateRecord | undefined {
+  return readMaterialSyncStates()[materialId];
+}
+
+export function clearMaterialSyncState(materialId: string): void {
+  if (!materialId) return;
+  const registry = readMaterialSyncStates();
+  if (registry[materialId] === undefined) return;
+  delete registry[materialId];
+  writeMaterialSyncStates(registry);
+}
+
+// ---------------------------------------------------------------------------
+// Server-save confirmation records (account-scoped).
+//
+// When a save response is lost, the retry must ask the SERVER (by content hash)
+// whether that exact content is already stored, instead of uploading again and
+// bumping the version. Only syncBody:true edit saves are recorded here.
+// ---------------------------------------------------------------------------
+
+const MATERIAL_SERVER_SAVE_KEY = 'material_server_saves_v1';
+
+export interface MaterialServerSaveRecord {
+  /** materialContentHash of the content that the (possibly lost) save confirmed. */
+  contentHash: string;
+  confirmedAt: string;
+}
+
+function readMaterialServerSaves(): Record<string, MaterialServerSaveRecord> {
+  return safeGetItem<Record<string, MaterialServerSaveRecord>>(MATERIAL_SERVER_SAVE_KEY, {});
+}
+
+function writeMaterialServerSaves(registry: Record<string, MaterialServerSaveRecord>): boolean {
+  safeSetItem(MATERIAL_SERVER_SAVE_KEY, registry);
+  const readBack = safeGetItem<Record<string, MaterialServerSaveRecord>>(MATERIAL_SERVER_SAVE_KEY, {});
+  return JSON.stringify(readBack) === JSON.stringify(registry);
+}
+
+export function recordMaterialServerSave(materialId: string, contentHash: string): boolean {
+  if (!materialId || !contentHash) return false;
+  const registry = readMaterialServerSaves();
+  registry[materialId] = { contentHash, confirmedAt: new Date().toISOString() };
+  return writeMaterialServerSaves(registry);
+}
+
+export function getMaterialServerSaveRecord(materialId: string): MaterialServerSaveRecord | undefined {
+  return readMaterialServerSaves()[materialId];
+}
+
+export function clearMaterialServerSaveRecord(materialId: string): void {
+  if (!materialId) return;
+  const registry = readMaterialServerSaves();
+  if (registry[materialId] === undefined) return;
+  delete registry[materialId];
+  writeMaterialServerSaves(registry);
+}
+
+// ---------------------------------------------------------------------------
 // Local body-hash registry (account-scoped, never sent to the server).
 //
 // bodyHash identifies the converted markdown of a material so a reconnected
@@ -405,7 +567,13 @@ export interface MaterialHashIdentity {
 }
 
 interface StoredMaterialBodyHash extends MaterialHashIdentity {
-  hash: string;
+  hash?: string;
+  /**
+   * The last recorded hash could not be persisted for a body that WAS saved.
+   * While this flag is set, the old hash must never be used to judge a
+   * reconnect candidate; the stored body is recomputed instead.
+   */
+  unverified?: boolean;
 }
 
 function readBodyHashRegistry(): Record<string, StoredMaterialBodyHash> {
@@ -434,6 +602,9 @@ function mergeStoredBodyHash(
 ): string | undefined {
   const record = registry[material.id];
   if (!record) return material.bodyHash;
+  // A body was saved but its identity could not be recorded: the old hash must
+  // NOT silently stand in, and the metadata hash must not be a silent fallback.
+  if (record.unverified) return undefined;
   if (!storedHashIdentityMatches(record, { subjectId: material.subjectId, kind: material.kind })) {
     // A different material identity with the same id: never use the old hash,
     // and never fall back to the (possibly stale) metadata-carried hash either.
@@ -475,8 +646,45 @@ export function getStoredMaterialBodyHash(
   identity?: MaterialHashIdentity
 ): string | undefined {
   const record = readBodyHashRegistry()[materialId];
-  if (!record || !storedHashIdentityMatches(record, identity)) return undefined;
+  if (!record || record.unverified || !storedHashIdentityMatches(record, identity)) return undefined;
   return record.hash;
+}
+
+/** Marks the recorded identity as unverified so it never rejects a real body. */
+export function markMaterialBodyHashUnverified(materialId: string, identity?: MaterialHashIdentity): void {
+  if (!materialId) return;
+  const registry = readBodyHashRegistry();
+  const previous = registry[materialId];
+  registry[materialId] = {
+    hash: previous?.hash,
+    unverified: true,
+    subjectId: identity?.subjectId ?? previous?.subjectId,
+    kind: identity?.kind ?? previous?.kind,
+  };
+  writeBodyHashRegistry(registry);
+}
+
+export function isMaterialBodyHashUnverified(materialId: string): boolean {
+  const record = readBodyHashRegistry()[materialId];
+  return Boolean(record?.unverified);
+}
+
+/**
+ * Recovery: re-reads the PERSISTED body (memory cache bypassed) and recomputes
+ * the identity hash, so a hash record that failed to persist after a successful
+ * body save never permanently blocks reconnecting the real body.
+ */
+export async function refreshMaterialBodyHashFromStoredBody(
+  materialId: string,
+  identity?: MaterialHashIdentity
+): Promise<boolean> {
+  if (!materialId) return false;
+  const result = await loadMaterialContentInScope(getStorageScopeId(), materialId, {
+    skipMemoryCache: true,
+  });
+  if (result.status !== 'found' || typeof result.content.markdown !== 'string') return false;
+  const hash = computeMarkdownHash(result.content.markdown);
+  return recordMaterialBodyHash(materialId, hash, identity);
 }
 
 export function removeStoredMaterialBodyHash(materialId: string): void {
@@ -1799,6 +2007,9 @@ export function resetToInitialDemoData(): void {
   safeRemoveItem(MATERIAL_BODY_HASHES_KEY);
   safeRemoveItem(DELETED_MATERIAL_IDS_KEY);
   safeRemoveItem(LOCAL_ONLY_MATERIAL_IDS_KEY);
+  safeRemoveItem(MATERIAL_SAVE_FAILURE_KEY);
+  safeRemoveItem(MATERIAL_SYNC_STATE_KEY);
+  safeRemoveItem(MATERIAL_SERVER_SAVE_KEY);
   safeRemoveItem(STORAGE_KEYS.CONCEPTS);
   safeRemoveItem(STORAGE_KEYS.CONCEPT_DRAFTS);
   safeRemoveItem(STORAGE_KEYS.PROBLEMS);

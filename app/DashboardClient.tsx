@@ -135,6 +135,7 @@ import {
   resolveDashboardUrl,
   type NotFoundEntityKind,
 } from '../lib/dashboardUrl';
+import { resolveSessionAffiliation } from '../lib/sessionAffiliation';
 import { TodayWorkspace } from '../components/TodayWorkspace';
 import { MaterialsWorkspace } from '../components/MaterialsWorkspace';
 import { ProblemsWorkspace } from '../components/ProblemsWorkspace';
@@ -184,15 +185,23 @@ import {
   isLocalOnlyMaterial,
   reconcileDeletedMaterialMarkers,
   saveStoredMaterialsFromServerCache,
+  recordMaterialSyncState,
+  getMaterialServerSaveRecord,
+  recordMaterialServerSave,
   type MaterialHashIdentity,
 } from '../lib/storage';
 import { loadDefaultMaterialPolicy, materialPolicyOf } from '../lib/materialPolicy';
-import type { MaterialServerSaveResult } from '../lib/materialEditSave';
+import { materialContentHash } from '../lib/cloud/hash';
+import {
+  evaluateMaterialServerRetry,
+  type MaterialServerSaveResult,
+} from '../lib/materialEditSave';
 import { loadCloudLibrary } from '../lib/cloud/library';
 import { upsertSubject } from '../lib/cloud/subjectsRepository';
 import {
   createMaterialSignedUrl,
   deleteMaterial,
+  getMaterialServerBodyHash,
   writeMaterial,
   writeMaterialMetadata,
 } from '../lib/cloud/materialsRepository';
@@ -310,6 +319,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [activeRechallengeReservationId, setActiveRechallengeReservationId] = useState<string | null>(null);
   const [activePlanItemIdForSession, setActivePlanItemIdForSession] = useState<string | null>(null);
   const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(null);
+  // An explicit exam id from the URL (?tab=exam&exam=Y). Opens that exact exam
+  // read-only when needed; cleared when the exam screen is opened from a menu.
+  const [examIdFromUrl, setExamIdFromUrl] = useState<string | null>(null);
   const [urlNotice, setUrlNotice] = useState<{
     message: string;
     entity?: { kind: NotFoundEntityKind; id: string };
@@ -417,12 +429,29 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               pages: material.pages,
             });
             // The downloaded body is this material's legitimate current body;
-            // keep the local identity hash in step with it (only after the
-            // durable save succeeded, never on a failed write).
+            // keep the local identity hash and the sync state in step with it
+            // (only after the durable save succeeded, never on a failed write).
             if (saved.persisted) {
               const identity: MaterialHashIdentity = { subjectId: material.subjectId, kind: material.kind };
               recordMaterialBodyHash(material.id, computeMarkdownHash(material.parsedMarkdown ?? ''), identity);
+              const serverBodyHash = materialContentHash({
+                markdown: material.parsedMarkdown ?? '',
+                rawText: material.rawText,
+                pages: material.pages,
+              });
+              recordMaterialSyncState(material.id, {
+                serverBodyHash,
+                serverHasBody: true,
+                localBodyHash: serverBodyHash,
+                status: 'confirmed',
+              });
             }
+          } else {
+            // The server row has NO body: never claim body sync for it.
+            recordMaterialSyncState(material.id, {
+              serverHasBody: false,
+              status: materialPolicyOf(material).syncBody ? 'unknown' : 'not_required',
+            });
           }
         }
         if (cancelled) return;
@@ -929,6 +958,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       subjectId: material.subjectId,
       kind: material.kind,
     });
+    // A reconnect is device-only: the server body (if any) now differs from the
+    // local body. Record it as pending so the list never claims "synced".
+    recordMaterialSyncState(material.id, {
+      localBodyHash: materialContentHash({ markdown: text }),
+      status: materialPolicyOf(material).syncBody ? 'pending' : 'not_required',
+    });
     const updated = materials.map((m) =>
       m.id === material.id ? { ...m, parsedMarkdown: text, bodyHash: candidateHash } : m
     );
@@ -1136,6 +1171,25 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       linked.find((p) => p.type === selectedProblemType) || linked[0]
     );
   }, [subjectConcepts, selectedConceptId, availableSubjectProblems, activeProblemIdForSession, selectedProblemType]);
+
+  // The session's OWN problem, pinned across subject switches. A session opened
+  // for a problem must never be re-labelled as a different subject's problem.
+  const pinnedSessionProblem = useMemo(() => {
+    if (!activeProblemIdForSession) return null;
+    return allProblems.find((p) => p.id === activeProblemIdForSession) ?? null;
+  }, [allProblems, activeProblemIdForSession]);
+  const pinnedSessionSubject = useMemo(() => {
+    if (!pinnedSessionProblem) return null;
+    return subjects.find((s) => s.id === pinnedSessionProblem.subjectId) ?? null;
+  }, [subjects, pinnedSessionProblem]);
+  // Pure affiliation: a session opened for another subject never becomes the
+  // active subject's session; the UI shows its real owner and a return path.
+  const sessionAffiliation = useMemo(
+    () => resolveSessionAffiliation(pinnedSessionProblem, activeSubject.id),
+    [pinnedSessionProblem, activeSubject.id]
+  );
+  const sessionSubjectMismatch =
+    isProblemSessionOpen && sessionAffiliation.kind === 'other_subject';
 
   // Stage 10: Deterministic personal correction state recomputed from real records.
   // Same inputs (records, problems, settings, reference date) always yield the same state.
@@ -1468,8 +1522,20 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     handleSelectTab('session', { problemId: probId });
   };
 
+  // Closing the practice screen clears every session-scoped state at once so a
+  // later subject switch cannot resurrect a half-open session.
+  const closeProblemSession = () => {
+    setIsProblemSessionOpen(false);
+    setActiveProblemIdForSession(null);
+    setActiveRechallengeReservationId(null);
+    setActivePlanItemIdForSession(null);
+    handleSelectTab('problems');
+  };
+
   const openMockExamScreen = (config?: MockExamInitialConfig | null) => {
     setMockExamInitialConfig(config ?? null);
+    // Opened from the menu, not from an exam URL: resume the active session.
+    setExamIdFromUrl(null);
     setIsMockExamModalOpen(true);
     handleSelectTab('exam');
   };
@@ -1502,7 +1568,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         return;
       }
 
-      setUrlNotice(null);
+      // An unknown tab value is normalized safely, but the user is told so the
+      // URL and the shown screen never silently disagree.
+      setUrlNotice(
+        resolution.status === 'invalid_tab'
+          ? { message: '알 수 없는 탭 주소라 기본 화면으로 이동했습니다.' }
+          : null
+      );
       if (resolution.subjectId && resolution.subjectId !== activeSubjectId) {
         setActiveSubjectId(resolution.subjectId);
       }
@@ -1528,7 +1600,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       }
 
       if (resolution.tab === 'exam') {
+        // Keep the exact exam id so the screen opens THAT session, not merely
+        // whichever session the subject happens to have active.
+        setExamIdFromUrl(resolution.examId ?? null);
         setIsMockExamModalOpen(true);
+      } else {
+        setExamIdFromUrl(null);
       }
     };
 
@@ -1669,6 +1746,27 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         ? (result.data as { fallbackUsed?: boolean }).fallbackUsed
         : (result.data as unknown as Record<string, unknown>).fallback_used
     );
+
+    // Sync state: only a server-confirmed body upload (syncBody) is 'confirmed'.
+    if (uploadBody && !fallbackUsed) {
+      const bodyContentHash = materialContentHash(content);
+      recordMaterialSyncState(newMat.id, {
+        serverBodyHash: bodyContentHash,
+        serverHasBody: true,
+        localBodyHash: bodyContentHash,
+        status: 'confirmed',
+      });
+    } else if (uploadBody && fallbackUsed) {
+      recordMaterialSyncState(newMat.id, {
+        localBodyHash: materialContentHash(content),
+        status: 'pending',
+      });
+    } else {
+      recordMaterialSyncState(newMat.id, {
+        localBodyHash: materialContentHash(content),
+        status: 'not_required',
+      });
+    }
 
     const updated = [materialToStore, ...materials];
     setMaterials(updated);
@@ -2194,6 +2292,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
     // Server sync (idempotent by attempt id). Local persistence already holds
     // the result, but a server failure is surfaced, never reported as success.
+    // The scope is pinned so a late response is never applied to another account.
+    const scopeAtSubmit = getStorageScopeId();
+    const applyIfSameScope = (fn: () => void) => {
+      if (getStorageScopeId() === scopeAtSubmit) fn();
+    };
     const syncEvent = updatedConcept?.events.find((e) => e.attemptId === attempt.id);
     if (syncEvent && isSupabaseConfigured()) {
       // Pass the validated review round of the linked plan item so the server
@@ -2213,18 +2316,26 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             planRound
           );
           if (!submitted.ok) {
-            showToast(`풀이는 로컬에 저장됐지만 서버 저장에 실패했습니다: ${submitted.error}`);
+            applyIfSameScope(() =>
+              showToast(`풀이는 로컬에 저장됐지만 서버 저장에 실패했습니다: ${submitted.error}`)
+            );
             return;
           }
           // Attempt persistence and plan linkage are distinct outcomes.
           const planStatus = submitted.data.planStatus;
           if (planStatus === 'PLAN_ITEM_MISMATCH' || planStatus === 'PLAN_ITEM_NOT_FOUND' || planStatus === 'PLAN_ITEM_SKIPPED') {
-            showToast('풀이는 저장됐지만 계획 연결은 반영되지 않았습니다. 올바른 계획을 선택해 다시 시도해 주세요.');
+            applyIfSameScope(() =>
+              showToast('풀이는 저장됐지만 계획 연결은 반영되지 않았습니다. 올바른 계획을 선택해 다시 시도해 주세요.')
+            );
           } else if (planStatus === 'PLAN_ITEM_COMPLETED_BY_OTHER') {
-            showToast('이 계획은 다른 풀이로 이미 완료되어 기존 완료 기록을 유지했습니다.');
+            applyIfSameScope(() =>
+              showToast('이 계획은 다른 풀이로 이미 완료되어 기존 완료 기록을 유지했습니다.')
+            );
           }
         } catch (e) {
-          showToast(`풀이 서버 저장 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+          applyIfSameScope(() =>
+            showToast(`풀이 서버 저장 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`)
+          );
         }
       })();
     }
@@ -2465,6 +2576,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
   const handleResumeMockExam = () => {
     setMockExamInitialConfig(null);
+    // Resuming from a CTA/menu is not a deep link: use the subject's active session.
+    setExamIdFromUrl(null);
     setIsMockExamModalOpen(true);
   };
 
@@ -2874,16 +2987,27 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       )}
 
       {/* Active Session / Exam Resume Banners when navigating to another tab */}
-      {activeTab !== 'session' && isProblemSessionOpen && activeSessionProblem && (
+      {activeTab !== 'session' && isProblemSessionOpen && (pinnedSessionProblem || activeSessionProblem) && (
         <div className="w-full bg-amber-50/90 border-b border-amber-300">
           <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-2 flex items-center justify-between text-xs text-amber-900">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-              <span>진행 중인 문제 풀이가 있습니다: <strong>{activeSessionProblem.title}</strong></span>
+              <span>
+                진행 중인 문제 풀이가 있습니다: <strong>{(pinnedSessionProblem || activeSessionProblem)!.title}</strong>
+                {pinnedSessionSubject && pinnedSessionProblem && pinnedSessionSubject.id !== activeSubject.id && (
+                  <> · 소속 과목: <strong>{pinnedSessionSubject.name}</strong></>
+                )}
+              </span>
             </div>
             <button
               type="button"
-              onClick={() => handleSelectTab('session')}
+              onClick={() => {
+                // Return path also restores the session's own subject.
+                if (pinnedSessionProblem && pinnedSessionProblem.subjectId !== activeSubject.id) {
+                  handleSelectSubject(pinnedSessionProblem.subjectId);
+                }
+                handleSelectTab('session', { problemId: pinnedSessionProblem?.id });
+              }}
               className="px-2.5 py-1 bg-amber-800 hover:bg-amber-900 text-white font-bold rounded-xs transition-colors"
             >
               문제 풀이 화면으로 돌아가기
@@ -2897,7 +3021,15 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-2 flex items-center justify-between text-xs text-purple-900">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-purple-500 animate-pulse" />
-              <span>진행 중인 모의시험이 있습니다. (제한 시간 작동 중)</span>
+              <span>
+                {activeMockSession?.status === 'in_progress'
+                  ? '진행 중인 모의시험이 있습니다. (제한 시간 작동 중)'
+                  : activeMockSession?.status === 'submitted'
+                  ? '제출된 모의시험이 있습니다. (채점 대기)'
+                  : activeMockSession?.status === 'graded'
+                  ? '채점이 완료된 모의시험이 있습니다.'
+                  : '모의시험 화면이 열려 있습니다.'}
+              </span>
             </div>
             <button
               type="button"
@@ -3094,21 +3226,47 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
         {/* Dedicated in-layout screen: Problem Session */}
         <div className={activeTab === 'session' ? 'block' : 'hidden'}>
-          {isProblemSessionOpen && sessionConcept && activeSessionProblem ? (
+          {isProblemSessionOpen && sessionSubjectMismatch && pinnedSessionProblem && pinnedSessionSubject ? (
+            <div className="bg-white border border-[#c8c2b5] rounded-xs p-8 text-center max-w-xl mx-auto my-8">
+              <p className="text-sm font-semibold text-[#191817] mb-2">
+                진행 중인 풀이는 다른 과목에 속해 있습니다.
+              </p>
+              <p className="text-xs text-[#57544e] mb-4">
+                소속 과목: <strong>{pinnedSessionSubject.name}</strong> · 문제:{' '}
+                <strong>{pinnedSessionProblem.title}</strong>
+                <br />
+                현재 선택된 과목 [{activeSubject.name}]의 풀이로 표시하지 않습니다. 원래 과목으로 돌아가 이어서 풀 수 있습니다.
+              </p>
+              <div className="flex items-center justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleSelectSubject(pinnedSessionProblem.subjectId);
+                    handleSelectTab('session', { problemId: pinnedSessionProblem.id });
+                  }}
+                  className="px-3.5 py-1.5 bg-[#191817] text-white text-xs font-bold rounded-xs transition-colors"
+                >
+                  {pinnedSessionSubject.name} 과목으로 돌아가 계속 풀기
+                </button>
+                <button
+                  type="button"
+                  onClick={closeProblemSession}
+                  className="px-3.5 py-1.5 border border-[#ded6c8] bg-white text-[#57544e] text-xs font-bold rounded-xs transition-colors"
+                >
+                  풀이 닫기
+                </button>
+              </div>
+            </div>
+          ) : isProblemSessionOpen && sessionConcept && activeSessionProblem ? (
             <ProblemSessionModal
               variant="page"
               key={`${activeSubject.id}-${activeSessionProblem.id}-${activeSessionProblem.version ?? 1}`}
               isOpen={isProblemSessionOpen}
-              onClose={() => {
-                setIsProblemSessionOpen(false);
-                setActiveProblemIdForSession(null);
-                setActiveRechallengeReservationId(null);
-                setActivePlanItemIdForSession(null);
-                handleSelectTab('problems');
-              }}
+              onClose={closeProblemSession}
               subject={activeSubject}
               concept={sessionConcept}
               problem={activeSessionProblem}
+              userId={currentUser.id}
               onSubmitAttempt={handleSubmitAttempt}
               rechallengeReservationId={activeRechallengeReservationId || undefined}
               planItemId={activePlanItemIdForSession || undefined}
@@ -3135,11 +3293,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           {isMockExamModalOpen ? (
             <MockExamModal
               variant="page"
-              key={activeSubject.id}
+              key={`${activeSubject.id}-${examIdFromUrl ?? 'active'}`}
               isOpen={isMockExamModalOpen}
               onClose={() => {
                 setIsMockExamModalOpen(false);
                 setMockExamInitialConfig(null);
+                setExamIdFromUrl(null);
                 handleSelectTab('problems');
               }}
               subject={activeSubject}
@@ -3147,12 +3306,15 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               problems={availableSubjectProblems}
               userId={currentUser.id}
               initialConfig={mockExamInitialConfig}
+              initialExamId={examIdFromUrl}
+              deferExpiredSubmit={Boolean(examIdFromUrl)}
               onExamRecorded={() => {
                 setAllConcepts(loadStoredConcepts());
                 setAttempts(loadStoredAttempts());
                 setMockExams(loadMockExams());
                 setIsMockExamModalOpen(false);
                 setMockExamInitialConfig(null);
+                setExamIdFromUrl(null);
                 handleSelectTab('history');
                 showToast('모의시험 답안과 평가가 학습 이력에 저장되었습니다.');
               }}
@@ -3307,6 +3469,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         subject={activeSubject}
         draftCount={editingMaterial ? conceptDrafts.filter((d) => d.materialId === editingMaterial.id).length : 0}
         onSave={async (updatedMat, updatedContent): Promise<MaterialServerSaveResult> => {
+          const contentForSave = {
+            markdown: updatedContent.markdown,
+            rawText: updatedMat.rawText,
+            pages: updatedContent.pages,
+          };
+          const contentHash = materialContentHash(contentForSave);
           if (isLocalOnlyMaterial(updatedMat.id)) {
             const updated = materials.map((m) =>
               m.id === updatedMat.id ? updatedMat : m
@@ -3375,22 +3543,75 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               showToast(`[${updatedMat.title}] 로컬 전용 자료 내용이 저장되었습니다.`);
             }
 
+            // Local-only material: the body sync state never claims the server.
+            recordMaterialSyncState(updatedMat.id, {
+              localBodyHash: contentHash,
+              status: 'not_required',
+            });
+
             return { status: 'not_required' };
           }
 
+          // Response-loss recovery: if a previous save of THIS exact content is
+          // on record, ask the SERVER whether it already has that body instead
+          // of uploading again (no version bump, no duplicate job).
+          const previousSave = getMaterialServerSaveRecord(updatedMat.id);
+          if (previousSave && previousSave.contentHash === contentHash) {
+            const probe = await getMaterialServerBodyHash(updatedMat.id);
+            const verdict = evaluateMaterialServerRetry(previousSave, contentHash, {
+              ok: probe.ok,
+              hasBody: probe.ok ? probe.data.hasBody : undefined,
+              hash: probe.ok ? probe.data.hash : null,
+            });
+            if (verdict === 'already_saved') {
+              recordMaterialSyncState(updatedMat.id, {
+                serverBodyHash: contentHash,
+                serverHasBody: true,
+                status: 'confirmed',
+              });
+              return { status: 'already_saved' };
+            }
+            if (verdict === 'conflict') {
+              showToast('서버에 이후 변경된 본문이 있어 덮어쓰지 않았습니다. 새로고침 후 다시 확인해 주세요.');
+              return { status: 'failed', error: '서버에 이후 변경된 본문이 있어 덮어쓰지 않았습니다.' };
+            }
+            if (verdict === 'unknown') {
+              showToast('이전 서버 저장 여부를 확인하지 못했습니다. 네트워크를 확인한 뒤 다시 시도해 주세요.');
+              return { status: 'failed', error: '이전 서버 저장 여부를 확인하지 못했습니다. 다시 시도해 주세요.' };
+            }
+            // no_record: the earlier write did not reach the server — a normal
+            // new write may proceed.
+          }
+
           // Persist a new version to the server before updating local state.
+          // The retry record is written BEFORE the request so a lost success
+          // response can be recovered by probing the server on the next retry.
+          recordMaterialServerSave(updatedMat.id, contentHash);
           const writeResult = await writeMaterial({
             material: updatedMat,
-            content: {
-              markdown: updatedContent.markdown,
-              rawText: updatedMat.rawText,
-              pages: updatedContent.pages,
-            },
+            content: contentForSave,
             policy: materialPolicyOf(updatedMat),
           });
           if (!writeResult.ok) {
+            // The request may have actually reached the server (response loss).
+            // Keep the retry record; a later retry of the same content probes
+            // the server instead of uploading again.
+            recordMaterialSyncState(updatedMat.id, { status: 'failed' });
             showToast(`자료 수정 저장 실패: ${writeResult.error}`);
             return { status: 'failed', error: writeResult.error };
+          }
+
+          if (materialPolicyOf(updatedMat).syncBody) {
+            // The server confirmed THIS body (read-back hash verification was
+            // performed inside writeMaterial).
+            recordMaterialSyncState(updatedMat.id, {
+              serverBodyHash: contentHash,
+              serverHasBody: true,
+              status: 'confirmed',
+            });
+          } else {
+            // syncBody off: only metadata was written; never claim body sync.
+            recordMaterialSyncState(updatedMat.id, { status: 'not_required' });
           }
 
           const updated = materials.map((m) =>

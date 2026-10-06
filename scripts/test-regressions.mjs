@@ -13,6 +13,7 @@ const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts', 'lib/materialRestore.ts',
   'lib/materialDraft.ts', 'lib/materialEditSave.ts', 'lib/dashboardUrl.ts',
+  'lib/practiceAnswerDraft.ts', 'lib/sessionAffiliation.ts',
   'lib/todayStudy.ts', 'lib/reviewStats.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
@@ -133,6 +134,8 @@ exports.requireApiUser = async () => {
   const materialDraft = load(path.join(output, 'lib/materialDraft.js'));
   const materialEditSave = load(path.join(output, 'lib/materialEditSave.js'));
   const dashboardUrl = load(path.join(output, 'lib/dashboardUrl.js'));
+  const practiceAnswerDraft = load(path.join(output, 'lib/practiceAnswerDraft.js'));
+  const sessionAffiliation = load(path.join(output, 'lib/sessionAffiliation.js'));
   const { INITIAL_SUBJECTS, INITIAL_CONCEPTS, INITIAL_PROBLEMS } = load(path.join(output, 'lib/initialData.js'));
   let passed = 0;
   const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -5755,6 +5758,402 @@ exports.requireApiUser = async () => {
     assert.ok(dashSrc.includes("activeTab === 'exam'"), 'DashboardClient must support exam tab dedicated screen');
     assert.ok(dashSrc.includes('진행 중인 문제 풀이가 있습니다'), 'DashboardClient must render resume banner for session');
     assert.ok(dashSrc.includes('진행 중인 모의시험이 있습니다'), 'DashboardClient must render resume banner for exam');
+  });
+
+  check('Stage 2: materialEditSave reports the server-success/device-failure matrix as partial', () => {
+    // Server saved but the device write failed -> partial, input must be kept.
+    const partial = materialEditSave.evaluateMaterialEditSave({
+      server: 'saved',
+      local: 'failed',
+      localError: 'IndexedDB quota',
+    });
+    assert.equal(partial.canClose, false);
+    assert.equal(partial.level, 'partial');
+    assert.ok(partial.succeeded.includes('서버 저장'));
+    assert.ok(partial.failed.some((f) => f.includes('이 기기 저장')));
+    assert.ok(partial.message.includes('입력은 유지되며 다시 시도할 수 있습니다'));
+
+    // Server failed -> local is skipped and never replaces the stored body.
+    const serverFailed = materialEditSave.evaluateMaterialEditSave({
+      server: 'failed',
+      serverError: 'offline',
+      local: 'skipped',
+    });
+    assert.equal(serverFailed.level, 'failed');
+    assert.ok(serverFailed.notes.some((n) => n.includes('이 기기에 저장된 본문은 변경하지 않았습니다')));
+    assert.equal(serverFailed.succeeded.length, 0);
+
+    // Retry after an already confirmed server write: exactly one server success.
+    const alreadySaved = materialEditSave.evaluateMaterialEditSave({
+      server: 'already_saved',
+      local: 'saved',
+    });
+    assert.equal(alreadySaved.level, 'complete');
+    assert.equal(alreadySaved.succeeded.filter((s) => s === '서버 저장').length, 1, 'retry must not double-count the server save');
+
+    // Body saved but its identity hash could not be stored: reported, not hidden.
+    const identityFailed = materialEditSave.evaluateMaterialEditSave({
+      server: 'saved',
+      local: 'saved',
+      identityRecordFailed: true,
+    });
+    assert.equal(identityFailed.canClose, true);
+    assert.ok(identityFailed.notes.some((n) => n.includes('본문 식별 정보')));
+  });
+
+  await checkAsync('Stage 2: practiceAnswerDraft preserves, restores and clears unsaved answers safely (per tab)', async () => {
+    const userId = 'practice-draft-user';
+    const otherUser = 'practice-draft-other';
+    const tabA = 'tab-A';
+    const tabB = 'tab-B';
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraft(userId, 'p1'), null);
+
+    const draft = {
+      problemId: 'p1',
+      problemVersion: 3,
+      answerText: '중간까지 푼 답안',
+      revealedHints: [0, 2],
+      confidence: 4,
+      errorType: 'none',
+      reasoningNotes: '메모',
+      solvingReason: '정규분포 근사',
+      isReasonNotApplicable: false,
+      reasonNotApplicableJustification: '',
+      savedAt: '2026-01-01T00:00:00.000Z',
+    };
+    assert.equal(practiceAnswerDraft.hasPracticeDraftContent(draft), true);
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, tabA, draft), true, 'verified device write');
+    const loaded = practiceAnswerDraft.loadPracticeAnswerDraft(userId, 'p1');
+    assert.equal(loaded.answerText, '중간까지 푼 답안');
+    assert.deepEqual(loaded.revealedHints, [0, 2]);
+
+    // Account isolation: another user never sees this draft.
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraft(otherUser, 'p1'), null);
+
+    // Two tabs never overwrite each other: each tab keeps its own draft, and
+    // the LATEST one (by savedAt) is what a fresh tab restores.
+    const tabBDraft = { ...draft, answerText: 'B 탭 입력', savedAt: '2026-01-01T00:10:00.000Z' };
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, tabB, tabBDraft), true);
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraft(userId, 'p1').answerText, 'B 탭 입력');
+    assert.deepEqual(
+      practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1').map((d) => d.answerText).sort(),
+      ['B 탭 입력', '중간까지 푼 답안'].sort(),
+      'both tabs drafts coexist'
+    );
+
+    // Identity: version match is required for restore.
+    assert.equal(practiceAnswerDraft.draftMatchesProblem(loaded, 'p1', 3), true);
+    assert.equal(practiceAnswerDraft.draftMatchesProblem(loaded, 'p1', 4), false, 'a newer problem version is not silently restored');
+    assert.equal(practiceAnswerDraft.draftMatchesProblem(loaded, 'p2', 3), false);
+
+    // An empty draft carries no content and is not stored as meaningful input.
+    assert.equal(
+      practiceAnswerDraft.hasPracticeDraftContent({
+        ...draft,
+        answerText: '',
+        reasoningNotes: '',
+        solvingReason: '',
+        reasonNotApplicableJustification: '',
+        revealedHints: [],
+      }),
+      false
+    );
+
+    // Recording tab A's attempt clears ONLY the matching draft; tab B's newer
+    // draft survives so it is never silently discarded.
+    assert.equal(practiceAnswerDraft.clearPracticeAnswerDraft(userId, 'p1', draft), true);
+    const remaining = practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1');
+    assert.deepEqual(remaining.map((d) => d.answerText), ['B 탭 입력']);
+
+    // A DIFFERENT draft stored for the recorded content is kept, not cleared.
+    const newer = { ...draft, answerText: '이후에 추가로 입력한 내용', savedAt: '2026-01-01T00:20:00.000Z' };
+    assert.equal(practiceAnswerDraft.savePracticeAnswerDraft(userId, tabA, newer), true);
+    assert.equal(practiceAnswerDraft.clearPracticeAnswerDraft(userId, 'p1', draft), true, 'non-matching content stays');
+    assert.equal(
+      practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1').some((d) => d.answerText === '이후에 추가로 입력한 내용'),
+      true
+    );
+    // Clearing succeeds for the exact recorded content.
+    assert.equal(practiceAnswerDraft.clearPracticeAnswerDraft(userId, 'p1', newer), true);
+    assert.equal(
+      practiceAnswerDraft.listPracticeAnswerDrafts(userId, 'p1').some((d) => d.answerText === '이후에 추가로 입력한 내용'),
+      false
+    );
+  });
+
+  await checkAsync('Stage 2: practiceAnswerDraft reports a failed device write instead of claiming success', async () => {
+    const userId = 'practice-draft-fail';
+    const key = 'redcall_user_' + encodeURIComponent(userId) + '__practice_answer_drafts_v1';
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = (k, v) => {
+      if (k === key) throw new Error('quota exceeded');
+      realSetItem(k, v);
+    };
+    let saved;
+    try {
+      saved = practiceAnswerDraft.savePracticeAnswerDraft(userId, 'tab-1', {
+        problemId: 'p1',
+        problemVersion: 1,
+        answerText: 'x',
+        revealedHints: [],
+        confidence: 3,
+        errorType: 'none',
+        reasoningNotes: '',
+        solvingReason: '',
+        isReasonNotApplicable: false,
+        reasonNotApplicableJustification: '',
+        savedAt: 't',
+      });
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+    assert.equal(saved, false, 'an unpersisted draft is never reported as saved');
+    assert.equal(practiceAnswerDraft.loadPracticeAnswerDraft(userId, 'p1'), null);
+  });
+
+  await checkAsync('Stage 2: an unverified body hash never rejects the real body and recovers from storage', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'hash-recover' });
+      // ① Body A stored with hash A.
+      await matStorage.saveMaterialContent('m-recover', { markdown: '# body A' });
+      assert.equal(storage.recordMaterialBodyHash('m-recover', 'hash-A', { subjectId: 's1', kind: 'pdf' }), true);
+
+      // ② Body B saved durably, ③ but the hash record write FAILS.
+      await matStorage.saveMaterialContent('m-recover', { markdown: '# body B' });
+      const registryKey = 'redcall_user_hash-recover__material_body_hashes_v1';
+      const realSetItem = localStorage.setItem.bind(localStorage);
+      localStorage.setItem = (k, v) => {
+        if (k === registryKey) throw new Error('quota exceeded');
+        realSetItem(k, v);
+      };
+      let recorded;
+      try {
+        recorded = storage.recordMaterialBodyHash('m-recover', 'hash-B', { subjectId: 's1', kind: 'pdf' });
+      } finally {
+        localStorage.setItem = realSetItem;
+      }
+      assert.equal(recorded, false);
+
+      // The editor would now mark the hash unverified (simulate that step).
+      storage.markMaterialBodyHashUnverified('m-recover', { subjectId: 's1', kind: 'pdf' });
+
+      // ④ After refresh, the material's resolved hash must NOT be the old A,
+      // and must NOT silently fall back to a stale metadata hash.
+      const staleMaterial = {
+        id: 'm-recover', subjectId: 's1', kind: 'pdf', title: 'T', status: 'ready',
+        isConverted: true, uploadedAt: 't', bodyHash: 'hash-A-stale',
+      };
+      assert.equal(storage.resolveStoredMaterialBodyHash(staleMaterial), undefined, 'old hash A must not reject body B');
+      assert.equal(storage.isMaterialBodyHashUnverified('m-recover'), true);
+
+      // ⑤ Recovery re-reads the persisted body B and re-records its hash.
+      const recovered = await storage.refreshMaterialBodyHashFromStoredBody('m-recover', {
+        subjectId: 's1',
+        kind: 'pdf',
+      });
+      assert.equal(recovered, true);
+      assert.equal(
+        storage.getStoredMaterialBodyHash('m-recover', { subjectId: 's1', kind: 'pdf' }),
+        markdownUtils.computeMarkdownHash('# body B'),
+        'the hash is recomputed from the persisted body B'
+      );
+      const resolvedHash = storage.resolveStoredMaterialBodyHash(staleMaterial);
+      assert.equal(resolvedHash, markdownUtils.computeMarkdownHash('# body B'), 'the recovered hash is body B identity, never A');
+      assert.equal(storage.isMaterialBodyHashUnverified('m-recover'), false);
+    });
+  });
+
+  check('Stage 2: body sync is claimed only from a server-confirmed hash-equal record', () => {
+    const material = { storagePolicy: { syncBody: true, backupOriginal: false } };
+
+    // 설정 ON + 서버 상태 미확인 -> 동기화 완료 미표시.
+    let d = materialPolicy.deriveMaterialBodySyncState(material, undefined, true);
+    assert.equal(d.state, 'unknown');
+    assert.equal(d.synced, false);
+    assert.ok(d.label.includes('미확인'));
+
+    // 서버 본문과 로컬 편집본 버전 불일치 -> pending, not confirmed.
+    d = materialPolicy.deriveMaterialBodySyncState(material, {
+      serverBodyHash: 'server-1', localBodyHash: 'local-2', serverHasBody: true,
+      status: 'confirmed', updatedAt: 't',
+    }, true);
+    assert.equal(d.state, 'pending');
+    assert.equal(d.synced, false);
+    assert.ok(d.label.includes('대기'));
+
+    // 현재 버전 서버 저장·검증 성공 -> confirmed만 동기화 완료.
+    d = materialPolicy.deriveMaterialBodySyncState(material, {
+      serverBodyHash: 'same', localBodyHash: 'same', serverHasBody: true,
+      status: 'confirmed', updatedAt: 't',
+    }, true);
+    assert.equal(d.state, 'confirmed');
+    assert.equal(d.synced, true);
+
+    // 실패는 실패로 표시, 확인됨으로 해석하지 않음.
+    d = materialPolicy.deriveMaterialBodySyncState(material, {
+      serverHasBody: false, status: 'failed', updatedAt: 't',
+    }, true);
+    assert.equal(d.state, 'failed');
+    assert.equal(d.synced, false);
+
+    // 로컬 전용 자료(not_required / syncBody off)는 동기화 주장 없음.
+    d = materialPolicy.deriveMaterialBodySyncState(
+      { storagePolicy: { syncBody: false, backupOriginal: false } },
+      { serverHasBody: false, status: 'not_required', updatedAt: 't' },
+      true
+    );
+    assert.equal(d.state, 'local_only');
+    assert.equal(d.synced, false);
+
+    // 상태 기록에서도 같은 규칙: confirmed지만 해시 불일치면 라벨에 '동기화됨' 없음.
+    const state = materialPolicy.deriveMaterialStorageState({
+      material,
+      hasLocalBody: true,
+      hasLocalOriginal: false,
+      syncState: { serverBodyHash: 'a', localBodyHash: 'b', serverHasBody: true, status: 'confirmed', updatedAt: 't' },
+    });
+    assert.ok(!state.labels.includes('본문 동기화됨'));
+    assert.ok(state.labels.some((l) => l.includes('대기')));
+  });
+
+  check('Stage 2: server-save response loss recovery never re-uploads confirmed content', () => {
+    // already_saved when the server holds the exact hash.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(
+        { contentHash: 'h1' }, 'h1', { ok: true, hasBody: true, hash: 'h1' }
+      ),
+      'already_saved'
+    );
+    // Server changed later -> conflict, never overwrite.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(
+        { contentHash: 'h1' }, 'h1', { ok: true, hasBody: true, hash: 'h2' }
+      ),
+      'conflict'
+    );
+    // Lookup FAILURE -> unknown, never treated as "not saved".
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(
+        { contentHash: 'h1' }, 'h1', { ok: false }
+      ),
+      'unknown'
+    );
+    // Server genuinely has no such body: the earlier write did not land -> normal retry.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(
+        { contentHash: 'h1' }, 'h1', { ok: true, hasBody: false, hash: null }
+      ),
+      'no_record'
+    );
+    // No matching record for this content -> normal write.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(undefined, 'h1', { ok: true, hasBody: false, hash: null }),
+      'no_record'
+    );
+  });
+
+  await checkAsync('Stage 2: the retry record survives a reload and deletion clears it', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'retry-record' });
+    assert.equal(storage.recordMaterialServerSave('m-r', 'hash-x'), true);
+    // Simulated reload: the record is read back from storage.
+    const record = storage.getMaterialServerSaveRecord('m-r');
+    assert.equal(record.contentHash, 'hash-x');
+    // Account isolation.
+    storageScope.setStorageScope({ kind: 'user', userId: 'retry-other' });
+    assert.equal(storage.getMaterialServerSaveRecord('m-r'), undefined);
+    storageScope.setStorageScope({ kind: 'user', userId: 'retry-record' });
+    // Explicit delete clears the retry record.
+    storage.markMaterialDeleted('m-r');
+    assert.equal(storage.getMaterialServerSaveRecord('m-r'), undefined);
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  check('Stage 2: an expired exam opened by URL is manual-submit, a running one keeps auto expiry', () => {
+    const exams = load(path.join(output, 'lib/mockExam.js'));
+    const submitted = { id: 'e1', status: 'submitted' };
+    const inProgress = { id: 'e2', status: 'in_progress' };
+    assert.equal(exams.examOpenPolicy(submitted, true), 'expired_manual');
+    assert.equal(exams.examOpenPolicy(submitted, false), 'running', 'menu-open keeps the existing policy path');
+    assert.equal(exams.examOpenPolicy(inProgress, true), 'running');
+    assert.equal(exams.examOpenPolicy(null, true), 'running');
+  });
+
+
+  check('Stage 2: material save failures are tracked per account and cleared on success/delete', () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'savefail-a' });
+    assert.equal(storage.isMaterialSaveFailed('m-1'), false);
+    storage.markMaterialSaveFailed('m-1', '서버 저장 실패');
+    assert.equal(storage.isMaterialSaveFailed('m-1'), true);
+    // Another account must not see this account's failure marker.
+    storageScope.setStorageScope({ kind: 'user', userId: 'savefail-b' });
+    assert.equal(storage.isMaterialSaveFailed('m-1'), false);
+    storageScope.setStorageScope({ kind: 'user', userId: 'savefail-a' });
+    storage.clearMaterialSaveFailed('m-1');
+    assert.equal(storage.isMaterialSaveFailed('m-1'), false);
+
+    // An explicit delete clears the failure state too.
+    storage.markMaterialSaveFailed('m-2', '기기 저장 실패');
+    storage.markMaterialDeleted('m-2');
+    assert.equal(storage.isMaterialSaveFailed('m-2'), false);
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  check('Stage 2: exam deep links resolve to the exam own subject and settings tab round-trips', () => {
+    const ctx = {
+      isLoaded: true,
+      isCloudLoading: false,
+      subjects: [{ id: 'sub-a', name: 'A' }, { id: 'sub-b', name: 'B' }],
+      materials: [],
+      problems: [],
+      attempts: [],
+      mockExams: [{ id: 'exam-b1', subjectId: 'sub-b' }],
+    };
+    // URL says subject A, but the exam belongs to subject B: B must win.
+    const res = dashboardUrl.resolveDashboardUrl(
+      { tab: 'exam', subjectId: 'sub-a', examId: 'exam-b1' },
+      ctx
+    );
+    assert.equal(res.status, 'valid');
+    assert.equal(res.subjectId, 'sub-b', 'the exam own subject overrides a mismatched subject param');
+    assert.equal(res.examId, 'exam-b1');
+
+    // Unknown exam id is a safe not_found with a return path.
+    const missing = dashboardUrl.resolveDashboardUrl(
+      { tab: 'exam', subjectId: 'sub-b', examId: 'exam-none' },
+      ctx
+    );
+    assert.equal(missing.status, 'not_found');
+    assert.equal(missing.notFoundEntity.kind, 'exam');
+
+    // settings tab is parsed and built consistently (menu/back-forward target).
+    const parsedSettings = dashboardUrl.parseDashboardUrl('?tab=settings&subject=sub-a');
+    assert.equal(parsedSettings.tab, 'settings');
+    assert.equal(
+      dashboardUrl.buildDashboardUrl({ tab: 'settings', subjectId: 'sub-a' }),
+      '?tab=settings&subject=sub-a'
+    );
+    const settingsRes = dashboardUrl.resolveDashboardUrl({ tab: 'settings', subjectId: 'sub-a' }, ctx);
+    assert.equal(settingsRes.status, 'valid');
+    assert.equal(settingsRes.tab, 'settings');
+
+    // exam id is only emitted on the exam tab, never leaked onto other tabs.
+    assert.equal(
+      dashboardUrl.buildDashboardUrl({ tab: 'problems', subjectId: 'sub-a', examId: 'exam-b1' }),
+      '?tab=problems&subject=sub-a'
+    );
+  });
+
+  check('Stage 2: a practice session pinned to another subject is never shown as the active subject session', () => {
+    const pinned = { id: 'prob-1', subjectId: 'sub-a' };
+    assert.deepEqual(sessionAffiliation.resolveSessionAffiliation(pinned, 'sub-a'), {
+      kind: 'same_subject',
+      problemId: 'prob-1',
+      problemSubjectId: 'sub-a',
+    });
+    const mismatch = sessionAffiliation.resolveSessionAffiliation(pinned, 'sub-b');
+    assert.equal(mismatch.kind, 'other_subject');
+    assert.equal(mismatch.problemSubjectId, 'sub-a', 'the session keeps its real subject');
+    assert.equal(sessionAffiliation.resolveSessionAffiliation(null, 'sub-b').kind, 'none');
   });
 
   console.log(`${passed} regression checks passed`);

@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Material, Subject, ConceptDraft } from '../lib/types';
 import { listMaterialContentIds, listMaterialOriginalIds } from '../lib/materialStorage';
+import { getMaterialSyncState, isMaterialSaveFailed } from '../lib/storage';
 import { deriveMaterialStorageState } from '../lib/materialPolicy';
 import {
   FolderOpen,
@@ -298,9 +299,13 @@ export function MaterialsWorkspace({
               material: mat,
               hasLocalBody: bodyIds.has(mat.id),
               hasLocalOriginal: originalIds.has(mat.id),
-              bodySynced:
-                (Boolean(mat.storagePolicy?.syncBody) || !mat.storagePolicy) &&
-                (bodyIds.has(mat.id) || Boolean(mat.parsedMarkdown)),
+              originalBackedUp: hasOriginal ? hasOriginal(mat.id) : originalIds.has(mat.id),
+              // A failed/partial edit save is recorded by the editor, so the
+              // list can show the real retry-needed state instead of "synced".
+              saveFailed: isMaterialSaveFailed(mat.id),
+              // Body sync is claimed ONLY from the server-confirmed record
+              // (hash-equal), never from settings or local presence alone.
+              syncState: getMaterialSyncState(mat.id),
             });
 
             const hasOriginalFile = hasOriginal ? hasOriginal(mat.id) : originalIds.has(mat.id);

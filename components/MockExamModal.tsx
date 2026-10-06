@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Attempt,
   Concept,
@@ -12,7 +12,7 @@ import {
   isProblemAvailableForPractice,
   METHOD_REASON_RATING_LABELS,
 } from '../lib/types';
-import { expireMockExam, getExamScore, loadMockExams, saveMockExam, selectMockExamProblems, updateMockExamAnswer } from '../lib/mockExam';
+import { examOpenPolicy, expireMockExam, getExamScore, loadMockExams, saveMockExam, selectMockExamProblems, updateMockExamAnswer } from '../lib/mockExam';
 import { loadStoredSettings, recordAttemptAndUpdateConcept } from '../lib/storage';
 import {
   autosaveMockExam,
@@ -54,6 +54,17 @@ interface Props {
   userId?: string;
   /** 계획에서 시작한 경우 전달되는 초기 설정. 일반 메뉴에서는 undefined. */
   initialConfig?: MockExamInitialConfig | null;
+  /**
+   * URL(?tab=exam&exam=Y)로 직접 접근한 경우 그 시험을 연다. 이 값이 없으면
+   * 해당 과목의 진행 중 세션을 연다. URL 접근은 조회만 하며 새 시험을 만들지 않는다.
+   */
+  initialExamId?: string | null;
+  /**
+   * URL 딥링크로 연 경우 true: 만료된 시험을 열었다는 이유만으로 새 제출 요청을
+   * 보내지 않고, '저장된 답안으로 제출' 명시적 행동을 제공한다. 일반 메뉴에서
+   * 연 경우 기존 마감 자동 제출 정책을 유지한다.
+   */
+  deferExpiredSubmit?: boolean;
   onExamRecorded: () => void;
 }
 
@@ -63,7 +74,7 @@ const labels: Partial<Record<ProblemType, string>> = {
   complexity_proof: '복잡도 증명', debug_counterexample: '디버깅·반례',
 };
 
-export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, concepts, problems, userId = '', initialConfig, onExamRecorded }: Props) {
+export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, concepts, problems, userId = '', initialConfig, initialExamId, deferExpiredSubmit = false, onExamRecorded }: Props) {
   const eligible = useMemo(() => problems.filter((p) => p.subjectId === subject.id && p.isApproved !== false && isProblemAvailableForPractice(p)), [problems, subject.id]);
   const availableTypes = useMemo(() => Array.from(new Set(eligible.map((p) => p.type))), [eligible]);
 
@@ -104,7 +115,14 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       (s) => s.subjectId === subject.id && s.status !== 'recorded' && s.status !== 'abandoned'
     );
   const [session, setSession] = useState<MockExamSession | null>(() => {
-    const stored = activeStoredSession();
+    // An explicit exam id from the URL opens EXACTLY that session (including a
+    // submitted/graded one, shown read-only). Otherwise resume the subject's
+    // active session. Never creates a new exam, and never shows another
+    // subject's exam under this subject.
+    const requested = initialExamId
+      ? loadMockExams().find((s) => s.id === initialExamId && s.subjectId === subject.id) ?? null
+      : null;
+    const stored = requested ?? activeStoredSession();
     return stored ? expireMockExam(stored, Date.now()) : null;
   });
   // 진행 중 세션이 있고 계획 설정이 전달되면 "이어서 풀기"와 "새 계획으로 시작"을 구분한다.
@@ -132,9 +150,9 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
   const opTokenRef = useRef(0);
   const sessionRef = useRef<MockExamSession | null>(session);
 
-  const enqueue = (task: () => Promise<void>) => {
+  const enqueue = useCallback((task: () => Promise<void>) => {
     syncChainRef.current = syncChainRef.current.then(task, task);
-  };
+  }, []);
 
   // Applies a server snapshot (answers + version + status + evaluations) as one
   // consistent unit, so a stale local answer set is never paired with a newer
@@ -235,8 +253,37 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
     }, 800);
   };
 
+  // Idempotent server submit of a submitted/expired session. Shared by the
+  // expiry interval and by a keystroke that lands after the deadline.
+  const enqueueSubmitSession = useCallback(
+    (submitted: MockExamSession) => {
+      const token = opTokenRef.current;
+      enqueue(async () => {
+        if (token !== opTokenRef.current) return;
+        const result = await submitMockExamOnServer(submitted, serverVersionRef.current);
+        if (token !== opTokenRef.current) return;
+        if (result.ok) {
+          serverVersionRef.current = result.version;
+          setSaveState('saved');
+        } else if (result.code === 'stale' || result.code === 'locked') {
+          if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
+          setPendingAvailable(true);
+          setSyncBlocked(true);
+          setSaveState('conflict');
+        } else if (result.code !== 'not_configured') {
+          if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
+          setPendingAvailable(true);
+          setSaveState('error');
+          setSaveMessage('제출을 서버에 저장하지 못했습니다. 다시 시도해 주세요.');
+        }
+      });
+    },
+    [enqueue, userId]
+  );
+
   // Persist local, then mirror to the server according to the exam phase.
   const save = (updated: MockExamSession) => {
+    const previousStatus = sessionRef.current?.status;
     saveMockExam(updated);
     setSession(updated);
     const token = opTokenRef.current;
@@ -244,6 +291,12 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       // Preserve the edit BEFORE scheduling the debounced server save.
       persistPending(updated, serverVersionRef.current);
       scheduleAutosave(updated);
+    } else if (updated.status === 'submitted' && previousStatus === 'in_progress') {
+      // A keystroke landed after the deadline: the session just became
+      // submitted. Preserve the answers and enqueue the idempotent submit so the
+      // server cannot stay in_progress until the next open.
+      persistPending(updated, serverVersionRef.current);
+      enqueueSubmitSession(updated);
     } else if (updated.status === 'graded' || updated.status === 'recorded') {
       enqueue(() => runGrading(updated, updated.status === 'recorded' ? 'recorded' : 'graded', token));
     }
@@ -288,32 +341,13 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
           if (userId && !savePendingExamAnswers(userId, submitted, serverVersionRef.current)) {
             setSyncNotice('미저장 답안을 이 기기에 보존하지 못했습니다. 창을 닫지 말고 다시 시도해 주세요.');
           }
-          const token = opTokenRef.current;
-          enqueue(async () => {
-            if (token !== opTokenRef.current) return;
-            const result = await submitMockExamOnServer(submitted, serverVersionRef.current);
-            if (token !== opTokenRef.current) return;
-            if (result.ok) {
-              serverVersionRef.current = result.version;
-              setSaveState('saved');
-            } else if (result.code === 'stale' || result.code === 'locked') {
-              if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
-              setPendingAvailable(true);
-              setSyncBlocked(true);
-              setSaveState('conflict');
-            } else if (result.code !== 'not_configured') {
-              if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
-              setPendingAvailable(true);
-              setSaveState('error');
-              setSaveMessage('제출을 서버에 저장하지 못했습니다. 다시 시도해 주세요.');
-            }
-          });
+          enqueueSubmitSession(submitted);
           return submitted;
         });
       }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [isOpen, session?.status, session?.endsAt, userId]);
+  }, [isOpen, session?.status, session?.endsAt, userId, enqueueSubmitSession]);
 
   // On open (or session change) reconcile with the server. The server snapshot
   // (answers + version + status + evaluations) is applied as ONE unit. Local
@@ -337,6 +371,17 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         return;
       }
       const server = result.session;
+      // A stale exam opened via URL must NOT be auto-submitted: keep the local
+      // expired (submitted) copy, do NOT adopt the server's in_progress state,
+      // and offer an explicit '저장된 답안으로 제출' action instead.
+      if (deferExpiredSubmit && local && local.status === 'submitted' && server.status === 'in_progress') {
+        serverVersionRef.current = result.version;
+        setSyncBlocked(true);
+        setSyncNotice(
+          '만료된 시험이 서버에는 아직 진행 중으로 남아 있습니다. "저장된 답안으로 제출"을 눌러 마감 처리하거나, 목록으로 돌아가세요.'
+        );
+        return;
+      }
       const pending = userId ? loadPendingExamAnswers(userId, server.id) : null;
       const plan = planReconcile(local, server, result.version, pending);
       serverVersionRef.current = result.version;
@@ -344,6 +389,10 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       // Apply the server snapshot (answers + version + status + evaluations) as
       // one unit. Local answers are never merged on top of it.
       applySnapshot(server);
+      if (server.status !== 'in_progress') {
+        // The server already holds the terminal state: no local submit is pending.
+        setSaveState('saved');
+      }
 
       if (plan.unsaved) {
         // Unsaved changes stay in the separate pending area for explicit review;
@@ -375,7 +424,7 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       }
     });
     return () => { cancelled = true; };
-  }, [isOpen, session?.id, userId]);
+  }, [isOpen, session?.id, userId, deferExpiredSubmit]);
 
   const resolveFromServer = async () => {
     const local = sessionRef.current;
@@ -1006,6 +1055,18 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
             )}
           </section>}
           {session.status === 'in_progress' && <button onClick={submitExam} className="bg-[#c52828] text-white px-4 py-2">시험 제출</button>}
+          {examOpenPolicy(session, deferExpiredSubmit) === 'expired_manual' && saveState !== 'saved' && (
+            <button
+              onClick={() => {
+                persistPending(session, serverVersionRef.current);
+                enqueueSubmitSession(session);
+              }}
+              disabled={busy}
+              className="bg-[#c52828] text-white px-4 py-2 disabled:opacity-50"
+            >
+              저장된 답안으로 제출
+            </button>
+          )}
           {session.status === 'submitted' && <button onClick={gradeExam} disabled={busy || Boolean(blocked.length)} className="bg-[#191817] text-white px-4 py-2 disabled:opacity-50">{busy ? 'AI 평가 중...' : '답안 평가 (미응답 0점)'}</button>}
           {session.status === 'graded' && <div className="border-t pt-3 space-y-3"><h3 className="font-bold">결과: {getExamScore(session)}점 (문항 평균)</h3><p className="text-xs text-[#606060]">미응답은 0점으로 합산하며 풀이 이력은 만들지 않습니다. 코딩 답안은 실행하지 않는 AI 정적 평가입니다.</p><button onClick={recordExam} disabled={Boolean(blocked.length)} className="bg-[#191817] text-white px-4 py-2 disabled:opacity-50">결과 확인 및 학습 이력 확정</button></div>}
           {blocked.length > 0 && <p className="text-sm text-red-700">품질 검토 상태로 바뀐 문항 {blocked.length}개가 있습니다. 평가·기록을 보류합니다.</p>}

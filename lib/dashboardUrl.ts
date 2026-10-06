@@ -250,6 +250,14 @@ export function resolveDashboardUrl(
         noticeMessage: '요청하신 모의시험 세션을 찾을 수 없거나 접근 권한이 없습니다.',
       };
     }
+    // The exam's own subject wins, so a direct exam URL opens under the right
+    // subject instead of whichever subject happened to be in the URL.
+    if (resolvedSubjectId && exam.subjectId !== resolvedSubjectId) {
+      const ownsSubject = ctx.subjects.some((s) => s.id === exam.subjectId);
+      if (ownsSubject) {
+        resolvedSubjectId = exam.subjectId;
+      }
+    }
   }
 
   return {
