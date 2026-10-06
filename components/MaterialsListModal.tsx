@@ -59,6 +59,7 @@ export function MaterialsListModal({
   const [bodyIds, setBodyIds] = useState<Set<string>>(new Set());
   const [originalIds, setOriginalIds] = useState<Set<string>>(new Set());
   const [reconnectTarget, setReconnectTarget] = useState<{ id: string; kind: 'original' | 'body' } | null>(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const refreshPresence = useCallback(async () => {
@@ -423,17 +424,38 @@ export function MaterialsListModal({
                       )}
 
                       {!mat.isDemo && onDeleteMaterial && (
-                        <button
-                          onClick={() => {
-                            if (confirm(`'${mat.title}' 자료를 삭제하시겠습니까?`)) {
-                              onDeleteMaterial(mat.id);
-                            }
-                          }}
-                          className="p-1.5 text-[#827d73] hover:text-[#c52828] hover:bg-red-50 rounded transition-colors"
-                          title="자료 삭제"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                        deleteConfirmId === mat.id ? (
+                          <div className="flex items-center gap-1 bg-red-50 p-1 rounded-xs border border-red-200">
+                            <span className="text-[10px] text-red-700 font-bold">삭제할까요?</span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDeleteConfirmId(null);
+                                onDeleteMaterial(mat.id);
+                              }}
+                              className="px-2 py-0.5 text-[10px] bg-red-600 hover:bg-red-700 text-white font-bold rounded-xs transition-colors"
+                              title="삭제 확정"
+                            >
+                              삭제
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setDeleteConfirmId(null)}
+                              className="px-1.5 py-0.5 text-[10px] text-gray-600 hover:bg-gray-200 rounded-xs transition-colors"
+                            >
+                              취소
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setDeleteConfirmId(mat.id)}
+                            className="p-1.5 text-[#827d73] hover:text-[#c52828] hover:bg-red-50 rounded-xs transition-colors"
+                            title="자료 삭제"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )
                       )}
                     </div>
                   </div>

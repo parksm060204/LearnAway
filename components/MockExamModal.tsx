@@ -814,7 +814,29 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
           <div className="flex justify-between items-center gap-3 border-b pb-2"><strong>{session.status === 'in_progress' ? '진행 중' : session.status === 'submitted' ? '제출 완료 · 평가 대기' : '평가 완료'}</strong><span className="flex items-center gap-1 font-mono"><Clock className="w-4 h-4" />{String(Math.floor(remaining / 60)).padStart(2, '0')}:{String(remaining % 60).padStart(2, '0')}</span></div>
           <nav className="flex flex-wrap gap-2" aria-label="문항 이동">{session.problems.map((p, i) => <button key={p.id} onClick={() => setIndex(i)} className={`border px-2 py-1 ${index === i ? 'bg-[#191817] text-white' : ''}`}>{i + 1}{session.answers[p.id]?.trim() ? ' ✓' : ''}</button>)}</nav>
           {current && <section className="space-y-3">
-            <div className="text-xs text-[#827d73]">문항 {index + 1}/{session.problems.length} · {labels[current.type]} · 권장 {current.timeStandardMinutes}분 · 버전 {current.version ?? 1}</div>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-[#827d73]">
+              <span>문항 {index + 1}/{session.problems.length} · {labels[current.type]} · 권장 {current.timeStandardMinutes}분 · 버전 {current.version ?? 1}</span>
+              {current.needsSourceReview && (
+                <span className="bg-amber-50 border border-amber-300 text-amber-800 px-1.5 py-0.5 rounded-2xs font-semibold">
+                  ⚠️ 출처 검토 필요
+                </span>
+              )}
+              {current.isOutdated && (
+                <span className="bg-red-50 border border-red-300 text-red-800 px-1.5 py-0.5 rounded-2xs font-semibold">
+                  구버전 자료 기반
+                </span>
+              )}
+            </div>
+            {current.needsSourceReview && (
+              <div className="p-2 bg-amber-50 border border-amber-300 rounded-xs text-xs text-amber-900 flex items-center gap-1.5">
+                <span>⚠️ 출처 검토 필요 안내: 이 문제의 근거 학습 자료 본문이 수정되었습니다. 최신 자료 내용을 참고하세요.</span>
+              </div>
+            )}
+            {current.isOutdated && (
+              <div className="p-2 bg-red-50 border border-red-300 rounded-xs text-xs text-red-900 flex items-center gap-1.5">
+                <span>⚠️ 구버전 자료 기반 안내: 학습 자료 본문이 수정되어 출제 당시와 차이가 있을 수 있습니다.</span>
+              </div>
+            )}
             <h3 className="font-bold text-lg">{current.title}</h3><div className="whitespace-pre-wrap leading-relaxed"><AcademicMathView content={current.promptText} /></div>
             {current.mathFormula && <div className="p-2.5 bg-white border border-[#e2ded6] rounded-xs text-center overflow-x-auto"><AcademicMathView content={current.mathFormula} displayMode /></div>}
             {current.codeSnippet && <pre className="overflow-x-auto bg-[#191817] text-white p-2">{current.codeSnippet}</pre>}

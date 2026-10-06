@@ -30,6 +30,8 @@ export function mergeConcepts(
       lastCalculatedAt: mine.lastCalculatedAt,
       postponedUntil: mine.postponedUntil,
       postponeDays: mine.postponeDays,
+      needsSourceReview: mine.needsSourceReview ?? remote.needsSourceReview,
+      sourceEvidence: mine.sourceEvidence ?? remote.sourceEvidence,
     };
   });
   const unSynced = originals.filter((o) => !serverIds.has(o.id) && !migratedIds.has(o.id));

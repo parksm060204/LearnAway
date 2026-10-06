@@ -338,6 +338,11 @@ export function ProblemGeneratorModal({
                               미학습 (대기)
                             </span>
                           )}
+                          {concept.needsSourceReview && (
+                            <span className="text-[9.5px] font-academic-mono bg-amber-50 border border-amber-300 text-amber-800 px-1 rounded-2xs font-semibold flex items-center gap-0.5">
+                              ⚠️ 출처 검토 필요
+                            </span>
+                          )}
                         </div>
                         {concept.description && (
                           <p className="text-[11px] text-[#57544e] line-clamp-1 mt-0.5">
@@ -348,6 +353,14 @@ export function ProblemGeneratorModal({
                     </label>
                   );
                 })}
+              </div>
+            )}
+            {selectedConceptIds.some((id) => eligibleConcepts.find((c) => c.id === id)?.needsSourceReview) && (
+              <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-xs text-[11px] text-amber-900 flex items-start gap-1.5 mt-2">
+                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold">출처 검토 필요 안내:</span> 선택한 개념 중 학습 자료 본문 수정으로 인해 출처 검토가 필요한 개념이 포함되어 있습니다. 최신 본문과 일치하는지 확인 후 출제를 진행하세요.
+                </div>
               </div>
             )}
           </div>

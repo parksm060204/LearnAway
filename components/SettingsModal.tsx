@@ -54,10 +54,10 @@ export function SettingsModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs">
-      <div className="w-full max-w-lg bg-white border border-[#c8c2b5] rounded-xs shadow-xl overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto">
+      <div className="w-full max-w-xl bg-white border border-[#c8c2b5] rounded-xs shadow-xl my-auto max-h-[90vh] flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="bg-[#191817] text-white px-5 py-3 flex items-center justify-between">
+        <div className="bg-[#191817] text-white px-5 py-3 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
             <Settings className="w-4 h-4 text-[#c52828]" />
             <h3 className="font-academic-serif text-sm font-bold">
@@ -69,8 +69,9 @@ export function SettingsModal({
           </button>
         </div>
 
-        {/* Body */}
-        <form onSubmit={handleSave} className="p-5 space-y-4 text-xs font-sans">
+        {/* Scrollable Body */}
+        <div className="overflow-y-auto flex-1">
+          <form onSubmit={handleSave} className="p-5 space-y-4 text-xs font-sans">
           {/* Transparent Notice */}
           <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1.5 text-[#57544e]">
             <div className="flex items-center gap-1.5 font-academic-mono text-[11px] font-bold text-[#827d73]">
@@ -197,5 +198,6 @@ export function SettingsModal({
         </div>
       </div>
     </div>
-  );
+  </div>
+);
 }

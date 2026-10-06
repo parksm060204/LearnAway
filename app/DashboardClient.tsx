@@ -175,6 +175,8 @@ import {
   markMaterialDeleted,
   markMaterialLocalOnly,
   clearDeletedMaterialMarker,
+  clearLocalOnlyMaterialMarker,
+  isLocalOnlyMaterial,
   reconcileDeletedMaterialMarkers,
   saveStoredMaterialsFromServerCache,
   type MaterialHashIdentity,
@@ -1540,14 +1542,26 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       return false;
     }
 
+    const fallbackUsed = Boolean(
+      'fallbackUsed' in result.data
+        ? (result.data as { fallbackUsed?: boolean }).fallbackUsed
+        : (result.data as unknown as Record<string, unknown>).fallback_used
+    );
+
     const updated = [materialToStore, ...materials];
     setMaterials(updated);
     saveStoredMaterials(updated);
-    showToast(
-      uploadBody || uploadOriginal
-        ? `자료 [${newMat.title}]가 이 기기와 서버에 저장되었습니다.`
-        : `자료 [${newMat.title}]가 이 기기에 저장되었습니다. (서버에는 연결 메타데이터만 저장)`
-    );
+    if (fallbackUsed) {
+      showToast(
+        `자료 [${newMat.title}]가 저장되었으나 서버 마이그레이션 9 미적용으로 저장 정책/해시는 서버에 저장되지 않았습니다.`
+      );
+    } else {
+      showToast(
+        uploadBody || uploadOriginal
+          ? `자료 [${newMat.title}]가 이 기기와 서버에 저장되었습니다.`
+          : `자료 [${newMat.title}]가 이 기기에 저장되었습니다. (서버에는 연결 메타데이터만 저장)`
+      );
+    }
     return true;
   };
 
@@ -2963,15 +2977,20 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             : handleReconnectBody(material, file)
         }
         onDeleteMaterial={async (materialId) => {
-          // Delete on the server first; never report success on failure.
-          const result = await deleteMaterial(materialId);
-          if (!result.ok) {
-            showToast(`자료 삭제 실패: ${result.error}`);
-            return;
+          const isLocalOnly = isLocalOnlyMaterial(materialId);
+          // Server-known materials must be deleted on the server first; never hide server delete failures.
+          // Local-only materials (e.g. restored from backup) do not require server success.
+          if (!isLocalOnly) {
+            const result = await deleteMaterial(materialId);
+            if (!result.ok) {
+              showToast(`자료 삭제 실패: ${result.error}`);
+              return;
+            }
           }
           // Ledger the explicit deletion BEFORE any local save, so no later
           // wholesale list save (or stale snapshot) can resurrect this material.
           markMaterialDeleted(materialId);
+          clearLocalOnlyMaterialMarker(materialId);
           const updated = materials.filter((m) => m.id !== materialId);
           setMaterials(updated);
           saveStoredMaterials(updated);
@@ -2983,7 +3002,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           showToast(
             localCleanupOk
               ? '자료와 이 기기에 저장된 본문·원본이 삭제되었습니다.'
-              : `서버에서는 삭제됐지만 이 기기 파일 정리에 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '알 수 없는 오류'})`
+              : `자료 메타데이터는 삭제되었으나 로컬 파일 정리에 일부 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '다시 시도 가능'})`
           );
         }}
         onOpenConceptReview={(mat) => {
@@ -3040,16 +3059,86 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           setAllProblems(newProblems);
           saveStoredProblems(newProblems);
 
-          if (outdatedIds.length > 0) {
+          // Mark concepts and concept drafts linked to this material as needing review
+          const newHash = computeMarkdownHash(updatedMat.parsedMarkdown || '');
+          let affectedConceptsCount = 0;
+          const newConcepts = allConcepts.map((c) => {
+            if (c.subjectId === updatedMat.subjectId && c.materialIds.includes(updatedMat.id)) {
+              affectedConceptsCount++;
+              return {
+                ...c,
+                needsSourceReview: true,
+                sourceEvidence: c.sourceEvidence
+                  ? {
+                      ...c.sourceEvidence,
+                      verified: false,
+                      verificationNote: '근거 자료 본문이 수정되어 재검토가 필요합니다.',
+                    }
+                  : undefined,
+              };
+            }
+            return c;
+          });
+          if (affectedConceptsCount > 0) {
+            setAllConcepts(newConcepts);
+            saveStoredConcepts(newConcepts);
+          }
+
+          let affectedDraftsCount = 0;
+          const newDrafts = conceptDrafts.map((d) => {
+            if (d.materialId === updatedMat.id && d.sourceMarkdownHash !== newHash) {
+              affectedDraftsCount++;
+              return {
+                ...d,
+                needsSourceReview: true,
+              };
+            }
+            return d;
+          });
+          if (affectedDraftsCount > 0) {
+            setConceptDrafts(newDrafts);
+            saveStoredConceptDrafts(newDrafts);
+          }
+
+          // Persist affected source review flags to Supabase so it survives reload / other devices
+          if (currentUser && isSupabaseConfigured()) {
+            const supabase = createBrowserSupabaseClient();
+            for (const pid of [...outdatedIds, ...reviewIds]) {
+              const prob = newProblems.find((p) => p.id === pid);
+              if (prob) {
+                void updateProblemQuality(supabase, prob.id, {
+                  isOutdated: prob.isOutdated,
+                  needsSourceReview: prob.needsSourceReview,
+                  payload: prob as unknown as Record<string, unknown>,
+                });
+              }
+            }
+            for (const c of newConcepts) {
+              if (c.subjectId === updatedMat.subjectId && c.materialIds.includes(updatedMat.id)) {
+                void supabase.from('concepts').update({ payload: c as unknown as Record<string, unknown> }).eq('id', c.id);
+              }
+            }
+            for (const d of newDrafts) {
+              if (d.materialId === updatedMat.id && d.needsSourceReview) {
+                void supabase.from('concept_drafts').update({ payload: d as unknown as Record<string, unknown> }).eq('id', d.id);
+              }
+            }
+          }
+
+          if (outdatedIds.length > 0 || reviewIds.length > 0 || affectedConceptsCount > 0) {
+            const parts: string[] = [];
+            if (affectedConceptsCount > 0) parts.push(`개념 ${affectedConceptsCount}건`);
+            if (outdatedIds.length > 0) parts.push(`구버전 문제 ${outdatedIds.length}건`);
+            if (reviewIds.length > 0) parts.push(`확인 필요 문제 ${reviewIds.length}건`);
             showToast(
-              `[${updatedMat.title}] 수정으로 문제 ${outdatedIds.length}건이 구버전으로 표시되어 재검토가 필요합니다.`
-            );
-          } else if (reviewIds.length > 0) {
-            showToast(
-              `[${updatedMat.title}] 수정과 연관된 문제 ${reviewIds.length}건을 확인 필요 상태로 표시했습니다.`
+              `[${updatedMat.title}] 수정으로 연관 ${parts.join(', ')}을 검토 필요 상태로 표시했습니다.`
             );
           } else {
-            showToast(`[${updatedMat.title}] 수정 내용이 서버에 저장되었습니다.`);
+            showToast(
+              writeResult.data?.fallbackUsed
+                ? `[${updatedMat.title}] 수정 내용이 저장되었으나 서버 마이그레이션 9 미적용으로 일부 정책/해시는 서버에 저장되지 않았습니다.`
+                : `[${updatedMat.title}] 수정 내용이 서버에 저장되었습니다.`
+            );
           }
           return true;
         }}

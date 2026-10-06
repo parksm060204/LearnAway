@@ -176,6 +176,7 @@ export interface ConceptDraft {
   createdAt: string;
   updatedAt: string;
   editedByUser?: boolean;
+  needsSourceReview?: boolean;
   // Server-authoritative contract fields (present when loaded from Supabase).
   contentVersion?: number;
   approvalState?: 'pending' | 'approved' | 'failed';
@@ -208,6 +209,7 @@ export interface Concept {
   examples?: string[];
   sourceEvidence?: ConceptEvidence;
   draftId?: string;
+  needsSourceReview?: boolean;
   // Stage 5 fields: Spaced repetition recommendation & postpone tracking
   postponeDays?: number;         // 미루기 누적 일수 (기본 0)
   postponedUntil?: string;       // 미루기 적용 목표 일자 (ISO 또는 YYYY-MM-DD)

@@ -389,6 +389,12 @@ export function ProblemSessionModal({
                 <span className="text-[10px] font-academic-mono bg-[#ded6c8]/60 text-[#57544e] px-1.5 py-0.5 rounded-2xs font-semibold">
                   v{problem.version || 1}
                 </span>
+                {problem.needsSourceReview && (
+                  <span className="text-[10px] font-academic-mono bg-amber-50 border border-amber-300 text-amber-800 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">
+                    <AlertTriangle className="w-2.5 h-2.5 text-amber-600" />
+                    출처 검토 필요
+                  </span>
+                )}
               </div>
 
               <div className="flex items-center gap-3">
@@ -427,6 +433,16 @@ export function ProblemSessionModal({
                 <div>
                   <strong className="font-bold">이전 자료 기반 출제: </strong>
                   <span>원문 학습 자료 또는 Markdown이 수정되어 출제 당시의 원문 버전과 차이가 있을 수 있습니다.</span>
+                </div>
+              </div>
+            )}
+
+            {problem.needsSourceReview && (
+              <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-xs text-[11.5px] text-amber-950 flex items-start gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <strong className="font-bold">출처 검토 필요 안내: </strong>
+                  <span>이 문제의 근거 자료 본문이 수정되어 출처 검토가 필요한 상태입니다. 풀이 전 최신 본문 내용을 확인해 주세요.</span>
                 </div>
               </div>
             )}

@@ -375,11 +375,12 @@ export function DataManagementSection({
             </button>
             <input
               ref={importInputRef}
+              id="material-backup-file-input"
+              data-testid="material-backup-file-input"
               type="file"
               accept="application/json,.json"
               className="hidden"
-              aria-hidden="true"
-              tabIndex={-1}
+              aria-label="학습 자료 백업 파일 선택"
               onChange={(e) => {
                 const file = e.target.files?.[0] ?? null;
                 e.target.value = '';

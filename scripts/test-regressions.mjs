@@ -5414,6 +5414,129 @@ exports.requireApiUser = async () => {
     } finally { data.clear(); for (const [key, value] of backup) data.set(key, value); }
   });
 
+  check('migration 9 column error detection strictly distinguishes missing columns from permission/constraint errors', () => {
+    // 1) Real undefined column errors (Postgres 42703 or PostgREST cache)
+    assert.equal(
+      cloudMaterials.isMissingMigration9ColumnError({
+        code: '42703',
+        message: 'column "sync_body" of relation "materials" does not exist',
+      }),
+      true
+    );
+    assert.equal(
+      cloudMaterials.isMissingMigration9ColumnError({
+        code: 'PGRST204',
+        message: "Could not find the 'original_hash' column of 'materials' in the schema cache",
+      }),
+      true
+    );
+    assert.equal(
+      cloudMaterials.isMissingMigration9ColumnError({
+        message: 'column materials.backup_original does not exist',
+      }),
+      true
+    );
+
+    // 2) Errors unrelated to migration 9 columns
+    assert.equal(
+      cloudMaterials.isMissingMigration9ColumnError({
+        code: '42703',
+        message: 'column "non_migration_col" does not exist',
+      }),
+      false
+    );
+
+    // 3) Permission, constraint, not-null, and network errors must NEVER be treated as missing column
+    assert.equal(
+      cloudMaterials.isMissingMigration9ColumnError({
+        code: '42501',
+        message: 'permission denied for column sync_body',
+      }),
+      false,
+      '42501 permission denied must never trigger fallback'
+    );
+    assert.equal(
+      cloudMaterials.isMissingMigration9ColumnError({
+        code: '23502',
+        message: 'null value in column "sync_body" violates not-null constraint',
+      }),
+      false,
+      '23502 not-null violation must never trigger fallback'
+    );
+    assert.equal(
+      cloudMaterials.isMissingMigration9ColumnError({
+        code: '23514',
+        message: 'check constraint "materials_file_size_check" violated for file_size',
+      }),
+      false,
+      '23514 check constraint must never trigger fallback'
+    );
+    assert.equal(
+      cloudMaterials.isMissingMigration9ColumnError({
+        code: '08006',
+        message: 'connection failure while writing sync_body',
+      }),
+      false,
+      'network failure must never trigger fallback'
+    );
+  });
+
+  check('stripMigration9Columns removes exactly migration 9 columns and preserves all other fields', () => {
+    const fullPayload = {
+      id: 'm-test',
+      title: 'Linear Algebra',
+      subject_id: 's-math',
+      sync_body: true,
+      backup_original: false,
+      body_synced: false,
+      original_backed_up: false,
+      original_hash: 'abc123hash',
+      file_size: 4096,
+      version: 0,
+      upload_state: 'ready',
+    };
+    const stripped = cloudMaterials.stripMigration9Columns(fullPayload);
+    assert.equal(stripped.id, 'm-test');
+    assert.equal(stripped.title, 'Linear Algebra');
+    assert.equal(stripped.subject_id, 's-math');
+    assert.equal(stripped.version, 0);
+    assert.equal(stripped.upload_state, 'ready');
+    assert.equal(stripped.sync_body, undefined);
+    assert.equal(stripped.backup_original, undefined);
+    assert.equal(stripped.body_synced, undefined);
+    assert.equal(stripped.original_backed_up, undefined);
+    assert.equal(stripped.original_hash, undefined);
+    assert.equal(stripped.file_size, undefined);
+  });
+
+  check('mergeConcepts preserves local needsSourceReview and sourceEvidence', () => {
+    const serverConcept = {
+      id: 'c-1',
+      subjectId: 's-1',
+      title: 'Eigenvalues',
+      needsSourceReview: false,
+      sourceEvidence: { verified: true, quote: 'Definition 1' },
+    };
+    const localConcept = {
+      id: 'c-1',
+      subjectId: 's-1',
+      title: 'Eigenvalues',
+      needsSourceReview: true,
+      sourceEvidence: { verified: false, verificationNote: '근거 자료 본문이 수정되어 재검토가 필요합니다.' },
+    };
+
+    const merged = cloudMerge.mergeConcepts([serverConcept], [localConcept]);
+    assert.equal(merged.length, 1);
+    assert.equal(merged[0].needsSourceReview, true, 'local needsSourceReview preserved');
+    assert.equal(merged[0].sourceEvidence.verified, false, 'local sourceEvidence verification state preserved');
+  });
+
+  check('GatewayPage does not contain hardcoded passwords and guards dev email login', () => {
+    const gatewaySrc = fs.readFileSync(path.join(root, 'components/GatewayPage.tsx'), 'utf8');
+    assert.equal(gatewaySrc.includes('TestPassword123!@#'), false, 'hardcoded password must be removed');
+    assert.ok(gatewaySrc.includes("process.env.NODE_ENV !== 'production'"), 'must be guarded by dev check');
+  });
+
   console.log(`${passed} regression checks passed`);
 }
 

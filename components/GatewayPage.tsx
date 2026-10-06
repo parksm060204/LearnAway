@@ -32,6 +32,39 @@ export function GatewayPage({ nextPath, initialError }: GatewayPageProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(initialError);
 
+  const [showEmailLogin, setShowEmailLogin] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [isEmailSubmitting, setIsEmailSubmitting] = useState(false);
+
+  const handleEmailLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email.trim() || !password) {
+      setErrorMessage('이메일과 비밀번호를 입력해 주세요.');
+      return;
+    }
+    setIsEmailSubmitting(true);
+    setErrorMessage(null);
+
+    try {
+      const supabase = createClient();
+      const { error } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
+
+      if (error) {
+        setErrorMessage('이메일 또는 비밀번호가 올바르지 않거나 로그인을 완료할 수 없습니다.');
+        setIsEmailSubmitting(false);
+        return;
+      }
+      window.location.assign(nextPath || '/');
+    } catch {
+      setErrorMessage('로그인을 처리하는 중 오류가 발생했습니다.');
+      setIsEmailSubmitting(false);
+    }
+  };
+
   const handleGoogleLogin = async () => {
     // Guard against duplicate clicks while the OAuth redirect is being prepared.
     if (isSubmitting) return;
@@ -134,6 +167,94 @@ export function GatewayPage({ nextPath, initialError }: GatewayPageProps) {
             <p className="text-xs text-[#827d73]">
               로그인 후 과목을 만들고 학습 자료를 등록하세요.
             </p>
+
+            {process.env.NODE_ENV !== 'production' && (
+              <div className="w-full max-w-sm mt-1 pt-3 border-t border-[#e2ded6]/60">
+                <button
+                  type="button"
+                  id="toggle-email-login"
+                  onClick={() => setShowEmailLogin(!showEmailLogin)}
+                  className="text-xs text-[#57544e] hover:text-[#191817] underline transition-colors"
+                >
+                  {showEmailLogin ? '테스트 로그인 접기' : '개발용 이메일 로그인'}
+                </button>
+
+                {showEmailLogin && (
+                  <form
+                    onSubmit={handleEmailLogin}
+                    className="mt-3 p-4 bg-white border border-[#c8c2b5] rounded-xs text-left space-y-3"
+                  >
+                    <div>
+                      <label
+                        htmlFor="email-input"
+                        className="block text-[11px] font-semibold text-[#57544e] mb-1"
+                      >
+                        이메일
+                      </label>
+                      <input
+                        id="email-input"
+                        type="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder="user@example.com"
+                        className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] focus:outline-hidden focus:border-[#c52828]"
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label
+                        htmlFor="password-input"
+                        className="block text-[11px] font-semibold text-[#57544e] mb-1"
+                      >
+                        비밀번호
+                      </label>
+                      <input
+                        id="password-input"
+                        type="password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] focus:outline-hidden focus:border-[#c52828]"
+                        required
+                      />
+                    </div>
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        type="submit"
+                        id="email-login-submit"
+                        disabled={isEmailSubmitting}
+                        className="flex-1 rounded-xs bg-[#191817] text-white px-3 py-2 text-xs font-semibold hover:bg-[#333] transition-colors disabled:opacity-50"
+                      >
+                        {isEmailSubmitting ? '로그인 중...' : '로그인'}
+                      </button>
+                    </div>
+                    <div className="pt-2 border-t border-[#e2ded6] flex flex-wrap gap-1.5 text-[10px]">
+                      <span className="text-[#827d73] self-center">이메일 채우기:</span>
+                      <button
+                        type="button"
+                        id="quick-fill-test1"
+                        onClick={() => {
+                          setEmail('learnaway-test-user-01@example.com');
+                        }}
+                        className="px-2 py-0.5 border border-[#c8c2b5] bg-[#faf8f4] text-[#57544e] rounded-xs hover:border-[#191817]"
+                      >
+                        테스트 계정 1
+                      </button>
+                      <button
+                        type="button"
+                        id="quick-fill-test2"
+                        onClick={() => {
+                          setEmail('learnaway-test-user-02@example.com');
+                        }}
+                        className="px-2 py-0.5 border border-[#c8c2b5] bg-[#faf8f4] text-[#57544e] rounded-xs hover:border-[#191817]"
+                      >
+                        테스트 계정 2
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            )}
           </div>
         </section>
 

@@ -197,9 +197,74 @@ export interface MaterialMetadataInput {
  * link (id/owner/subject/title/kind/hashes/policy) WITHOUT uploading the body or
  * the original. Never touches an existing row's paths, version or sync state.
  */
+export const MIGRATION_9_COLUMNS = [
+  'sync_body',
+  'backup_original',
+  'body_synced',
+  'original_backed_up',
+  'original_hash',
+  'file_size',
+] as const;
+
+export function isMissingMigration9ColumnError(error: unknown): boolean {
+  if (!error) return false;
+  const errObj = typeof error === 'object' && error !== null ? (error as { code?: string; message?: string; details?: string }) : null;
+  const code = errObj?.code;
+  const msg = typeof error === 'string' ? error : errObj?.message || '';
+  const details = errObj?.details || '';
+  const fullText = `${msg} ${details}`;
+
+  // Never treat auth/permission/constraint/timeout/network errors as missing column
+  if (code && ['42501', '23502', '23503', '23505', '23514', '08000', '08003', '08006', '57014'].includes(code)) {
+    return false;
+  }
+
+  const isUndefinedColumn =
+    code === '42703' ||
+    /(?:column[\s\S]*does not exist|column[\s\S]*schema cache)/i.test(fullText);
+
+  if (!isUndefinedColumn) return false;
+
+  return MIGRATION_9_COLUMNS.some((col) => fullText.includes(col));
+}
+
+export function stripMigration9Columns<T extends Record<string, unknown>>(payload: T): T {
+  const copy = { ...payload };
+  for (const col of MIGRATION_9_COLUMNS) {
+    delete copy[col];
+  }
+  return copy;
+}
+
+let cachedMigration9Status: boolean | null = null;
+
+export async function checkMigration9Applied(forceRefresh = false): Promise<boolean> {
+  if (!forceRefresh && cachedMigration9Status !== null) {
+    return cachedMigration9Status;
+  }
+  try {
+    const supabase = createClient();
+    const { error } = await supabase
+      .from('materials')
+      .select('sync_body,backup_original,body_synced,original_backed_up,original_hash,file_size')
+      .limit(0);
+    if (!error) {
+      cachedMigration9Status = true;
+      return true;
+    }
+    if (isMissingMigration9ColumnError(error)) {
+      cachedMigration9Status = false;
+      return false;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export async function writeMaterialMetadata(
   input: MaterialMetadataInput
-): Promise<RepoResult<MaterialRow>> {
+): Promise<RepoResult<MaterialRow & { fallbackUsed?: boolean }>> {
   try {
     const supabase = createClient();
     const userId = await getCurrentUserId(supabase);
@@ -214,40 +279,60 @@ export async function writeMaterialMetadata(
     if (existingResult.error) return repoError(existingResult.error.message);
     const existing = (existingResult.data as MaterialRow | null) ?? null;
 
+    let fallbackUsed = false;
     if (!existing) {
-      const inserted = await supabase
+      const payload: Record<string, unknown> = {
+        ...base,
+        version: 0,
+        upload_state: 'ready',
+        upload_error: null,
+        content_hash: null,
+        body_synced: input.bodySynced ?? false,
+        original_backed_up: input.originalBackedUp ?? false,
+        original_path: null,
+        markdown_path: null,
+        pages_path: null,
+        transcript_path: null,
+      };
+      let inserted = await supabase
         .from('materials')
-        .upsert(
-          {
-            ...base,
-            version: 0,
-            upload_state: 'ready',
-            upload_error: null,
-            content_hash: null,
-            body_synced: input.bodySynced ?? false,
-            original_backed_up: input.originalBackedUp ?? false,
-            original_path: null,
-            markdown_path: null,
-            pages_path: null,
-            transcript_path: null,
-          },
-          { onConflict: 'id,user_id' }
-        )
+        .upsert(payload, { onConflict: 'id,user_id' })
         .select('*')
         .single();
+      if (inserted.error && isMissingMigration9ColumnError(inserted.error)) {
+        fallbackUsed = true;
+        inserted = await supabase
+          .from('materials')
+          .upsert(stripMigration9Columns(payload), { onConflict: 'id,user_id' })
+          .select('*')
+          .single();
+      }
       if (inserted.error) return repoError(inserted.error.message);
-      return repoOk(inserted.data as MaterialRow);
+      const row = inserted.data as MaterialRow & { fallbackUsed?: boolean };
+      if (fallbackUsed) row.fallbackUsed = true;
+      return repoOk(row);
     }
 
     // Metadata-only update: never touch version, paths or sync state.
-    const updated = await supabase
+    let updated = await supabase
       .from('materials')
       .update(base)
       .eq('id', input.material.id)
       .select('*')
       .single();
+    if (updated.error && isMissingMigration9ColumnError(updated.error)) {
+      fallbackUsed = true;
+      updated = await supabase
+        .from('materials')
+        .update(stripMigration9Columns(base as unknown as Record<string, unknown>))
+        .eq('id', input.material.id)
+        .select('*')
+        .single();
+    }
     if (updated.error) return repoError(updated.error.message);
-    return repoOk(updated.data as MaterialRow);
+    const row = updated.data as MaterialRow & { fallbackUsed?: boolean };
+    if (fallbackUsed) row.fallbackUsed = true;
+    return repoOk(row);
   } catch (error) {
     return repoError(toMessage(error, '자료 메타데이터를 저장하지 못했습니다.'));
   }
@@ -257,6 +342,7 @@ export interface MaterialWriteResult {
   row: MaterialRow;
   version: number;
   jobId: string;
+  fallbackUsed?: boolean;
 }
 
 /**
@@ -328,27 +414,34 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
       pending_transcript_path: syncBody && content.rawText ? paths.transcript : null,
     };
 
+    let fallbackUsed = false;
     if (!existing) {
       const base = materialBaseUpsert(material);
-      const inserted = await supabase
+      const payload: Record<string, unknown> = {
+        ...base,
+        version: 0,
+        upload_state: 'uploading',
+        upload_error: null,
+        content_hash: null,
+        original_path: null,
+        markdown_path: null,
+        pages_path: null,
+        transcript_path: null,
+        ...pending,
+      };
+      let inserted = await supabase
         .from('materials')
-        .upsert(
-          {
-            ...base,
-            version: 0,
-            upload_state: 'uploading',
-            upload_error: null,
-            content_hash: null,
-            original_path: null,
-            markdown_path: null,
-            pages_path: null,
-            transcript_path: null,
-            ...pending,
-          },
-          { onConflict: 'id,user_id' }
-        )
+        .upsert(payload, { onConflict: 'id,user_id' })
         .select('*')
         .single();
+      if (inserted.error && isMissingMigration9ColumnError(inserted.error)) {
+        fallbackUsed = true;
+        inserted = await supabase
+          .from('materials')
+          .upsert(stripMigration9Columns(payload), { onConflict: 'id,user_id' })
+          .select('*')
+          .single();
+      }
       if (inserted.error) return repoError(inserted.error.message);
     } else {
       // Claim the pending slot for this job. Last claim wins; the switch below
@@ -425,46 +518,60 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
 
     // Activate only if this job still owns the pending slot AND the active
     // version is still the base version this job started from.
-    const switched = await supabase
+    const switchPayload: Record<string, unknown> = {
+      version,
+      upload_state: 'ready',
+      upload_error: null,
+      content_hash: contentHash,
+      original_path: pendingOriginalPath,
+      // Preserve an existing cloud body when it is not being re-synced.
+      markdown_path: syncBody ? paths.markdown : existing?.markdown_path ?? null,
+      pages_path: pagesProvided ? paths.pages : existing?.pages_path ?? null,
+      transcript_path: syncBody && content.rawText ? paths.transcript : existing?.transcript_path ?? null,
+      body_synced: syncBody || Boolean(existing?.markdown_path),
+      original_backed_up: Boolean(pendingOriginalPath),
+      // Cloud upload completion is separate from conversion status.
+      status: material.status,
+      is_converted: material.isConverted ?? material.status === 'ready',
+      last_edited_at: new Date().toISOString(),
+      pending_job_id: null,
+      pending_version: null,
+      pending_upload_state: null,
+      pending_upload_error: null,
+      pending_content_hash: null,
+      pending_original_path: null,
+      pending_markdown_path: null,
+      pending_pages_path: null,
+      pending_transcript_path: null,
+    };
+    let switched = await supabase
       .from('materials')
-      .update({
-        version,
-        upload_state: 'ready',
-        upload_error: null,
-        content_hash: contentHash,
-        original_path: pendingOriginalPath,
-        // Preserve an existing cloud body when it is not being re-synced.
-        markdown_path: syncBody ? paths.markdown : existing?.markdown_path ?? null,
-        pages_path: pagesProvided ? paths.pages : existing?.pages_path ?? null,
-        transcript_path: syncBody && content.rawText ? paths.transcript : existing?.transcript_path ?? null,
-        body_synced: syncBody || Boolean(existing?.markdown_path),
-        original_backed_up: Boolean(pendingOriginalPath),
-        // Cloud upload completion is separate from conversion status.
-        status: material.status,
-        is_converted: material.isConverted ?? material.status === 'ready',
-        last_edited_at: new Date().toISOString(),
-        pending_job_id: null,
-        pending_version: null,
-        pending_upload_state: null,
-        pending_upload_error: null,
-        pending_content_hash: null,
-        pending_original_path: null,
-        pending_markdown_path: null,
-        pending_pages_path: null,
-        pending_transcript_path: null,
-      })
+      .update(switchPayload)
       .eq('id', material.id)
       .eq('pending_job_id', jobId)
       .eq('version', activeVersion)
       .select('*')
       .single();
+    if (switched.error && isMissingMigration9ColumnError(switched.error)) {
+      fallbackUsed = true;
+      switched = await supabase
+        .from('materials')
+        .update(stripMigration9Columns(switchPayload))
+        .eq('id', material.id)
+        .eq('pending_job_id', jobId)
+        .eq('version', activeVersion)
+        .select('*')
+        .single();
+    }
     if (switched.error) {
       // Lost the race to another job: discard only this job's own objects.
       await cleanupJobObjects(supabase, userId, material.id, jobId);
       return repoError('다른 작업이 먼저 완료되어 이번 업로드 결과를 반영하지 않았습니다. 다시 시도해 주세요.');
     }
 
-    return repoOk({ row: switched.data as MaterialRow, version, jobId });
+    const row = switched.data as MaterialRow & { fallbackUsed?: boolean };
+    if (fallbackUsed) row.fallbackUsed = true;
+    return repoOk({ row, version, jobId, fallbackUsed });
   } catch (error) {
     return repoError(toMessage(error, '자료를 저장하지 못했습니다.'));
   }

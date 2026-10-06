@@ -382,7 +382,7 @@ export function clearLocalOnlyMaterialMarker(materialId: string): void {
   writeLocalOnlyMaterialMarkers(registry);
 }
 
-function isLocalOnlyMaterial(materialId: string): boolean {
+export function isLocalOnlyMaterial(materialId: string): boolean {
   return readLocalOnlyMaterialMarkers()[materialId] !== undefined;
 }
 

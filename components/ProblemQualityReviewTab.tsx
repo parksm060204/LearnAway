@@ -527,6 +527,20 @@ export function ProblemQualityReviewTab({
                       <AcademicMathView inline content={p.promptText} />
                     </p>
 
+                    {p.needsSourceReview && (
+                      <div className="flex items-center gap-1 text-[10px] font-academic-mono text-amber-800 bg-amber-50 border border-amber-300 px-1.5 py-0.5 rounded-2xs mt-0.5">
+                        <AlertTriangle className="w-3 h-3 text-amber-600" />
+                        <span>출처 검토 필요 (자료 본문 수정됨)</span>
+                      </div>
+                    )}
+
+                    {p.isOutdated && (
+                      <div className="flex items-center gap-1 text-[10px] font-academic-mono text-red-800 bg-red-50 border border-red-300 px-1.5 py-0.5 rounded-2xs mt-0.5">
+                        <AlertTriangle className="w-3 h-3 text-red-600" />
+                        <span>구버전 자료 기반 (재검토 필요)</span>
+                      </div>
+                    )}
+
                     {openReportsCount > 0 && (
                       <div className="flex items-center gap-1 text-[10.5px] font-academic-mono text-red-700 bg-red-50 border border-red-200 px-1.5 py-0.5 rounded-2xs mt-0.5">
                         <ShieldAlert className="w-3 h-3 text-red-600" />
@@ -570,6 +584,20 @@ export function ProblemQualityReviewTab({
                   ) : (
                     <span className="text-[11px] font-academic-mono text-emerald-800 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-2xs">
                       AI 생성 승인 문제
+                    </span>
+                  )}
+
+                  {activeProblem.needsSourceReview && (
+                    <span className="text-[11px] font-academic-mono text-amber-800 bg-amber-50 border border-amber-300 px-2 py-0.5 rounded-xs font-semibold flex items-center gap-1">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                      출처 검토 필요
+                    </span>
+                  )}
+
+                  {activeProblem.isOutdated && (
+                    <span className="text-[11px] font-academic-mono text-red-800 bg-red-50 border border-red-300 px-2 py-0.5 rounded-xs font-semibold flex items-center gap-1">
+                      <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
+                      구버전 자료 기반
                     </span>
                   )}
                 </div>
@@ -668,6 +696,17 @@ export function ProblemQualityReviewTab({
 
             {/* Detail Scrollable Content */}
             <div className="p-4 sm:p-6 space-y-5">
+              {(activeProblem.needsSourceReview || activeProblem.isOutdated) && (
+                <div className="p-3 bg-amber-50 border border-amber-300 rounded-xs text-xs text-amber-900 flex items-start gap-2 shadow-2xs">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold">출처 검토 필요 안내:</span>{' '}
+                    {activeProblem.isOutdated
+                      ? '이 문제는 연관 학습 자료 본문이 수정되어 내용이 구버전으로 분류되었습니다. 문제 내용과 루브릭을 최신 자료에 맞게 재검토해 주세요.'
+                      : '이 문제의 근거가 되는 학습 자료 본문이 수정되었습니다. 문제 내용이 여전히 타당한지 출처 검토가 필요합니다.'}
+                  </div>
+                </div>
+              )}
               {/* Section 1: 접수된 신고 내역 (Reports Section) */}
               <div className="bg-white border border-[#ded6c8] rounded-xs p-4 sm:p-5 shadow-2xs space-y-3">
                 <div className="flex items-center justify-between pb-2 border-b border-[#f1ede4]">

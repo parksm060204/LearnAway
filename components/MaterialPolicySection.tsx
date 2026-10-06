@@ -6,6 +6,7 @@ import type { MaterialStoragePolicy } from '../lib/types';
 import { loadDefaultMaterialPolicy, saveDefaultMaterialPolicy } from '../lib/materialPolicy';
 import { estimateLocalStorageUsage, requestPersistentStorage } from '../lib/materialStorage';
 import { subscribeStorageScope } from '../lib/storageScope';
+import { checkMigration9Applied } from '../lib/cloud/materialsRepository';
 
 function formatBytes(value?: number): string {
   if (!value || value <= 0) return '0 B';
@@ -19,6 +20,7 @@ export function MaterialPolicySection() {
   const [usage, setUsage] = useState<{ supported: boolean; usage?: number; quota?: number }>({ supported: false });
   const [persistState, setPersistState] = useState<'idle' | 'granted' | 'denied' | 'unsupported'>('idle');
   const [saveError, setSaveError] = useState('');
+  const [migration9Applied, setMigration9Applied] = useState<boolean | null>(null);
 
   // Re-read the account-scoped policy whenever the account (storage scope)
   // changes, so another account's setting is never shown here. The initial
@@ -33,6 +35,7 @@ export function MaterialPolicySection() {
 
   useEffect(() => {
     void estimateLocalStorageUsage().then(setUsage);
+    void checkMigration9Applied().then(setMigration9Applied);
   }, []);
 
   const update = (next: MaterialStoragePolicy) => {
@@ -77,6 +80,25 @@ export function MaterialPolicySection() {
         {!syncBody && !backupOriginal && (
           <p className="flex items-center gap-1.5 text-[10.5px] text-emerald-700">
             <ShieldCheck className="w-3.5 h-3.5" /> 로컬 전용 · 서버에는 메타데이터만 저장됩니다.
+          </p>
+        )}
+
+        {migration9Applied === false && (
+          <div role="alert" className="p-2.5 bg-amber-50 border border-amber-300 rounded-xs text-[11px] text-amber-900 space-y-1">
+            <div className="font-semibold flex items-center gap-1.5">
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+              <span>서버 DB 스키마 제한 안내 (마이그레이션 9 미적용)</span>
+            </div>
+            <p className="leading-relaxed text-[10.5px]">
+              서버 DB에 자료 저장 정책 컬럼(sync_body, backup_original, original_hash 등)이 적용되지 않은 상태입니다. 새 자료는 메타데이터로 저장되지만 저장 정책 및 원본 해시는 서버에 영구 보존되지 않고 기본 정책으로 fallback 동작합니다.
+            </p>
+          </div>
+        )}
+
+        {migration9Applied === true && (
+          <p className="text-[10.5px] text-[#827d73] flex items-center gap-1">
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+            서버 저장 정책(마이그레이션 9) 적용 확인됨 · 계정별 정책 및 원본 해시 보존 지원
           </p>
         )}
 

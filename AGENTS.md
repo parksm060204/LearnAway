@@ -104,3 +104,13 @@ LearnAway는 대학 강의 자료를 분석하고, 시험 수준의 문제 풀�
 - 테스트 통과만으로 실제 서비스 정상 작동을 단정하지 않는다.
 - 실행하지 못한 검증과 남은 제한 사항을 명시한다.
 - 완료 보고에는 변경 내용, 검사 결과, 필요한 설정을 포함한다.
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->
