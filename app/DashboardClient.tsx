@@ -128,14 +128,13 @@ import {
 } from '../lib/logicSession';
 import { LearningAnalyticsModal } from '../components/LearningAnalyticsModal';
 import { LogicStrengthenModal } from '../components/LogicStrengthenModal';
-import { TopUtilityBar } from '../components/TopUtilityBar';
-import { ExamRecordCard } from '../components/ExamRecordCard';
-import { StatusStrip } from '../components/StatusStrip';
-import { ConceptRail, SortMode } from '../components/ConceptRail';
-import { ForgettingCurveChart } from '../components/ForgettingCurveChart';
-import { ArchiveRecordDetail } from '../components/ArchiveRecordDetail';
-import { TodayReviewPanel } from '../components/TodayReviewPanel';
-import { TodayStudyList } from '../components/TodayStudyList';
+import { TopUtilityBar, type DashboardTab } from '../components/TopUtilityBar';
+import { TodayWorkspace } from '../components/TodayWorkspace';
+import { MaterialsWorkspace } from '../components/MaterialsWorkspace';
+import { ProblemsWorkspace } from '../components/ProblemsWorkspace';
+import { HistoryWorkspace } from '../components/HistoryWorkspace';
+import { SettingsWorkspace } from '../components/SettingsWorkspace';
+import { type SortMode } from '../components/ConceptRail';
 import { type MigrationUiBlock } from '../components/DataManagementSection';
 import { ProblemSessionModal } from '../components/ProblemSessionModal';
 import { ExamScheduleModal } from '../components/ExamScheduleModal';
@@ -250,6 +249,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [settings, setSettings] = useState<RetentionModelSettings>(DEFAULT_RETENTION_SETTINGS);
 
   // Interaction State
+  const [activeTab, setActiveTab] = useState<DashboardTab>('today');
   const [selectedConceptId, setSelectedConceptId] = useState<string>('');
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [selectedProblemType, setSelectedProblemType] = useState<ProblemType>('essay_descriptive');
@@ -267,8 +267,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [isProblemSessionOpen, setIsProblemSessionOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [aiConnectionMissing, setAiConnectionMissing] = useState(false);
-  const [isArchiveOpen, setIsArchiveOpen] = useState(false);
-  const [isPracticeOpen, setIsPracticeOpen] = useState(false);
   const [isMockExamModalOpen, setIsMockExamModalOpen] = useState(false);
   const [mockExamInitialConfig, setMockExamInitialConfig] = useState<MockExamInitialConfig | null>(null);
   const [isMaterialsListOpen, setIsMaterialsListOpen] = useState(false);
@@ -1412,8 +1410,47 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     setIsComparisonMode(false);
     setComparedConceptIds([]);
 
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      url.searchParams.set('subject', newSubjectId);
+      window.history.pushState(null, '', url.toString());
+    }
+
     showToast(`과목이 [${targetSubject?.name || '새 과목'}]으로 전환되었습니다.`);
   };
+
+  const handleSelectTab = (newTab: DashboardTab) => {
+    setActiveTab(newTab);
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      url.searchParams.set('tab', newTab);
+      if (activeSubjectId) {
+        url.searchParams.set('subject', activeSubjectId);
+      }
+      window.history.pushState(null, '', url.toString());
+    }
+  };
+
+  // Synchronize activeTab and activeSubject from URL search params on mount & browser back/forward
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const syncFromUrl = () => {
+      const params = new URLSearchParams(window.location.search);
+      const tabParam = params.get('tab') as DashboardTab | null;
+      if (tabParam && ['today', 'materials', 'problems', 'history', 'settings'].includes(tabParam)) {
+        setActiveTab(tabParam);
+      }
+      const subjectParam = params.get('subject');
+      if (subjectParam && subjects.some((s) => s.id === subjectParam)) {
+        setActiveSubjectId(subjectParam);
+      }
+    };
+
+    syncFromUrl();
+    window.addEventListener('popstate', syncFromUrl);
+    return () => window.removeEventListener('popstate', syncFromUrl);
+  }, [subjects]);
 
   // Add Subject Handler (Stage 0) — persists to Supabase first.
   const handleAddSubject = async (newSubject: Subject) => {
@@ -2467,7 +2504,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       setSelectedEventId(lastEvent ? lastEvent.id : null);
     }
 
-    setIsArchiveOpen(true);
+    handleSelectTab('today');
     setTimeout(() => {
       const el = document.getElementById('archive-record-detail');
       if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -2490,13 +2527,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     );
   };
 
-  // Scroll to Today Review panel
-  const handleScrollToTodayReview = () => {
-    const el = document.getElementById('today-review-panel');
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth' });
-    }
-  };
 
   // Reset to initial demo data (also clears IndexedDB material bodies + memory cache)
   const handleResetData = async () => {
@@ -2663,14 +2693,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         onSelectSubject={handleSelectSubject}
         onOpenAddSubject={() => setIsAddSubjectModalOpen(true)}
         onOpenUpload={() => setIsUploadModalOpen(true)}
-        onOpenMaterialsList={() => setIsMaterialsListOpen(true)}
+        onOpenMaterialsList={() => handleSelectTab('materials')}
         onOpenConceptReview={() => {
           setConceptReviewMaterial(null);
           setIsConceptReviewOpen(true);
         }}
         draftCount={activeSubjectDrafts.length}
         onOpenProblemGenerator={() => setIsProblemGeneratorOpen(true)}
-        onOpenProblemReview={() => setIsProblemReviewOpen(true)}
+        onOpenProblemReview={() => handleSelectTab('problems')}
         problemDraftCount={activeSubjectProblemDrafts.length}
         problemReportedCount={activeSubjectReportedCount}
         onOpenProblemSession={() => {
@@ -2683,36 +2713,19 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           setIsProblemSessionOpen(true);
         }}
         onOpenMockExam={() => {
-          // 일반 메뉴에서 시작: 계획 설정 없이 기본값을 사용한다.
           setMockExamInitialConfig(null);
           setIsMockExamModalOpen(true);
         }}
         onOpenStudyPlan={() => setIsStudyPlanOpen(true)}
-        onOpenLearningAnalytics={() => setIsLearningAnalyticsOpen(true)}
-        onOpenSettings={() => setIsSettingsModalOpen(true)}
-        onScrollToTodayReview={handleScrollToTodayReview}
+        onOpenLearningAnalytics={() => handleSelectTab('history')}
+        onOpenSettings={() => handleSelectTab('settings')}
+        onScrollToTodayReview={() => handleSelectTab('today')}
+        activeTab={activeTab}
+        onSelectTab={handleSelectTab}
         userEmail={currentUser.email}
         onLogout={handleLogout}
         isLoggingOut={isLoggingOut}
       />
-
-      {materials.filter((m) => m.subjectId === activeSubject.id).length === 0 && (
-        <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
-          <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
-            <p className="text-xs text-[#57544e] leading-relaxed">
-              이 과목에는 아직 학습 자료가 없습니다. PDF 또는 강의 전사본을 등록하면 자료 분석과
-              문제 생성이 시작됩니다.
-            </p>
-            <button
-              type="button"
-              onClick={() => setIsUploadModalOpen(true)}
-              className="shrink-0 text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors"
-            >
-              자료 등록
-            </button>
-          </div>
-        </div>
-      )}
 
       {aiConnectionMissing && (
         <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
@@ -2723,7 +2736,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             </div>
             <button
               type="button"
-              onClick={() => setIsSettingsModalOpen(true)}
+              onClick={() => handleSelectTab('settings')}
               className="text-xs font-semibold bg-[#191817] text-white px-3 py-1.5 rounded-xs hover:bg-[#33302b] transition-colors shrink-0"
             >
               내 API 연결
@@ -2734,38 +2747,21 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
       {/* Main Workspace Container */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-3 sm:px-6 py-4 sm:py-6 space-y-4">
-        {/* Section 1: Subject Exam Record & D-Day */}
-        <ExamRecordCard
-          subject={activeSubject}
-          onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
-          onOpenScopeModal={() => setIsScopeModalOpen(true)}
-          onPrimaryAction={primaryCta ? handleStartTodayPrimary : undefined}
-          primaryLabel={primaryCta ? (primaryCta.kind === 'resume-mock' ? '이어서 풀기' : '오늘 복습 시작') : undefined}
-          estimatedMinutesText={todayDigest.estimateText}
-        />
-
-        {/* Section 2: Status Strip */}
-        <StatusStrip
-          subject={activeSubject}
-          concepts={subjectConcepts}
-        />
-
-        {/* Section 3: Concept Rail (Table 1.0) */}
-        <ConceptRail
-          concepts={subjectConcepts}
-          selectedConceptId={selectedConceptId}
-          onSelectConcept={handleSelectConcept}
-          sortMode={sortMode}
-          onChangeSortMode={setSortMode}
-          isComparisonMode={isComparisonMode}
-          comparedConceptIds={comparedConceptIds}
-          onToggleCompareConcept={handleToggleCompareConcept}
-        />
-
-        {/* Section 4: Forgetting Curve (center, full width) */}
-        {selectedConcept && (
-          <ForgettingCurveChart
-            concept={selectedConcept}
+        {activeTab === 'today' && (
+          <TodayWorkspace
+            activeSubject={activeSubject}
+            onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
+            onOpenScopeModal={() => setIsScopeModalOpen(true)}
+            primaryCta={primaryCta}
+            onPrimaryAction={primaryCta ? handleStartTodayPrimary : undefined}
+            todayDigest={todayDigest}
+            todayDayLabel={todayDayLabel}
+            hasActiveSession={Boolean(activeMockSession)}
+            onStartPlanItem={handleStartPlanItem}
+            onResumeMock={handleResumeMockExam}
+            onOpenAllStudyPlan={() => setIsStudyPlanOpen(true)}
+            subjectConcepts={subjectConcepts}
+            selectedConcept={selectedConcept}
             comparedConcepts={comparedConcepts}
             isComparisonMode={isComparisonMode}
             onToggleComparisonMode={() => {
@@ -2776,109 +2772,172 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               }
             }}
             selectedEventId={selectedEventId}
-            onSelectEvent={(evId) => {
-              setSelectedEventId(evId);
-              setIsArchiveOpen(true);
-            }}
+            onSelectEvent={(evId) => setSelectedEventId(evId)}
             settings={settings}
-            examDayOffset={examDDay}
-            hasExamDate={Boolean(activeSubject.examAt && !isNaN(new Date(activeSubject.examAt).getTime()))}
+            examDDay={examDDay}
+            sortMode={sortMode}
+            onChangeSortMode={setSortMode}
+            selectedConceptId={selectedConceptId}
+            onSelectConcept={handleSelectConcept}
+            comparedConceptIds={comparedConceptIds}
+            onToggleCompareConcept={handleToggleCompareConcept}
+            subjectProblems={subjectProblems}
+            selectedProblemType={selectedProblemType}
+            onSelectProblemType={setSelectedProblemType}
+            onStartSession={(problemId) => {
+              if (problemId) {
+                setActiveProblemIdForSession(problemId);
+              }
+              setActiveRechallengeReservationId(null);
+              setActivePlanItemIdForSession(null);
+              setIsProblemSessionOpen(true);
+            }}
+            onPostponeDay={handlePostponeDay}
+            onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
+            onOpenProblemGenerator={(conceptId) => {
+              if (conceptId) {
+                setSelectedConceptId(conceptId);
+              }
+              setIsProblemGeneratorOpen(true);
+            }}
+            onOpenProblemReview={() => handleSelectTab('problems')}
+            activeSubjectProblemDraftsCount={activeSubjectProblemDrafts.length}
+            selectedConceptRecommendation={selectedConceptRecommendation}
+            selectedEvent={selectedEvent}
+            attempts={attempts}
+            allProblems={allProblems}
+            onReportProblem={handleReportProblem}
+            onOpenLogicStrengthen={handleOpenLogicStrengthen}
+            onOpenUpload={() => setIsUploadModalOpen(true)}
           />
         )}
 
-        {/* Section 5: Today Study (compact top items + full plan link) */}
-        <TodayStudyList
-          dayLabel={todayDayLabel}
-          items={todayDigest.items}
-          pendingCount={todayDigest.pendingCount}
-          estimatedMinutesText={todayDigest.estimateText}
-          hasActiveSession={Boolean(activeMockSession)}
-          onStartItem={handleStartPlanItem}
-          onResumeMock={handleResumeMockExam}
-          onOpenAll={() => setIsStudyPlanOpen(true)}
-        />
-
-        {/* Section 6: Selected-concept practice detail (collapsible) */}
-        {selectedConcept && (
-          <details
-            open={isPracticeOpen}
-            onToggle={(e) => setIsPracticeOpen((e.target as HTMLDetailsElement).open)}
-            className="w-full bg-white border border-[#e2ded6] rounded-xs shadow-2xs"
-          >
-            <summary className="cursor-pointer list-none px-4 py-3 flex items-center justify-between gap-2 text-xs font-bold text-[#191817] hover:bg-[#faf8f4] transition-colors">
-              <span>선택한 개념 상세 연습 · {selectedConcept.title}</span>
-              <span className="text-[11px] font-academic-mono font-medium text-[#827d73]">
-                {isPracticeOpen ? '접기' : '펼치기'}
-              </span>
-            </summary>
-            <div className="px-4 pb-4 max-w-3xl">
-              <TodayReviewPanel
-                subject={activeSubject}
-                concept={selectedConcept}
-                problems={subjectProblems}
-                selectedProblemType={selectedProblemType}
-                onSelectProblemType={setSelectedProblemType}
-                onStartSession={(problemId) => {
-                  if (problemId) {
-                    setActiveProblemIdForSession(problemId);
-                  }
-                  setActiveRechallengeReservationId(null);
-                  setActivePlanItemIdForSession(null);
-                  setIsProblemSessionOpen(true);
-                }}
-                onPostponeDay={handlePostponeDay}
-                onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
-                onOpenProblemGenerator={(conceptId) => {
-                  if (conceptId) {
-                    setSelectedConceptId(conceptId);
-                  }
-                  setIsProblemGeneratorOpen(true);
-                }}
-                onOpenProblemReview={() => setIsProblemReviewOpen(true)}
-                problemDraftCount={activeSubjectProblemDrafts.length}
-                recommendation={selectedConceptRecommendation}
-                totalConceptsCount={subjectConcepts.length}
-              />
-            </div>
-          </details>
+        {activeTab === 'materials' && (
+          <MaterialsWorkspace
+            activeSubject={activeSubject}
+            materials={materials}
+            drafts={conceptDrafts}
+            onOpenUpload={() => setIsUploadModalOpen(true)}
+            onSelectMaterial={(mat) => {
+              setEditingMaterial(mat);
+              setIsMaterialEditorOpen(true);
+            }}
+            hasOriginal={(materialId) => Boolean(cloudOriginalPaths[materialId])}
+            onOpenOriginal={handleOpenOriginal}
+            onOpenConceptReview={(mat) => {
+              setConceptReviewMaterial(mat || null);
+              setIsConceptReviewOpen(true);
+            }}
+            onTriggerAnalysis={handleTriggerAiAnalysis}
+            isAnalyzing={isAiAnalyzing}
+            onReconnectFile={async (material, kind, file) =>
+              kind === 'original'
+                ? handleReconnectOriginal(material, file)
+                : handleReconnectBody(material, file)
+            }
+            onDeleteMaterial={async (materialId) => {
+              const isLocalOnly = isLocalOnlyMaterial(materialId);
+              if (!isLocalOnly) {
+                const result = await deleteMaterial(materialId);
+                if (!result.ok) {
+                  showToast(`자료 삭제 실패: ${result.error}`);
+                  return;
+                }
+              }
+              markMaterialDeleted(materialId);
+              clearLocalOnlyMaterialMarker(materialId);
+              const updated = materials.filter((m) => m.id !== materialId);
+              setMaterials(updated);
+              saveStoredMaterials(updated);
+              removeStoredMaterialBodyHash(materialId);
+              const bodyCleanup = await deleteMaterialContent(materialId);
+              const originalCleanup = await deleteMaterialOriginal(materialId);
+              const localCleanupOk = bodyCleanup.deleted && originalCleanup.deleted;
+              showToast(
+                localCleanupOk
+                  ? '자료와 이 기기에 저장된 본문·원본이 삭제되었습니다.'
+                  : `자료 메타데이터는 삭제되었으나 로컬 파일 정리에 일부 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '다시 시도 가능'})`
+              );
+            }}
+          />
         )}
 
-        {/* Section 7: Learning record detail (collapsible) */}
-        {selectedConcept && (
-          <details
-            open={isArchiveOpen}
-            onToggle={(e) => setIsArchiveOpen((e.target as HTMLDetailsElement).open)}
-            className="w-full bg-white border border-[#e2ded6] rounded-xs shadow-2xs"
-          >
-            <summary className="cursor-pointer list-none px-4 py-3 flex items-center justify-between gap-2 text-xs font-bold text-[#191817] hover:bg-[#faf8f4] transition-colors">
-              <span>학습 기록 상세 · {selectedConcept.title}</span>
-              <span className="text-[11px] font-academic-mono font-medium text-[#827d73]">
-                {isArchiveOpen ? '접기' : '펼치기'}
-              </span>
-            </summary>
-            <div id="archive-record-detail" className="px-4 pb-4 scroll-mt-20">
-              <ArchiveRecordDetail
-                concept={selectedConcept}
-                event={selectedEvent}
-                attempts={attempts}
-                problems={allProblems}
-                onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
-                onReportProblem={handleReportProblem}
-                onOpenLogicStrengthen={handleOpenLogicStrengthen}
-              />
-            </div>
-          </details>
+        {activeTab === 'problems' && (
+          <ProblemsWorkspace
+            activeSubject={activeSubject}
+            problems={allProblems}
+            drafts={problemDrafts}
+            materials={materials}
+            concepts={subjectConcepts}
+            onOpenGenerator={() => setIsProblemGeneratorOpen(true)}
+            onStartProblemSession={(problemId) => {
+              if (problemId) {
+                setActiveProblemIdForSession(problemId);
+              } else if (availableSubjectProblems.length > 0) {
+                setActiveProblemIdForSession(availableSubjectProblems[0].id);
+              } else {
+                showToast('풀이 가능한 승인된 문제가 없습니다. 먼저 문제를 출제·승인해 주세요.');
+                return;
+              }
+              setActiveRechallengeReservationId(null);
+              setActivePlanItemIdForSession(null);
+              setIsProblemSessionOpen(true);
+            }}
+            onStartMockExam={() => {
+              setMockExamInitialConfig(null);
+              setIsMockExamModalOpen(true);
+            }}
+            hasActiveMockSession={Boolean(activeMockSession)}
+            onResumeMockExam={handleResumeMockExam}
+            onUpdateDraft={handleUpdateProblemDraft}
+            onApproveDraft={handleApproveProblemDraft}
+            onBatchApproveDrafts={handleBatchApproveProblemDrafts}
+            onDeleteDraft={handleDeleteProblemDraft}
+            onUpdateProblemQualityStatus={handleUpdateProblemQualityStatus}
+            onDismissReport={handleDismissProblemReport}
+            onReviseProblem={handleReviseProblem}
+            onReapproveProblem={handleReapproveProblem}
+            onSuspendProblem={handleSuspendProblem}
+          />
         )}
 
-        {/* Notice Banner */}
-        <div className="bg-[#f6f3eb] border border-[#ded6c8] p-3 rounded-xs text-[11px] font-academic-mono text-[#57544e] flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
-          <div>
-            <strong className="text-[#191817]">NOTE:</strong> 시험 일정 변경 시 이전 학습 데이터 및 풀이 기록은 무결하게 보존되며 감쇠 계수 곡선만 즉시 재산출됩니다.
-          </div>
-          <div className="text-[#827d73] shrink-0">
-            TIMEZONE: ASIA/SEOUL (UTC+09:00) · SCHEDULER: 00:00:00 KST SYNC
-          </div>
-        </div>
+        {activeTab === 'history' && (
+          <HistoryWorkspace
+            activeSubject={activeSubject}
+            subjects={subjects}
+            concepts={allConcepts}
+            problems={allProblems}
+            attempts={attempts}
+            mockExams={mockExams}
+            personalizationSettings={personalizationSettings}
+            correctionState={effectiveCorrectionState}
+            onUpdatePersonalizationSettings={handleUpdatePersonalizationSettings}
+            onResetPersonalizationSettings={handleResetPersonalizationSettings}
+            onRecalculateCorrection={handleRecalculateCorrection}
+            onOpenLogicStrengthen={handleOpenLogicStrengthen}
+            onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
+            onReportProblem={handleReportProblem}
+          />
+        )}
+
+        {activeTab === 'settings' && (
+          <SettingsWorkspace
+            settings={settings}
+            onSaveSettings={(newSettings) => {
+              setSettings(newSettings);
+              saveStoredSettings(newSettings);
+              showToast('복습 감쇠 모델 설정이 저장되었습니다.');
+            }}
+            onResetData={handleResetData}
+            materials={materials}
+            subjects={subjects}
+            onRestoreMaterials={handleRestoreMaterials}
+            migrationBlocks={migrationBlocks}
+            currentUserEmail={currentUser.email}
+            onLogout={handleLogout}
+            isLoggingOut={isLoggingOut}
+          />
+        )}
       </main>
 
       {/* Clean Academic Footer (Fake company / fake patent info removed as requested) */}

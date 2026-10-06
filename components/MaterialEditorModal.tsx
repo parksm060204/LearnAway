@@ -60,12 +60,12 @@ export function MaterialEditorModal({
   const [saveWarning, setSaveWarning] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'split' | 'edit_only' | 'preview_only'>('split');
+  const [showUnsavedDialog, setShowUnsavedDialog] = useState(false);
+  const initialMarkdownRef = useRef<string | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Load decoupled content when modal opens or material changes.
-  // The component is mounted fresh per material (keyed by the parent), so the
-  // initial loading state is correct without setting state inside the effect.
   useEffect(() => {
     if (!isOpen || !material) return;
 
@@ -74,18 +74,23 @@ export function MaterialEditorModal({
     loadMaterialContentResult(material.id).then((result) => {
       if (!isMounted) return;
 
+      let loadedMarkdown = '';
       if (result.status === 'found') {
-        setMarkdown(result.content.markdown || material.parsedMarkdown || '');
+        loadedMarkdown = result.content.markdown || material.parsedMarkdown || '';
+        setMarkdown(loadedMarkdown);
         setRawText(result.content.rawText || material.rawText || '');
         setPages(result.content.pages || material.pages || []);
       } else if (result.status === 'missing') {
-        setMarkdown(material.parsedMarkdown || '');
+        loadedMarkdown = material.parsedMarkdown || '';
+        setMarkdown(loadedMarkdown);
         setRawText(material.rawText || '');
         setPages(material.pages || []);
       } else {
         setLoadError(result.error);
-        setMarkdown(material.parsedMarkdown || '');
+        loadedMarkdown = material.parsedMarkdown || '';
+        setMarkdown(loadedMarkdown);
       }
+      initialMarkdownRef.current = loadedMarkdown;
       setIsLoading(false);
     });
 
@@ -156,6 +161,9 @@ export function MaterialEditorModal({
       };
 
       const savedToServer = await onSave(updatedMaterial, { markdown, pages });
+      if (savedToServer) {
+        initialMarkdownRef.current = markdown;
+      }
 
       const now = new Date().toLocaleTimeString('ko-KR', { hour12: false });
       if (!savedToServer) {
@@ -173,6 +181,14 @@ export function MaterialEditorModal({
       alert(`저장 중 오류가 발생했습니다: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const handleAttemptClose = () => {
+    if (initialMarkdownRef.current !== null && markdown !== initialMarkdownRef.current) {
+      setShowUnsavedDialog(true);
+    } else {
+      onClose();
     }
   };
 
@@ -284,7 +300,7 @@ export function MaterialEditorModal({
             </button>
 
             <button
-              onClick={onClose}
+              onClick={handleAttemptClose}
               className="p-1.5 text-[#ded6c8] hover:text-white hover:bg-white/10 rounded"
               title="닫기"
             >
@@ -292,6 +308,56 @@ export function MaterialEditorModal({
             </button>
           </div>
         </div>
+
+        {/* Unsaved Changes Confirmation Modal */}
+        {showUnsavedDialog && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60">
+            <div className="w-full max-w-md bg-white border border-[#c8c2b5] rounded-xs shadow-2xl p-5 space-y-4 font-sans text-xs">
+              <div className="flex items-center gap-2 text-amber-700 font-bold text-sm">
+                <AlertTriangle className="w-4 h-4 text-amber-600" />
+                <span>저장되지 않은 본문 수정 내용이 있습니다</span>
+              </div>
+              <p className="text-[#57544e] leading-relaxed">
+                작성 중인 본문 내용이 아직 서버에 영구 저장되지 않았습니다. 어떻게 처리할지 선택해 주세요.
+              </p>
+              <div className="flex flex-col gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await handleSave();
+                    setShowUnsavedDialog(false);
+                    onClose();
+                  }}
+                  className="w-full py-2 px-3 bg-[#c52828] hover:bg-[#a81f1f] text-white font-bold rounded-xs flex items-center justify-center gap-1.5 transition-colors shadow-2xs"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>저장하고 닫기</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowUnsavedDialog(false);
+                    onClose();
+                  }}
+                  className="w-full py-2 px-3 bg-[#191817] hover:bg-[#33302b] text-white font-semibold rounded-xs transition-colors"
+                >
+                  <span>임시 보존하고 닫기 (로컬 입력 유지)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMarkdown(initialMarkdownRef.current || '');
+                    setShowUnsavedDialog(false);
+                    onClose();
+                  }}
+                  className="w-full py-2 px-3 bg-[#faf8f4] hover:bg-[#f1ede4] border border-[#ded6c8] text-[#57544e] rounded-xs transition-colors"
+                >
+                  <span>변경 취소 (원래 본문으로 되돌리기)</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {loadError && (
           <div className="bg-red-50 border-b border-red-200 px-5 py-2 text-xs text-red-800 flex items-center gap-2">

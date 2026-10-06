@@ -5537,6 +5537,39 @@ exports.requireApiUser = async () => {
     assert.ok(gatewaySrc.includes("process.env.NODE_ENV !== 'production'"), 'must be guarded by dev check');
   });
 
+  check('Stage 2: 5 workspaces are properly defined and exported', () => {
+    const topBarSrc = fs.readFileSync(path.join(root, 'components/TopUtilityBar.tsx'), 'utf8');
+    assert.ok(topBarSrc.includes("'today' | 'materials' | 'problems' | 'history' | 'settings'"));
+    
+    // Check all 5 workspaces exist
+    const workspaces = [
+      'components/TodayWorkspace.tsx',
+      'components/MaterialsWorkspace.tsx',
+      'components/ProblemsWorkspace.tsx',
+      'components/HistoryWorkspace.tsx',
+      'components/SettingsWorkspace.tsx',
+    ];
+    for (const w of workspaces) {
+      assert.ok(fs.existsSync(path.join(root, w)), `${w} must exist`);
+    }
+  });
+
+  check('Stage 2: MaterialEditorModal protects unsaved edits with user choices', () => {
+    const editorSrc = fs.readFileSync(path.join(root, 'components/MaterialEditorModal.tsx'), 'utf8');
+    assert.ok(editorSrc.includes('showUnsavedDialog'), 'must track unsaved confirm dialog state');
+    assert.ok(editorSrc.includes('저장하고 닫기'), 'must provide save & close option');
+    assert.ok(editorSrc.includes('임시 보존하고 닫기'), 'must provide keep & close option');
+    assert.ok(editorSrc.includes('변경 취소'), 'must provide cancel edit option');
+  });
+
+  check('Stage 2: Dashboard URL sync parses tabs and falls back safely', () => {
+    const dashboardSrc = fs.readFileSync(path.join(root, 'app/DashboardClient.tsx'), 'utf8');
+    assert.ok(dashboardSrc.includes(".get('tab')"), 'must read tab param from URL');
+    assert.ok(dashboardSrc.includes(".get('subject')"), 'must read subject param from URL');
+    assert.ok(dashboardSrc.includes('window.addEventListener'), 'must listen for popstate events');
+    assert.ok(dashboardSrc.includes('window.history.pushState'), 'must sync tab state to history');
+  });
+
   console.log(`${passed} regression checks passed`);
 }
 
