@@ -129,6 +129,12 @@ import {
 import { LearningAnalyticsModal } from '../components/LearningAnalyticsModal';
 import { LogicStrengthenModal } from '../components/LogicStrengthenModal';
 import { TopUtilityBar, type DashboardTab } from '../components/TopUtilityBar';
+import {
+  parseDashboardUrl,
+  buildDashboardUrl,
+  resolveDashboardUrl,
+  type NotFoundEntityKind,
+} from '../lib/dashboardUrl';
 import { TodayWorkspace } from '../components/TodayWorkspace';
 import { MaterialsWorkspace } from '../components/MaterialsWorkspace';
 import { ProblemsWorkspace } from '../components/ProblemsWorkspace';
@@ -180,7 +186,8 @@ import {
   saveStoredMaterialsFromServerCache,
   type MaterialHashIdentity,
 } from '../lib/storage';
-import { loadDefaultMaterialPolicy } from '../lib/materialPolicy';
+import { loadDefaultMaterialPolicy, materialPolicyOf } from '../lib/materialPolicy';
+import type { MaterialServerSaveResult } from '../lib/materialEditSave';
 import { loadCloudLibrary } from '../lib/cloud/library';
 import { upsertSubject } from '../lib/cloud/subjectsRepository';
 import {
@@ -219,7 +226,7 @@ import { isSupabaseConfigured } from '../lib/supabase/config';
 import type { AppUser } from '../lib/auth/types';
 import type { AuthChangeEvent, Session } from '@supabase/supabase-js';
 import { reportAppReady, reportAppError } from '../lib/appReadiness';
-import { CheckCircle2 } from 'lucide-react';
+import { CheckCircle2, AlertTriangle } from 'lucide-react';
 
 // Stable no-op subscription used only to detect client hydration.
 const hydrationSubscribe = () => () => {};
@@ -302,6 +309,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [rechallengeReservations, setRechallengeReservations] = useState<RechallengeReservation[]>([]);
   const [activeRechallengeReservationId, setActiveRechallengeReservationId] = useState<string | null>(null);
   const [activePlanItemIdForSession, setActivePlanItemIdForSession] = useState<string | null>(null);
+  const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(null);
+  const [urlNotice, setUrlNotice] = useState<{
+    message: string;
+    entity?: { kind: NotFoundEntityKind; id: string };
+  } | null>(null);
 
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -1411,46 +1423,119 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     setComparedConceptIds([]);
 
     if (typeof window !== 'undefined') {
-      const url = new URL(window.location.href);
-      url.searchParams.set('subject', newSubjectId);
-      window.history.pushState(null, '', url.toString());
+      const url = buildDashboardUrl({
+        tab: activeTab,
+        subjectId: newSubjectId,
+        materialId: editingMaterial?.id,
+        problemId: activeSessionProblem?.id,
+        attemptId: selectedAttemptId || undefined,
+      });
+      window.history.pushState(null, '', url || window.location.pathname);
     }
 
     showToast(`과목이 [${targetSubject?.name || '새 과목'}]으로 전환되었습니다.`);
   };
 
-  const handleSelectTab = (newTab: DashboardTab) => {
+  const handleSelectTab = (
+    newTab: DashboardTab,
+    extraParams?: { problemId?: string; materialId?: string; attemptId?: string; examId?: string }
+  ) => {
     setActiveTab(newTab);
     if (typeof window !== 'undefined') {
-      const url = new URL(window.location.href);
-      url.searchParams.set('tab', newTab);
-      if (activeSubjectId) {
-        url.searchParams.set('subject', activeSubjectId);
-      }
-      window.history.pushState(null, '', url.toString());
+      const url = buildDashboardUrl({
+        tab: newTab,
+        subjectId: activeSubjectId || undefined,
+        problemId: extraParams?.problemId ?? (newTab === 'session' ? (activeSessionProblem?.id || activeProblemIdForSession || undefined) : undefined),
+        materialId: extraParams?.materialId ?? (newTab === 'materials' ? editingMaterial?.id : undefined),
+        attemptId: extraParams?.attemptId ?? (newTab === 'history' ? (selectedAttemptId || undefined) : undefined),
+        examId: extraParams?.examId,
+      });
+      window.history.pushState(null, '', url || window.location.pathname);
     }
   };
 
-  // Synchronize activeTab and activeSubject from URL search params on mount & browser back/forward
+  const openProblemSessionScreen = (probId?: string, rechallengeId?: string, planId?: string) => {
+    if (probId) {
+      setActiveProblemIdForSession(probId);
+    }
+    if (rechallengeId !== undefined) {
+      setActiveRechallengeReservationId(rechallengeId);
+    }
+    if (planId !== undefined) {
+      setActivePlanItemIdForSession(planId);
+    }
+    setIsProblemSessionOpen(true);
+    handleSelectTab('session', { problemId: probId });
+  };
+
+  const openMockExamScreen = (config?: MockExamInitialConfig | null) => {
+    setMockExamInitialConfig(config ?? null);
+    setIsMockExamModalOpen(true);
+    handleSelectTab('exam');
+  };
+
+  // Synchronize activeTab, activeSubject and deep items from URL query params
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
     const syncFromUrl = () => {
-      const params = new URLSearchParams(window.location.search);
-      const tabParam = params.get('tab') as DashboardTab | null;
-      if (tabParam && ['today', 'materials', 'problems', 'history', 'settings'].includes(tabParam)) {
-        setActiveTab(tabParam);
+      const parsed = parseDashboardUrl(window.location.search);
+      const resolution = resolveDashboardUrl(parsed, {
+        isLoaded,
+        isCloudLoading: isSupabaseConfigured() && cloudStatus === 'loading',
+        subjects,
+        materials,
+        problems: allProblems,
+        attempts,
+        mockExams,
+      });
+
+      if (resolution.status === 'loading') {
+        return;
       }
-      const subjectParam = params.get('subject');
-      if (subjectParam && subjects.some((s) => s.id === subjectParam)) {
-        setActiveSubjectId(subjectParam);
+
+      if (resolution.status === 'not_found') {
+        setUrlNotice({
+          message: resolution.noticeMessage || '요청하신 항목을 찾을 수 없습니다.',
+          entity: resolution.notFoundEntity,
+        });
+        return;
+      }
+
+      setUrlNotice(null);
+      if (resolution.subjectId && resolution.subjectId !== activeSubjectId) {
+        setActiveSubjectId(resolution.subjectId);
+      }
+      setActiveTab(resolution.tab);
+
+      if (resolution.materialId) {
+        const mat = materials.find((m) => m.id === resolution.materialId);
+        if (mat) {
+          setEditingMaterial(mat);
+          setIsMaterialEditorOpen(true);
+        }
+      }
+
+      if (resolution.problemId) {
+        setActiveProblemIdForSession(resolution.problemId);
+        if (resolution.tab === 'session') {
+          setIsProblemSessionOpen(true);
+        }
+      }
+
+      if (resolution.attemptId) {
+        setSelectedAttemptId(resolution.attemptId);
+      }
+
+      if (resolution.tab === 'exam') {
+        setIsMockExamModalOpen(true);
       }
     };
 
     syncFromUrl();
     window.addEventListener('popstate', syncFromUrl);
     return () => window.removeEventListener('popstate', syncFromUrl);
-  }, [subjects]);
+  }, [isLoaded, cloudStatus, subjects, materials, allProblems, attempts, mockExams, activeSubjectId]);
 
   // Add Subject Handler (Stage 0) — persists to Supabase first.
   const handleAddSubject = async (newSubject: Subject) => {
@@ -1990,7 +2075,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       setActiveProblemIdForSession(problemToPracticeId);
     }
     setIsProblemReviewOpen(false);
-    setIsProblemSessionOpen(true);
+    openProblemSessionScreen(problemToPracticeId || undefined);
   };
 
   // Stage 6: Problem Quality, Reporting, Review, Revision & Re-approval Handlers
@@ -2273,10 +2358,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     if (transferProblem.conceptIds[0]) setSelectedConceptId(transferProblem.conceptIds[0]);
     setSelectedProblemType(transferProblem.type);
     setActiveProblemIdForSession(transferProblem.id);
-    setActiveRechallengeReservationId(null);
-    setActivePlanItemIdForSession(null);
     setLogicTarget(null);
-    setIsProblemSessionOpen(true);
+    openProblemSessionScreen(transferProblem.id);
     showToast('전이 문제를 시작합니다. 모범답안은 제출 전까지 표시되지 않습니다.');
   };
 
@@ -2704,17 +2787,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         problemDraftCount={activeSubjectProblemDrafts.length}
         problemReportedCount={activeSubjectReportedCount}
         onOpenProblemSession={() => {
-          if (!activeSessionProblem) {
-            showToast('선택 개념에 연결된 출제 가능한 문제가 없습니다. 문제를 생성·승인해 주세요.');
-            return;
+          if (!activeSessionProblem && availableSubjectProblems.length > 0) {
+            openProblemSessionScreen(availableSubjectProblems[0].id);
+          } else if (activeSessionProblem) {
+            handleSelectTab('session');
+          } else {
+            showToast('풀이 가능한 승인된 문제가 없습니다. 먼저 문제를 출제·승인해 주세요.');
           }
-          setActiveRechallengeReservationId(null);
-          setActivePlanItemIdForSession(null);
-          setIsProblemSessionOpen(true);
         }}
         onOpenMockExam={() => {
-          setMockExamInitialConfig(null);
-          setIsMockExamModalOpen(true);
+          openMockExamScreen();
         }}
         onOpenStudyPlan={() => setIsStudyPlanOpen(true)}
         onOpenLearningAnalytics={() => handleSelectTab('history')}
@@ -2745,7 +2827,88 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         </div>
       )}
 
-      {/* Main Workspace Container */}
+      {/* URL Notice Banner */}
+      {urlNotice && (
+        <div role="alert" className="w-full bg-amber-50 border-b border-amber-300">
+          <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-900">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+              <div>
+                <p className="font-bold">{urlNotice.message}</p>
+                <p className="text-[11px] text-amber-800">
+                  링크 주소를 다시 확인하거나 아래 버튼을 통해 정상 화면으로 이동할 수 있습니다.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setUrlNotice(null);
+                  handleSelectTab('today');
+                }}
+                className="px-3 py-1.5 bg-[#191817] hover:bg-[#33302b] text-white font-bold rounded-xs transition-colors"
+              >
+                오늘 학습으로 이동
+              </button>
+              {urlNotice.entity?.kind !== 'subject' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const fallbackTab = urlNotice.entity?.kind === 'material'
+                      ? 'materials'
+                      : urlNotice.entity?.kind === 'problem' || urlNotice.entity?.kind === 'exam'
+                      ? 'problems'
+                      : 'history';
+                    setUrlNotice(null);
+                    handleSelectTab(fallbackTab);
+                  }}
+                  className="px-3 py-1.5 bg-white hover:bg-[#faf8f4] border border-[#ded6c8] text-[#57544e] rounded-xs transition-colors"
+                >
+                  목록으로 이동
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Active Session / Exam Resume Banners when navigating to another tab */}
+      {activeTab !== 'session' && isProblemSessionOpen && activeSessionProblem && (
+        <div className="w-full bg-amber-50/90 border-b border-amber-300">
+          <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-2 flex items-center justify-between text-xs text-amber-900">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+              <span>진행 중인 문제 풀이가 있습니다: <strong>{activeSessionProblem.title}</strong></span>
+            </div>
+            <button
+              type="button"
+              onClick={() => handleSelectTab('session')}
+              className="px-2.5 py-1 bg-amber-800 hover:bg-amber-900 text-white font-bold rounded-xs transition-colors"
+            >
+              문제 풀이 화면으로 돌아가기
+            </button>
+          </div>
+        </div>
+      )}
+
+      {activeTab !== 'exam' && isMockExamModalOpen && (
+        <div className="w-full bg-purple-50/90 border-b border-purple-300">
+          <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-2 flex items-center justify-between text-xs text-purple-900">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-purple-500 animate-pulse" />
+              <span>진행 중인 모의시험이 있습니다. (제한 시간 작동 중)</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => handleSelectTab('exam')}
+              className="px-2.5 py-1 bg-purple-800 hover:bg-purple-900 text-white font-bold rounded-xs transition-colors"
+            >
+              모의시험 화면으로 돌아가기
+            </button>
+          </div>
+        </div>
+      )}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-3 sm:px-6 py-4 sm:py-6 space-y-4">
         {activeTab === 'today' && (
           <TodayWorkspace
@@ -2785,12 +2948,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             selectedProblemType={selectedProblemType}
             onSelectProblemType={setSelectedProblemType}
             onStartSession={(problemId) => {
-              if (problemId) {
-                setActiveProblemIdForSession(problemId);
-              }
-              setActiveRechallengeReservationId(null);
-              setActivePlanItemIdForSession(null);
-              setIsProblemSessionOpen(true);
+              openProblemSessionScreen(problemId);
             }}
             onPostponeDay={handlePostponeDay}
             onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
@@ -2821,6 +2979,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             onSelectMaterial={(mat) => {
               setEditingMaterial(mat);
               setIsMaterialEditorOpen(true);
+              handleSelectTab('materials', { materialId: mat.id });
             }}
             hasOriginal={(materialId) => Boolean(cloudOriginalPaths[materialId])}
             onOpenOriginal={handleOpenOriginal}
@@ -2871,21 +3030,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             concepts={subjectConcepts}
             onOpenGenerator={() => setIsProblemGeneratorOpen(true)}
             onStartProblemSession={(problemId) => {
-              if (problemId) {
-                setActiveProblemIdForSession(problemId);
-              } else if (availableSubjectProblems.length > 0) {
-                setActiveProblemIdForSession(availableSubjectProblems[0].id);
-              } else {
-                showToast('풀이 가능한 승인된 문제가 없습니다. 먼저 문제를 출제·승인해 주세요.');
-                return;
-              }
-              setActiveRechallengeReservationId(null);
-              setActivePlanItemIdForSession(null);
-              setIsProblemSessionOpen(true);
+              openProblemSessionScreen(problemId || (availableSubjectProblems[0]?.id));
             }}
             onStartMockExam={() => {
-              setMockExamInitialConfig(null);
-              setIsMockExamModalOpen(true);
+              openMockExamScreen();
             }}
             hasActiveMockSession={Boolean(activeMockSession)}
             onResumeMockExam={handleResumeMockExam}
@@ -2917,6 +3065,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             onOpenLogicStrengthen={handleOpenLogicStrengthen}
             onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
             onReportProblem={handleReportProblem}
+            initialSelectedAttemptId={selectedAttemptId}
+            onSelectAttempt={(attId) => {
+              setSelectedAttemptId(attId);
+              handleSelectTab('history', { attemptId: attId || undefined });
+            }}
           />
         )}
 
@@ -2938,6 +3091,95 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             isLoggingOut={isLoggingOut}
           />
         )}
+
+        {/* Dedicated in-layout screen: Problem Session */}
+        <div className={activeTab === 'session' ? 'block' : 'hidden'}>
+          {isProblemSessionOpen && sessionConcept && activeSessionProblem ? (
+            <ProblemSessionModal
+              variant="page"
+              key={`${activeSubject.id}-${activeSessionProblem.id}-${activeSessionProblem.version ?? 1}`}
+              isOpen={isProblemSessionOpen}
+              onClose={() => {
+                setIsProblemSessionOpen(false);
+                setActiveProblemIdForSession(null);
+                setActiveRechallengeReservationId(null);
+                setActivePlanItemIdForSession(null);
+                handleSelectTab('problems');
+              }}
+              subject={activeSubject}
+              concept={sessionConcept}
+              problem={activeSessionProblem}
+              onSubmitAttempt={handleSubmitAttempt}
+              rechallengeReservationId={activeRechallengeReservationId || undefined}
+              planItemId={activePlanItemIdForSession || undefined}
+              onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
+              onReportProblem={handleReportProblem}
+            />
+          ) : activeTab === 'session' ? (
+            <div className="bg-white border border-[#c8c2b5] rounded-xs p-8 text-center max-w-xl mx-auto my-8">
+              <p className="text-sm font-semibold text-[#191817] mb-2">진행 중인 문제 풀이 세션이 없습니다.</p>
+              <p className="text-xs text-[#57544e] mb-4">문제은행에서 풀이할 문제를 선택하거나 오늘 학습에서 복습을 시작해 주세요.</p>
+              <button
+                type="button"
+                onClick={() => handleSelectTab('problems')}
+                className="px-3.5 py-1.5 bg-[#191817] text-white text-xs font-bold rounded-xs transition-colors"
+              >
+                문제은행으로 이동
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        {/* Dedicated in-layout screen: Mock Exam */}
+        <div className={activeTab === 'exam' ? 'block' : 'hidden'}>
+          {isMockExamModalOpen ? (
+            <MockExamModal
+              variant="page"
+              key={activeSubject.id}
+              isOpen={isMockExamModalOpen}
+              onClose={() => {
+                setIsMockExamModalOpen(false);
+                setMockExamInitialConfig(null);
+                handleSelectTab('problems');
+              }}
+              subject={activeSubject}
+              concepts={subjectConcepts}
+              problems={availableSubjectProblems}
+              userId={currentUser.id}
+              initialConfig={mockExamInitialConfig}
+              onExamRecorded={() => {
+                setAllConcepts(loadStoredConcepts());
+                setAttempts(loadStoredAttempts());
+                setMockExams(loadMockExams());
+                setIsMockExamModalOpen(false);
+                setMockExamInitialConfig(null);
+                handleSelectTab('history');
+                showToast('모의시험 답안과 평가가 학습 이력에 저장되었습니다.');
+              }}
+            />
+          ) : activeTab === 'exam' ? (
+            <div className="bg-white border border-[#c8c2b5] rounded-xs p-8 text-center max-w-xl mx-auto my-8">
+              <p className="text-sm font-semibold text-[#191817] mb-2">진행 중인 모의시험이 없습니다.</p>
+              <p className="text-xs text-[#57544e] mb-4">새 모의시험을 시작하거나 문제은행으로 이동해 주세요.</p>
+              <div className="flex items-center justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsMockExamModalOpen(true)}
+                  className="px-3.5 py-1.5 bg-[#c52828] text-white text-xs font-bold rounded-xs transition-colors"
+                >
+                  새 모의시험 시작
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSelectTab('problems')}
+                  className="px-3.5 py-1.5 bg-[#191817] text-white text-xs font-bold rounded-xs transition-colors"
+                >
+                  문제은행으로 이동
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </div>
       </main>
 
       {/* Clean Academic Footer (Fake company / fake patent info removed as requested) */}
@@ -2962,27 +3204,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       </footer>
 
       {/* Modals */}
-      {/* 1. Problem Session Workspace Modal */}
-      {isProblemSessionOpen && sessionConcept && activeSessionProblem && (
-        <ProblemSessionModal
-          key={`${activeSubject.id}-${activeSessionProblem.id}-${activeSessionProblem.version ?? 1}`}
-          isOpen={isProblemSessionOpen}
-          onClose={() => {
-            setIsProblemSessionOpen(false);
-            setActiveProblemIdForSession(null);
-            setActiveRechallengeReservationId(null);
-            setActivePlanItemIdForSession(null);
-          }}
-          subject={activeSubject}
-          concept={sessionConcept}
-          problem={activeSessionProblem}
-          onSubmitAttempt={handleSubmitAttempt}
-          rechallengeReservationId={activeRechallengeReservationId || undefined}
-          planItemId={activePlanItemIdForSession || undefined}
-          onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
-          onReportProblem={handleReportProblem}
-        />
-      )}
 
       {/* 2. Exam Schedule Modal */}
       <ExamScheduleModal
@@ -3085,7 +3306,78 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         material={editingMaterial}
         subject={activeSubject}
         draftCount={editingMaterial ? conceptDrafts.filter((d) => d.materialId === editingMaterial.id).length : 0}
-        onSave={async (updatedMat, updatedContent) => {
+        onSave={async (updatedMat, updatedContent): Promise<MaterialServerSaveResult> => {
+          if (isLocalOnlyMaterial(updatedMat.id)) {
+            const updated = materials.map((m) =>
+              m.id === updatedMat.id ? updatedMat : m
+            );
+            setMaterials(updated);
+            saveStoredMaterials(updated);
+            setEditingMaterial(updatedMat);
+
+            const { updatedProblems: newProblems, outdatedIds, reviewIds } = applyMaterialEditToProblems(
+              allProblems,
+              updatedMat,
+              allConcepts
+            );
+            setAllProblems(newProblems);
+            saveStoredProblems(newProblems);
+
+            const newHash = computeMarkdownHash(updatedMat.parsedMarkdown || '');
+            let affectedConceptsCount = 0;
+            const newConcepts = allConcepts.map((c) => {
+              if (c.subjectId === updatedMat.subjectId && c.materialIds.includes(updatedMat.id)) {
+                affectedConceptsCount++;
+                return {
+                  ...c,
+                  needsSourceReview: true,
+                  sourceEvidence: c.sourceEvidence
+                    ? {
+                        ...c.sourceEvidence,
+                        verified: false,
+                        verificationNote: '근거 자료 본문이 수정되어 재검토가 필요합니다.',
+                      }
+                    : undefined,
+                };
+              }
+              return c;
+            });
+            if (affectedConceptsCount > 0) {
+              setAllConcepts(newConcepts);
+              saveStoredConcepts(newConcepts);
+            }
+
+            let affectedDraftsCount = 0;
+            const newDrafts = conceptDrafts.map((d) => {
+              if (d.materialId === updatedMat.id && d.sourceMarkdownHash !== newHash) {
+                affectedDraftsCount++;
+                return {
+                  ...d,
+                  needsSourceReview: true,
+                };
+              }
+              return d;
+            });
+            if (affectedDraftsCount > 0) {
+              setConceptDrafts(newDrafts);
+              saveStoredConceptDrafts(newDrafts);
+            }
+
+            if (outdatedIds.length > 0 || reviewIds.length > 0 || affectedConceptsCount > 0) {
+              const parts: string[] = [];
+              if (affectedConceptsCount > 0) parts.push(`개념 ${affectedConceptsCount}건`);
+              if (outdatedIds.length > 0) parts.push(`구버전 문제 ${outdatedIds.length}건`);
+              if (reviewIds.length > 0) parts.push(`확인 필요 문제 ${reviewIds.length}건`);
+              showToast(
+                `[${updatedMat.title}] 로컬 수정으로 연관 ${parts.join(', ')}을 검토 필요 상태로 표시했습니다.`
+              );
+            } else {
+              showToast(`[${updatedMat.title}] 로컬 전용 자료 내용이 저장되었습니다.`);
+            }
+
+            return { status: 'not_required' };
+          }
+
           // Persist a new version to the server before updating local state.
           const writeResult = await writeMaterial({
             material: updatedMat,
@@ -3094,10 +3386,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               rawText: updatedMat.rawText,
               pages: updatedContent.pages,
             },
+            policy: materialPolicyOf(updatedMat),
           });
           if (!writeResult.ok) {
             showToast(`자료 수정 저장 실패: ${writeResult.error}`);
-            return false;
+            return { status: 'failed', error: writeResult.error };
           }
 
           const updated = materials.map((m) =>
@@ -3199,7 +3492,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 : `[${updatedMat.title}] 수정 내용이 서버에 저장되었습니다.`
             );
           }
-          return true;
+          return { status: 'saved', fallbackUsed: writeResult.data?.fallbackUsed };
         }}
         onOpenConceptReview={(mat) => {
           setConceptReviewMaterial(mat || null);
@@ -3362,26 +3655,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         migrationBlocks={migrationBlocks}
       />
 
-      {/* 7. Mock Exam Modal */}
-      {isMockExamModalOpen && <MockExamModal
-        key={activeSubject.id}
-        isOpen={isMockExamModalOpen}
-        onClose={() => {
-          setIsMockExamModalOpen(false);
-          setMockExamInitialConfig(null);
-        }}
-        subject={activeSubject}
-        concepts={subjectConcepts}
-        problems={availableSubjectProblems}
-        userId={currentUser.id}
-        initialConfig={mockExamInitialConfig}
-        onExamRecorded={() => {
-          setAllConcepts(loadStoredConcepts());
-          setAttempts(loadStoredAttempts());
-          setMockExams(loadMockExams());
-          showToast('모의시험 답안과 평가가 학습 이력에 저장되었습니다.');
-        }}
-      />}
+      {/* 7. Mock Exam (Handled as dedicated screen above) */}
 
       {/* 8. Add Subject Modal (Stage 0) */}
       <AddSubjectModal

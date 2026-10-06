@@ -46,6 +46,7 @@ export interface MockExamInitialConfig {
 interface Props {
   isOpen: boolean;
   onClose: () => void;
+  variant?: 'modal' | 'page';
   subject: Subject;
   concepts: Concept[];
   problems: Problem[];
@@ -62,7 +63,7 @@ const labels: Partial<Record<ProblemType, string>> = {
   complexity_proof: '복잡도 증명', debug_counterexample: '디버깅·반례',
 };
 
-export function MockExamModal({ isOpen, onClose, subject, concepts, problems, userId = '', initialConfig, onExamRecorded }: Props) {
+export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, concepts, problems, userId = '', initialConfig, onExamRecorded }: Props) {
   const eligible = useMemo(() => problems.filter((p) => p.subjectId === subject.id && p.isApproved !== false && isProblemAvailableForPractice(p)), [problems, subject.id]);
   const availableTypes = useMemo(() => Array.from(new Set(eligible.map((p) => p.type))), [eligible]);
 
@@ -704,8 +705,9 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
   };
 
   if (!isOpen) return null;
-  return <div className="fixed inset-0 z-50 flex items-center justify-center p-3 bg-black/50" role="dialog" aria-modal="true" aria-label="혼합형 모의시험">
-    <div className="w-full max-w-4xl max-h-[94vh] overflow-y-auto bg-white border border-[#c8c2b5] shadow-xl">
+  const isPage = variant === 'page';
+  const modalContent = (
+    <div className={isPage ? "w-full max-w-5xl mx-auto my-3 bg-white border border-[#c8c2b5] rounded-xs shadow-sm min-h-[calc(100vh-140px)]" : "w-full max-w-4xl max-h-[94vh] overflow-y-auto bg-white border border-[#c8c2b5] shadow-xl"}>
       <header className="bg-[#191817] text-white px-5 py-3 flex items-center justify-between">
         <h2 className="font-bold flex items-center gap-2"><Award className="w-4 h-4 text-[#c52828]" />{subject.name} · 혼합형 모의시험</h2>
         <button onClick={onClose} aria-label="닫기"><X className="w-5 h-5" /></button>
@@ -1010,5 +1012,15 @@ export function MockExamModal({ isOpen, onClose, subject, concepts, problems, us
         </>)}
       </div>
     </div>
-  </div>;
+  );
+
+  return isPage ? (
+    <div role="region" aria-label="혼합형 모의시험 전용 작업 화면">
+      {modalContent}
+    </div>
+  ) : (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 bg-black/50" role="dialog" aria-modal="true" aria-label="혼합형 모의시험">
+      {modalContent}
+    </div>
+  );
 }

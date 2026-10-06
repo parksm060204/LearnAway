@@ -20,7 +20,7 @@ import {
   LogOut,
 } from 'lucide-react';
 
-export type DashboardTab = 'today' | 'materials' | 'problems' | 'history' | 'settings';
+export type DashboardTab = 'today' | 'materials' | 'problems' | 'history' | 'settings' | 'session' | 'exam';
 
 interface TopUtilityBarProps {
   subjects: Subject[];

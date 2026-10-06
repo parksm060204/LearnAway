@@ -38,6 +38,7 @@ export interface HistoryWorkspaceProps {
     reportData: { type: ProblemReportType; details: string; attemptId?: string }
   ) => { success: boolean; error?: string };
   initialSelectedAttemptId?: string | null;
+  onSelectAttempt?: (attemptId: string | null) => void;
 }
 
 export function HistoryWorkspace({
@@ -49,11 +50,13 @@ export function HistoryWorkspace({
   onOpenSourceModal,
   onReportProblem,
   initialSelectedAttemptId,
+  onSelectAttempt,
 }: HistoryWorkspaceProps) {
   const [periodFilter, setPeriodFilter] = useState<'7days' | '30days' | 'all'>('30days');
   const [conceptFilter, setConceptFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(initialSelectedAttemptId || null);
+  const [internalSelectedId, setInternalSelectedId] = useState<string | null>(initialSelectedAttemptId || null);
+  const selectedAttemptId = initialSelectedAttemptId !== undefined ? (initialSelectedAttemptId || null) : internalSelectedId;
   const [referenceTime] = useState(() => Date.now());
 
   // Subject attempts
@@ -280,7 +283,10 @@ export function HistoryWorkspace({
                     <button
                       key={att.id}
                       type="button"
-                      onClick={() => setSelectedAttemptId(att.id)}
+                      onClick={() => {
+                        setInternalSelectedId(att.id);
+                        onSelectAttempt?.(att.id);
+                      }}
                       className={`w-full text-left p-3 rounded-xs border transition-all ${
                         isSelected
                           ? 'bg-[#fef2f2] border-[#c52828] shadow-2xs'

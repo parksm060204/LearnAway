@@ -48,6 +48,7 @@ interface EvaluationInputSnapshot {
 interface ProblemSessionModalProps {
   isOpen: boolean;
   onClose: () => void;
+  variant?: 'modal' | 'page';
   subject: Subject;
   concept: Concept;
   problem: Problem;
@@ -72,6 +73,7 @@ interface ProblemSessionModalProps {
 export function ProblemSessionModal({
   isOpen,
   onClose,
+  variant = 'modal',
   subject,
   concept,
   problem,
@@ -330,10 +332,11 @@ export function ProblemSessionModal({
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto">
-      <div className="w-full max-w-4xl bg-white border border-[#c8c2b5] rounded-xs shadow-xl my-auto overflow-hidden flex flex-col max-h-[92vh]">
-        {/* Modal Top Bar */}
+  const isPage = variant === 'page';
+
+  const modalBody = (
+    <div className={isPage ? "w-full max-w-5xl mx-auto my-3 bg-white border border-[#c8c2b5] rounded-xs shadow-sm overflow-hidden flex flex-col min-h-[calc(100vh-140px)]" : "w-full max-w-4xl bg-white border border-[#c8c2b5] rounded-xs shadow-xl my-auto overflow-hidden flex flex-col max-h-[92vh]"}>
+      {/* Modal Top Bar */}
         <div className="bg-[#191817] text-white px-4 sm:px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span className="w-2.5 h-2.5 bg-[#c52828] inline-block" />
@@ -1171,6 +1174,17 @@ export function ProblemSessionModal({
           )}
         </div>
       </div>
+    );
+
+  return (
+    <>
+      {isPage ? (
+        modalBody
+      ) : (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto">
+          {modalBody}
+        </div>
+      )}
 
       {/* Problem Report Modal */}
       {isReportModalOpen && (
@@ -1187,6 +1201,6 @@ export function ProblemSessionModal({
           }}
         />
       )}
-    </div>
+    </>
   );
 }

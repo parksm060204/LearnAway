@@ -12,6 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts', 'lib/materialRestore.ts',
+  'lib/materialDraft.ts', 'lib/materialEditSave.ts', 'lib/dashboardUrl.ts',
   'lib/todayStudy.ts', 'lib/reviewStats.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
@@ -129,6 +130,9 @@ exports.requireApiUser = async () => {
   const markdownUtils = load(path.join(output, 'lib/markdownUtils.js'));
   const personalization = load(path.join(output, 'lib/personalization.js'));
   const types = load(path.join(output, 'lib/types.js'));
+  const materialDraft = load(path.join(output, 'lib/materialDraft.js'));
+  const materialEditSave = load(path.join(output, 'lib/materialEditSave.js'));
+  const dashboardUrl = load(path.join(output, 'lib/dashboardUrl.js'));
   const { INITIAL_SUBJECTS, INITIAL_CONCEPTS, INITIAL_PROBLEMS } = load(path.join(output, 'lib/initialData.js'));
   let passed = 0;
   const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -5564,10 +5568,193 @@ exports.requireApiUser = async () => {
 
   check('Stage 2: Dashboard URL sync parses tabs and falls back safely', () => {
     const dashboardSrc = fs.readFileSync(path.join(root, 'app/DashboardClient.tsx'), 'utf8');
-    assert.ok(dashboardSrc.includes(".get('tab')"), 'must read tab param from URL');
-    assert.ok(dashboardSrc.includes(".get('subject')"), 'must read subject param from URL');
+    const urlSrc = fs.readFileSync(path.join(root, 'lib/dashboardUrl.ts'), 'utf8');
+    assert.ok(urlSrc.includes(".get('tab')"), 'must read tab param from URL');
+    assert.ok(urlSrc.includes(".get('subject')"), 'must read subject param from URL');
     assert.ok(dashboardSrc.includes('window.addEventListener'), 'must listen for popstate events');
     assert.ok(dashboardSrc.includes('window.history.pushState'), 'must sync tab state to history');
+  });
+
+  // ---- Stage 2 UI & Dedicated Screen & Draft Persistence Checks ----
+
+  await checkAsync('Stage 2: materialDraft saves, loads, deletes, and isolates drafts per scope', async () => {
+    await withFakeIndexedDB(async () => {
+      // 1. Save draft under u_user1
+      const saveRes = await materialDraft.saveMaterialDraftInScope('u_user1', {
+        materialId: 'mat-alpha',
+        draftMarkdown: '# Draft Content Alpha',
+        baseHash: 'hash-1234',
+        baseLastEditedAt: 1000,
+      });
+      assert.equal(saveRes.ok, true, 'draft save must succeed');
+      assert.equal(saveRes.record.materialId, 'mat-alpha');
+
+      // 2. Load draft under u_user1
+      const loaded = await materialDraft.loadMaterialDraftInScope('u_user1', 'mat-alpha');
+      assert.equal(loaded.status, 'found', 'draft must be found');
+      assert.equal(loaded.record.draftMarkdown, '# Draft Content Alpha');
+      assert.equal(loaded.record.baseHash, 'hash-1234');
+
+      // 3. Scope isolation: u_user2 cannot see u_user1 drafts
+      const loadedOther = await materialDraft.loadMaterialDraftInScope('u_user2', 'mat-alpha');
+      assert.equal(loadedOther.status, 'none', 'draft must be isolated to scope');
+
+      // 4. Delete draft
+      const delRes = await materialDraft.deleteMaterialDraftInScope('u_user1', 'mat-alpha');
+      assert.equal(delRes.ok, true, 'draft deletion must succeed');
+      const loadedAfterDel = await materialDraft.loadMaterialDraftInScope('u_user1', 'mat-alpha');
+      assert.equal(loadedAfterDel.status, 'none', 'draft must be gone after deletion');
+    });
+  });
+
+  await checkAsync('Stage 2: materialDraft handles injected IndexedDB write failure securely', async () => {
+    await withFakeIndexedDB(async (fake) => {
+      fake.__failure.put.add('mat-fail');
+      const saveRes = await materialDraft.saveMaterialDraftInScope('u_user1', {
+        materialId: 'mat-fail',
+        draftMarkdown: '# Will Fail',
+        baseHash: 'hash-fail',
+        baseLastEditedAt: 1000,
+      });
+      assert.equal(saveRes.ok, false, 'failed save must report ok: false');
+      assert.ok(saveRes.error, 'must report error');
+    });
+  });
+
+  check('Stage 2: materialDraft evaluates relation against base correctly (identical, restorable, conflict)', () => {
+    const draft = {
+      materialId: 'm-1',
+      draftMarkdown: 'New Draft Content',
+      baseHash: 'base-hash-1',
+      baseLastEditedAt: 1000,
+      savedAt: 1500,
+    };
+
+    // Identical
+    assert.equal(
+      materialDraft.evaluateDraftAgainstBase(draft, { baseHash: 'base-hash-1', markdown: 'New Draft Content' }),
+      'identical'
+    );
+
+    // Restorable (base hash unchanged, draft differs)
+    assert.equal(
+      materialDraft.evaluateDraftAgainstBase(draft, { baseHash: 'base-hash-1', markdown: 'Old Base Content' }),
+      'restorable'
+    );
+
+    // Conflict (base hash changed since draft was taken)
+    assert.equal(
+      materialDraft.evaluateDraftAgainstBase(draft, { baseHash: 'base-hash-CHANGED', markdown: 'Changed Content' }),
+      'conflict'
+    );
+  });
+
+  check('Stage 2: materialEditSave evaluates local and server save requirements strictly', () => {
+    // 1. Local-only material: server not required, local saved -> canClose: true
+    const localOnlyRes = materialEditSave.evaluateMaterialEditSave({
+      server: 'not_required',
+      local: 'saved',
+    });
+    assert.equal(localOnlyRes.canClose, true);
+    assert.equal(localOnlyRes.level, 'complete');
+
+    // 2. Server required, server failed -> canClose: false, must retain input & retry
+    const serverFailRes = materialEditSave.evaluateMaterialEditSave({
+      server: 'failed',
+      serverError: '500 Internal Error',
+      local: 'skipped',
+    });
+    assert.equal(serverFailRes.canClose, false);
+    assert.ok(serverFailRes.failed.some((f) => f.includes('서버 저장')));
+
+    // 3. Server saved with migration 9 fallback -> canClose: true, note added
+    const fallbackRes = materialEditSave.evaluateMaterialEditSave({
+      server: 'saved',
+      serverFallbackUsed: true,
+      local: 'saved',
+    });
+    assert.equal(fallbackRes.canClose, true);
+    assert.ok(fallbackRes.notes.some((n) => n.includes('마이그레이션 9')));
+
+    // 4. Retry after server write already succeeded -> canClose: true
+    const retryRes = materialEditSave.evaluateMaterialEditSave({
+      server: 'already_saved',
+      local: 'saved',
+    });
+    assert.equal(retryRes.canClose, true);
+  });
+
+  check('Stage 2: dashboardUrl parses and builds URLs without leaking sensitive data', () => {
+    // Parse
+    const parsed = dashboardUrl.parseDashboardUrl('?tab=materials&subject=sub-1&material=mat-1&leak=secret&answer=forbidden');
+    assert.equal(parsed.tab, 'materials');
+    assert.equal(parsed.subjectId, 'sub-1');
+    assert.equal(parsed.materialId, 'mat-1');
+    assert.equal('answer' in parsed, false, 'answers must never be parsed into URL state');
+    assert.equal('leak' in parsed, false, 'secrets must never be parsed into URL state');
+
+    // Build
+    const built = dashboardUrl.buildDashboardUrl({
+      tab: 'session',
+      subjectId: 'sub-1',
+      problemId: 'prob-1',
+    });
+    assert.equal(built, '?tab=session&subject=sub-1&problem=prob-1');
+  });
+
+  check('Stage 2: dashboardUrl resolves URLs safely without disclosing existence or false not-founds', () => {
+    const ctx = {
+      isLoaded: true,
+      isCloudLoading: false,
+      subjects: [{ id: 'sub-1', name: 'Math' }],
+      materials: [{ id: 'mat-1', subjectId: 'sub-1', title: 'Algebra' }],
+      problems: [{ id: 'prob-1', subjectId: 'sub-1', title: 'Problem 1' }],
+      attempts: [{ id: 'att-1', subjectId: 'sub-1' }],
+    };
+
+    // 1. While loading: status must be 'loading' so IDs are not marked missing
+    const loadingRes = dashboardUrl.resolveDashboardUrl({ subjectId: 'sub-1' }, { ...ctx, isLoaded: false });
+    assert.equal(loadingRes.status, 'loading');
+
+    // 2. Unknown tab: normalizes to 'today' with 'invalid_tab' status
+    const invalidTabRes = dashboardUrl.resolveDashboardUrl({ rawTab: 'bad_tab' }, ctx);
+    assert.equal(invalidTabRes.status, 'invalid_tab');
+    assert.equal(invalidTabRes.tab, 'today');
+
+    // 3. Unknown subject: not_found with safe notice (no leak of whether it exists for other users)
+    const missingSubRes = dashboardUrl.resolveDashboardUrl({ subjectId: 'sub-nonexistent' }, ctx);
+    assert.equal(missingSubRes.status, 'not_found');
+    assert.equal(missingSubRes.notFoundEntity.kind, 'subject');
+    assert.ok(missingSubRes.noticeMessage.includes('찾을 수 없거나 접근 권한이 없습니다'));
+
+    // 4. Unknown material: not_found
+    const missingMatRes = dashboardUrl.resolveDashboardUrl({ tab: 'materials', materialId: 'mat-none' }, ctx);
+    assert.equal(missingMatRes.status, 'not_found');
+    assert.equal(missingMatRes.notFoundEntity.kind, 'material');
+
+    // 5. Valid selection
+    const validRes = dashboardUrl.resolveDashboardUrl({ tab: 'problems', problemId: 'prob-1', subjectId: 'sub-1' }, ctx);
+    assert.equal(validRes.status, 'valid');
+    assert.equal(validRes.problemId, 'prob-1');
+    assert.equal(validRes.subjectId, 'sub-1');
+  });
+
+  check('Stage 2: ProblemSessionModal and MockExamModal support variant="page" dedicated screen', () => {
+    const sessionSrc = fs.readFileSync(path.join(root, 'components/ProblemSessionModal.tsx'), 'utf8');
+    const examSrc = fs.readFileSync(path.join(root, 'components/MockExamModal.tsx'), 'utf8');
+    const dashSrc = fs.readFileSync(path.join(root, 'app/DashboardClient.tsx'), 'utf8');
+
+    assert.ok(sessionSrc.includes("variant?: 'modal' | 'page'"), 'ProblemSessionModal must declare variant prop');
+    assert.ok(sessionSrc.includes("variant === 'page'"), 'ProblemSessionModal must branch on page variant');
+    assert.ok(examSrc.includes("variant?: 'modal' | 'page'"), 'MockExamModal must declare variant prop');
+    assert.ok(examSrc.includes("variant === 'page'"), 'MockExamModal must branch on page variant');
+
+    // DashboardClient renders dedicated in-layout screens inside <main>
+    assert.ok(dashSrc.includes('variant="page"'), 'DashboardClient must render variant="page"');
+    assert.ok(dashSrc.includes("activeTab === 'session'"), 'DashboardClient must support session tab dedicated screen');
+    assert.ok(dashSrc.includes("activeTab === 'exam'"), 'DashboardClient must support exam tab dedicated screen');
+    assert.ok(dashSrc.includes('진행 중인 문제 풀이가 있습니다'), 'DashboardClient must render resume banner for session');
+    assert.ok(dashSrc.includes('진행 중인 모의시험이 있습니다'), 'DashboardClient must render resume banner for exam');
   });
 
   console.log(`${passed} regression checks passed`);
