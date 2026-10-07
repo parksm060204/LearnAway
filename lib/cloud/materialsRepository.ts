@@ -106,8 +106,9 @@ async function listAllPaths(supabase: SupabaseClient, prefix: string): Promise<L
   return { ok: true, paths };
 }
 
-function generateJobId(): string {
-  try {
+/** Creates a caller-owned job id BEFORE the first request, so the retry
+ *  record can reference the exact job the server will stage. */
+export function generateJobId(): string {  try {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
       return crypto.randomUUID();
     }
@@ -172,25 +173,48 @@ export async function downloadMaterialContent(
 }
 
 /**
- * Reads the SERVER's current body for one material and returns its content
- * hash and row version. A lookup failure is reported as an error — callers
- * must never treat it as "no body" or "not saved".
+ * Reads the SERVER's current row for one material: body hash, version, the
+ * pending job (if any), and the metadata columns the server persists. A lookup
+ * failure is reported as an error — callers must never treat it as "no body"
+ * or "not saved". Missing columns (pre-migration rows) arrive as undefined so
+ * a retry verdict can treat them as insufficient evidence rather than proof.
  */
+export interface MaterialServerState {
+  hash: string | null;
+  hasBody: boolean;
+  version: number;
+  pendingJobId: string | null;
+  metadata: {
+    title?: string;
+    status?: string;
+    kind?: string;
+    /** Derived without migration-9 columns: a stored body path means synced. */
+    syncBody?: boolean;
+  } | null;
+}
+
 export async function getMaterialServerBodyHash(
   materialId: string
-): Promise<RepoResult<{ hash: string | null; hasBody: boolean; version: number }>> {
+): Promise<RepoResult<MaterialServerState>> {
   try {
     const rows = await listMaterialRows();
     if (!rows.ok) return rows;
     const row = rows.data.find((r) => r.id === materialId);
-    if (!row) return repoOk({ hash: null, hasBody: false, version: 0 });
+    if (!row) return repoOk({ hash: null, hasBody: false, version: 0, pendingJobId: null, metadata: null });
     const version = row.version ?? 0;
+    const pendingJobId = row.pending_job_id ?? null;
+    const metadata = {
+      title: row.title ?? undefined,
+      status: row.status ?? undefined,
+      kind: row.kind ?? undefined,
+      syncBody: Boolean(row.markdown_path) || Boolean((row as { body_synced?: unknown }).body_synced),
+    };
     if (!row.markdown_path && !row.transcript_path && !row.pages_path) {
-      return repoOk({ hash: null, hasBody: false, version });
+      return repoOk({ hash: null, hasBody: false, version, pendingJobId, metadata });
     }
     const content = await downloadMaterialContent(row);
     if (!content.ok) return content;
-    return repoOk({ hash: materialContentHash(content.data), hasBody: true, version });
+    return repoOk({ hash: materialContentHash(content.data), hasBody: true, version, pendingJobId, metadata });
   } catch (error) {
     return repoError(toMessage(error, '서버 본문을 확인하지 못했습니다.'));
   }
@@ -207,6 +231,13 @@ export interface MaterialWriteInput {
   jobId?: string;
   /** Defaults to the legacy behaviour (sync body + back up original). */
   policy?: MaterialStoragePolicy;
+  /**
+   * Optimistic concurrency: the write proceeds ONLY when the row still holds
+   * this version (the version confirmed right before the attempt). A newer row
+   * is refused as stale WITHOUT touching the pending slot, uploads or cleanup,
+   * so a checked base can never be silently bypassed.
+   */
+  expectedVersion?: number;
 }
 
 const LEGACY_WRITE_POLICY: MaterialStoragePolicy = { syncBody: true, backupOriginal: true };
@@ -406,6 +437,16 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
     if (existingResult.error) return repoError(existingResult.error.message);
     const existing = (existingResult.data as MaterialRow | null) ?? null;
     const activeVersion = existing?.version ?? 0;
+
+    // Optimistic concurrency on the checked base: if the caller confirmed this
+    // base version just before the attempt, refuse (without any side effect)
+    // when the row has moved since. A refreshed "latest" must never be adopted
+    // as the new base to bypass a conflict.
+    if (input.expectedVersion !== undefined && activeVersion !== input.expectedVersion) {
+      return repoError(
+        `MATERIAL_VERSION_STALE: 서버 자료가 먼저 변경되었습니다(기대 v${input.expectedVersion}, 현재 v${activeVersion}). 덮어쓰지 않았습니다.`
+      );
+    }
 
     // A provided job id is only a retry when it matches the current pending job.
     const sameJobRetry = Boolean(

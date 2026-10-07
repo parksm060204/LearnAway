@@ -19,18 +19,24 @@ import {
   createMockExamOnServer,
   decideExpiredSubmit,
   fetchMockExamFromServer,
-  planExpiredOpen,
+  planExpiredUrlOpen,
   planReconcile,
+  resolveLocalBaseVersion,
   saveMockExamGradingOnServer,
+  shouldAutoSubmitExpired,
   submitExamAttemptOnServer,
   submitMockExamOnServer,
 } from '../lib/cloud/mockExamSync';
 import {
   applyPendingAnswers,
+  clearConflictArchive,
   clearPendingExamAnswers,
+  loadConflictArchive,
   loadPendingExamAnswers,
   pendingAfterAutosave,
+  saveConflictArchive,
   savePendingExamAnswers,
+  type ExamConflictArchive,
 } from '../lib/cloud/pendingExamAnswers';
 import { AcademicMathView } from './AcademicMathView';
 import { X, Clock, Award, Compass, HelpCircle } from 'lucide-react';
@@ -147,6 +153,23 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
   // explicitly compares and chooses.
   const [expiredConflict, setExpiredConflict] = useState(false);
   const [serverSnapshot, setServerSnapshot] = useState<MockExamSession | null>(null);
+  // Whether THIS open started from an already-expired session: interval ticks
+  // and keystroke saves must never auto-submit it (explicit submit only).
+  const [expiredAtOpen] = useState(() => {
+    const requested = initialExamId
+      ? loadMockExams().find((s) => s.id === initialExamId && s.subjectId === subject.id) ?? null
+      : null;
+    const stored = requested ?? activeStoredSession();
+    return Boolean(
+      stored && stored.status === 'in_progress' && expireMockExam(stored, Date.now()).status === 'submitted'
+    );
+  });
+  // Local answers preserved at conflict time for explicit review. Never
+  // auto-merged, auto-saved or auto-cleared; shown even after the server
+  // snapshot is adopted.
+  const [conflictArchive, setConflictArchive] = useState<ExamConflictArchive | null>(null);
+  // Server version the preserved local answers were written against.
+  const [conflictBaseVersion, setConflictBaseVersion] = useState<number | null>(null);
   // Server-authoritative version guard for optimistic autosave/submit.
   const serverVersionRef = useRef(1);
   const autosaveTimerRef = useRef<number | null>(null);
@@ -180,6 +203,51 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
     }
     return ok;
   };
+
+  // Preserves the local conflicting answers as a reviewable archive BEFORE any
+  // server snapshot is adopted. An already-preserved copy for the same session
+  // is kept (never silently replaced); the pending slot is untouched. Returns
+  // false only when nothing is preserved AND nothing was preserved before, in
+  // which case the caller must NOT adopt the server snapshot.
+  const preserveLocalAsConflictArchive = useCallback(
+    (
+      local: MockExamSession,
+      baseVersion: number,
+      comparedVersion: number
+    ): boolean => {
+      if (!userId) {
+        setSyncNotice('계정 정보가 없어 로컬 답안을 보존하지 못했습니다. 서버 답안을 적용하지 않았습니다.');
+        return false;
+      }
+      const archive: ExamConflictArchive = {
+        sessionId: local.id,
+        answers: { ...local.answers },
+        reasons: local.reasons ? { ...local.reasons } : undefined,
+        isReasonNotApplicable: local.isReasonNotApplicable ? { ...local.isReasonNotApplicable } : undefined,
+        reasonNotApplicableJustification: local.reasonNotApplicableJustification
+          ? { ...local.reasonNotApplicableJustification }
+          : undefined,
+        baseVersion,
+        comparedServerVersion: comparedVersion,
+        savedAt: new Date().toISOString(),
+      };
+      const result = saveConflictArchive(userId, archive);
+      if (result.ok) {
+        setConflictArchive(loadConflictArchive(userId, local.id));
+        return true;
+      }
+      if (result.reason === 'exists') {
+        // An earlier conflict already preserved a copy: keep showing THAT copy.
+        setConflictArchive(loadConflictArchive(userId, local.id));
+        return true;
+      }
+      setSyncNotice(
+        `로컬 답안 보존에 실패했습니다(${result.error ?? '저장소 확인 불가'}). 현재 로컬 답안을 유지하며, 서버 답안을 적용하지 않았습니다.`
+      );
+      return false;
+    },
+    [userId]
+  );
 
   const runAutosave = (target: MockExamSession, token: number) => {
     if (token !== opTokenRef.current) return Promise.resolve();
@@ -272,6 +340,9 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         if (result.ok) {
           serverVersionRef.current = result.version;
           setSaveState('saved');
+          // A confirmed submit supersedes any preserved conflict copy.
+          if (userId) clearConflictArchive(userId, submitted.id);
+          setConflictArchive(null);
         } else if (result.code === 'stale' || result.code === 'locked') {
           if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
           setPendingAvailable(true);
@@ -300,10 +371,15 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       scheduleAutosave(updated);
     } else if (updated.status === 'submitted' && previousStatus === 'in_progress') {
       // A keystroke landed after the deadline: the session just became
-      // submitted. Preserve the answers and enqueue the idempotent submit so the
-      // server cannot stay in_progress until the next open.
+      // submitted. Preserve the answers; the idempotent submit is enqueued
+      // ONLY when the deadline policy allows auto-submit (a session that was
+      // ALREADY expired at open needs an explicit submit action instead).
       persistPending(updated, serverVersionRef.current);
-      enqueueSubmitSession(updated);
+      if (shouldAutoSubmitExpired({ deferExpiredSubmit, expiredAtOpen })) {
+        enqueueSubmitSession(updated);
+      } else {
+        setSyncNotice('만료된 시험입니다. 자동 제출하지 않습니다. "시험 제출" 또는 "저장된 답안으로 제출" 버튼으로 명시적으로 제출해 주세요.');
+      }
     } else if (updated.status === 'graded' || updated.status === 'recorded') {
       enqueue(() => runGrading(updated, updated.status === 'recorded' ? 'recorded' : 'graded', token));
     }
@@ -348,13 +424,19 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
           if (userId && !savePendingExamAnswers(userId, submitted, serverVersionRef.current)) {
             setSyncNotice('미저장 답안을 이 기기에 보존하지 못했습니다. 창을 닫지 말고 다시 시도해 주세요.');
           }
-          enqueueSubmitSession(submitted);
+          // A session that was ALREADY expired at open never auto-submits from
+          // the interval: every submit there needs an explicit user action.
+          if (shouldAutoSubmitExpired({ deferExpiredSubmit, expiredAtOpen })) {
+            enqueueSubmitSession(submitted);
+          } else {
+            setSyncNotice('만료된 시험입니다. 자동 제출하지 않습니다. "시험 제출" 또는 "저장된 답안으로 제출" 버튼으로 명시적으로 제출해 주세요.');
+          }
           return submitted;
         });
       }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [isOpen, session?.status, session?.endsAt, userId, enqueueSubmitSession]);
+  }, [isOpen, session?.status, session?.endsAt, userId, enqueueSubmitSession, deferExpiredSubmit, expiredAtOpen]);
 
   // On open (or session change) reconcile with the server. The server snapshot
   // (answers + version + status + evaluations) is applied as ONE unit. Local
@@ -383,16 +465,36 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       // snapshot, and require an EXPLICIT comparison/choice when the local
       // answers differ from the server's (never let a plain submit overwrite).
       if (deferExpiredSubmit && local && local.status === 'submitted' && server.status === 'in_progress') {
-        const openPlan = planExpiredOpen(local, server);
+        const pending = userId ? loadPendingExamAnswers(userId, server.id) : null;
+        const decision = planExpiredUrlOpen({
+          local,
+          server,
+          serverVersion: result.version,
+          localBaseVersion: resolveLocalBaseVersion({
+            pendingBaseVersion: pending?.baseVersion,
+            sessionServerVersion: local.serverVersion,
+            lastKnownVersion: serverVersionRef.current,
+          }),
+        });
         // The version confirmed at comparison time: an explicit submit uses it,
         // so a later server change is caught as stale (re-conflict).
-        serverVersionRef.current = result.version;
+        serverVersionRef.current = decision.confirmedVersion;
+        setConflictBaseVersion(decision.localBaseVersion);
+        // Preserve the local answers WITH their base version BEFORE showing any
+        // choice: adopting the server snapshot must never lose them, and a
+        // failed preservation keeps the local copy and blocks the choice UI.
+        if (!preserveLocalAsConflictArchive(local, decision.localBaseVersion, decision.confirmedVersion)) {
+          setServerSnapshot(server);
+          setExpiredConflict(false);
+          setSyncBlocked(true);
+          return;
+        }
         setServerSnapshot(server);
-        setExpiredConflict(openPlan.conflict);
+        setExpiredConflict(decision.conflict);
         setSyncBlocked(true);
         setSyncNotice(
-          openPlan.conflict
-            ? '서버에 더 최신 답안이 있습니다. 비교 후 선택해야 하며, 비교 없이 제출하면 서버 답안을 덮어쓰지 않습니다.'
+          decision.conflict
+            ? '서버에 더 최신 답안이 있습니다. 로컬 답안은 이 기기에 보존했습니다. 비교 후 선택해야 하며, 비교 없이 제출하면 서버 답안을 덮어쓰지 않습니다.'
             : '만료된 시험이 서버에는 아직 진행 중으로 남아 있습니다. "저장된 답안으로 제출"을 눌러 마감 처리하세요.'
         );
         return;
@@ -441,7 +543,7 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       }
     });
     return () => { cancelled = true; };
-  }, [isOpen, session?.id, userId, deferExpiredSubmit]);
+  }, [isOpen, session?.id, userId, deferExpiredSubmit, preserveLocalAsConflictArchive]);
 
   const resolveFromServer = async () => {
     const local = sessionRef.current;
@@ -487,16 +589,70 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
     scheduleAutosave(merged);
   };
 
-  // Explicit choice: adopt the SERVER answers (recommended). Never overwrites
-  // the server; the local expired copy is preserved separately until submit.
+  // Explicit choice: adopt the SERVER answers (recommended). The local expired
+  // copy is preserved as a reviewable archive FIRST — adopting never deletes
+  // it, never submits anything, and never touches the pending slot. If the
+  // adopted snapshot is itself past the deadline it is flipped to submitted
+  // LOCALLY only; the final submit still needs the explicit submit button.
   const adoptServerSnapshot = () => {
-    if (!serverSnapshot) return;
+    const local = sessionRef.current;
+    if (!local || !serverSnapshot) return;
+    const pending = userId ? loadPendingExamAnswers(userId, local.id) : null;
+    const baseVersion =
+      conflictBaseVersion ??
+      resolveLocalBaseVersion({
+        pendingBaseVersion: pending?.baseVersion,
+        sessionServerVersion: local.serverVersion,
+        lastKnownVersion: serverVersionRef.current,
+      });
+    // Preservation failure (or missing account) blocks the adoption: the
+    // current local answers are kept and the user is told how to retry.
+    if (!preserveLocalAsConflictArchive(local, baseVersion, serverVersionRef.current)) return;
     applySnapshot(serverSnapshot);
     setExpiredConflict(false);
     setServerSnapshot(null);
+    if (serverSnapshot.status === 'in_progress' && expireMockExam(serverSnapshot, Date.now()).status === 'submitted') {
+      const expired = expireMockExam(serverSnapshot, Date.now());
+      applySnapshot(expired);
+      setSyncBlocked(true);
+      setSyncNotice(
+        '서버 답안을 적용했습니다. 만료된 시험이므로 자동 제출하지 않습니다. "저장된 답안으로 제출" 버튼으로 명시적으로 제출하거나, 아래 보존된 로컬 답안을 확인할 수 있습니다.'
+      );
+    } else {
+      setSyncBlocked(false);
+      setSaveState('saved');
+      setSyncNotice('서버의 최신 답안을 적용했습니다. 보존된 로컬 답안은 아래에서 계속 확인할 수 있습니다.');
+    }
+  };
+
+  // Restores the preserved local answers onto the working copy. Allowed only
+  // while the working copy is still in_progress; a submitted/graded/recorded
+  // exam keeps its terminal state and the archive stays for review.
+  const restoreConflictArchive = () => {
+    const local = sessionRef.current;
+    const archived = userId && local ? loadConflictArchive(userId, local.id) : null;
+    if (!local || !archived) return;
+    if (local.status !== 'in_progress') {
+      setSyncNotice('제출·채점이 끝난 시험에는 보존된 답안을 적용할 수 없습니다. 보존 내용은 계속 확인할 수 있습니다.');
+      return;
+    }
+    const merged = applyPendingAnswers(local, { ...archived, savedAt: archived.savedAt });
+    applySnapshot(merged);
+    setConflictArchive(archived);
     setSyncBlocked(false);
-    setSaveState('saved');
-    setSyncNotice('서버의 최신 답안을 적용했습니다. 이 시험은 아직 진행 중 상태입니다.');
+    setSyncNotice('보존된 로컬 답안을 작업본에 복구했습니다. 서버 저장을 다시 시도합니다.');
+    scheduleAutosave(merged);
+  };
+
+  // Explicit user deletion of the preserved copy (e.g. after review). The
+  // working copy and the pending slot are untouched.
+  const deleteConflictArchive = () => {
+    const local = sessionRef.current;
+    if (!userId || !local) return;
+    if (!window.confirm('보존된 로컬 답안을 삭제할까요? 현재 작업본에는 영향이 없습니다.')) return;
+    clearConflictArchive(userId, local.id);
+    setConflictArchive(null);
+    setSyncNotice('보존된 로컬 답안을 삭제했습니다.');
   };
 
   // Explicit choice: submit the LOCAL expired answers, using the server version
@@ -627,6 +783,9 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         serverVersionRef.current = result.version;
         setSaveState('saved');
         setSaveMessage('');
+        // A confirmed submit supersedes any preserved conflict copy.
+        if (userId) clearConflictArchive(userId, submitted.id);
+        setConflictArchive(null);
         if (userId) {
           const current = sessionRef.current;
           if (pendingAfterAutosave(submitted, current) === 'keep-current' && current) {
@@ -786,6 +945,9 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         .filter((p) => Boolean(session.answers[p.id]?.trim() && session.evaluations[p.id]))
         .map((p) => `att-exam-${session.id}-${p.id}`),
     });
+    // A recorded exam is terminal: any preserved conflict copy is superseded.
+    if (userId) clearConflictArchive(userId, session.id);
+    setConflictArchive(null);
     setSyncNotice('');
     onExamRecorded();
     } catch (cause) {
@@ -892,6 +1054,42 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
                 className="bg-[#c52828] text-white px-3 py-1 font-bold disabled:opacity-50"
               >
                 내 만료 답안으로 제출
+              </button>
+            </div>
+          </div>
+        )}
+        {conflictArchive && session && (
+          <div role="group" aria-label="보존된 로컬 답안" className="p-3 bg-slate-50 border border-slate-300 text-slate-900 text-xs space-y-2">
+            <p className="font-bold">
+              보존된 로컬 답안 (서버 선택 후에도 유지됩니다. 자동 병합·자동 저장·자동 삭제되지 않습니다.)
+            </p>
+            <ul className="space-y-1">
+              {session.problems.map((p) => {
+                const kept = conflictArchive.answers[p.id]?.trim() || '미응답';
+                return (
+                  <li key={p.id} className="border-t border-slate-200 pt-1">
+                    <strong>{p.title}</strong>
+                    <div>보존 답안: {kept.slice(0, 60)}{kept.length > 60 ? '…' : ''}</div>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="flex flex-wrap gap-2">
+              {session.status === 'in_progress' && (
+                <button
+                  type="button"
+                  onClick={restoreConflictArchive}
+                  className="border border-slate-400 bg-white px-3 py-1 font-bold"
+                >
+                  이 답안으로 복구 선택
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={deleteConflictArchive}
+                className="border border-slate-300 bg-white px-3 py-1"
+              >
+                보존 삭제
               </button>
             </div>
           </div>
@@ -1153,8 +1351,13 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
             <button
               type="button"
               onClick={() => {
+                // Real plan state: blocked while a conflict is unresolved OR
+                // the server snapshot is already terminal (adopt it instead).
                 const decision = decideExpiredSubmit(
-                  { serverTerminal: false, conflict: false },
+                  {
+                    serverTerminal: serverSnapshot ? serverSnapshot.status !== 'in_progress' : false,
+                    conflict: expiredConflict,
+                  },
                   serverVersionRef.current
                 );
                 if (decision.action !== 'submit') return;

@@ -301,11 +301,21 @@ export function clearPracticeAnswerDraft(
 // ---------------------------------------------------------------------------
 
 const TAB_ID_KEY = 'redcall_practice_tab_id_v1';
-const TAB_NONCE_KEY = 'redcall_practice_tab_nonce_v1';
 const TAB_LEASE_KEY = 'redcall_practice_tab_leases_v1';
 const TAB_LEASE_TTL_MS = 15000;
 
-type TabLeases = Record<string, { nonce: string; at: number }>;
+type TabLeases = Record<string, { nonce: string; at: number; released?: boolean }>;
+
+/** Page-instance identity: one per JS context, i.e. one per real page load. */
+let pageInstanceNonce: string | null = null;
+
+/**
+ * Test seam: emulates a fresh page load (new JS context, same storages) so
+ * refresh and duplication can be distinguished in tests exactly as browsers do.
+ */
+export function resetPracticeTabPageForTests(): void {
+  pageInstanceNonce = null;
+}
 
 function readLeases(storage: Storage | null): TabLeases {
   if (!storage) return {};
@@ -333,9 +343,10 @@ function newTabToken(prefix: string, now: number): string {
 
 /** Resolves a stable id for THIS tab, forking away from a live duplicate. */
 export function resolvePracticeTabId(now: number = Date.now()): string {
+  if (!pageInstanceNonce) pageInstanceNonce = newTabToken('page', now);
+  const nonce = pageInstanceNonce;
   const session = getSessionStorage();
   const storage = getStorage();
-  const nonce = newTabToken('n', now);
   const leases = readLeases(storage);
 
   let tabId: string | null = null;
@@ -346,16 +357,15 @@ export function resolvePracticeTabId(now: number = Date.now()): string {
   }
 
   const lease = tabId ? leases[tabId] : undefined;
-  const liveLease = lease && now - lease.at < TAB_LEASE_TTL_MS;
-  if (tabId && liveLease && lease!.nonce !== nonce) {
-    // A different live page still owns this id (duplicated tab): fork.
+  const liveUnreleasedLease = lease && !lease.released && now - lease.at < TAB_LEASE_TTL_MS;
+  if (tabId && liveUnreleasedLease && lease!.nonce !== nonce) {
+    // A different LIVE page still owns this id (duplicated tab): fork.
     tabId = null;
   }
   if (!tabId) tabId = newTabToken('tab', now);
 
   try {
     session?.setItem(TAB_ID_KEY, tabId);
-    session?.setItem(TAB_NONCE_KEY, nonce);
   } catch {
     // sessionStorage unavailable: the returned id is still usable this mount
   }
@@ -368,38 +378,32 @@ export function resolvePracticeTabId(now: number = Date.now()): string {
   return tabId;
 }
 
-/** Keeps this tab's lease fresh during active editing. */
+/**
+ * Keeps this page's lease fresh during active editing. Never takes over an id
+ * that a live page with a different nonce currently owns.
+ */
 export function refreshPracticeTabLease(tabId: string, now: number = Date.now()): void {
-  if (!tabId) return;
-  const session = getSessionStorage();
+  if (!tabId || !pageInstanceNonce) return;
   const storage = getStorage();
-  let nonce: string | null = null;
-  try {
-    nonce = session?.getItem(TAB_NONCE_KEY) ?? null;
-  } catch {
-    nonce = null;
-  }
-  if (!nonce) return;
   const leases = readLeases(storage);
-  leases[tabId] = { nonce, at: now };
+  const existing = leases[tabId];
+  if (existing && existing.nonce !== pageInstanceNonce && now - existing.at < TAB_LEASE_TTL_MS) {
+    return;
+  }
+  leases[tabId] = { nonce: pageInstanceNonce, at: now };
   writeLeases(storage, leases);
 }
 
-/** Releases this tab's lease on pagehide so a refresh keeps the same id. */
+/**
+ * Releases this page's own lease on pagehide so a refresh keeps the same id.
+ * A lease owned by a different live page is never touched.
+ */
 export function releasePracticeTabLease(tabId: string): void {
-  if (!tabId) return;
-  const session = getSessionStorage();
+  if (!tabId || !pageInstanceNonce) return;
   const storage = getStorage();
-  let nonce: string | null = null;
-  try {
-    nonce = session?.getItem(TAB_NONCE_KEY) ?? null;
-  } catch {
-    nonce = null;
-  }
   const leases = readLeases(storage);
   const entry = leases[tabId];
-  if (!entry) return;
-  if (nonce && entry.nonce !== nonce) return; // a different page owns it now
+  if (!entry || entry.nonce !== pageInstanceNonce) return;
   delete leases[tabId];
   writeLeases(storage, leases);
 }

@@ -161,6 +161,65 @@ export function decideExpiredSubmit(
 }
 
 /**
+ * Whether the deadline policy may auto-submit an expiry transition.
+ *
+ * A session opened while ALREADY expired (typically via a deep link) must
+ * never auto-submit from interval ticks or keystroke saves: every submit there
+ * needs an explicit user action. A session that was genuinely running stays on
+ * the normal deadline-auto-submit path.
+ */
+export function shouldAutoSubmitExpired(input: {
+  deferExpiredSubmit: boolean;
+  expiredAtOpen: boolean;
+}): boolean {
+  return !(input.deferExpiredSubmit && input.expiredAtOpen);
+}
+
+/**
+ * Resolves which server version the local expired answers were written
+ * against: the pending snapshot's base first (it proves what the user typed),
+ * then the session's own server version, then the last confirmed version.
+ */
+export function resolveLocalBaseVersion(input: {
+  pendingBaseVersion?: number;
+  sessionServerVersion?: number;
+  lastKnownVersion: number;
+}): number {
+  if (typeof input.pendingBaseVersion === 'number') return input.pendingBaseVersion;
+  if (typeof input.sessionServerVersion === 'number') return input.sessionServerVersion;
+  return input.lastKnownVersion;
+}
+
+export interface ExpiredUrlOpenDecision {
+  /** The local expired answers differ from the server snapshot. */
+  conflict: boolean;
+  /** Server version confirmed at comparison time (submit guard). */
+  confirmedVersion: number;
+  /** Server version the preserved local answers were written against. */
+  localBaseVersion: number;
+}
+
+/**
+ * The exact mapping a URL-opened expired exam performs: resolve the local
+ * base version, confirm the server version, and compare the answer sets as one
+ * unit. Callers MUST use all three outputs (conflict gate, submit guard,
+ * archive stamp) so none of them can silently fall back to a default.
+ */
+export function planExpiredUrlOpen(input: {
+  local: MockExamSession;
+  server: MockExamSession;
+  serverVersion: number;
+  localBaseVersion: number;
+}): ExpiredUrlOpenDecision {
+  const plan = planExpiredOpen(input.local, input.server);
+  return {
+    conflict: plan.conflict,
+    confirmedVersion: input.serverVersion,
+    localBaseVersion: input.localBaseVersion,
+  };
+}
+
+/**
  * Creates a mock exam on the server insert-only. If the id already exists the
  * server row is returned: identical content is an idempotent success, differing
  * content is a `conflict` (never overwritten). Retries/migration cannot reset a

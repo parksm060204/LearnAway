@@ -27,6 +27,13 @@ export interface MaterialServerSaveResult {
   error?: string;
   /** Server saved, but migration 9 is missing so policy/hash columns were not stored. */
   fallbackUsed?: boolean;
+  /**
+   * How many linked-flag server reflections failed AFTER the body was saved.
+   * The body itself is confirmed; only the follow-up review-flag mirroring
+   * needs an explicit retry (the editor offers it, the next same-body save
+   * re-runs it). Absent/zero means nothing is pending.
+   */
+  postprocessFailed?: number;
 }
 
 export interface MaterialEditSaveInput {
@@ -37,6 +44,12 @@ export interface MaterialEditSaveInput {
   localError?: string;
   /** The body was saved but its identity hash could not be persisted. */
   identityRecordFailed?: boolean;
+  /**
+   * Linked-flag server reflections that failed AFTER the body was saved. The
+   * body itself is confirmed, so this never blocks closing — but it must be
+   * surfaced (not hidden) so the user can retry the reflection explicitly.
+   */
+  postprocessFailed?: number;
 }
 
 export interface MaterialEditSaveOutcome {
@@ -69,6 +82,14 @@ export interface MaterialServerRetryRecord {
   syncBody?: boolean;
   /** Job id of the attempt, so the SAME job can be re-run safely. */
   jobId?: string | null;
+  /** Intended title at save time (metadata-match proof for already_saved). */
+  targetTitle?: string;
+  /** Intended status at save time. */
+  targetStatus?: string;
+  /** Intended kind at save time. */
+  targetKind?: string;
+  /** Intended body-sync policy at save time. */
+  targetSyncBody?: boolean;
 }
 
 export interface MaterialServerProbe {
@@ -77,20 +98,67 @@ export interface MaterialServerProbe {
   hash?: string | null;
   /** Server row version at probe time (used for metadata-only writes). */
   version?: number;
+  /** Pending job that currently owns the server slot, if any. */
+  pendingJobId?: string | null;
+  /**
+   * Metadata columns the server persists (missing fields arrive as undefined).
+   * Compared field-by-field against the attempt's target; a missing server
+   * field is insufficient evidence, never proof.
+   */
+  metadata?: {
+    title?: string;
+    status?: string;
+    kind?: string;
+    syncBody?: boolean;
+  } | null;
+}
+
+function probeMetadataMatches(
+  server: { title?: string; status?: string; kind?: string; syncBody?: boolean } | null | undefined,
+  record: MaterialServerRetryRecord
+): 'match' | 'mismatch' | 'unknown' {
+  // A record that stored no target metadata cannot demand metadata proof;
+  // only records WITH targets require the server to confirm them.
+  const hasTargets =
+    record.targetTitle !== undefined ||
+    record.targetStatus !== undefined ||
+    record.targetKind !== undefined ||
+    record.targetSyncBody !== undefined;
+  if (!hasTargets) return 'match';
+  if (!server) return 'unknown';
+  const pairs: Array<[string | boolean | undefined, string | boolean | undefined]> = [
+    [server.title, record.targetTitle],
+    [server.status, record.targetStatus],
+    [server.kind, record.targetKind],
+  ];
+  for (const [serverValue, targetValue] of pairs) {
+    if (targetValue === undefined) continue;
+    if (serverValue === undefined) return 'unknown';
+    if (serverValue !== targetValue) return 'mismatch';
+  }
+  if (record.targetSyncBody !== undefined) {
+    if (server.syncBody === undefined) return 'unknown';
+    if (server.syncBody !== record.targetSyncBody) return 'mismatch';
+  }
+  return 'match';
 }
 
 /**
  * Response-loss recovery rule. A retry of the SAME content asks the SERVER what
  * it actually stored, and distinguishes "unchanged since the attempt" from
- * "someone else changed it":
- *  - no matching previous record -> a normal new write may proceed,
- *  - server already holds the target body -> 'already_saved' (never re-upload),
- *  - server still holds the pre-attempt body (baseHash) -> the earlier request
- *    did NOT land: 'retry_same_job' (safe to redo the SAME job),
- *  - server holds neither -> another operation changed it: 'conflict',
- *  - lookup FAILED -> 'unknown': never treated as "not saved yet",
- *  - metadata-only write (syncBody false): confirmed by the row VERSION, never
- *    by a body hash.
+ * "someone else changed it". A version bump or a matching hash alone never
+ * proves THIS job completed: job id, base version, target body hash and target
+ * metadata are checked TOGETHER.
+ *  - no matching previous save record -> a normal new write may proceed,
+ *  - server holds this job's exact state (hash + metadata + evidence of our
+ *    job) -> 'already_saved' (never re-upload),
+ *  - server still holds the pre-attempt state (baseHash/baseVersion) -> the
+ *    earlier request did NOT land: 'retry_same_job' (safe to redo the SAME job),
+ *  - anything else changed by another operation -> 'conflict',
+ *  - lookup FAILED or required evidence missing -> 'unknown': never treated
+ *    as "not saved yet",
+ *  - metadata-only write (syncBody false): confirmed by the row VERSION plus
+ *    matching metadata, never by a body hash or a version bump alone.
  */
 export function evaluateMaterialServerRetry(
   record: MaterialServerRetryRecord | undefined,
@@ -101,16 +169,46 @@ export function evaluateMaterialServerRetry(
   // A lookup FAILURE is never interpreted as "not saved": the retry must stop.
   if (!server.ok) return 'unknown';
 
-  // Metadata-only write: the server version is the only signal.
+  // Another job owns the server slot right now: our claim cannot be verified.
+  if (server.pendingJobId && record.jobId && server.pendingJobId !== record.jobId) {
+    return 'conflict';
+  }
+  // Our own job is still staged on the server: safe to re-run the same job.
+  if (server.pendingJobId && record.jobId && server.pendingJobId === record.jobId) {
+    return 'retry_same_job';
+  }
+
+  // Metadata-only write (syncBody false): the row VERSION is the only signal,
+  // and only together with matching metadata.
   if (record.syncBody === false) {
     if (server.version === undefined || record.baseVersion === undefined) return 'unknown';
-    if (server.version > record.baseVersion) return 'already_saved';
+    const meta = probeMetadataMatches(server.metadata ?? null, record);
+    if (meta === 'unknown') return 'unknown';
+    if (server.version > record.baseVersion) {
+      return meta === 'match' ? 'already_saved' : 'conflict';
+    }
     if (server.version === record.baseVersion) return 'retry_same_job';
     return 'conflict';
   }
 
-  // Body-sync write: the server body hash is the signal.
-  if (server.hasBody && server.hash === currentContentHash) return 'already_saved';
+  // Body-sync write (or legacy record without a syncBody flag): the body hash.
+  if (server.hasBody && server.hash === currentContentHash) {
+    const meta = probeMetadataMatches(server.metadata ?? null, record);
+    if (meta === 'mismatch') return 'conflict';
+    if (meta === 'unknown') return 'unknown';
+    // Hash AND metadata match: completes only with evidence of OUR job — the
+    // version advanced from our base, or the base already equaled the target.
+    if (server.version !== undefined && record.baseVersion !== undefined) {
+      if (server.version > record.baseVersion) return 'already_saved';
+      if (server.version === record.baseVersion) {
+        return record.baseHash === currentContentHash ? 'already_saved' : 'unknown';
+      }
+      return 'conflict';
+    }
+    const baseKnown =
+      record.baseHash !== undefined || record.baseVersion !== undefined || record.jobId != null;
+    return baseKnown ? 'already_saved' : 'unknown';
+  }
   if (server.hasBody) {
     if (record.baseHash !== undefined && server.hash === record.baseHash) return 'retry_same_job';
     return 'conflict';
@@ -151,6 +249,12 @@ export function evaluateMaterialEditSave(input: MaterialEditSaveInput): Material
 
   if (input.local === 'saved' && input.identityRecordFailed) {
     notes.push('본문은 이 기기에 저장됐지만 본문 식별 정보(해시)를 저장하지 못했습니다. 저장된 본문에서 재계산을 시도했으며 실패 시 "재검증 필요"로 표시해 재연결 때 오래된 해시로 거부하지 않습니다.');
+  }
+
+  if ((input.postprocessFailed ?? 0) > 0) {
+    notes.push(
+      `본문 저장은 완료됐지만 연관 검토 상태 서버 반영 ${input.postprocessFailed}건에 실패했습니다. 아래 버튼으로 다시 반영할 수 있으며, 본문을 다시 업로드하지 않습니다.`
+    );
   }
 
   const canClose = failed.length === 0;

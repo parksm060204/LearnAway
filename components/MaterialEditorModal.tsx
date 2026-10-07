@@ -107,9 +107,10 @@ export function MaterialEditorModal({
   // against it so a late result never touches another account.
   const pinnedScopeRef = useRef<string>(getStorageScopeId());
   const savingRef = useRef(false);
-  // Last server step confirmed for an exact body hash: a retry then performs
-  // only the failed part and never repeats a confirmed write.
-  const serverStepRef = useRef<{ hash: string; status: 'saved' | 'already_saved' | 'not_required'; fallbackUsed: boolean } | null>(null);
+  // Post-body reflection failures (linked review flags) that still need an
+  // explicit retry. Retrying re-runs ONLY the reflection: the same body hits
+  // the server's already_saved path and is never re-uploaded.
+  const [postprocessFailed, setPostprocessFailed] = useState(0);
   const markdownRef = useRef('');
   const baselineRef = useRef<string | null>(null);
   const materialRef = useRef(material);
@@ -257,6 +258,7 @@ export function MaterialEditorModal({
     setSaveSuccessMsg(null);
     setSaveWarning(null);
     setSaveOutcome(null);
+    setPostprocessFailed(0);
 
     const pinned = pinnedScopeRef.current;
     const scopeUnchanged = () => getStorageScopeId() === pinned;
@@ -266,38 +268,36 @@ export function MaterialEditorModal({
     const savedHash = computeMarkdownHash(savedMarkdown);
 
     try {
-      // 1) Server write (skipped on retry when already confirmed for this exact body).
+      // 1) Server write. Always delegated to onSave: its retry record probes
+      // the SERVER for this exact body, so a confirmed write is recovered as
+      // already_saved instead of re-uploaded — no client-side step cache that
+      // could skip the authoritative check or the postprocess retry.
       let server: ServerSaveStatus;
       let serverError: string | undefined;
       let fallbackUsed = false;
-      const confirmed = serverStepRef.current;
-      if (confirmed && confirmed.hash === savedHash) {
-        server = confirmed.status === 'saved' ? 'already_saved' : 'not_required';
-        fallbackUsed = confirmed.fallbackUsed;
-      } else {
-        const updatedMaterial: Material = {
-          ...material,
-          parsedMarkdown: savedMarkdown,
-          bodyHash: savedHash,
-          lastEditedAt: new Date().toISOString(),
-          isConverted: true,
-          // If it was failed, allow user manual edit to promote it to needs_review or ready
-          status: material.status === 'failed' ? 'needs_review' : material.status,
-        };
-        try {
-          const result = await onSave(updatedMaterial, { markdown: savedMarkdown, pages: savedPages });
-          if (result.status === 'failed') {
-            server = 'failed';
-            serverError = result.error;
-          } else {
-            server = result.status;
-            fallbackUsed = Boolean(result.fallbackUsed);
-            serverStepRef.current = { hash: savedHash, status: result.status, fallbackUsed };
-          }
-        } catch (e) {
+      let postprocessFailedCount = 0;
+      const updatedMaterial: Material = {
+        ...material,
+        parsedMarkdown: savedMarkdown,
+        bodyHash: savedHash,
+        lastEditedAt: new Date().toISOString(),
+        isConverted: true,
+        // If it was failed, allow user manual edit to promote it to needs_review or ready
+        status: material.status === 'failed' ? 'needs_review' : material.status,
+      };
+      try {
+        const result = await onSave(updatedMaterial, { markdown: savedMarkdown, pages: savedPages });
+        if (result.status === 'failed') {
           server = 'failed';
-          serverError = e instanceof Error ? e.message : '알 수 없는 오류';
+          serverError = result.error;
+        } else {
+          server = result.status;
+          fallbackUsed = Boolean(result.fallbackUsed);
+          postprocessFailedCount = result.postprocessFailed ?? 0;
         }
+      } catch (e) {
+        server = 'failed';
+        serverError = e instanceof Error ? e.message : '알 수 없는 오류';
       }
 
       // 2) Device write in the account the editor was opened in. Skipped when the
@@ -360,6 +360,7 @@ export function MaterialEditorModal({
         local,
         localError,
         identityRecordFailed,
+        postprocessFailed: postprocessFailedCount,
       });
 
       // A failed required save must not lose the typed text: also keep it as a device draft.
@@ -380,6 +381,7 @@ export function MaterialEditorModal({
         ? { ...outcome, message: `${outcome.message} 입력은 이 기기에 임시 보존했습니다.` }
         : outcome;
       setSaveOutcome(finalOutcome);
+      setPostprocessFailed(postprocessFailedCount);
       if (finalOutcome.canClose) {
         const now = new Date().toLocaleTimeString('ko-KR', { hour12: false });
         setBaseline(savedMarkdown);
@@ -738,6 +740,9 @@ export function MaterialEditorModal({
             {saveOutcome.notes.map((n) => <p key={n}>{n}</p>)}
             {!saveOutcome.canClose && (
               <button type="button" disabled={isSaving} onClick={() => { void handleSave(); }} className="mt-1 px-2.5 py-1 bg-[#c52828] text-white rounded-xs disabled:opacity-50">다시 저장 (AI 분석은 다시 호출하지 않음)</button>
+            )}
+            {saveOutcome.canClose && postprocessFailed > 0 && (
+              <button type="button" disabled={isSaving} onClick={() => { void handleSave(); }} className="mt-1 px-2.5 py-1 bg-amber-700 text-white rounded-xs disabled:opacity-50">연관 검토 상태 다시 반영 (본문은 다시 업로드하지 않음)</button>
             )}
           </div>
         )}

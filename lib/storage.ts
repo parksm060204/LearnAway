@@ -309,6 +309,7 @@ export function markMaterialDeleted(materialId: string): void {
   clearMaterialSaveFailed(materialId);
   clearMaterialSyncState(materialId);
   clearMaterialServerSaveRecord(materialId);
+  clearMaterialPostprocessState(materialId);
 }
 
 /** Clears the marker when the material legitimately exists again (explicit restore, re-upload). */
@@ -514,9 +515,9 @@ export function clearMaterialSyncState(materialId: string): void {
 const MATERIAL_SERVER_SAVE_KEY = 'material_server_saves_v1';
 
 export interface MaterialServerSaveRecord {
-  /** materialContentHash of the content that the (possibly lost) save targeted. */
+  /** materialContentHash of the content the previous attempt tried to write. */
   contentHash: string;
-  /** Server body hash BEFORE the attempt (undefined only for a legacy record). */
+  /** Server body hash BEFORE the attempt (undefined for a legacy record). */
   baseHash?: string | null;
   /** Server row version BEFORE the attempt. */
   baseVersion?: number;
@@ -524,6 +525,14 @@ export interface MaterialServerSaveRecord {
   syncBody?: boolean;
   /** Job id of the attempt, so the SAME job can be re-run safely. */
   jobId?: string | null;
+  /** Intended title at save time (metadata-match proof for already_saved). */
+  targetTitle?: string;
+  /** Intended status at save time. */
+  targetStatus?: string;
+  /** Intended kind at save time. */
+  targetKind?: string;
+  /** Intended body-sync policy at save time. */
+  targetSyncBody?: boolean;
   confirmedAt: string;
 }
 
@@ -562,6 +571,74 @@ export function clearMaterialServerSaveRecord(materialId: string): void {
   if (registry[materialId] === undefined) return;
   delete registry[materialId];
   writeMaterialServerSaves(registry);
+}
+
+// ---------------------------------------------------------------------------
+// Material-edit postprocess ledger (account-scoped).
+//
+// The body write and the follow-up reflection (linked problems' stale/review
+// flags, concepts/drafts review state mirrored to the server) are separate
+// steps. When the reflection only partially lands, this ledger keeps the
+// failure VISIBLE and retryable: the next save of the same body re-runs ONLY
+// the reflection, and the editor offers an explicit "retry reflection" action
+// instead of silently dropping the flags. Clearing happens only on explicit
+// success (zero failures), on delete, or when a different body is saved.
+// ---------------------------------------------------------------------------
+
+const MATERIAL_POSTPROCESS_KEY = 'material_postprocess_v1';
+
+export interface MaterialPostprocessState {
+  /** materialContentHash of the body whose reflection is pending/failed. */
+  contentHash: string;
+  /** How many server reflections failed in the last attempt. */
+  failedCount: number;
+  /** Human-readable summary of the last failure (Korean, UI-facing). */
+  lastError?: string;
+  updatedAt: string;
+}
+
+function readMaterialPostprocessStates(): Record<string, MaterialPostprocessState> {
+  return safeGetItem<Record<string, MaterialPostprocessState>>(MATERIAL_POSTPROCESS_KEY, {});
+}
+
+function writeMaterialPostprocessStates(registry: Record<string, MaterialPostprocessState>): boolean {
+  safeSetItem(MATERIAL_POSTPROCESS_KEY, registry);
+  const readBack = safeGetItem<Record<string, MaterialPostprocessState>>(MATERIAL_POSTPROCESS_KEY, {});
+  return JSON.stringify(readBack) === JSON.stringify(registry);
+}
+
+/** Records the reflection outcome for one saved body. Zero failures clears. */
+export function recordMaterialPostprocessState(
+  materialId: string,
+  input: { contentHash: string; failedCount: number; lastError?: string }
+): boolean {
+  if (!materialId || !input.contentHash) return false;
+  const registry = readMaterialPostprocessStates();
+  if (input.failedCount <= 0) {
+    if (registry[materialId] === undefined) return true;
+    delete registry[materialId];
+    return writeMaterialPostprocessStates(registry);
+  }
+  registry[materialId] = {
+    contentHash: input.contentHash,
+    failedCount: input.failedCount,
+    lastError: input.lastError,
+    updatedAt: new Date().toISOString(),
+  };
+  return writeMaterialPostprocessStates(registry);
+}
+
+export function getMaterialPostprocessState(materialId: string): MaterialPostprocessState | undefined {
+  if (!materialId) return undefined;
+  return readMaterialPostprocessStates()[materialId];
+}
+
+export function clearMaterialPostprocessState(materialId: string): void {
+  if (!materialId) return;
+  const registry = readMaterialPostprocessStates();
+  if (registry[materialId] === undefined) return;
+  delete registry[materialId];
+  writeMaterialPostprocessStates(registry);
 }
 
 // ---------------------------------------------------------------------------

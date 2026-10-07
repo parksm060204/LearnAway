@@ -188,6 +188,7 @@ import {
   recordMaterialSyncState,
   getMaterialServerSaveRecord,
   recordMaterialServerSave,
+  recordMaterialPostprocessState,
   type MaterialHashIdentity,
 } from '../lib/storage';
 import { loadDefaultMaterialPolicy, materialPolicyOf } from '../lib/materialPolicy';
@@ -201,6 +202,7 @@ import { upsertSubject } from '../lib/cloud/subjectsRepository';
 import {
   createMaterialSignedUrl,
   deleteMaterial,
+  generateJobId,
   getMaterialServerBodyHash,
   writeMaterial,
   writeMaterialMetadata,
@@ -3627,13 +3629,29 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               localBodyHash: contentHash,
               status: 'not_required',
             });
+            recordMaterialPostprocessState(updatedMat.id, {
+              contentHash,
+              failedCount: effects.serverReflectionFailed,
+              lastError:
+                effects.serverReflectionFailed > 0
+                  ? `연관 검토 상태 서버 반영 ${effects.serverReflectionFailed}건 실패`
+                  : undefined,
+            });
             showMaterialEditToast(updatedMat.title, effects, 'local');
-            return { status: 'not_required' };
+            return { status: 'not_required', postprocessFailed: effects.serverReflectionFailed };
           }
 
           const syncBody = materialPolicyOf(updatedMat).syncBody;
           const previousSave = getMaterialServerSaveRecord(updatedMat.id);
           const retryingSameContent = Boolean(previousSave && previousSave.contentHash === contentHash);
+          // The identity this attempt intends to store: required evidence for
+          // an 'already_saved' recovery (hash alone never proves OUR job landed).
+          const targetState = {
+            targetTitle: updatedMat.title,
+            targetStatus: updatedMat.status,
+            targetKind: updatedMat.kind,
+            targetSyncBody: syncBody,
+          };
 
           // Response-loss recovery: if a previous save of THIS exact content is
           // on record, ask the SERVER what it stored before uploading again.
@@ -3644,6 +3662,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               hasBody: probe.ok ? probe.data.hasBody : undefined,
               hash: probe.ok ? probe.data.hash : null,
               version: probe.ok ? probe.data.version : undefined,
+              pendingJobId: probe.ok ? probe.data.pendingJobId : undefined,
+              metadata: probe.ok ? probe.data.metadata : undefined,
             });
             if (verdict === 'already_saved') {
               // The server already holds this exact body: recover WITHOUT a new
@@ -3654,6 +3674,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 baseVersion: previousSave?.baseVersion,
                 syncBody,
                 jobId: previousSave?.jobId ?? null,
+                ...targetState,
               });
               recordMaterialSyncState(
                 updatedMat.id,
@@ -3662,8 +3683,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                   : { status: 'not_required' }
               );
               const effects = await applyMaterialEditSideEffects(updatedMat, scopeAtStart);
+              recordMaterialPostprocessState(updatedMat.id, {
+                contentHash,
+                failedCount: effects.serverReflectionFailed,
+                lastError:
+                  effects.serverReflectionFailed > 0
+                    ? `연관 검토 상태 서버 반영 ${effects.serverReflectionFailed}건 실패`
+                    : undefined,
+              });
               showMaterialEditToast(updatedMat.title, effects, 'recovered');
-              return { status: 'already_saved' };
+              return { status: 'already_saved', postprocessFailed: effects.serverReflectionFailed };
             }
             if (verdict === 'conflict') {
               showToast('서버에 이후 변경된 본문이 있어 덮어쓰지 않았습니다. 새로고침 후 다시 확인해 주세요.');
@@ -3679,30 +3708,40 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
           // Capture the server state BEFORE the attempt so a lost response can be
           // recognized as "server unchanged" (baseHash/baseVersion) on retry.
+          // The job id is created BEFORE the first request so the retry record
+          // references the exact job the server will stage.
           const probeBefore = await getMaterialServerBodyHash(updatedMat.id);
           const baseHash = probeBefore.ok ? probeBefore.data.hash : previousSave?.baseHash ?? null;
           const baseVersion = probeBefore.ok ? probeBefore.data.version : previousSave?.baseVersion ?? 0;
           const reuseJobId = retryingSameContent ? previousSave?.jobId ?? undefined : undefined;
+          const jobIdForAttempt = reuseJobId ?? generateJobId();
           recordMaterialServerSave(updatedMat.id, {
             contentHash,
             baseHash,
             baseVersion,
             syncBody,
-            jobId: reuseJobId ?? null,
+            jobId: jobIdForAttempt,
+            ...targetState,
           });
 
           const writeResult = await writeMaterial({
             material: updatedMat,
             content: contentForSave,
             policy: materialPolicyOf(updatedMat),
-            jobId: reuseJobId,
+            jobId: jobIdForAttempt,
+            expectedVersion: baseVersion,
           });
           if (!writeResult.ok) {
             // The request may have actually reached the server (response loss).
             // Keep the retry record; a later retry of the same content probes
-            // the server instead of uploading again.
+            // the server instead of uploading again. A stale base is a real
+            // conflict: never bypass it with a refreshed "latest".
             recordMaterialSyncState(updatedMat.id, { status: 'failed' });
-            showToast(`자료 수정 저장 실패: ${writeResult.error}`);
+            if (writeResult.error.includes('MATERIAL_VERSION_STALE')) {
+              showToast('서버에 이후 변경된 본문이 있어 덮어쓰지 않았습니다. 새로고침 후 다시 확인해 주세요.');
+            } else {
+              showToast(`자료 수정 저장 실패: ${writeResult.error}`);
+            }
             return { status: 'failed', error: writeResult.error };
           }
           // Remember the job id the write actually used so a retry reuses it.
@@ -3711,7 +3750,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             baseHash,
             baseVersion,
             syncBody,
-            jobId: writeResult.data.jobId ?? reuseJobId ?? null,
+            jobId: writeResult.data.jobId ?? jobIdForAttempt,
+            ...targetState,
           });
           recordMaterialSyncState(
             updatedMat.id,
@@ -3721,12 +3761,24 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           );
 
           const effects = await applyMaterialEditSideEffects(updatedMat, scopeAtStart);
+          recordMaterialPostprocessState(updatedMat.id, {
+            contentHash,
+            failedCount: effects.serverReflectionFailed,
+            lastError:
+              effects.serverReflectionFailed > 0
+                ? `연관 검토 상태 서버 반영 ${effects.serverReflectionFailed}건 실패`
+                : undefined,
+          });
           showMaterialEditToast(
             updatedMat.title,
             effects,
             writeResult.data?.fallbackUsed ? 'fallback' : 'saved'
           );
-          return { status: 'saved', fallbackUsed: writeResult.data?.fallbackUsed };
+          return {
+            status: 'saved',
+            fallbackUsed: writeResult.data?.fallbackUsed,
+            postprocessFailed: effects.serverReflectionFailed,
+          };
         }}
         onOpenConceptReview={(mat) => {
           setConceptReviewMaterial(mat || null);

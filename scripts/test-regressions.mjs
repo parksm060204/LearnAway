@@ -2443,6 +2443,48 @@ exports.requireApiUser = async () => {
     });
   });
 
+  await checkAsync('a write with a superseded expected version is refused without side effects', async () => {
+    const material = {
+      id: 'm-exp', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z', parsedMarkdown: '# new',
+    };
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      materials: [readyMaterialRow({
+        id: 'm-exp', version: 2, content_hash: 'base',
+        original_path: 'u1/m-exp/v1/original.pdf', markdown_path: 'u1/m-exp/v1/markdown.md',
+      })],
+      objects: { 'u1/m-exp/v1/markdown.md': new Blob(['# base']) },
+    }, async (client) => {
+      // The caller confirmed v1, but the server already holds v2: refuse BEFORE
+      // any pending claim, upload or cleanup so the newer row is never bypassed.
+      const stale = await cloudMaterials.writeMaterial({
+        material, content: { markdown: '# new' }, jobId: 'job-stale-1', expectedVersion: 1,
+      });
+      assert.equal(stale.ok, false);
+      assert.match(stale.error, /MATERIAL_VERSION_STALE/);
+      const row = client.__state.materials[0];
+      assert.equal(row.version, 2, 'active version untouched');
+      assert.equal(row.pending_job_id, null, 'pending slot untouched');
+      assert.equal(client.__state.objects.size, 1, 'no objects uploaded');
+
+      // A matching expected version proceeds normally.
+      const fresh = await cloudMaterials.writeMaterial({
+        material, content: { markdown: '# new' }, jobId: 'job-fresh-1', expectedVersion: 2,
+      });
+      assert.equal(fresh.ok, true, fresh.ok ? '' : fresh.error);
+      assert.equal(client.__state.materials[0].version, 3);
+    });
+  });
+
+  check('generated job ids are unique non-empty strings', () => {
+    const a = cloudMaterials.generateJobId();
+    const b = cloudMaterials.generateJobId();
+    assert.equal(typeof a, 'string');
+    assert.ok(a.length > 0);
+    assert.notEqual(a, b);
+  });
+
   await checkAsync('an empty pages array is stored and verified consistently', async () => {
     const material = {
       id: 'm-pages', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
@@ -5911,26 +5953,44 @@ exports.requireApiUser = async () => {
     assert.equal(practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, 'p3', 1, 'tab-B').answerText, 'B 탭 이후 입력');
   });
 
-  check('Stage 2: resolvePracticeTabId keeps a refreshed tab id but forks a duplicated tab', () => {
+  check('Stage 2: resolvePracticeTabId keeps its id on repeated calls in the same page', () => {
     sessionStorage.clear();
     for (const key of Array.from(data.keys())) {
       if (key.startsWith('redcall_practice_tab_leases_v1') || key.startsWith('redcall_practice_tab_id_v1')) data.delete(key);
     }
+    practiceAnswerDraft.resetPracticeTabPageForTests();
     const first = practiceAnswerDraft.resolvePracticeTabId(1000);
-    // A refresh fires pagehide -> the lease is released, so the same tab keeps its id.
+    const second = practiceAnswerDraft.resolvePracticeTabId(2000);
+    assert.equal(second, first, 'same page (remount/StrictMode) must keep the id');
+    const third = practiceAnswerDraft.resolvePracticeTabId(2000);
+    assert.equal(third, first);
+  });
+
+  check('Stage 2: a refresh keeps the tab id, a live duplicate forks', () => {
+    sessionStorage.clear();
+    for (const key of Array.from(data.keys())) {
+      if (key.startsWith('redcall_practice_tab_leases_v1') || key.startsWith('redcall_practice_tab_id_v1')) data.delete(key);
+    }
+    practiceAnswerDraft.resetPracticeTabPageForTests();
+    const first = practiceAnswerDraft.resolvePracticeTabId(1000);
+    // A refresh fires pagehide -> the lease is released, so the reloaded page
+    // (fresh JS context) keeps its stored id.
     practiceAnswerDraft.releasePracticeTabLease(first);
+    practiceAnswerDraft.resetPracticeTabPageForTests();
     const afterRefresh = practiceAnswerDraft.resolvePracticeTabId(2000);
     assert.equal(afterRefresh, first, 'same tab keeps its id across refresh');
 
-    // A duplicated tab copies sessionStorage but the original tab is still live:
-    // a fresh lease owned by a different nonce makes the duplicate FORK.
+    // A duplicated tab copies sessionStorage while the original tab is still
+    // live (fresh unreleased lease owned by another nonce): it must FORK.
+    practiceAnswerDraft.resetPracticeTabPageForTests();
     const duplicate = practiceAnswerDraft.resolvePracticeTabId(3000);
     assert.notEqual(duplicate, first, 'a duplicated tab forks a new id instead of colliding');
 
-    // The lease heartbeat can be refreshed so it stays owned during editing.
-    practiceAnswerDraft.refreshPracticeTabLease(first, 4000);
-    const stillOwned = practiceAnswerDraft.resolvePracticeTabId(4000);
-    assert.notEqual(stillOwned, first, 'the original id is still live-owned, so a second page forks');
+    // Heartbeats never steal a live page's lease; repeating on the same page
+    // keeps the forked id afterwards.
+    practiceAnswerDraft.refreshPracticeTabLease(duplicate, 4000);
+    const stillDuplicate = practiceAnswerDraft.resolvePracticeTabId(4000);
+    assert.equal(stillDuplicate, duplicate, 'the forked page keeps its own id afterwards');
   });
 
   await checkAsync('Stage 2: practiceAnswerDraft reports a failed device write instead of claiming success', async () => {
@@ -6070,10 +6130,20 @@ exports.requireApiUser = async () => {
   });
 
   check('Stage 2: server-save response loss recovery never re-uploads confirmed content', () => {
-    // already_saved when the server holds the exact hash.
+    // A hash match WITHOUT any evidence of OUR job (no base/job record) is
+    // insufficient proof -> unknown, never treated as "already saved".
     assert.equal(
       materialEditSave.evaluateMaterialServerRetry(
         { contentHash: 'h1' }, 'h1', { ok: true, hasBody: true, hash: 'h1' }
+      ),
+      'unknown'
+    );
+    // The same hash WITH base evidence of our job -> already saved.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(
+        { contentHash: 'h1', baseHash: 'h0', baseVersion: 3, jobId: 'job-1' },
+        'h1',
+        { ok: true, hasBody: true, hash: 'h1', version: 4 }
       ),
       'already_saved'
     );
@@ -6102,6 +6172,61 @@ exports.requireApiUser = async () => {
     assert.equal(
       materialEditSave.evaluateMaterialServerRetry(undefined, 'h1', { ok: true, hasBody: false, hash: null }),
       'no_record'
+    );
+  });
+
+  check('Stage 2: retry verdicts check job identity, base version and metadata together', () => {
+    const record = {
+      contentHash: 'h2', baseHash: 'h0', baseVersion: 3, syncBody: true, jobId: 'job-1',
+      targetTitle: 'T', targetStatus: 'ready', targetKind: 'pdf', targetSyncBody: true,
+    };
+    const meta = { title: 'T', status: 'ready', kind: 'pdf', syncBody: true };
+    // Another job owns the server slot right now -> conflict, never adopted.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(record, 'h2', {
+        ok: true, hasBody: true, hash: 'h0', version: 3, pendingJobId: 'job-other', metadata: meta,
+      }),
+      'conflict'
+    );
+    // Our own job is still staged -> safe to re-run the SAME job.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(record, 'h2', {
+        ok: true, hasBody: true, hash: 'h0', version: 3, pendingJobId: 'job-1', metadata: meta,
+      }),
+      'retry_same_job'
+    );
+    // Hash AND version advanced, but the stored metadata is someone else's edit
+    // -> conflict, never claimed as our save.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(record, 'h2', {
+        ok: true, hasBody: true, hash: 'h2', version: 4,
+        metadata: { ...meta, title: 'OTHER' },
+      }),
+      'conflict'
+    );
+    // Hash matches but the server cannot prove the metadata (missing column)
+    // -> unknown, never treated as "already saved".
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(record, 'h2', {
+        ok: true, hasBody: true, hash: 'h2', version: 4, metadata: null,
+      }),
+      'unknown'
+    );
+    // Metadata-only write with matching metadata and advanced version -> saved.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(
+        { ...record, syncBody: false }, 'h2',
+        { ok: true, hasBody: false, hash: null, version: 4, metadata: meta }
+      ),
+      'already_saved'
+    );
+    // Metadata-only write whose metadata changed -> conflict.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(
+        { ...record, syncBody: false }, 'h2',
+        { ok: true, hasBody: false, hash: null, version: 4, metadata: { ...meta, title: 'OTHER' } }
+      ),
+      'conflict'
     );
   });
 
@@ -6257,6 +6382,101 @@ exports.requireApiUser = async () => {
     const plan = cloudMockExamSync.planExpiredOpen(localExpired, serverSubmitted);
     assert.equal(plan.serverTerminal, true);
     assert.deepEqual(cloudMockExamSync.decideExpiredSubmit(plan, 7), { action: 'blocked_conflict' });
+  });
+
+  check('Stage 2: expired opens suppress auto-submit and map versions explicitly', () => {
+    // Only a deferred exam that was ALREADY expired at open suppresses
+    // interval/keystroke auto-submit; a genuinely running session keeps it.
+    assert.equal(
+      cloudMockExamSync.shouldAutoSubmitExpired({ deferExpiredSubmit: true, expiredAtOpen: true }),
+      false
+    );
+    assert.equal(
+      cloudMockExamSync.shouldAutoSubmitExpired({ deferExpiredSubmit: true, expiredAtOpen: false }),
+      true
+    );
+    assert.equal(
+      cloudMockExamSync.shouldAutoSubmitExpired({ deferExpiredSubmit: false, expiredAtOpen: true }),
+      true
+    );
+    // Local base resolution: pending proof first, then the session, then last known.
+    assert.equal(
+      cloudMockExamSync.resolveLocalBaseVersion({ pendingBaseVersion: 2, sessionServerVersion: 5, lastKnownVersion: 7 }),
+      2
+    );
+    assert.equal(
+      cloudMockExamSync.resolveLocalBaseVersion({ sessionServerVersion: 5, lastKnownVersion: 7 }),
+      5
+    );
+    assert.equal(cloudMockExamSync.resolveLocalBaseVersion({ lastKnownVersion: 7 }), 7);
+    // The URL-open mapping carries conflict, confirmed version and local base
+    // together so the caller cannot silently fall back to a default.
+    const local = { id: 'x1', status: 'submitted', answers: { p1: 'A' }, reasons: {}, evaluations: {} };
+    const server = { id: 'x1', status: 'in_progress', answers: { p1: 'B' }, reasons: {}, evaluations: {} };
+    assert.deepEqual(
+      cloudMockExamSync.planExpiredUrlOpen({ local, server, serverVersion: 9, localBaseVersion: 4 }),
+      { conflict: true, confirmedVersion: 9, localBaseVersion: 4 }
+    );
+  });
+
+  check('Stage 2: conflict archives are preserved, never silently replaced or auto-cleared', () => {
+    const first = { sessionId: 's1', answers: { p1: 'A' }, baseVersion: 1, comparedServerVersion: 2, savedAt: 't1' };
+    assert.deepEqual(pendingAnswers.saveConflictArchive('archive-user', first), { ok: true });
+    assert.deepEqual(pendingAnswers.loadConflictArchive('archive-user', 's1').answers, { p1: 'A' });
+    // An identical re-save is a no-op success.
+    assert.deepEqual(pendingAnswers.saveConflictArchive('archive-user', first), { ok: true });
+    // A different second conflict never silently replaces the earlier copy.
+    const refused = pendingAnswers.saveConflictArchive('archive-user', { ...first, answers: { p1: 'B' }, savedAt: 't2' });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.reason, 'exists');
+    assert.deepEqual(pendingAnswers.loadConflictArchive('archive-user', 's1').answers, { p1: 'A' });
+    // Only an explicit user deletion clears the archive.
+    assert.equal(pendingAnswers.clearConflictArchive('archive-user', 's1'), true);
+    assert.equal(pendingAnswers.loadConflictArchive('archive-user', 's1'), null);
+    // An unverified store reports failure instead of claiming success.
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = () => { throw new Error('quota exceeded'); };
+    try {
+      const failed = pendingAnswers.saveConflictArchive('archive-user', first);
+      assert.equal(failed.ok, false);
+      assert.equal(failed.reason, 'unverified');
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+    assert.equal(pendingAnswers.loadConflictArchive('archive-user', 's1'), null);
+  });
+
+  check('Stage 2: postprocess ledger and retry target identity are explicit', () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'ledger-user' });
+    assert.equal(
+      storage.recordMaterialPostprocessState('m-pp', { contentHash: 'h1', failedCount: 2, lastError: 'x' }),
+      true
+    );
+    const pp = storage.getMaterialPostprocessState('m-pp');
+    assert.equal(pp.failedCount, 2);
+    assert.equal(pp.contentHash, 'h1');
+    // Zero failures clears the entry.
+    assert.equal(storage.recordMaterialPostprocessState('m-pp', { contentHash: 'h1', failedCount: 0 }), true);
+    assert.equal(storage.getMaterialPostprocessState('m-pp'), undefined);
+    // Retry records carry the intended target identity and survive partial updates.
+    assert.equal(
+      storage.recordMaterialServerSave('m-t', {
+        contentHash: 'h2', baseHash: 'h0', baseVersion: 3, syncBody: true, jobId: 'job-1',
+        targetTitle: 'T', targetStatus: 'ready', targetKind: 'pdf', targetSyncBody: true,
+      }),
+      true
+    );
+    assert.equal(storage.recordMaterialServerSave('m-t', { contentHash: 'h2' }), true);
+    const merged = storage.getMaterialServerSaveRecord('m-t');
+    assert.equal(merged.jobId, 'job-1');
+    assert.equal(merged.targetTitle, 'T');
+    assert.equal(merged.targetSyncBody, true);
+    // An explicit delete clears both ledgers.
+    assert.equal(storage.recordMaterialPostprocessState('m-t', { contentHash: 'h2', failedCount: 1 }), true);
+    storage.markMaterialDeleted('m-t');
+    assert.equal(storage.getMaterialServerSaveRecord('m-t'), undefined);
+    assert.equal(storage.getMaterialPostprocessState('m-t'), undefined);
+    storageScope.setStorageScope({ kind: 'legacy' });
   });
 
   await checkAsync('Stage 2: an explicit choice submits with the confirmed version, and a later server change re-conflicts', async () => {
