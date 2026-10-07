@@ -48,7 +48,6 @@ import {
   saveStoredSettings,
   recordAttemptAndUpdateConcept,
   recordAssistedRevisionAttempt,
-  resetToInitialDemoData,
   postponeConceptReview,
   reportProblemError,
   updateProblemQualityStatus,
@@ -153,14 +152,12 @@ import { ConceptReviewModal } from '../components/ConceptReviewModal';
 import { ProblemGeneratorModal } from '../components/ProblemGeneratorModal';
 import { ProblemReviewModal } from '../components/ProblemReviewModal';
 import { PdfViewerModal } from '../components/PdfViewerModal';
-import { SettingsModal } from '../components/SettingsModal';
 import { MockExamModal, MockExamInitialConfig } from '../components/MockExamModal';
 import { AddSubjectModal } from '../components/AddSubjectModal';
 import { StudyPlanModal } from '../components/StudyPlanModal';
 import { calculateDDay, toSeoulDateString, addDaysToDate } from '../lib/dateUtils';
 import { getTodayPendingItems, resolvePrimaryCta } from '../lib/todayStudy';
 import {
-  clearAllMaterialContent,
   deleteMaterialContent,
   deleteMaterialOriginal,
   loadMaterialContentResult,
@@ -283,7 +280,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [isScopeModalOpen, setIsScopeModalOpen] = useState(false);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [isProblemSessionOpen, setIsProblemSessionOpen] = useState(false);
-  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [aiConnectionMissing, setAiConnectionMissing] = useState(false);
   const [isMockExamModalOpen, setIsMockExamModalOpen] = useState(false);
   const [mockExamInitialConfig, setMockExamInitialConfig] = useState<MockExamInitialConfig | null>(null);
@@ -2869,13 +2865,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   };
 
 
-  // Reset to initial demo data (also clears IndexedDB material bodies + memory cache)
-  const handleResetData = async () => {
-    resetToInitialDemoData();
-    await clearAllMaterialContent();
-    window.location.reload();
-  };
-
   if (loadError) {
     return (
       <div className="min-h-screen bg-[#faf8f4] flex flex-col items-center justify-center gap-4 p-6 text-center text-[#191817]">
@@ -3358,7 +3347,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               saveStoredSettings(newSettings);
               showToast('복습 감쇠 모델 설정이 저장되었습니다.');
             }}
-            onResetData={handleResetData}
             materials={materials}
             subjects={subjects}
             onRestoreMaterials={handleRestoreMaterials}
@@ -3501,7 +3489,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
           <div className="flex flex-wrap items-center gap-3 text-[#57544e]">
             <button
-              onClick={() => setIsSettingsModalOpen(true)}
+              onClick={() => handleSelectTab('settings')}
               className="hover:text-[#191817] underline decoration-dotted"
             >
               설정
@@ -3663,12 +3651,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               hash: probe.ok ? probe.data.hash : null,
               version: probe.ok ? probe.data.version : undefined,
               pendingJobId: probe.ok ? probe.data.pendingJobId : undefined,
+              completedJobId: probe.ok ? probe.data.completedJobId : undefined,
               metadata: probe.ok ? probe.data.metadata : undefined,
             });
             if (verdict === 'already_saved') {
               // The server already holds this exact body: recover WITHOUT a new
               // upload/version bump, but run the SAME post-processing as a save.
-              recordMaterialServerSave(updatedMat.id, {
+              const recoveryRecordStored = recordMaterialServerSave(updatedMat.id, {
                 contentHash,
                 baseHash: previousSave?.baseHash ?? null,
                 baseVersion: previousSave?.baseVersion,
@@ -3676,6 +3665,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 jobId: previousSave?.jobId ?? null,
                 ...targetState,
               });
+              if (!recoveryRecordStored) {
+                showToast('서버 저장은 확인했지만 복구 기록을 확인하지 못했습니다. 입력을 보존하고 재시도해 주세요.');
+                return { status: 'failed', error: '서버 저장 상태는 확인했지만 복구 기록을 저장하지 못했습니다.' };
+              }
               recordMaterialSyncState(
                 updatedMat.id,
                 syncBody
@@ -3711,11 +3704,15 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           // The job id is created BEFORE the first request so the retry record
           // references the exact job the server will stage.
           const probeBefore = await getMaterialServerBodyHash(updatedMat.id);
-          const baseHash = probeBefore.ok ? probeBefore.data.hash : previousSave?.baseHash ?? null;
-          const baseVersion = probeBefore.ok ? probeBefore.data.version : previousSave?.baseVersion ?? 0;
+          if (!probeBefore.ok) {
+            showToast('저장 전 서버 자료 상태를 확인하지 못했습니다. 입력은 그대로 보존했습니다.');
+            return { status: 'failed', error: `저장 전 서버 상태 확인 실패: ${probeBefore.error}` };
+          }
+          const baseHash = probeBefore.data.hash;
+          const baseVersion = probeBefore.data.version;
           const reuseJobId = retryingSameContent ? previousSave?.jobId ?? undefined : undefined;
           const jobIdForAttempt = reuseJobId ?? generateJobId();
-          recordMaterialServerSave(updatedMat.id, {
+          const retryRecordStored = recordMaterialServerSave(updatedMat.id, {
             contentHash,
             baseHash,
             baseVersion,
@@ -3723,6 +3720,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             jobId: jobIdForAttempt,
             ...targetState,
           });
+          if (!retryRecordStored) {
+            showToast('재시도 복구 정보를 이 기기에 저장하지 못해 서버 쓰기를 시작하지 않았습니다.');
+            return { status: 'failed', error: '재시도 복구 정보를 저장하지 못했습니다. 저장 공간을 확인해 주세요.' };
+          }
 
           const writeResult = await writeMaterial({
             material: updatedMat,
@@ -3744,15 +3745,24 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             }
             return { status: 'failed', error: writeResult.error };
           }
+          if (writeResult.data.jobId !== jobIdForAttempt) {
+            recordMaterialSyncState(updatedMat.id, { status: 'failed' });
+            showToast('서버가 다른 작업 ID로 저장을 확인했습니다. 입력을 보존했으니 새로고침 후 다시 확인해 주세요.');
+            return { status: 'failed', error: 'MATERIAL_JOB_ID_MISMATCH' };
+          }
           // Remember the job id the write actually used so a retry reuses it.
-          recordMaterialServerSave(updatedMat.id, {
+          const confirmedRecordStored = recordMaterialServerSave(updatedMat.id, {
             contentHash,
             baseHash,
             baseVersion,
             syncBody,
-            jobId: writeResult.data.jobId ?? jobIdForAttempt,
+            jobId: writeResult.data.jobId,
             ...targetState,
           });
+          if (!confirmedRecordStored) {
+            showToast('서버 저장은 응답으로 확인했지만 복구 정보를 갱신하지 못했습니다. 입력을 보존하고 재시도해 주세요.');
+            return { status: 'failed', error: '서버 저장 응답을 받았지만 복구 기록을 확인하지 못했습니다.' };
+          }
           recordMaterialSyncState(
             updatedMat.id,
             syncBody
@@ -3925,22 +3935,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       )}
 
       {/* 6. Settings Modal */}
-      <SettingsModal
-        isOpen={isSettingsModalOpen}
-        onClose={() => setIsSettingsModalOpen(false)}
-        settings={settings}
-        onSaveSettings={(newSettings) => {
-          setSettings(newSettings);
-          saveStoredSettings(newSettings);
-          showToast('복습 감쇠 모델 설정이 저장되었습니다.');
-        }}
-        onResetData={handleResetData}
-        materials={materials}
-        subjects={subjects}
-        onRestoreMaterials={handleRestoreMaterials}
-        migrationBlocks={migrationBlocks}
-      />
-
       {/* 7. Mock Exam (Handled as dedicated screen above) */}
 
       {/* 8. Add Subject Modal (Stage 0) */}

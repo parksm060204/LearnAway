@@ -40,6 +40,8 @@ export interface MaterialRow {
   upload_state: MaterialUploadState;
   upload_error: string | null;
   version: number;
+  /** Last job that switched a pending material version into the active row. */
+  last_completed_job_id?: string | null;
   content_hash: string | null;
   // Storage policy + actual sync state (see migration 9).
   sync_body: boolean;

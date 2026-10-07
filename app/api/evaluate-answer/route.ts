@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
+import { createClient } from '../../../lib/supabase/server';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { validateEvaluationOutput, validateEvaluationRubric } from '../../../lib/evaluationValidation';
@@ -35,6 +36,48 @@ export interface EvaluateAnswerRequest {
   reasonNotApplicableJustification?: string;
 }
 
+const MAX_REQUEST_BYTES = 128 * 1024;
+const MAX_PROMPT_CHARS = 12_000;
+const MAX_ANSWER_CHARS = 16_000;
+const MAX_MODEL_ANSWER_CHARS = 12_000;
+const MAX_AUXILIARY_CHARS = 8_000;
+const MAX_HINTS = 12;
+
+async function readBoundedJson(req: NextRequest): Promise<unknown> {
+  const contentLength = Number(req.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BYTES) throw new RangeError('REQUEST_TOO_LARGE');
+  if (!req.body) throw new SyntaxError('EMPTY_BODY');
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_REQUEST_BYTES) {
+        await reader.cancel();
+        throw new RangeError('REQUEST_TOO_LARGE');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+}
+
+function isStringWithin(value: unknown, limit: number): value is string | undefined {
+  return value === undefined || (typeof value === 'string' && value.length <= limit);
+}
+
 export async function POST(req: NextRequest) {
   const auth = await requireApiUser();
   if (!auth.ok) return auth.response;
@@ -42,9 +85,12 @@ export async function POST(req: NextRequest) {
   try {
     let body: EvaluateAnswerRequest;
     try {
-      body = await req.json();
+      body = await readBoundedJson(req) as EvaluateAnswerRequest;
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Invalid body');
-    } catch {
+    } catch (cause) {
+      if (cause instanceof RangeError) {
+        return NextResponse.json({ success: false, error: '요청 본문이 너무 큽니다.' }, { status: 413 });
+      }
       return NextResponse.json({ success: false, error: '요청 본문은 JSON 객체여야 합니다.' }, { status: 400 });
     }
     const {
@@ -67,6 +113,35 @@ export async function POST(req: NextRequest) {
       isReasonNotApplicable = false,
       reasonNotApplicableJustification,
     } = body;
+
+    const boundedStrings =
+      typeof problemTitle === 'string' &&
+      isStringWithin(problemTitle, 300) &&
+      isStringWithin(problemPrompt, MAX_PROMPT_CHARS) &&
+      isStringWithin(modelAnswer, MAX_MODEL_ANSWER_CHARS) &&
+      isStringWithin(userAnswer, MAX_ANSWER_CHARS) &&
+      isStringWithin(appliedConditionNote, 2_000) &&
+      isStringWithin(mathFormula, 4_000) &&
+      isStringWithin(codeSnippet, 6_000) &&
+      isStringWithin(solvingReason, MAX_ANSWER_CHARS) &&
+      isStringWithin(reasonNotApplicableJustification, 2_000);
+    const validHints = Array.isArray(hints) && hints.length <= MAX_HINTS && hints.every(
+      (hint) => typeof hint === 'string' && hint.length <= 1_000
+    );
+    if (!boundedStrings || !Array.isArray(rubric) || rubric.length > 12 || !validHints || !Number.isInteger(revealedHintCount) || revealedHintCount < 0 ||
+        (conceptIds !== undefined && (!Array.isArray(conceptIds) || conceptIds.length > 20 || conceptIds.some((id) => typeof id !== 'string' || id.length > 200)))) {
+      return NextResponse.json({ success: false, error: '요청의 텍스트 또는 목록 크기가 허용 범위를 넘었습니다.' }, { status: 400 });
+    }
+    const auxiliaryTextLength = [problemTitle, appliedConditionNote, mathFormula, codeSnippet, solvingReason,
+      reasonNotApplicableJustification].reduce((sum, value) => sum + (typeof value === 'string' ? value.length : 0), 0) +
+      hints.reduce((sum, hint) => sum + hint.length, 0) +
+      (Array.isArray(rubric) ? rubric.reduce((sum, criterion) => sum +
+        (criterion && typeof criterion === 'object'
+          ? String(criterion.label ?? '').length + String(criterion.description ?? '').length
+          : 0), 0) : MAX_AUXILIARY_CHARS + 1);
+    if (auxiliaryTextLength > MAX_AUXILIARY_CHARS) {
+      return NextResponse.json({ success: false, error: '요청의 보조 설명이 너무 깁니다.' }, { status: 400 });
+    }
 
     // 1. Mandatory Input Validations
     if (typeof userAnswer !== 'string' || !userAnswer.trim()) {
@@ -103,6 +178,20 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
         { status: needsAiConnection ? 400 : 502 }
+      );
+    }
+
+    const supabase = await createClient();
+    const { data: budgetData, error: budgetError } = await supabase.rpc('consume_ai_call_budget');
+    if (budgetError || !budgetData || typeof budgetData !== 'object') {
+      return NextResponse.json({ success: false, error: 'AI 호출 한도를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.' }, { status: 503 });
+    }
+    const budget = budgetData as { allowed?: boolean; retryAfterSeconds?: number };
+    if (!budget.allowed) {
+      const retryAfter = Math.max(1, Math.min(60, Number(budget.retryAfterSeconds) || 60));
+      return NextResponse.json(
+        { success: false, error: '평가 요청이 잠시 많습니다. 잠시 후 다시 시도해 주세요.', retryAfterSeconds: retryAfter },
+        { status: 429, headers: { 'Retry-After': String(retryAfter) } }
       );
     }
 
@@ -278,6 +367,7 @@ ${
       user: userPrompt,
       temperature: 0.15, // Low temperature for consistent academic grading
       json: true,
+      outputTokenCeiling: 16_000,
       timeoutMs: 45000,
       label: 'evaluate-answer',
     }, cred.config);

@@ -45,6 +45,8 @@ export interface AiChatOptions {
   user: string;
   temperature?: number;
   maxOutputTokens?: number;
+  /** Optional hard ceiling applied after provider-specific minimum budgets. */
+  outputTokenCeiling?: number;
   /** Request a JSON response format where the provider supports it. */
   json?: boolean;
   timeoutMs?: number;
@@ -92,7 +94,11 @@ function buildRequestBody(options: AiChatOptions, config: AiConfig): Record<stri
   // Manage output budget per task. Reasoning models (school gateway) need a
   // larger budget or the provider returns an empty/truncated answer.
   const requested = options.maxOutputTokens ?? 0;
-  const budget = Math.max(requested, config.minOutputTokens || 0);
+  const minimumBudget = Math.max(requested, config.minOutputTokens || 0);
+  const ceiling = options.outputTokenCeiling;
+  const budget = Number.isFinite(ceiling) && (ceiling ?? 0) > 0
+    ? Math.min(minimumBudget, ceiling as number)
+    : minimumBudget;
   if (budget > 0) body.max_tokens = budget;
 
   // Structured output. Unverified providers get NO response_format unless the

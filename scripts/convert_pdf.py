@@ -9,13 +9,14 @@ import sys
 import os
 import json
 
-def convert_pdf_to_markdown(pdf_path):
+def convert_pdf_to_markdown(pdf_path, max_pages=250):
     if not os.path.exists(pdf_path):
         return {
             "success": False,
             "hasText": False,
             "pageCount": 0,
-            "error": f"파일을 찾을 수 없습니다: {pdf_path}",
+            "code": "PDF_NOT_FOUND",
+            "error": "업로드된 임시 PDF 파일을 찾지 못했습니다.",
             "pages": [],
             "fullMarkdown": ""
         }
@@ -28,7 +29,8 @@ def convert_pdf_to_markdown(pdf_path):
             "success": False,
             "hasText": False,
             "pageCount": 0,
-            "error": f"PyMuPDF4LLM 라이브러리가 로드되지 않았습니다: {str(e)}",
+            "code": "WORKER_DEPENDENCY_MISSING",
+            "error": "PDF 변환기가 서버에 준비되지 않았습니다.",
             "pages": [],
             "fullMarkdown": ""
         }
@@ -38,11 +40,23 @@ def convert_pdf_to_markdown(pdf_path):
         doc = pymupdf.open(pdf_path)
         page_count = len(doc)
 
+        if page_count > max_pages:
+            return {
+                "success": False,
+                "hasText": False,
+                "pageCount": page_count,
+                "code": "PDF_PAGE_LIMIT",
+                "error": "PDF 페이지 수가 허용 범위를 넘었습니다.",
+                "pages": [],
+                "fullMarkdown": ""
+            }
+
         if page_count == 0:
             return {
                 "success": False,
                 "hasText": False,
                 "pageCount": 0,
+                "code": "PDF_EMPTY",
                 "error": "빈 PDF 문서입니다.",
                 "pages": [],
                 "fullMarkdown": ""
@@ -80,6 +94,7 @@ def convert_pdf_to_markdown(pdf_path):
                 "success": False,
                 "hasText": False,
                 "pageCount": page_count,
+                "code": "PDF_NO_TEXT",
                 "error": "이미지 기반 PDF이거나 텍스트 레이어가 없어 텍스트를 추출하지 못했습니다. 원본 확인이 필요합니다.",
                 "pages": pages,
                 "fullMarkdown": ""
@@ -94,12 +109,13 @@ def convert_pdf_to_markdown(pdf_path):
             "error": None
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "success": False,
             "hasText": False,
             "pageCount": 0,
-            "error": f"변환 실패: {str(e)}",
+            "code": "PDF_CONVERSION_FAILED",
+            "error": "PDF 페이지를 변환하지 못했습니다. 파일이 손상되지 않았는지 확인해 주세요.",
             "pages": [],
             "fullMarkdown": ""
         }
@@ -127,5 +143,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     pdf_file = sys.argv[1]
-    result = convert_pdf_to_markdown(pdf_file)
+    try:
+        max_pages = max(1, min(int(sys.argv[2]), 250)) if len(sys.argv) > 2 else 250
+    except (TypeError, ValueError):
+        max_pages = 250
+    result = convert_pdf_to_markdown(pdf_file, max_pages)
     print(json.dumps(result, ensure_ascii=False))

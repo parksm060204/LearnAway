@@ -739,7 +739,7 @@ export function MaterialEditorModal({
             {saveOutcome.failed.length > 0 && <p>실패: {saveOutcome.failed.join(', ')}</p>}
             {saveOutcome.notes.map((n) => <p key={n}>{n}</p>)}
             {!saveOutcome.canClose && (
-              <button type="button" disabled={isSaving} onClick={() => { void handleSave(); }} className="mt-1 px-2.5 py-1 bg-[#c52828] text-white rounded-xs disabled:opacity-50">다시 저장 (AI 분석은 다시 호출하지 않음)</button>
+               <button type="button" disabled={isSaving} onClick={() => { void handleSave(); }} className="mt-1 px-2.5 py-1 bg-[#c52828] text-white rounded-xs disabled:opacity-50">{postprocessFailed > 0 ? '후처리 다시 시도' : '다시 저장'} (AI 분석은 다시 호출하지 않음)</button>
             )}
             {saveOutcome.canClose && postprocessFailed > 0 && (
               <button type="button" disabled={isSaving} onClick={() => { void handleSave(); }} className="mt-1 px-2.5 py-1 bg-amber-700 text-white rounded-xs disabled:opacity-50">연관 검토 상태 다시 반영 (본문은 다시 업로드하지 않음)</button>

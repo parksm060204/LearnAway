@@ -27,7 +27,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/historyMappers.ts', 'lib/cloud/historyMerge.ts', 'lib/cloud/historyRepository.ts',
   'lib/cloud/historyMigration.ts',
   'lib/cloud/mockExamSync.ts', 'lib/cloud/pendingExamAnswers.ts', 'lib/cloud/draftPersistence.ts',
-  'app/api/evaluate-answer/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
+  'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -231,8 +231,17 @@ exports.requireApiUser = async () => {
   process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
   const aiClient = load(path.join(output, 'lib/aiClient.js'));
   const aiCredentials = load(path.join(output, 'lib/aiCredentials.js'));
+  globalThis.__fakeSupabaseClient = {
+    rpc: async (name) => ({
+      data: name === 'consume_ai_call_budget'
+        ? { allowed: true, remaining: 9, retryAfterSeconds: 60 }
+        : null,
+      error: null,
+    }),
+  };
   const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
   const { POST } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+  const { POST: convertPdf } = load(path.join(output, 'app/api/convert/route.js'));
   const body = { ...attempt, domain: 'math_stats', problemTitle: 'Test', problemPrompt: 'Test question',
     userAnswer: 'answer', modelAnswer: 'model', rubric, revealedHintCount: 0 };
   let calls = 0;
@@ -249,16 +258,22 @@ exports.requireApiUser = async () => {
   const valid = await POST(request(body));
   const response = await valid.json();
   check('valid API evaluation returns actual rubric sum', () => {
-    assert.equal(valid.status, 200); assert.equal(response.evaluation.calculatedScore, 80.5);
+    assert.equal(valid.status, 200, JSON.stringify(response)); assert.equal(response.evaluation.calculatedScore, 80.5);
   });
 
   // ---- Authentication gate ----
   const callsBeforeAnonymous = calls;
   auth.__setMode('anonymous');
   const unauthenticated = await POST(request(body));
+  const unauthenticatedPdf = await convertPdf(new NextRequest('http://localhost/api/convert', {
+    method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: 'not a multipart PDF request',
+  }));
   check('unauthenticated AI evaluation is blocked with 401 before any AI call', () => {
     assert.equal(unauthenticated.status, 401);
     assert.equal(calls, callsBeforeAnonymous);
+  });
+  check('unauthenticated PDF conversion is rejected before parsing or worker startup', () => {
+    assert.equal(unauthenticatedPdf.status, 401);
   });
   auth.__setMode('authenticated');
 
@@ -431,11 +446,12 @@ exports.requireApiUser = async () => {
       rows.filter((row) => filters.every(([col, val]) => row[col] === val));
 
     function tableBuilder(table) {
-      const ctx = { op: 'select', payload: null, onConflict: null, ignoreDuplicates: false, filters: [], order: [], range: null };
+      const ctx = { op: 'select', payload: null, onConflict: null, ignoreDuplicates: false, filters: [], order: [], range: null, limit: null };
       const builder = {
         select() { return builder; },
         order(col, opts) { ctx.order.push({ col, opts }); return builder; },
         range(from, to) { ctx.range = { from, to }; return builder; },
+        limit(count) { ctx.limit = count; return builder; },
         eq(col, val) { ctx.filters.push([col, val]); return builder; },
         update(payload) { ctx.op = 'update'; ctx.payload = payload; return builder; },
         upsert(payload, opts) {
@@ -467,6 +483,7 @@ exports.requireApiUser = async () => {
               });
             }
             if (ctx.range) result = result.slice(ctx.range.from, ctx.range.to + 1);
+            if (ctx.limit !== null) result = result.slice(0, ctx.limit);
             if (maybe === true) return { data: result[0] ? clone(result[0]) : null, error: null };
             if (maybe === false) {
               if (result.length === 0) return { data: null, error: { message: 'no rows', code: 'PGRST116' } };
@@ -5729,8 +5746,17 @@ exports.requireApiUser = async () => {
       serverFallbackUsed: true,
       local: 'saved',
     });
-    assert.equal(fallbackRes.canClose, true);
+    assert.equal(fallbackRes.canClose, false, 'missing server policy migration keeps the save incomplete');
     assert.ok(fallbackRes.notes.some((n) => n.includes('마이그레이션 9')));
+
+    const postprocessPending = materialEditSave.evaluateMaterialEditSave({
+      server: 'saved',
+      local: 'saved',
+      postprocessFailed: 1,
+    });
+    assert.equal(postprocessPending.canClose, false, 'unfinished server reflections cannot be reported complete');
+    assert.equal(postprocessPending.level, 'partial');
+    assert.equal(postprocessPending.failed.length, 1);
 
     // 4. Retry after server write already succeeded -> canClose: true
     const retryRes = materialEditSave.evaluateMaterialEditSave({
@@ -6143,7 +6169,7 @@ exports.requireApiUser = async () => {
       materialEditSave.evaluateMaterialServerRetry(
         { contentHash: 'h1', baseHash: 'h0', baseVersion: 3, jobId: 'job-1' },
         'h1',
-        { ok: true, hasBody: true, hash: 'h1', version: 4 }
+        { ok: true, hasBody: true, hash: 'h1', version: 4, completedJobId: 'job-1' }
       ),
       'already_saved'
     );
@@ -6199,7 +6225,7 @@ exports.requireApiUser = async () => {
     // -> conflict, never claimed as our save.
     assert.equal(
       materialEditSave.evaluateMaterialServerRetry(record, 'h2', {
-        ok: true, hasBody: true, hash: 'h2', version: 4,
+        ok: true, hasBody: true, hash: 'h2', version: 4, completedJobId: 'job-1',
         metadata: { ...meta, title: 'OTHER' },
       }),
       'conflict'
@@ -6208,7 +6234,7 @@ exports.requireApiUser = async () => {
     // -> unknown, never treated as "already saved".
     assert.equal(
       materialEditSave.evaluateMaterialServerRetry(record, 'h2', {
-        ok: true, hasBody: true, hash: 'h2', version: 4, metadata: null,
+        ok: true, hasBody: true, hash: 'h2', version: 4, completedJobId: 'job-1', metadata: null,
       }),
       'unknown'
     );
@@ -6216,7 +6242,7 @@ exports.requireApiUser = async () => {
     assert.equal(
       materialEditSave.evaluateMaterialServerRetry(
         { ...record, syncBody: false }, 'h2',
-        { ok: true, hasBody: false, hash: null, version: 4, metadata: meta }
+        { ok: true, hasBody: false, hash: null, version: 4, completedJobId: 'job-1', metadata: meta }
       ),
       'already_saved'
     );
@@ -6224,9 +6250,23 @@ exports.requireApiUser = async () => {
     assert.equal(
       materialEditSave.evaluateMaterialServerRetry(
         { ...record, syncBody: false }, 'h2',
-        { ok: true, hasBody: false, hash: null, version: 4, metadata: { ...meta, title: 'OTHER' } }
+        { ok: true, hasBody: false, hash: null, version: 4, completedJobId: 'job-1', metadata: { ...meta, title: 'OTHER' } }
       ),
       'conflict'
+    );
+    // Matching content and metadata from another completed job is a conflict.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(record, 'h2', {
+        ok: true, hasBody: true, hash: 'h2', version: 4, completedJobId: 'job-other', metadata: meta,
+      }),
+      'conflict'
+    );
+    // Missing completion identity is insufficient proof after a version bump.
+    assert.equal(
+      materialEditSave.evaluateMaterialServerRetry(record, 'h2', {
+        ok: true, hasBody: true, hash: 'h2', version: 4, metadata: meta,
+      }),
+      'unknown'
     );
   });
 
@@ -6286,7 +6326,7 @@ exports.requireApiUser = async () => {
     );
     // Server confirms the target body -> already saved, never re-uploaded.
     assert.equal(
-      materialEditSave.evaluateMaterialServerRetry(prior, 'h2', { ok: true, hasBody: true, hash: 'h2', version: 4 }),
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h2', { ok: true, hasBody: true, hash: 'h2', version: 4, completedJobId: 'job-1' }),
       'already_saved'
     );
     // A body that matches NEITHER the base nor the target belongs to another
@@ -6311,7 +6351,7 @@ exports.requireApiUser = async () => {
     const prior = { contentHash: 'h-meta', baseHash: 'h0', baseVersion: 7, syncBody: false, jobId: 'job-9' };
     // Version advanced: the metadata write landed.
     assert.equal(
-      materialEditSave.evaluateMaterialServerRetry(prior, 'h-meta', { ok: true, hasBody: false, hash: null, version: 8 }),
+      materialEditSave.evaluateMaterialServerRetry(prior, 'h-meta', { ok: true, hasBody: false, hash: null, version: 8, completedJobId: 'job-9' }),
       'already_saved'
     );
     // Version unchanged: the request did not land -> redo the same job.

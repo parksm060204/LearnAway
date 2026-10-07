@@ -184,6 +184,7 @@ export interface MaterialServerState {
   hasBody: boolean;
   version: number;
   pendingJobId: string | null;
+  completedJobId?: string | null;
   metadata: {
     title?: string;
     status?: string;
@@ -200,9 +201,10 @@ export async function getMaterialServerBodyHash(
     const rows = await listMaterialRows();
     if (!rows.ok) return rows;
     const row = rows.data.find((r) => r.id === materialId);
-    if (!row) return repoOk({ hash: null, hasBody: false, version: 0, pendingJobId: null, metadata: null });
+    if (!row) return repoOk({ hash: null, hasBody: false, version: 0, pendingJobId: null, completedJobId: null, metadata: null });
     const version = row.version ?? 0;
     const pendingJobId = row.pending_job_id ?? null;
+    const completedJobId = row.last_completed_job_id;
     const metadata = {
       title: row.title ?? undefined,
       status: row.status ?? undefined,
@@ -210,11 +212,11 @@ export async function getMaterialServerBodyHash(
       syncBody: Boolean(row.markdown_path) || Boolean((row as { body_synced?: unknown }).body_synced),
     };
     if (!row.markdown_path && !row.transcript_path && !row.pages_path) {
-      return repoOk({ hash: null, hasBody: false, version, pendingJobId, metadata });
+      return repoOk({ hash: null, hasBody: false, version, pendingJobId, completedJobId, metadata });
     }
     const content = await downloadMaterialContent(row);
     if (!content.ok) return content;
-    return repoOk({ hash: materialContentHash(content.data), hasBody: true, version, pendingJobId, metadata });
+    return repoOk({ hash: materialContentHash(content.data), hasBody: true, version, pendingJobId, completedJobId, metadata });
   } catch (error) {
     return repoError(toMessage(error, '서버 본문을 확인하지 못했습니다.'));
   }
@@ -329,7 +331,7 @@ export async function writeMaterialMetadata(
     const base = materialBaseUpsert(input.material);
     const existingResult = await supabase
       .from('materials')
-      .select('*')
+      .select('*,last_completed_job_id')
       .eq('id', input.material.id)
       .maybeSingle();
     if (existingResult.error) return repoError(existingResult.error.message);
@@ -468,6 +470,17 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
       ? (backupOriginal ? paths.original : existing?.original_path ?? existing?.pending_original_path ?? null)
       : existing?.original_path ?? existing?.pending_original_path ?? null;
 
+    // A completed-job identity is required to recover response-loss retries.
+    // Check the migration before claiming a pending slot or uploading any file.
+    const jobIdentitySchema = await supabase
+      .from('materials')
+      .select('last_completed_job_id')
+      .eq('id', material.id)
+      .limit(1);
+    if (jobIdentitySchema.error) {
+      return repoError('서버 자료 작업 ID 검증을 사용할 수 없습니다. 데이터베이스 migration 적용 상태를 확인해 주세요.');
+    }
+
     const pending = {
       pending_job_id: jobId,
       pending_version: version,
@@ -601,6 +614,7 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
       is_converted: material.isConverted ?? material.status === 'ready',
       last_edited_at: new Date().toISOString(),
       pending_job_id: null,
+      last_completed_job_id: jobId,
       pending_version: null,
       pending_upload_state: null,
       pending_upload_error: null,

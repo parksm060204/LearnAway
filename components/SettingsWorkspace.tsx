@@ -21,7 +21,6 @@ import {
 export interface SettingsWorkspaceProps {
   settings: RetentionModelSettings;
   onSaveSettings: (settings: RetentionModelSettings) => void;
-  onResetData: () => void;
   materials: Material[];
   subjects: Subject[];
   onRestoreMaterials: (restored: Material[]) => boolean | Promise<boolean>;
@@ -34,7 +33,6 @@ export interface SettingsWorkspaceProps {
 export function SettingsWorkspace({
   settings,
   onSaveSettings,
-  onResetData,
   materials,
   subjects,
   onRestoreMaterials,
@@ -153,7 +151,7 @@ export function SettingsWorkspace({
             }`}
           >
             <User className="w-4 h-4 text-indigo-500" />
-            <span>계정 및 초기화</span>
+            <span>계정</span>
           </button>
         </div>
 
@@ -320,21 +318,6 @@ export function SettingsWorkspace({
                 )}
               </div>
 
-              <div className="pt-4 border-t border-[#f1ede4]">
-                <h3 className="font-academic-serif font-bold text-sm text-[#c52828] mb-1">
-                  위험 구역: 시연 데이터 초기화
-                </h3>
-                <p className="text-xs text-[#57544e] mb-3 leading-relaxed">
-                  이 기기의 로컬에 저장된 학습 이력, 풀이 시도 및 사용자 입력 데이터를 초기 데모 상태로 재설정합니다.
-                </p>
-                <button
-                  type="button"
-                  onClick={onResetData}
-                  className="px-3.5 py-1.5 bg-[#c52828] hover:bg-[#a81f1f] text-white rounded-xs text-xs font-bold transition-colors shadow-2xs"
-                >
-                  초기 데모 데이터로 재설정
-                </button>
-              </div>
             </div>
           )}
         </div>

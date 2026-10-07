@@ -3,7 +3,7 @@
 import React, { useState } from 'react';
 import type { Material, RetentionModelSettings, Subject } from '../lib/types';
 import { DEFAULT_RETENTION_SETTINGS } from '../lib/retentionModel';
-import { X, Settings, RotateCcw, Check, Info } from 'lucide-react';
+import { X, Settings, Check, Info } from 'lucide-react';
 import { AiConnectionSection } from './AiConnectionSection';
 import { MaterialPolicySection } from './MaterialPolicySection';
 import { DataManagementSection, type MigrationUiBlock } from './DataManagementSection';
@@ -13,7 +13,6 @@ interface SettingsModalProps {
   onClose: () => void;
   settings: RetentionModelSettings;
   onSaveSettings: (settings: RetentionModelSettings) => void;
-  onResetData: () => void;
   materials: Material[];
   subjects: Subject[];
   onRestoreMaterials: (restored: Material[]) => boolean | Promise<boolean>;
@@ -25,7 +24,6 @@ export function SettingsModal({
   onClose,
   settings,
   onSaveSettings,
-  onResetData,
   materials,
   subjects,
   onRestoreMaterials,
@@ -142,22 +140,7 @@ export function SettingsModal({
             </span>
           </div>
 
-          {/* Reset initial demo data */}
-          <div className="pt-2 border-t border-[#f1ede4] flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => {
-                if (confirm('모든 사용자 학습 기록과 설정을 초기 데모 데이터로 재설정하시겠습니까?')) {
-                  onResetData();
-                  onClose();
-                }
-              }}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-[#c52828] hover:bg-[#fef2f2] border border-[#fecaca] rounded-xs transition-colors"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>초기 데모 데이터로 복원</span>
-            </button>
-
+          <div className="pt-2 border-t border-[#f1ede4] flex justify-end">
             <button
               type="button"
               onClick={handleResetToDefaults}

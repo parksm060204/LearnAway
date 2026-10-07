@@ -44,11 +44,7 @@ export interface MaterialEditSaveInput {
   localError?: string;
   /** The body was saved but its identity hash could not be persisted. */
   identityRecordFailed?: boolean;
-  /**
-   * Linked-flag server reflections that failed AFTER the body was saved. The
-   * body itself is confirmed, so this never blocks closing — but it must be
-   * surfaced (not hidden) so the user can retry the reflection explicitly.
-   */
+  /** Linked-flag reflections that must succeed before the edit is complete. */
   postprocessFailed?: number;
 }
 
@@ -58,7 +54,7 @@ export interface MaterialEditSaveOutcome {
   level: 'complete' | 'partial' | 'failed';
   succeeded: string[];
   failed: string[];
-  /** Notes that do not block closing but must not be hidden. */
+  /** Additional state details that must remain visible. */
   notes: string[];
   message: string;
 }
@@ -100,6 +96,8 @@ export interface MaterialServerProbe {
   version?: number;
   /** Pending job that currently owns the server slot, if any. */
   pendingJobId?: string | null;
+  /** The job id that most recently activated the server row. */
+  completedJobId?: string | null;
   /**
    * Metadata columns the server persists (missing fields arrive as undefined).
    * Compared field-by-field against the attempt's target; a missing server
@@ -185,7 +183,9 @@ export function evaluateMaterialServerRetry(
     const meta = probeMetadataMatches(server.metadata ?? null, record);
     if (meta === 'unknown') return 'unknown';
     if (server.version > record.baseVersion) {
-      return meta === 'match' ? 'already_saved' : 'conflict';
+      if (meta === 'mismatch') return 'conflict';
+      if (!record.jobId || !server.completedJobId) return 'unknown';
+      return server.completedJobId === record.jobId ? 'already_saved' : 'conflict';
     }
     if (server.version === record.baseVersion) return 'retry_same_job';
     return 'conflict';
@@ -199,15 +199,18 @@ export function evaluateMaterialServerRetry(
     // Hash AND metadata match: completes only with evidence of OUR job — the
     // version advanced from our base, or the base already equaled the target.
     if (server.version !== undefined && record.baseVersion !== undefined) {
-      if (server.version > record.baseVersion) return 'already_saved';
+      if (server.version > record.baseVersion) {
+        if (!record.jobId || !server.completedJobId) return 'unknown';
+        return server.completedJobId === record.jobId ? 'already_saved' : 'conflict';
+      }
       if (server.version === record.baseVersion) {
         return record.baseHash === currentContentHash ? 'already_saved' : 'unknown';
       }
       return 'conflict';
     }
-    const baseKnown =
-      record.baseHash !== undefined || record.baseVersion !== undefined || record.jobId != null;
-    return baseKnown ? 'already_saved' : 'unknown';
+    if (record.baseHash === currentContentHash) return 'already_saved';
+    if (!record.jobId || !server.completedJobId) return 'unknown';
+    return server.completedJobId === record.jobId ? 'already_saved' : 'conflict';
   }
   if (server.hasBody) {
     if (record.baseHash !== undefined && server.hash === record.baseHash) return 'retry_same_job';
@@ -244,6 +247,7 @@ export function evaluateMaterialEditSave(input: MaterialEditSaveInput): Material
   // 'not_required': neither success nor failure of the server is claimed.
 
   if (serverOk && input.serverFallbackUsed) {
+    failed.push('서버 저장 정책과 원본 식별 정보 (필수 migration 미적용)');
     notes.push('서버 마이그레이션 9가 적용되지 않아 저장 정책과 원본 식별 정보는 서버에 저장되지 않았습니다.');
   }
 
@@ -252,8 +256,9 @@ export function evaluateMaterialEditSave(input: MaterialEditSaveInput): Material
   }
 
   if ((input.postprocessFailed ?? 0) > 0) {
+    failed.push(`연관 검토 상태 반영 (${input.postprocessFailed}건 재시도 필요)`);
     notes.push(
-      `본문 저장은 완료됐지만 연관 검토 상태 서버 반영 ${input.postprocessFailed}건에 실패했습니다. 아래 버튼으로 다시 반영할 수 있으며, 본문을 다시 업로드하지 않습니다.`
+      `본문은 저장됐지만 후처리가 남아 있습니다. 재시도는 같은 작업 ID로 서버 상태를 확인한 뒤 실패한 후처리만 실행합니다.`
     );
   }
 
