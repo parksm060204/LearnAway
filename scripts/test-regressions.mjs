@@ -6801,6 +6801,200 @@ exports.requireApiUser = async () => {
     assert.equal(sessionAffiliation.resolveSessionAffiliation(null, 'sub-b').kind, 'none');
   });
 
+
+  check('Stage 2: analysis checkpoint isolates users, rejects mismatched input, and hides other users session existence', () => {
+    const jobKeyA = analysisCheckpoint.makeAnalysisJobKey('user_A', 'mat_1', 'hash_abc', 'math_stats');
+    const sessionA = analysisCheckpoint.getOrCreateSessionLedger(
+      jobKeyA,
+      'user_A',
+      'mat_1',
+      'hash_abc',
+      'math_stats',
+      3
+    );
+    assert.equal(sessionA.jobKey, jobKeyA);
+
+    // User B cannot find User A's session in the registry
+    const sessionForB = analysisCheckpoint.findSessionLedger('user_B', jobKeyA);
+    assert.equal(sessionForB, null, 'Foreign user cannot locate another users session');
+
+    // validateJobIdentity rejects foreign user with generic not-found/forbidden message
+    const authCheck = analysisCheckpoint.validateJobIdentity(sessionA, 'user_B', 'mat_1', 'hash_abc', 'math_stats');
+    assert.equal(authCheck.ok, false);
+    assert.equal(authCheck.code, 'NOT_FOUND_OR_FORBIDDEN');
+    assert.ok(!authCheck.message.includes('user_A'), 'Never leaks user A identity or data in error message');
+
+    // Rejects mismatched material or markdown hash for the same jobKey
+    const mismatchMat = analysisCheckpoint.validateJobIdentity(sessionA, 'user_A', 'mat_OTHER', 'hash_abc', 'math_stats');
+    assert.equal(mismatchMat.ok, false);
+    assert.equal(mismatchMat.code, 'JOB_INPUT_MISMATCH');
+
+    const mismatchHash = analysisCheckpoint.validateJobIdentity(sessionA, 'user_A', 'mat_1', 'hash_DIFFERENT', 'math_stats');
+    assert.equal(mismatchHash.ok, false);
+    assert.equal(mismatchHash.code, 'JOB_INPUT_MISMATCH');
+  });
+
+  check('Stage 2: atomic chunk lease prevents concurrent duplicate execution and preserves completed empty results', () => {
+    const jobKey = analysisCheckpoint.makeAnalysisJobKey('user_lease', 'mat_1', 'hash_123', 'math_stats');
+    const session = analysisCheckpoint.getOrCreateSessionLedger(jobKey, 'user_lease', 'mat_1', 'hash_123', 'math_stats', 2);
+
+    // Worker 1 acquires chunk 1
+    const w1 = analysisCheckpoint.acquireChunkLease(session, 1, 'worker_1', 60000);
+    assert.equal(w1.acquired, true);
+    assert.equal(w1.reason, 'acquired');
+
+    // Worker 2 attempts chunk 1 while active lease is held -> locked
+    const w2 = analysisCheckpoint.acquireChunkLease(session, 1, 'worker_2', 60000);
+    assert.equal(w2.acquired, false);
+    assert.equal(w2.reason, 'locked');
+
+    // Worker 1 commits chunk 1 with valid empty drafts (e.g. intro section without standalone concepts)
+    const commit1 = analysisCheckpoint.commitChunkResult(session, 1, 'worker_1', 'completed', []);
+    assert.equal(commit1.committed, true);
+    assert.equal(session.chunks[1].status, 'completed');
+    assert.deepEqual(session.chunks[1].drafts, []);
+
+    // Subsequent worker attempts chunk 1 -> already_completed, prevents re-calling paid AI
+    const w3 = analysisCheckpoint.acquireChunkLease(session, 1, 'worker_3', 60000);
+    assert.equal(w3.acquired, false);
+    assert.equal(w3.reason, 'already_completed');
+
+    // Late arriving write to an already completed chunk is rejected as already_completed
+    const lateCommitOnCompleted = analysisCheckpoint.commitChunkResult(session, 1, 'worker_old', 'completed', []);
+    assert.equal(lateCommitOnCompleted.committed, false);
+    assert.equal(lateCommitOnCompleted.reason, 'already_completed');
+
+    // Worker 1 acquires chunk 2
+    analysisCheckpoint.acquireChunkLease(session, 2, 'worker_1', 60000);
+    // Worker 2 attempts to commit chunk 2 while worker 1 holds lease -> worker_mismatch
+    const lateCommitOnLocked = analysisCheckpoint.commitChunkResult(session, 2, 'worker_2', 'completed', []);
+    assert.equal(lateCommitOnLocked.committed, false);
+    assert.equal(lateCommitOnLocked.reason, 'worker_mismatch');
+  });
+
+  check('Stage 2: deterministic concept draft ID and merge preserves source citations and user approved status across retries', () => {
+    const draftId1 = analysisCheckpoint.makeConceptDraftId('gen_job_fixed', '중심극한정리');
+    const draftId2 = analysisCheckpoint.makeConceptDraftId('gen_job_fixed', '중심극한정리');
+    assert.equal(draftId1, draftId2, 'Concept Draft ID is strictly deterministic regardless of chunk order or index');
+
+    const draftA = {
+      id: draftId1,
+      subjectId: 'sub_1',
+      materialId: 'mat_1',
+      materialTitle: '확률통계',
+      title: '중심극한정리',
+      domain: 'math_stats',
+      description: '표본평균의 분포는 표본 크기가 충분히 크면 정규분포에 수렴한다.',
+      prerequisites: ['확률변수'],
+      relatedConcepts: ['대수의 법칙'],
+      commonMisconceptions: ['모집단이 정규분포여야만 성립한다.'],
+      examples: ['동전 던지기 표본평균'],
+      sourceEvidence: { type: 'page', pageNumber: 12, quote: '표본의 크기가 증가함에 따라', verified: true },
+      status: 'approved',
+      isApproved: true,
+      editedByUser: true,
+      sourceMarkdownHash: 'hash_1',
+    };
+
+    const draftB = {
+      id: draftId1,
+      subjectId: 'sub_1',
+      materialId: 'mat_1',
+      materialTitle: '확률통계',
+      title: '중심극한정리',
+      domain: 'math_stats',
+      description: '표본의 크기가 무한대로 갈 때 표준화된 표본평균은 표준정규분포로 분포수렴한다.',
+      prerequisites: ['특성함수', '확률변수'],
+      relatedConcepts: ['중심극한정리', '린데베르크 조건'],
+      commonMisconceptions: [],
+      examples: [],
+      sourceEvidence: { type: 'page', pageNumber: 45, quote: '린데베르크-레비 정리', verified: false },
+      status: 'draft',
+      isApproved: false,
+      sourceMarkdownHash: 'hash_1',
+    };
+
+    const merged = analysisCheckpoint.deduplicateConceptDrafts([draftA, draftB]);
+    assert.equal(merged.length, 1);
+    const item = merged[0];
+
+    // User approval is strictly preserved and not overwritten by retried unapproved draft
+    assert.equal(item.isApproved, true);
+    assert.equal(item.status, 'approved');
+    assert.equal(item.editedByUser, true);
+
+    // Prerequisites and related concepts merged
+    assert.ok(item.prerequisites.includes('특성함수'));
+    assert.ok(item.prerequisites.includes('확률변수'));
+
+    // Citations across multiple pages/chunks are preserved
+    assert.equal(item.sourceEvidence.pageNumber, 12, 'Primary verified evidence kept');
+    assert.ok(Array.isArray(item.additionalEvidences) && item.additionalEvidences.length === 1);
+    assert.equal(item.additionalEvidences[0].pageNumber, 45, 'Secondary citation preserved');
+  });
+
+  check('Stage 5: review notification DB snake_case mapping strictly validates rows and rejects unconfigured targets', () => {
+    // 1. Valid DB row -> domain object
+    const dbRow = {
+      id: 'sub-row-1',
+      user_id: 'usr-42',
+      channel: 'email',
+      target: 'student@kaist.ac.kr',
+      preferred_hour_kst: 14,
+      is_active: true,
+      consented_at: '2026-03-01T00:00:00.000Z',
+      updated_at: '2026-03-02T00:00:00.000Z',
+    };
+    const mapped = reviewNotifications.rowToSubscription(dbRow);
+    assert.ok(mapped !== null);
+    assert.equal(mapped.userId, 'usr-42');
+    assert.equal(mapped.channel, 'email');
+    assert.equal(mapped.target, 'student@kaist.ac.kr');
+    assert.equal(mapped.preferredHourKst, 14);
+    assert.equal(mapped.isActive, true);
+
+    // 2. Strict boolean validation on is_active
+    const inactiveRow = { ...dbRow, is_active: false };
+    const mappedInactive = reviewNotifications.rowToSubscription(inactiveRow);
+    assert.equal(mappedInactive.isActive, false);
+
+    // 3. Invalid/missing user_id returns null
+    assert.equal(reviewNotifications.rowToSubscription({ ...dbRow, user_id: '  ' }), null);
+    assert.equal(reviewNotifications.rowToSubscription(null), null);
+
+    // 4. Missing target suppresses dispatch
+    const noTargetSub = { ...mapped, target: '   ' };
+    const evalResult = reviewNotifications.evaluateNotificationDispatch(
+      noTargetSub,
+      3,
+      new Set(),
+      new Date('2026-10-14T05:00:00.000Z')
+    );
+    assert.equal(evalResult.shouldSend, false);
+    assert.ok(evalResult.reason.includes('수신 대상'));
+
+    // 5. Test idempotency key is distinct from daily reminder key
+    const testKey = reviewNotifications.makeTestNotificationIdempotencyKey('usr-42', 1700000000000, 'email');
+    const dailyKey = reviewNotifications.makeReminderIdempotencyKey('usr-42', '2026-10-14', 'email');
+    assert.notEqual(testKey, dailyKey);
+    assert.ok(testKey.startsWith('test_usr-42_'));
+
+    // 6. Delivery log mapping
+    const dbLog = {
+      id: 'log-1',
+      user_id: 'usr-42',
+      idempotency_key: dailyKey,
+      channel: 'email',
+      status: 'delivered',
+      due_item_count: 4,
+      message: '복습 알림',
+    };
+    const logMapped = reviewNotifications.rowToDeliveryLog(dbLog);
+    assert.ok(logMapped !== null);
+    assert.equal(logMapped.status, 'delivered');
+    assert.equal(logMapped.dueItemCount, 4);
+  });
+
   console.log(`${passed} regression checks passed`);
 }
 

@@ -164,14 +164,76 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    let checkedRubric: RubricCriterion[];
-    try {
-      checkedRubric = validateEvaluationRubric(rubric);
-    } catch (cause) {
-      return NextResponse.json({ success: false, error: cause instanceof Error ? cause.message : '채점 기준 오류' }, { status: 400 });
+    const supabase = await createClient();
+
+    // 2. Trust Boundary Enforcement: Resolve authoritative problem from server DB if problemId is present.
+    // Client-supplied modelAnswer or rubric tampering must not override server source-of-truth.
+    let verifiedPrompt = problemPrompt;
+    let verifiedModelAnswer = modelAnswer;
+    let verifiedRubric = rubric;
+    let qualityStatusNotice: string | undefined = undefined;
+
+    if (problemId && typeof supabase.from === 'function') {
+      try {
+        const { data: serverProb, error: probErr } = await supabase
+          .from('problems')
+          .select('*')
+          .eq('id', problemId)
+          .maybeSingle();
+
+        if (!probErr && serverProb) {
+          // Strict Account & Problem Isolation: reject foreign problems
+          if (serverProb.user_id && serverProb.user_id !== auth.user.id && !serverProb.is_demo) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: '해당 문제에 대한 접근 권한이 없거나 다른 사용자의 문제입니다.',
+              },
+              { status: 404 }
+            );
+          }
+
+          // Authoritative server payload replaces client-supplied text / rubric
+          const payload = (serverProb.payload || {}) as Record<string, unknown>;
+          if (typeof payload.promptText === 'string' && payload.promptText.trim()) {
+            verifiedPrompt = payload.promptText;
+          }
+          if (typeof payload.modelAnswer === 'string' && payload.modelAnswer.trim()) {
+            verifiedModelAnswer = payload.modelAnswer;
+          }
+          if (Array.isArray(payload.rubric) && payload.rubric.length > 0) {
+            verifiedRubric = payload.rubric as RubricCriterion[];
+          }
+
+          // Quality status check: distinguish verified from unverified/provisional problems
+          if (serverProb.quality_status !== 'verified') {
+            qualityStatusNotice =
+              '본 문항은 정답성 및 난이도에 대한 표본 검증 또는 교수자 자문이 진행 중인 문항입니다. AI 평가는 학습 참고용으로 제공됩니다.';
+          }
+        } else {
+          qualityStatusNotice =
+            '서버에 공인 등록되지 않은 로컬·초안 문항입니다. 정답성 및 난이도가 공인 검증되지 않았으므로 참고용으로 활용하세요.';
+        }
+      } catch {
+        qualityStatusNotice =
+          '문항 정답성 및 난이도 검증 상태를 확인하지 못했습니다. 평가는 참고용으로 제공됩니다.';
+      }
+    } else {
+      qualityStatusNotice =
+        '식별자가 없는 임시 문항입니다. 공인 검증을 거치지 않았으므로 참고용으로 활용하세요.';
     }
 
-    // 2. Resolve AI credentials (user's registered key first, then operator).
+    let checkedRubric: RubricCriterion[];
+    try {
+      checkedRubric = validateEvaluationRubric(verifiedRubric);
+    } catch (cause) {
+      return NextResponse.json(
+        { success: false, error: cause instanceof Error ? cause.message : '채점 기준 오류' },
+        { status: 400 }
+      );
+    }
+
+    // 3. Resolve AI credentials (user's registered key first, then operator).
     const cred = await resolveAiConfigForUser(auth.user.id);
     if (!cred.ok) {
       const needsAiConnection = cred.code === 'no_credentials';
@@ -181,7 +243,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const supabase = await createClient();
     const { data: budgetData, error: budgetError } = await supabase.rpc('consume_ai_call_budget');
     if (budgetError || !budgetData || typeof budgetData !== 'object') {
       return NextResponse.json({ success: false, error: 'AI 호출 한도를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.' }, { status: 503 });
@@ -195,7 +256,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3. Normalize Rubric Criteria
+    // 4. Normalize Rubric Criteria
     // Ensure total maxScore sum is tracked and each criterion is clearly defined
     const rubricDescList = checkedRubric.map((c, idx) => ({
       id: c.id || `crit-${idx + 1}`,
@@ -314,12 +375,12 @@ export async function POST(req: NextRequest) {
   }
 }`;
 
-    // 5. Build User Prompt
+    // 5. Build User Prompt using authoritative, verified content
     const userPrompt = `### [문제 정보]
 - 과목 분야: ${domain === 'math_stats' ? '수학·통계학' : '컴퓨터과학·알고리즘'}
 - 문제 제목: ${problemTitle}
 - 문제 본문:
-${problemPrompt}
+${verifiedPrompt}
 ${mathFormula ? `- 주요 수식: ${mathFormula}\n` : ''}${
       codeSnippet ? `- 코드 스니펫:\n${codeSnippet}\n` : ''
     }${
@@ -328,7 +389,7 @@ ${mathFormula ? `- 주요 수식: ${mathFormula}\n` : ''}${
         : ''
     }
 - 출제자가 제시한 모범 답안:
-${modelAnswer}
+${verifiedModelAnswer}
 
 ### [채점 기준표 (총합 ${rubricSum}점)]
 ${rubricDescList
@@ -482,6 +543,7 @@ ${
     };
 
     evaluationResult.methodSelectionDiagnosis = verifiedDiagnosis;
+    evaluationResult.qualityStatusNotice = qualityStatusNotice;
 
     return NextResponse.json({
       success: true,

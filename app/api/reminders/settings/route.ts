@@ -1,7 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '@/lib/auth/apiAuth';
 import { createClient } from '@/lib/supabase/server';
-import { NotificationChannel, NotificationSubscription } from '@/lib/reviewNotifications';
+import {
+  NotificationChannel,
+  NotificationSubscription,
+  rowToSubscription,
+  subscriptionToRow,
+  rowToDeliveryLog,
+} from '@/lib/reviewNotifications';
 
 export async function GET() {
   const auth = await requireApiUser();
@@ -9,7 +15,7 @@ export async function GET() {
 
   try {
     const supabase = await createClient();
-    const { data: sub, error } = await supabase
+    const { data: subRow, error } = await supabase
       .from('review_notification_subscriptions')
       .select('*')
       .eq('user_id', auth.user.id)
@@ -19,17 +25,23 @@ export async function GET() {
       return NextResponse.json({ success: false, error: error.message }, { status: 500 });
     }
 
-    const { data: logs } = await supabase
+    const subscription = subRow ? rowToSubscription(subRow) : null;
+
+    const { data: logRows } = await supabase
       .from('review_notification_logs')
       .select('*')
       .eq('user_id', auth.user.id)
       .order('created_at', { ascending: false })
-      .limit(5);
+      .limit(10);
+
+    const recentLogs = Array.isArray(logRows)
+      ? logRows.map(rowToDeliveryLog).filter(Boolean)
+      : [];
 
     return NextResponse.json({
       success: true,
-      subscription: sub || null,
-      recentLogs: logs || [],
+      subscription,
+      recentLogs,
     });
   } catch (err) {
     return NextResponse.json(
@@ -48,14 +60,17 @@ export async function POST(req: NextRequest) {
     try {
       body = await req.json();
     } catch {
-      return NextResponse.json({ success: false, error: '올바른 JSON 요청이어야 합니다.' }, { status: 400 });
+      return NextResponse.json(
+        { success: false, error: '올바른 JSON 요청이어야 합니다.' },
+        { status: 400 }
+      );
     }
 
     const payload = body as Partial<NotificationSubscription>;
     const channel: NotificationChannel = payload.channel === 'web_push' ? 'web_push' : 'email';
     const target = typeof payload.target === 'string' ? payload.target.trim() : '';
     const preferredHour = typeof payload.preferredHourKst === 'number'
-      ? Math.max(0, Math.min(23, payload.preferredHourKst))
+      ? Math.max(0, Math.min(23, Math.floor(payload.preferredHourKst)))
       : 9;
     const isActive = Boolean(payload.isActive);
 
@@ -67,32 +82,30 @@ export async function POST(req: NextRequest) {
     }
 
     const supabase = await createClient();
-    const now = new Date().toISOString();
+    const insertRow = subscriptionToRow({
+      userId: auth.user.id,
+      channel,
+      target,
+      preferredHourKst: preferredHour,
+      isActive,
+      consentedAt: new Date().toISOString(),
+    });
 
     const { data, error } = await supabase
       .from('review_notification_subscriptions')
-      .upsert(
-        {
-          user_id: auth.user.id,
-          channel,
-          target,
-          preferred_hour_kst: preferredHour,
-          is_active: isActive,
-          consented_at: now,
-          updated_at: now,
-        },
-        { onConflict: 'user_id,channel' }
-      )
-      .select()
+      .upsert(insertRow, { onConflict: 'user_id,channel' })
+      .select('*')
       .single();
 
     if (error) {
       return NextResponse.json({ success: false, error: error.message }, { status: 500 });
     }
 
+    const mapped = rowToSubscription(data);
+
     return NextResponse.json({
       success: true,
-      subscription: data,
+      subscription: mapped,
       message: isActive ? '알림 수신 설정이 등록되었습니다.' : '알림 수신이 해제되었습니다.',
     });
   } catch (err) {

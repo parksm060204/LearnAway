@@ -170,6 +170,7 @@ export interface ConceptDraft {
   commonMisconceptions: string[];
   examples: string[];
   sourceEvidence: ConceptEvidence;
+  additionalEvidences?: ConceptEvidence[];
   status: 'draft' | 'approved' | 'rejected';
   isApproved: boolean;
   sourceMarkdownHash: string;
@@ -549,6 +550,7 @@ export interface EvaluationResult {
   staticAnalysisNotice: string;
   needsReview: boolean;
   isAiEvaluated: boolean;
+  qualityStatusNotice?: string;
   // Stage 8 field:
   methodSelectionDiagnosis?: MethodSelectionDiagnosis;
 }
