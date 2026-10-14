@@ -29,6 +29,11 @@ async function getCurrentUserId(supabase: SupabaseClient): Promise<string | null
   return data.user?.id ?? null;
 }
 
+async function hashBlob(blob: Blob): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 // ---------------------------------------------------------------------------
 // Storage helpers
 // ---------------------------------------------------------------------------
@@ -440,6 +445,27 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
     const existing = (existingResult.data as MaterialRow | null) ?? null;
     const activeVersion = existing?.version ?? 0;
 
+    // Recover a response-lost retry before optimistic version checks. The
+    // original request may have activated this exact job while the client
+    // still believes it is writing the prior version.
+    const contentHash = materialContentHash(content);
+    const shouldUploadOriginal = Boolean(input.original) && backupOriginal;
+    const originalHash = shouldUploadOriginal ? await hashBlob(input.original!.blob) : null;
+    if (input.jobId && existing?.last_completed_job_id === input.jobId) {
+      const exactRetry = existing.content_hash === contentHash
+        && existing.subject_id === material.subjectId
+        && existing.title === material.title
+        && existing.kind === kind
+        && existing.status === material.status
+        && existing.sync_body === syncBody
+        && existing.backup_original === backupOriginal
+        && (!shouldUploadOriginal || existing.original_hash === originalHash);
+      if (exactRetry) {
+        return repoOk({ row: existing, version: activeVersion, jobId: input.jobId });
+      }
+      return repoError('MATERIAL_JOB_ID_CONFLICT: 완료된 업로드 ID가 다른 자료 내용에 사용되었습니다.');
+    }
+
     // Optimistic concurrency on the checked base: if the caller confirmed this
     // base version just before the attempt, refuse (without any side effect)
     // when the row has moved since. A refreshed "latest" must never be adopted
@@ -461,10 +487,8 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
     const version = sameJobRetry ? (existing!.pending_version as number) : activeVersion + 1;
 
     const paths = materialObjectPaths(userId, material.id, jobId, kind);
-    const contentHash = materialContentHash(content);
     // Only upload what the policy allows; anything not selected is never sent.
     const pagesProvided = syncBody && content.pages !== undefined;
-    const shouldUploadOriginal = Boolean(input.original) && backupOriginal;
     // Never lose an existing original when it is not being replaced/disabled.
     const pendingOriginalPath = input.original
       ? (backupOriginal ? paths.original : existing?.original_path ?? existing?.pending_original_path ?? null)
@@ -609,6 +633,7 @@ export async function writeMaterial(input: MaterialWriteInput): Promise<RepoResu
       transcript_path: syncBody && content.rawText ? paths.transcript : existing?.transcript_path ?? null,
       body_synced: syncBody || Boolean(existing?.markdown_path),
       original_backed_up: Boolean(pendingOriginalPath),
+      original_hash: shouldUploadOriginal ? originalHash : existing?.original_hash ?? null,
       // Cloud upload completion is separate from conversion status.
       status: material.status,
       is_converted: material.isConverted ?? material.status === 'ready',

@@ -138,8 +138,11 @@ export function ForgettingCurveChart({
             <span>MODEL: R(t) = S₀ · (1 + t/τ)^(-α)</span>
             <span className="text-[#c8c2b5]">·</span>
             <span className="text-[#57544e]">
-              τ={settings.tau}D, α={settings.alpha}, 임계치={settings.threshold}점 (학술 기준 모수)
+              τ={settings.tau}D, α={settings.alpha}, 임계치={settings.threshold}점 (복습 우선순위 산정용 추정치)
             </span>
+          </div>
+          <div className="text-[10px] text-[#827d73] mt-0.5 font-sans">
+            ※ 본 곡선은 학술적 복습 우선순위 산정을 위한 추정 모델이며, 실제 시험 성적이나 기억 확률을 보증하지 않습니다.
           </div>
         </div>
 

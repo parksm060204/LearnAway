@@ -2,7 +2,7 @@
 
 import React, { useState, useRef } from 'react';
 import { Material, MaterialKind, MaterialPage, Subject } from '../lib/types';
-import { parseTranscript } from '../lib/transcriptParser';
+import { MATERIAL_INPUT_LIMITS, findDuplicateMaterial, parseMaterialText, validateMaterialInputFile, validateMaterialText } from '../lib/materialIngestion';
 import { saveMaterialContent } from '../lib/materialStorage';
 import {
   X,
@@ -15,6 +15,7 @@ import {
   Loader2,
   ArrowRight,
   FileUp,
+  ExternalLink,
 } from 'lucide-react';
 
 interface MaterialUploadModalProps {
@@ -22,6 +23,7 @@ interface MaterialUploadModalProps {
   onClose: () => void;
   subjects: Subject[];
   activeSubject: Subject;
+  existingMaterials?: Material[];
   /** Resolves true only after the server confirmed the save. */
   onAddMaterial: (material: Material, originalFile?: File, jobId?: string) => Promise<boolean>;
   onOpenEditor?: (material: Material) => void;
@@ -44,6 +46,7 @@ export function MaterialUploadModal({
   onClose,
   subjects,
   activeSubject,
+  existingMaterials,
   onAddMaterial,
   onOpenEditor,
 }: MaterialUploadModalProps) {
@@ -63,6 +66,9 @@ export function MaterialUploadModal({
   const [pdfFullMarkdown, setPdfFullMarkdown] = useState<string>('');
   const [pageCount, setPageCount] = useState<number | undefined>(undefined);
 
+  // Duplicate detection state
+  const [duplicateMatch, setDuplicateMatch] = useState<{ id: string; title: string } | null>(null);
+
   // Transcript state
   const [transcriptInputMode, setTranscriptInputMode] = useState<'file' | 'paste'>('file');
   const [transcriptRawText, setTranscriptRawText] = useState('');
@@ -71,36 +77,109 @@ export function MaterialUploadModal({
   const [transcriptHasTimestamps, setTranscriptHasTimestamps] = useState(false);
   const [transcriptParsedMarkdown, setTranscriptParsedMarkdown] = useState('');
 
-
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const externalMdInputRef = useRef<HTMLInputElement>(null);
+  const textReadIdRef = useRef(0);
+  const pdfAbortRef = useRef<AbortController | null>(null);
+  const pdfConversionIdRef = useRef(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   // Stable id/job reused across retries so a failed attempt never creates a
   // duplicate row, version, or Storage folder.
   const materialIdRef = useRef<string | null>(null);
   const jobIdRef = useRef<string | null>(null);
 
+  const checkDuplicates = (targetMd: string, targetRaw: string) => {
+    if (!existingMaterials || existingMaterials.length === 0) {
+      setDuplicateMatch(null);
+      return;
+    }
+    const match = findDuplicateMaterial(existingMaterials, targetMd, targetRaw);
+    setDuplicateMatch(match);
+  };
+
+  const handleAttachExternalMarkdown = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.currentTarget.value = '';
+    if (!file) return;
+    const validationError = validateMaterialInputFile('handout', file);
+    if (validationError) {
+      alert(validationError);
+      return;
+    }
+    try {
+      const text = await file.text();
+      const textError = validateMaterialText(text);
+      if (textError) {
+        alert(textError);
+        return;
+      }
+      const parsed = parseMaterialText('handout', text, title || file.name);
+      setPdfFullMarkdown(parsed.markdown);
+      setPdfConvertStatus('success');
+      setPdfConvertMessage(`외부 Markdown 파일(${file.name})이 PDF와 연결되었습니다.`);
+      checkDuplicates(parsed.markdown, '');
+    } catch {
+      alert('Markdown 파일을 읽지 못했습니다. 파일을 확인해 주세요.');
+    }
+  };
+
   if (!isOpen) return null;
+
+  const cancelPdfConversion = () => {
+    pdfConversionIdRef.current += 1;
+    pdfAbortRef.current?.abort();
+    pdfAbortRef.current = null;
+    setIsConvertingPdf(false);
+    setPdfConvertStatus('idle');
+    setPdfConvertMessage('');
+    setPdfPages([]);
+    setPdfFullMarkdown('');
+    setPageCount(undefined);
+    setDuplicateMatch(null);
+  };
+
+  const handleClose = () => {
+    cancelPdfConversion();
+    onClose();
+  };
 
   // Handle PDF file selection
   const handlePdfFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.currentTarget.value = '';
     if (!file) return;
 
-    if (!file.name.toLowerCase().endsWith('.pdf')) {
-      alert('PDF 파일(.pdf)만 선택해 주세요.');
+    pdfAbortRef.current?.abort();
+    const conversionId = ++pdfConversionIdRef.current;
+    pdfAbortRef.current = null;
+    setIsConvertingPdf(false);
+    const validationError = validateMaterialInputFile('pdf', file);
+    if (validationError) {
+      setPdfFile(null);
+      setPdfPages([]);
+      setPdfFullMarkdown('');
+      setPageCount(undefined);
+      setPdfConvertStatus('error');
+      setPdfConvertMessage(validationError);
+      alert(validationError);
       return;
     }
 
+    const controller = new AbortController();
+    pdfAbortRef.current = controller;
     setPdfFile(file);
+    setPdfPages([]);
+    setPdfFullMarkdown('');
+    setPageCount(undefined);
     if (!title.trim()) {
       setTitle(file.name);
     }
 
     // Auto-trigger PyMuPDF4LLM conversion
-    await runPdfConversion(file);
+    await runPdfConversion(file, conversionId, controller);
   };
 
-  const runPdfConversion = async (file: File) => {
+  const runPdfConversion = async (file: File, conversionId: number, controller: AbortController) => {
     setIsConvertingPdf(true);
     setPdfConvertStatus('converting');
     setPdfConvertMessage('PyMuPDF4LLM 변환 파이프라인 구동 중...');
@@ -112,12 +191,15 @@ export function MaterialUploadModal({
       const res = await fetch('/api/convert', {
         method: 'POST',
         body: formData,
+        signal: controller.signal,
       });
+      if (conversionId !== pdfConversionIdRef.current) return;
 
       const data = await res.json();
+      if (conversionId !== pdfConversionIdRef.current) return;
 
       if (!res.ok || !data.success) {
-        if (data.hasText === false && data.pageCount > 0) {
+        if (data.code === 'PDF_NO_TEXT' && data.hasText === false && data.pageCount > 0) {
           // Image-only PDF or zero extractable text
           setPdfConvertStatus('needs_review');
           setPdfConvertMessage(
@@ -141,26 +223,33 @@ export function MaterialUploadModal({
       setPdfPages(data.pages || []);
       setPdfFullMarkdown(data.fullMarkdown || '');
       setPageCount(data.pageCount);
+      checkDuplicates(data.fullMarkdown || '', '');
 
       if (!sourceRefs.trim()) {
         setSourceRefs(`제1페이지 ~ 제${data.pageCount}페이지`);
       }
     } catch (err) {
+      if (conversionId !== pdfConversionIdRef.current) return;
       setPdfConvertStatus('error');
       setPdfConvertMessage(`변환 요청 실패: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
-      setIsConvertingPdf(false);
+      if (conversionId === pdfConversionIdRef.current) {
+        pdfAbortRef.current = null;
+        setIsConvertingPdf(false);
+      }
     }
   };
 
-  // Handle Transcript file selection (.txt or .md)
+  // Handle transcript or Markdown handout file selection.
   const handleTranscriptFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.currentTarget.value = '';
     if (!file) return;
 
-    const lower = file.name.toLowerCase();
-    if (!lower.endsWith('.txt') && !lower.endsWith('.md')) {
-      alert('전사본 파일은 .txt 또는 .md 형식만 지원합니다.');
+    const textKind = kind === 'handout' ? 'handout' : 'transcript';
+    const validationError = validateMaterialInputFile(textKind, file);
+    if (validationError) {
+      alert(validationError);
       return;
     }
 
@@ -169,27 +258,45 @@ export function MaterialUploadModal({
       setTitle(file.name);
     }
 
-    const text = await file.text();
-    processTranscriptText(text, file.name);
+    const readId = ++textReadIdRef.current;
+    try {
+      const text = await file.text();
+      if (readId !== textReadIdRef.current) return;
+      if (text.includes('\u0000')) {
+        alert('텍스트 파일을 읽을 수 없습니다. UTF-8 텍스트 또는 Markdown 파일을 선택해 주세요.');
+        return;
+      }
+      processTranscriptText(text, file.name, textKind);
+    } catch {
+      if (readId !== textReadIdRef.current) return;
+      alert('텍스트 파일을 읽지 못했습니다. 파일을 확인하고 다시 선택해 주세요.');
+    }
   };
 
-  const processTranscriptText = (text: string, defaultTitle: string) => {
-    setTranscriptRawText(text);
-    const parsed = parseTranscript(text, defaultTitle || title || '강의 전사본');
+  const processTranscriptText = (
+    text: string,
+    defaultTitle: string,
+    targetKind: 'transcript' | 'handout' = kind === 'handout' ? 'handout' : 'transcript'
+  ) => {
+    const textKind = targetKind;
+    const parsed = parseMaterialText(textKind, text, defaultTitle || title || '강의 전사본');
+    setTranscriptRawText(parsed.rawText);
     setTranscriptSpeakers(parsed.speakers);
     setTranscriptHasTimestamps(parsed.hasTimestamps);
     setTranscriptParsedMarkdown(parsed.markdown);
+    checkDuplicates(parsed.markdown, parsed.rawText);
 
-    if (!sourceRefs.trim()) {
+    if (!sourceRefs.trim() && textKind === 'transcript') {
       setSourceRefs(
         parsed.hasTimestamps
           ? '타임스탬프 전사본'
-          : `전사본 (${parsed.blocks.length}개 발화 블록)`
+          : `전사본 (${parsed.blockCount}개 발화 블록)`
       );
     }
   };
 
   const handlePasteChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    textReadIdRef.current += 1;
     const text = e.target.value;
     processTranscriptText(text, title || '강의 직접 입력 전사본');
   };
@@ -200,6 +307,14 @@ export function MaterialUploadModal({
     if (isSubmitting) return;
     if (!title.trim()) {
       alert('자료 제목을 입력해 주세요.');
+      return;
+    }
+    if (kind === 'pdf' && !pdfFile) {
+      alert('등록할 PDF 파일을 먼저 선택해 주세요.');
+      return;
+    }
+    if (kind === 'pdf' && pdfConvertStatus === 'idle') {
+      alert('PDF 변환 상태를 확인할 수 없습니다. 파일을 다시 선택해 주세요.');
       return;
     }
 
@@ -225,9 +340,10 @@ export function MaterialUploadModal({
       }
       finalMarkdown = pdfFullMarkdown;
     } else {
-      // Transcript
-      if (!transcriptRawText.trim()) {
-        alert('전사본 텍스트를 입력하거나 파일을 선택해 주세요.');
+      // Transcript or Markdown handout.
+      const textError = validateMaterialText(transcriptRawText);
+      if (textError) {
+        alert(textError);
         return;
       }
       finalMarkdown = transcriptParsedMarkdown;
@@ -246,7 +362,9 @@ export function MaterialUploadModal({
       subjectId: selectedSubjectId,
       kind,
       title: title.trim(),
-      sourceRefs: sourceRefs.trim() || (kind === 'pdf' ? `p.1 ~ p.${pageCount || 1}` : '전사본'),
+      sourceRefs: sourceRefs.trim() || (
+        kind === 'pdf' ? `p.1 ~ p.${pageCount || 1}` : kind === 'handout' ? 'Markdown/텍스트 자료' : '전사본'
+      ),
       pageCount: kind === 'pdf' ? pageCount || 1 : undefined,
       parsedMarkdown: finalMarkdown || undefined,
       rawText: finalRawText || undefined,
@@ -318,13 +436,44 @@ export function MaterialUploadModal({
               학습 교재 및 전사본 실제 자료 등록
             </h3>
           </div>
-          <button onClick={onClose} className="text-[#ded6c8] hover:text-white" aria-label="닫기">
+          <button type="button" onClick={handleClose} className="text-[#ded6c8] hover:text-white" aria-label="닫기">
             <X className="w-5 h-5" />
           </button>
         </div>
 
         {/* Form Body */}
         <form onSubmit={handleSubmit} className="p-5 space-y-4 text-xs font-sans overflow-y-auto">
+          {/* Duplicate Content Detection Banner */}
+          {duplicateMatch && (
+            <div className="p-3 bg-amber-50 border border-amber-300 rounded text-amber-900 text-xs flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                <div>
+                  <span className="font-bold">동일한 본문 내용의 자료가 이미 등록되어 있습니다.</span>
+                  <div className="text-[11px] text-amber-800">
+                    기존 등록 자료: <strong className="underline">{duplicateMatch.title}</strong>
+                  </div>
+                </div>
+              </div>
+              {onOpenEditor && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const target = existingMaterials?.find((m) => m.id === duplicateMatch.id);
+                    if (target) {
+                      onClose();
+                      onOpenEditor(target);
+                    }
+                  }}
+                  className="px-2.5 py-1 text-[11px] font-semibold bg-amber-600 text-white rounded hover:bg-amber-700 flex items-center gap-1 shrink-0"
+                >
+                  <ExternalLink className="w-3 h-3" />
+                  기존 자료 열기
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Subject selector */}
           <div>
             <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1 font-semibold">
@@ -348,7 +497,7 @@ export function MaterialUploadModal({
             <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1 font-semibold">
               자료 종류 선택:
             </label>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-3 gap-2">
               <button
                 type="button"
                 onClick={() => setKind('pdf')}
@@ -364,7 +513,11 @@ export function MaterialUploadModal({
 
               <button
                 type="button"
-                onClick={() => setKind('transcript')}
+                onClick={() => {
+                  textReadIdRef.current += 1;
+                  setKind('transcript');
+                  if (transcriptRawText) processTranscriptText(transcriptRawText, title || '강의 전사본', 'transcript');
+                }}
                 className={`p-3 rounded-xs border flex items-center justify-center gap-2 text-xs font-medium transition-all ${
                   kind === 'transcript'
                     ? 'border-[#c52828] bg-[#fef2f2] text-[#c52828] font-bold shadow-2xs'
@@ -373,6 +526,22 @@ export function MaterialUploadModal({
               >
                 <Mic className="w-4 h-4" />
                 <span>녹음 전사본 (.txt / .md / 직접입력)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  textReadIdRef.current += 1;
+                  setKind('handout');
+                  if (transcriptRawText) processTranscriptText(transcriptRawText, title || '강의 자료', 'handout');
+                }}
+                className={`p-3 rounded-xs border flex items-center justify-center gap-2 text-xs font-medium transition-all ${
+                  kind === 'handout'
+                    ? 'border-[#c52828] bg-[#fef2f2] text-[#c52828] font-bold shadow-2xs'
+                    : 'border-[#ded6c8] bg-[#faf8f4] text-[#57544e]'
+                }`}
+              >
+                <FileText className="w-4 h-4" />
+                <span>Markdown / 텍스트</span>
               </button>
             </div>
           </div>
@@ -386,7 +555,7 @@ export function MaterialUploadModal({
                   <FileUp className="w-4 h-4 text-[#c52828]" />
                   실제 PDF 파일 선택 및 PyMuPDF4LLM 변환
                 </span>
-                <span className="text-[10px] text-[#827d73] font-academic-mono">.pdf 파일 전용</span>
+                <span className="text-[10px] text-[#827d73] font-academic-mono">.pdf · 최대 {(MATERIAL_INPUT_LIMITS.pdfBytes / 1024 / 1024).toFixed(0)}MB</span>
               </div>
 
               <input
@@ -433,15 +602,37 @@ export function MaterialUploadModal({
               )}
 
               {pdfConvertStatus === 'needs_review' && (
-                <div className="p-3 bg-amber-50 border border-amber-300 rounded text-amber-900 text-xs flex items-start gap-2">
-                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                  <div>
-                    <span className="font-bold">⚠️ 원본 확인 필요 (스캔/이미지 기반 PDF)</span>
-                    <p className="text-[11px] leading-relaxed mt-0.5">
-                      {pdfConvertMessage}
-                      <br />
-                      임의의 가짜 텍스트를 만들지 않으며, 자료 등록 후 원문 대조 화면에서 직접 검토·입력할 수 있습니다.
-                    </p>
+                <div className="p-3 bg-amber-50 border border-amber-300 rounded text-amber-900 text-xs flex flex-col gap-2">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold">⚠️ 원본 확인 필요 (스캔/이미지 기반 PDF)</span>
+                      <p className="text-[11px] leading-relaxed mt-0.5">
+                        {pdfConvertMessage}
+                        <br />
+                        자체 OCR 기능은 지원되지 않으므로, 외부 OCR/변환 도구로 생성한 Markdown(.md) 파일을 직접 연결할 수 있습니다.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 pt-1 border-t border-amber-200">
+                    <input
+                      ref={externalMdInputRef}
+                      type="file"
+                      accept=".md,.txt"
+                      onChange={handleAttachExternalMarkdown}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => externalMdInputRef.current?.click()}
+                      className="px-2.5 py-1 text-[11px] font-bold bg-[#191817] text-white rounded hover:bg-[#33302b] flex items-center gap-1.5"
+                    >
+                      <FileText className="w-3.5 h-3.5" />
+                      외부 변환 Markdown 파일(.md) 연결하기
+                    </button>
+                    <span className="text-[10px] text-amber-800">
+                      선택한 Markdown이 이 PDF의 정규 본문으로 연결됩니다.
+                    </span>
                   </div>
                 </div>
               )}
@@ -458,7 +649,7 @@ export function MaterialUploadModal({
             <div className="space-y-3 p-4 bg-[#faf8f4] border border-[#ded6c8] rounded-xs">
               <div className="flex items-center justify-between border-b border-[#ded6c8] pb-2">
                 <span className="font-academic-mono text-[11px] font-bold text-[#191817]">
-                  전사본 입력 방식 선택:
+                  {kind === 'handout' ? 'Markdown / 텍스트 입력 방식 선택:' : '전사본 입력 방식 선택:'}
                 </span>
                 <div className="flex items-center gap-1">
                   <button
@@ -470,7 +661,7 @@ export function MaterialUploadModal({
                         : 'bg-white border border-[#ded6c8] text-[#57544e]'
                     }`}
                   >
-                    파일 업로드 (.txt/.md)
+                    {kind === 'handout' ? '자료 파일 (.md/.txt)' : '전사본 파일 (.txt/.md)'}
                   </button>
                   <button
                     type="button"
@@ -505,7 +696,9 @@ export function MaterialUploadModal({
                   <textarea
                     value={transcriptRawText}
                     onChange={handlePasteChange}
-                    placeholder="[00:15:30] 교수: 오늘 강의는 중심극한정리와 대수의 법칙을 다룹니다.&#10;학생: 질문 있습니다...&#10;&#10;(화자명이나 타임스탬프가 있으면 자동으로 인식하여 구조화합니다)"
+                    placeholder={kind === 'handout'
+                      ? '# 3장 조건부분포\n\nMarkdown 내용을 붙여넣으면 원문 형식을 그대로 보존합니다.'
+                      : '[00:15:30] 교수: 오늘 강의는 중심극한정리와 대수의 법칙을 다룹니다.\n학생: 질문 있습니다...\n\n(원문에 있는 화자명과 타임스탬프만 인식합니다)'}
                     rows={5}
                     className="w-full p-2.5 border border-[#ded6c8] rounded-xs bg-white text-[#191817] text-xs font-academic-mono resize-y"
                   />
@@ -513,7 +706,16 @@ export function MaterialUploadModal({
               )}
 
               {/* Transcript Analysis Result Preview */}
-              {transcriptRawText.trim() && (
+              {kind === 'handout' && transcriptRawText.trim() && (
+                <div className="p-3 bg-white border border-[#ded6c8] rounded text-xs space-y-1">
+                  <div className="font-bold text-[#191817] flex items-center justify-between">
+                    <span>Markdown 원문 미리보기:</span>
+                    <span className="font-academic-mono text-[10px] text-[#827d73]">{transcriptRawText.length}자 입력됨</span>
+                  </div>
+                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words text-[11px] text-[#57544e]">{transcriptRawText.slice(0, 4000)}</pre>
+                </div>
+              )}
+              {kind === 'transcript' && transcriptRawText.trim() && (
                 <div className="p-3 bg-white border border-[#ded6c8] rounded text-xs space-y-1">
                   <div className="font-bold text-[#191817] flex items-center justify-between">
                     <span>전사본 자동 구조화 분석:</span>
@@ -570,21 +772,28 @@ export function MaterialUploadModal({
             />
           </div>
 
-          {/* Disclaimer regarding Stage 2 */}
-          <div className="bg-[#faf8f4] border border-[#ded6c8] p-3 rounded-xs text-[11px] text-[#57544e] leading-relaxed">
-            <div className="flex items-center gap-1.5 font-bold text-[#827d73] mb-0.5">
+          {/* Disclaimer regarding Storage and AI Processing Policy */}
+          <div className="bg-[#faf8f4] border border-[#ded6c8] p-3 rounded-xs text-[11px] text-[#57544e] leading-relaxed space-y-1">
+            <div className="flex items-center gap-1.5 font-bold text-[#827d73]">
               <Info className="w-3.5 h-3.5 text-blue-600" />
-              <span>자료 등록 및 보관 정책 안내</span>
+              <span>보관 정책 및 데이터 전송 안내</span>
             </div>
-            등록된 자료는 과목별로 안전하게 보관되며 원문 대조 편집기를 통해 자유롭게 확인·수정할 수 있습니다.
-            AI 개념 추출 및 문제 자동 생성은 다음 단계에서 연결되며, 거짓 완료 표시를 하지 않습니다.
+            <div className="text-[11px] text-[#57544e]">
+              • <strong>보관 방식:</strong> 원본 파일과 본문 텍스트는 브라우저 로컬 저장소(IndexedDB)에 우선 보관되며, 클라우드 동기화 사용 시에만 안전하게 백업됩니다.
+            </div>
+            <div className="text-[11px] text-[#57544e]">
+              • <strong>전송 및 처리:</strong> PDF 구조화 변환 및 AI 개념 분석 요청 시에는 본문 내용이 전송되어 안전하게 처리된 후 즉시 휘발됩니다. (로컬 보관 설정이 AI 처리 전송까지 차단하는 것은 아닙니다)
+            </div>
+            <div className="text-[10px] text-[#827d73]">
+              ※ 대학 시험 수준의 엄밀성을 위해 숫자만 바꾼 문제가 아닌 복합 개념 문제가 생성되며, 가짜 성공이나 임의 완료 처리를 하지 않습니다.
+            </div>
           </div>
 
           {/* Buttons */}
           <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#f1ede4]">
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleClose}
               className="px-3.5 py-2 text-xs border border-[#ded6c8] text-[#57544e] hover:bg-[#faf8f4] rounded-xs"
             >
               취소

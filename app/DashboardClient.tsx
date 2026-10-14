@@ -3522,6 +3522,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         onClose={() => setIsUploadModalOpen(false)}
         subjects={subjects}
         activeSubject={activeSubject}
+        existingMaterials={materials}
         onAddMaterial={handleAddMaterial}
         onOpenEditor={(newMat) => {
           setEditingMaterial(newMat);
@@ -3603,6 +3604,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         draftCount={editingMaterial ? conceptDrafts.filter((d) => d.materialId === editingMaterial.id).length : 0}
         onSave={async (updatedMat, updatedContent): Promise<MaterialServerSaveResult> => {
           const scopeAtStart = getStorageScopeId();
+          const scopeIsUnchanged = () => getStorageScopeId() === scopeAtStart;
+          const scopeChangedResult = () => {
+            showToast('저장 중 계정이 변경되어 후속 처리를 중단했습니다. 입력은 유지됩니다. 현재 계정의 자료를 새로고침해 확인해 주세요.');
+            return { status: 'failed' as const, error: 'ACCOUNT_SCOPE_CHANGED' };
+          };
           const contentForSave = {
             markdown: updatedContent.markdown,
             rawText: updatedMat.rawText,
@@ -3612,6 +3618,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
           if (isLocalOnlyMaterial(updatedMat.id)) {
             const effects = await applyMaterialEditSideEffects(updatedMat, scopeAtStart);
+            if (!scopeIsUnchanged()) return scopeChangedResult();
             // Local-only material: the body sync state never claims the server.
             recordMaterialSyncState(updatedMat.id, {
               localBodyHash: contentHash,
@@ -3645,6 +3652,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           // on record, ask the SERVER what it stored before uploading again.
           if (retryingSameContent) {
             const probe = await getMaterialServerBodyHash(updatedMat.id);
+            if (!scopeIsUnchanged()) return scopeChangedResult();
             const verdict = evaluateMaterialServerRetry(previousSave, contentHash, {
               ok: probe.ok,
               hasBody: probe.ok ? probe.data.hasBody : undefined,
@@ -3676,6 +3684,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                   : { status: 'not_required' }
               );
               const effects = await applyMaterialEditSideEffects(updatedMat, scopeAtStart);
+              if (!scopeIsUnchanged()) return scopeChangedResult();
               recordMaterialPostprocessState(updatedMat.id, {
                 contentHash,
                 failedCount: effects.serverReflectionFailed,
@@ -3704,6 +3713,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           // The job id is created BEFORE the first request so the retry record
           // references the exact job the server will stage.
           const probeBefore = await getMaterialServerBodyHash(updatedMat.id);
+          if (!scopeIsUnchanged()) return scopeChangedResult();
           if (!probeBefore.ok) {
             showToast('저장 전 서버 자료 상태를 확인하지 못했습니다. 입력은 그대로 보존했습니다.');
             return { status: 'failed', error: `저장 전 서버 상태 확인 실패: ${probeBefore.error}` };
@@ -3732,6 +3742,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             jobId: jobIdForAttempt,
             expectedVersion: baseVersion,
           });
+          if (!scopeIsUnchanged()) return scopeChangedResult();
           if (!writeResult.ok) {
             // The request may have actually reached the server (response loss).
             // Keep the retry record; a later retry of the same content probes
@@ -3771,6 +3782,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           );
 
           const effects = await applyMaterialEditSideEffects(updatedMat, scopeAtStart);
+          if (!scopeIsUnchanged()) return scopeChangedResult();
           recordMaterialPostprocessState(updatedMat.id, {
             contentHash,
             failedCount: effects.serverReflectionFailed,

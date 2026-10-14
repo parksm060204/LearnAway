@@ -9,6 +9,7 @@ import { requireApiUser } from '../../../lib/auth/apiAuth';
 export const dynamic = 'force-dynamic';
 
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 128 * 1024;
 const MAX_PDF_PAGES = 250;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES = 16 * 1024;
@@ -18,7 +19,7 @@ let activeConversions = 0;
 
 async function readBoundedFormData(req: NextRequest): Promise<FormData> {
   const declaredLength = Number(req.headers.get('content-length'));
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_UPLOAD_BYTES) throw new Error('UPLOAD_TOO_LARGE');
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) throw new Error('UPLOAD_TOO_LARGE');
   if (!req.body) throw new Error('EMPTY_BODY');
 
   const reader = req.body.getReader();
@@ -29,7 +30,7 @@ async function readBoundedFormData(req: NextRequest): Promise<FormData> {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > MAX_UPLOAD_BYTES) {
+      if (size > MAX_REQUEST_BYTES) {
         await reader.cancel();
         throw new Error('UPLOAD_TOO_LARGE');
       }
@@ -50,7 +51,11 @@ async function readBoundedFormData(req: NextRequest): Promise<FormData> {
     headers: req.headers,
     body: body.buffer as ArrayBuffer,
   });
-  return replay.formData();
+  try {
+    return await replay.formData();
+  } catch {
+    throw new Error('FORM_DATA_INVALID');
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -175,14 +180,17 @@ export async function POST(req: NextRequest) {
     const tooLarge = code === 'UPLOAD_TOO_LARGE';
     const timedOut = code === 'CONVERSION_TIMEOUT';
     const unavailable = code === 'PYTHON_UNAVAILABLE';
-    const status = tooLarge ? 413 : timedOut ? 504 : unavailable ? 503 : 500;
+    const invalidForm = code === 'FORM_DATA_INVALID' || code === 'EMPTY_BODY';
+    const status = tooLarge ? 413 : timedOut ? 504 : unavailable ? 503 : invalidForm ? 400 : 500;
     const message = tooLarge
       ? 'PDF 업로드는 20MB 이하만 허용됩니다.'
       : timedOut
         ? 'PDF 변환 시간이 제한을 넘었습니다. 파일을 줄여 다시 시도해 주세요.'
         : unavailable
           ? 'PDF 변환 기능이 현재 서버에 준비되지 않았습니다.'
-          : code === 'CLIENT_ABORTED'
+          : invalidForm
+            ? 'PDF 업로드 형식을 확인해 주세요.'
+            : code === 'CLIENT_ABORTED'
             ? '요청이 취소되었습니다.'
             : 'PDF를 변환하지 못했습니다. 파일을 확인한 뒤 다시 시도해 주세요.';
     return NextResponse.json({ success: false, code, error: message }, { status });

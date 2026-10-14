@@ -834,7 +834,7 @@ export function MaterialEditorModal({
           </div>
         ) : (
           <div className="flex-1 flex overflow-hidden">
-            {/* LEFT PANE: Original Source Viewer (PDF Page or Transcript) */}
+            {/* LEFT PANE: Original Source Viewer (PDF Page, transcript, or handout) */}
             {(viewMode === 'split' || viewMode === 'edit_only' === false) && viewMode !== 'preview_only' && (
               <div className="w-1/2 border-r border-[#ded6c8] bg-[#fdfcfb] flex flex-col overflow-hidden">
                 {/* Left Pane Navigation Header */}
@@ -879,7 +879,7 @@ export function MaterialEditorModal({
                     <div className="flex items-center justify-between w-full">
                       <div className="flex items-center gap-2">
                         <span className="font-academic-mono text-[11px] font-bold text-[#191817]">
-                          전사본 원문 발화 대조:
+                          {material.kind === 'transcript' ? '전사본 원문 발화 대조:' : 'Markdown / 텍스트 원문 대조:'}
                         </span>
                         {material.speakers && material.speakers.length > 0 && (
                           <span className="text-[10px] text-[#57544e] font-academic-mono">
@@ -934,10 +934,12 @@ export function MaterialEditorModal({
                       )}
                     </div>
                   ) : (
-                    /* Transcript Viewer */
+                    /* Text source viewer */
                     <div className="space-y-3 font-sans">
                       <div className="p-3 bg-amber-50/50 border border-amber-200/60 rounded text-[11px] text-amber-900 leading-relaxed">
-                        전사본의 원문 텍스트입니다. 원하는 발화 블록의 [참조 삽입]을 클릭하면 오른쪽 Markdown 편집기에 출처 앵커가 삽입됩니다.
+                        {material.kind === 'transcript'
+                          ? '전사본 원문을 보존했습니다. 타임스탬프와 화자 정보는 입력에 포함된 경우에만 구조화합니다.'
+                          : 'Markdown / 텍스트 원문입니다. 입력 형식을 보존해 오른쪽 편집기에서 대조할 수 있습니다.'}
                       </div>
 
                       <div className="p-4 bg-white border border-[#ded6c8] rounded whitespace-pre-wrap font-academic-mono text-xs select-text">

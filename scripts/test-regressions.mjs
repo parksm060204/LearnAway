@@ -12,7 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts', 'lib/materialRestore.ts',
-  'lib/materialDraft.ts', 'lib/materialEditSave.ts', 'lib/dashboardUrl.ts',
+  'lib/materialDraft.ts', 'lib/materialEditSave.ts', 'lib/materialIngestion.ts', 'lib/analysisCheckpoint.ts', 'lib/reviewNotifications.ts', 'lib/dashboardUrl.ts',
   'lib/practiceAnswerDraft.ts', 'lib/sessionAffiliation.ts',
   'lib/todayStudy.ts', 'lib/reviewStats.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
@@ -144,6 +144,9 @@ exports.requireApiUser = async () => {
   const types = load(path.join(output, 'lib/types.js'));
   const materialDraft = load(path.join(output, 'lib/materialDraft.js'));
   const materialEditSave = load(path.join(output, 'lib/materialEditSave.js'));
+  const materialIngestion = load(path.join(output, 'lib/materialIngestion.js'));
+  const analysisCheckpoint = load(path.join(output, 'lib/analysisCheckpoint.js'));
+  const reviewNotifications = load(path.join(output, 'lib/reviewNotifications.js'));
   const dashboardUrl = load(path.join(output, 'lib/dashboardUrl.js'));
   const practiceAnswerDraft = load(path.join(output, 'lib/practiceAnswerDraft.js'));
   const sessionAffiliation = load(path.join(output, 'lib/sessionAffiliation.js'));
@@ -277,6 +280,18 @@ exports.requireApiUser = async () => {
   });
   auth.__setMode('authenticated');
 
+  const checkAsync = async (name, fn) => { await fn(); passed++; console.log(`PASS ${name}`); };
+  await checkAsync('authenticated PDF conversion rejects a fake signature before starting Python', async () => {
+    const form = new FormData();
+    form.append('file', new File(['not a PDF'], 'lecture.pdf', { type: 'application/pdf' }));
+    const response = await convertPdf(new NextRequest('http://localhost/api/convert', {
+      method: 'POST', body: form,
+    }));
+    const payload = await response.json();
+    assert.equal(response.status, 415);
+    assert.equal(payload.code, 'PDF_SIGNATURE_INVALID');
+  });
+
   check('auth failures map consistently to 401/503 with authError flag', async () => {
     const unauth = realApiAuth.authFailureResponse({ status: 'unauthenticated' });
     const errored = realApiAuth.authFailureResponse({ status: 'error', message: 'x' });
@@ -298,8 +313,6 @@ exports.requireApiUser = async () => {
   });
 
   // ---- Stage 11: material storage reliability ----
-  const checkAsync = async (name, fn) => { await fn(); passed++; console.log(`PASS ${name}`); };
-
   // A minimal in-memory IndexedDB that supports the operations materialStorage
   // uses, with failure injection so read/write/abort paths can be exercised
   // without replacing the service under test.
@@ -913,6 +926,153 @@ exports.requireApiUser = async () => {
       matStorage.materialContentFingerprint({ markdown: '# a', pages: [] }),
       'absent pages differ from an empty page array'
     );
+  });
+
+  check('material input validation bounds file types and preserves Markdown verbatim', () => {
+    assert.ok(materialIngestion.validateMaterialInputFile('pdf', { name: 'empty.pdf', size: 0 }));
+    assert.ok(materialIngestion.validateMaterialInputFile('pdf', { name: 'notes.txt', size: 12 }));
+    assert.ok(materialIngestion.validateMaterialInputFile('pdf', {
+      name: 'large.pdf', size: materialIngestion.MATERIAL_INPUT_LIMITS.pdfBytes + 1,
+    }));
+    assert.ok(materialIngestion.validateMaterialInputFile('handout', { name: 'notes.exe', size: 12 }));
+    assert.ok(materialIngestion.validateMaterialInputFile('transcript', {
+      name: 'large.txt', size: materialIngestion.MATERIAL_INPUT_LIMITS.textBytes + 1,
+    }));
+    assert.equal(materialIngestion.validateMaterialInputFile('handout', { name: 'notes.md', size: 12 }), null);
+    assert.ok(materialIngestion.validateMaterialText('  '));
+    assert.ok(materialIngestion.validateMaterialText('\u0000binary'));
+    assert.ok(materialIngestion.validateMaterialText('x'.repeat(materialIngestion.MATERIAL_INPUT_LIMITS.textBytes + 1)));
+    assert.equal(materialIngestion.validateMaterialText('정상 전사본'), null);
+
+    const source = '# Heading\r\n\r\n- item\r\n\r\n```ts\r\nconst x = 1;\r\n```';
+    const parsed = materialIngestion.parseMaterialText('handout', source, 'Notes');
+    assert.equal(parsed.rawText, source.replace(/\r\n/g, '\n'));
+    assert.equal(parsed.markdown, parsed.rawText, 'Markdown structure and code fences are not transcript-rewritten');
+
+    // Duplicate detection by content
+    const existing = [
+      { id: 'm-1', title: 'Chapter 1 Notes', parsedMarkdown: '# Heading\n\n- item\n\n```ts\nconst x = 1;\n```' },
+      { id: 'm-2', title: 'Calculus Intro', rawText: '미적분학 서론 강의 녹음' },
+    ];
+    const dupMd = materialIngestion.findDuplicateMaterial(existing, source, '');
+    assert.ok(dupMd, 'Finds duplicate when normalized markdown matches');
+    assert.equal(dupMd.id, 'm-1');
+
+    const dupRaw = materialIngestion.findDuplicateMaterial(existing, '', '미적분학 서론 강의 녹음\r\n');
+    assert.ok(dupRaw, 'Finds duplicate when rawText matches');
+    assert.equal(dupRaw.id, 'm-2');
+
+    const noDup = materialIngestion.findDuplicateMaterial(existing, '# Completely Different Chapter', '');
+    assert.equal(noDup, null, 'Returns null when content differs');
+  });
+
+  check('Stage 2: analysisCheckpoint generates deterministic keys and manages chunk state without re-calling completed', () => {
+    const key1 = analysisCheckpoint.makeAnalysisJobKey('user1', 'mat1', 'hash_abc', 'math_stats', 'v2');
+    const key2 = analysisCheckpoint.makeAnalysisJobKey('user1', 'mat1', 'hash_abc', 'math_stats', 'v2');
+    const keyOtherHash = analysisCheckpoint.makeAnalysisJobKey('user1', 'mat1', 'hash_xyz', 'math_stats', 'v2');
+    assert.equal(key1, key2, 'Same inputs derive identical job keys');
+    assert.notEqual(key1, keyOtherHash, 'Changed markdown hash derives distinct job key');
+
+    // Test session ledger across 5 chunks
+    const session = analysisCheckpoint.getOrCreateSessionLedger(
+      key1, 'user1', 'mat1', 'hash_abc', 'math_stats', 5,
+      [1, 2, 3, 4, 5].map((i) => ({ chunkIndex: i, sourceContext: '페이지 ' + i }))
+    );
+    assert.equal(session.totalChunks, 5);
+    const initialProg = analysisCheckpoint.getSessionProgress(session);
+    assert.equal(initialProg.completedChunks, 0);
+    assert.equal(initialProg.pendingChunks, 5);
+    assert.equal(initialProg.isAllComplete, false);
+
+    // Complete chunk 1 and 2
+    const draft1 = {
+      id: 'd1', subjectId: 's1', materialId: 'mat1', title: '중심극한정리', domain: 'math_stats',
+      description: '표본평균의 분포 수렴', coreDefinitionFormulaOrAlgorithm: '$\\sqrt{n}(\\bar{X}_n - \\mu) \\to N(0, \\sigma^2)$',
+      prerequisites: ['확률변수'], relatedConcepts: ['대수의 법칙'], commonMisconceptions: ['유한 표본 정규성 오인'],
+      examples: ['동전 던지기'], sourceEvidence: { type: 'page', pageNumber: 1, quote: '표본평균은 정규분포에 수렴한다.', verified: true },
+      status: 'draft', isApproved: false, sourceMarkdownHash: 'hash_abc', createdAt: '', updatedAt: ''
+    };
+    analysisCheckpoint.recordChunkResult(key1, 1, 'completed', [draft1]);
+    assert.equal(session.chunks[1].status, 'completed');
+
+    // Deduplication merges draft attributes from chunk 5 referring to the same concept
+    const draft5 = {
+      id: 'd5', subjectId: 's1', materialId: 'mat1', title: ' 중심극한정리 ', domain: 'math_stats',
+      description: '더 길고 풍부한 중심극한정리의 수학적 의미와 정칙성 조건 서술', coreDefinitionFormulaOrAlgorithm: '',
+      prerequisites: ['독립동등분포'], relatedConcepts: ['특성함수'], commonMisconceptions: ['분산 무한인 경우 간과'],
+      examples: ['주사위 시행'], sourceEvidence: { type: 'page', pageNumber: 5, quote: '분산이 유한해야 성립한다.', verified: false },
+      status: 'draft', isApproved: false, sourceMarkdownHash: 'hash_abc', createdAt: '', updatedAt: ''
+    };
+    analysisCheckpoint.recordChunkResult(key1, 5, 'completed', [draft5]);
+
+    // Check progress
+    const midProg = analysisCheckpoint.getSessionProgress(session);
+    assert.equal(midProg.completedChunks, 2);
+    assert.equal(midProg.pendingChunks, 3);
+    assert.equal(midProg.isAllComplete, false);
+    assert.equal(midProg.allDrafts.length, 1, 'Same concept from chunks 1 and 5 merged into 1');
+    const merged = midProg.allDrafts[0];
+    assert.ok(merged.prerequisites.includes('확률변수'));
+    assert.ok(merged.prerequisites.includes('독립동등분포'));
+    assert.ok(merged.relatedConcepts.includes('특성함수'));
+    assert.ok(merged.sourceEvidence.verified, 'Verified evidence from chunk 1 preserved');
+    assert.equal(merged.description, draft5.description, 'Richer description from chunk 5 kept');
+
+    // Complete remaining chunks
+    analysisCheckpoint.recordChunkResult(key1, 2, 'completed', []);
+    analysisCheckpoint.recordChunkResult(key1, 3, 'completed', []);
+    analysisCheckpoint.recordChunkResult(key1, 4, 'completed', []);
+    const finalProg = analysisCheckpoint.getSessionProgress(session);
+    assert.equal(finalProg.completedChunks, 5);
+    assert.equal(finalProg.pendingChunks, 0);
+    assert.equal(finalProg.isAllComplete, true);
+  });
+
+  check('Stage 5: reviewNotifications enforces KST time, idempotency, privacy-preserving messages, and consent gating', () => {
+    // 1. KST date calculation (UTC+9)
+    const fixedUtc = new Date('2026-10-14T01:30:00.000Z'); // 10:30 AM KST
+    const kstDate = reviewNotifications.getKstDateString(fixedUtc);
+    assert.equal(kstDate, '2026-10-14');
+    const kstHour = reviewNotifications.getKstHour(fixedUtc);
+    assert.equal(kstHour, 10);
+
+    // 2. Privacy-preserving notification message
+    const msg = reviewNotifications.formatReviewReminderMessage(3, ['수리통계학', '알고리즘']);
+    assert.ok(msg.includes('3개'));
+    assert.ok(msg.includes('수리통계학'));
+    assert.ok(!msg.includes('api_key') && !msg.includes('bearer') && !msg.includes('prompt'), 'Does not leak sensitive words');
+
+    // 3. Idempotency key
+    const idempKey1 = reviewNotifications.makeReminderIdempotencyKey('user_123', '2026-10-14', 'email');
+    const idempKey2 = reviewNotifications.makeReminderIdempotencyKey('user_123', '2026-10-14', 'email');
+    assert.equal(idempKey1, idempKey2, 'Same day and channel derive identical idempotency key');
+    assert.equal(idempKey1, 'reminder_user_123_2026-10-14_email');
+
+    // 4. Consent and suppression evaluation
+    const inactiveSub = {
+      userId: 'user_123', channel: 'email', target: 'student@univ.edu',
+      preferredHourKst: 9, isActive: false, consentedAt: '2026-01-01'
+    };
+    const activeSub = { ...inactiveSub, isActive: true };
+
+    const existingLogs = new Set();
+    const evalInactive = reviewNotifications.evaluateNotificationDispatch(inactiveSub, 5, existingLogs, fixedUtc);
+    assert.equal(evalInactive.shouldSend, false, 'Unconsented/inactive subscription is suppressed');
+
+    const evalActive = reviewNotifications.evaluateNotificationDispatch(activeSub, 5, existingLogs, fixedUtc);
+    assert.equal(evalActive.shouldSend, true, 'Active subscription with due items should send');
+    assert.equal(evalActive.idempotencyKey, idempKey1);
+
+    // After adding the key to existingLogs, duplicate dispatch is suppressed
+    existingLogs.add(idempKey1);
+    const evalDuplicate = reviewNotifications.evaluateNotificationDispatch(activeSub, 5, existingLogs, fixedUtc);
+    assert.equal(evalDuplicate.shouldSend, false, 'Duplicate dispatch on same day is suppressed');
+    assert.ok(evalDuplicate.reason.includes('중복 방지'));
+
+    // Zero due items is suppressed
+    const emptyLogs = new Set();
+    const evalZero = reviewNotifications.evaluateNotificationDispatch(activeSub, 0, emptyLogs, fixedUtc);
+    assert.equal(evalZero.shouldSend, false, 'Zero due items is suppressed');
   });
 
   check('material storage policy defaults to local-first and derives labels', () => {
@@ -2592,6 +2752,51 @@ exports.requireApiUser = async () => {
       for (const path of client.__state.objects.keys()) {
         assert.ok(path.startsWith(`u1/m-retry/${jobId}/`), `objects stay in the job folder: ${path}`);
       }
+    });
+  });
+
+  await checkAsync('completed material job retry is idempotent and rejects changed content', async () => {
+    const material = {
+      id: 'm-completed-retry', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const jobId = 'job-completed-retry';
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const first = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' }, jobId });
+      assert.equal(first.ok, true, first.ok ? '' : first.error);
+      const objectCount = client.__state.objects.size;
+      const retry = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' }, jobId, expectedVersion: 0 });
+      assert.equal(retry.ok, true, retry.ok ? '' : retry.error);
+      assert.equal(retry.data.version, 1);
+      assert.equal(client.__state.materials[0].version, 1, 'completed retry does not create a new version');
+      assert.equal(client.__state.objects.size, objectCount, 'completed retry does not upload again');
+
+      const changed = await cloudMaterials.writeMaterial({ material, content: { markdown: '# changed' }, jobId });
+      assert.equal(changed.ok, false);
+      assert.match(changed.error, /MATERIAL_JOB_ID_CONFLICT/);
+      assert.equal(client.__state.materials[0].version, 1, 'conflict leaves active version intact');
+    });
+  });
+
+  await checkAsync('completed PDF retry checks the original file hash', async () => {
+    const material = {
+      id: 'm-pdf-retry', subjectId: 's1', kind: 'pdf', title: 'T', sourceRefs: '', status: 'ready',
+      isConverted: true, uploadedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const jobId = 'job-pdf-retry';
+    const original = { blob: new Blob(['%PDF-1.7 source']), contentType: 'application/pdf' };
+    await withFakeSupabase({ user: { id: 'u1' } }, async (client) => {
+      const first = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' }, original, jobId });
+      assert.equal(first.ok, true, first.ok ? '' : first.error);
+      const retry = await cloudMaterials.writeMaterial({ material, content: { markdown: '# x' }, original, jobId });
+      assert.equal(retry.ok, true, retry.ok ? '' : retry.error);
+      const changed = await cloudMaterials.writeMaterial({
+        material, content: { markdown: '# x' },
+        original: { blob: new Blob(['%PDF-1.7 other']), contentType: 'application/pdf' }, jobId,
+      });
+      assert.equal(changed.ok, false);
+      assert.match(changed.error, /MATERIAL_JOB_ID_CONFLICT/);
+      assert.equal(client.__state.materials[0].version, 1);
     });
   });
 

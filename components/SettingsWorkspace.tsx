@@ -6,6 +6,7 @@ import { DEFAULT_RETENTION_SETTINGS } from '../lib/retentionModel';
 import { AiConnectionSection } from './AiConnectionSection';
 import { MaterialPolicySection } from './MaterialPolicySection';
 import { DataManagementSection, type MigrationUiBlock } from './DataManagementSection';
+import { RemindersSection } from './RemindersSection';
 import {
   Settings,
   Key,
@@ -16,6 +17,7 @@ import {
   Check,
   Info,
   LogOut,
+  Bell,
 } from 'lucide-react';
 
 export interface SettingsWorkspaceProps {
@@ -41,7 +43,7 @@ export function SettingsWorkspace({
   onLogout,
   isLoggingOut = false,
 }: SettingsWorkspaceProps) {
-  const [activeSubTab, setActiveSubTab] = useState<'api' | 'policy' | 'data' | 'model' | 'account'>('api');
+  const [activeSubTab, setActiveSubTab] = useState<'api' | 'reminders' | 'policy' | 'data' | 'model' | 'account'>('api');
 
   // Retention model state
   const [tau, setTau] = useState(settings.tau);
@@ -100,6 +102,19 @@ export function SettingsWorkspace({
           >
             <Key className="w-4 h-4 text-amber-500" />
             <span>AI API 연결</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveSubTab('reminders')}
+            className={`w-full flex items-center gap-2 px-3 py-2 text-xs rounded-xs font-semibold transition-colors text-left ${
+              activeSubTab === 'reminders'
+                ? 'bg-[#191817] text-white'
+                : 'text-[#57544e] hover:bg-[#faf8f4] hover:text-[#191817]'
+            }`}
+          >
+            <Bell className="w-4 h-4 text-rose-500" />
+            <span>복습 알림 설정</span>
           </button>
 
           <button
@@ -163,6 +178,12 @@ export function SettingsWorkspace({
                 AI API 연결 설정 (학교 BAZE Gateway / DeepSeek)
               </h3>
               <AiConnectionSection />
+            </div>
+          )}
+
+          {activeSubTab === 'reminders' && (
+            <div>
+              <RemindersSection currentUserEmail={currentUserEmail} />
             </div>
           )}
 

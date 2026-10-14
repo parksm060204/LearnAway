@@ -429,35 +429,8 @@ ${combinedSource}
             };
           });
 
-        let isScore100 = scoreSum === 100;
-        let finalRubric = normalizedRubric;
-        if (finalRubric.length === 0) {
-          finalRubric = [
-            {
-              id: 'r1',
-              label: '1. 문제 전제조건 및 정의 수립',
-              maxScore: 30,
-              weight: 0.3,
-              description: '조건 분석 및 기초 식 작성의 정확성',
-            },
-            {
-              id: 'r2',
-              label: '2. 핵심 정리 적용 및 전개 엄밀성',
-              maxScore: 40,
-              weight: 0.4,
-              description: '수식 전개 및 논리적 비약 없는 정당화',
-            },
-            {
-              id: 'r3',
-              label: '3. 최종 해 도출 및 결론 완성도',
-              maxScore: 30,
-              weight: 0.3,
-              description: '최종 답안 도출 및 복잡도/의의 해석 완성도',
-            },
-          ];
-          scoreSum = 100;
-          isScore100 = true;
-        }
+        const isScore100 = normalizedRubric.length > 0 && scoreSum === 100;
+        const finalRubric = normalizedRubric;
 
         const title = asString(raw.title).trim();
         const promptText = asString(raw.promptText).trim();
@@ -480,8 +453,9 @@ ${combinedSource}
         const isVerified = hasRequiredFields && isScore100 && hasConceptLink && isSourceVerified;
 
         const verificationNotes: string[] = [];
-        if (!hasRequiredFields) verificationNotes.push('필수 항목(제목/지문/모범답안/힌트) 누락');
-        if (!isScore100) verificationNotes.push(`루브릭 배점 합계 ${scoreSum}점 (100점 아님)`);
+        if (!hasRequiredFields) verificationNotes.push('필수 항목(제목/지문/모범답안/힌트/루브릭) 누락');
+        if (finalRubric.length === 0) verificationNotes.push('채점 루브릭 항목 누락 (배점 없음)');
+        else if (!isScore100) verificationNotes.push(`루브릭 배점 합계 ${scoreSum}점 (100점 아님)`);
         if (!hasConceptLink) verificationNotes.push('선택 개념과 연결되지 않음');
         if (!quote) verificationNotes.push('원문 인용 근거 없음');
         else if (!isSourceVerified) verificationNotes.push('원문 인용 근거가 제공된 자료에서 확인되지 않음');
@@ -530,7 +504,9 @@ ${combinedSource}
             hasConceptLink,
             isSourceVerified,
             note: isVerified
-              ? '필수 항목, 개념 연결, 100점 배점, 원문 인용 검증 완료'
+              ? (subjectDomain === 'computer_science'
+                  ? '형식/배점/출처 인용 검증 완료 (코딩 문제는 격리 실행기 미탑재로 AI 정적 분석 적용됨; 최종 승인 검토 필요)'
+                  : '형식/배점/출처 인용 검증 완료 (출처 인용이 정답성을 최종 보증하지 않으므로 승인 전 검토 필요)')
               : verificationNotes.join(' / '),
           },
           createdAt: now,
