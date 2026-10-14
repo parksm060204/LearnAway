@@ -107,9 +107,10 @@ export async function listProblemVersions(
 // Draft writes
 // ---------------------------------------------------------------------------
 
-/** Content-only upsert for AI generation / persistence retries. Approval
- *  columns (status, is_approved, content_version, approval_state, approved_*) are
- *  NEVER written here, so a re-save cannot reset an edited/approved draft. */
+/** Content-only upsert for AI generation / persistence retries.
+ *  CRITICAL: If a draft has been edited by the user (edited_by_user = true)
+ *  or already approved/rejected, the user's title, description, and definition
+ *  are STRICTLY PRESERVED and never overwritten by subsequent AI generation runs. */
 export async function upsertConceptDrafts(
   supabase: SupabaseClient,
   drafts: ConceptDraft[],
@@ -117,13 +118,80 @@ export async function upsertConceptDrafts(
 ): Promise<RepoResult<ConceptDraft[]>> {
   try {
     if (drafts.length === 0) return repoOk([]);
-    const rows = drafts.map((draft) => conceptDraftContentUpsert(draft, jobId ?? null));
-    const { data, error } = await supabase
+    const ids = drafts.map((d) => d.id);
+    const { data: existingRows, error: fetchErr } = await supabase
       .from('concept_drafts')
-      .upsert(rows, { onConflict: 'id,user_id' })
-      .select('*');
-    if (error) return repoError(error.message);
-    return repoOk(((data as ConceptDraftRow[]) ?? []).map(rowToConceptDraft));
+      .select('*')
+      .in('id', ids);
+
+    if (fetchErr) return repoError(fetchErr.message);
+
+    const existingMap = new Map<string, ConceptDraftRow>(
+      ((existingRows as ConceptDraftRow[]) ?? []).map((r) => [r.id, r])
+    );
+
+    const rowsToUpsert: ReturnType<typeof conceptDraftContentUpsert>[] = [];
+    const preservedDrafts: ConceptDraft[] = [];
+
+    for (const draft of drafts) {
+      const existing = existingMap.get(draft.id);
+      if (existing) {
+        const payload = (existing.payload || {}) as Record<string, unknown>;
+        const isUserEdited = existing.edited_by_user || payload.editedByUser;
+        const isApprovedOrRejected =
+          existing.is_approved ||
+          existing.status === 'approved' ||
+          existing.status === 'rejected';
+
+        if (isUserEdited || isApprovedOrRejected) {
+          // Strictly preserve user edits and approved state!
+          const preserved = rowToConceptDraft(existing);
+          if (
+            draft.sourceEvidence &&
+            (!preserved.sourceEvidence || preserved.sourceEvidence.quote !== draft.sourceEvidence.quote)
+          ) {
+            const existingAddl = Array.isArray(preserved.additionalEvidences)
+              ? preserved.additionalEvidences
+              : [];
+            const alreadyPresent = existingAddl.some(
+              (e) => e.quote === draft.sourceEvidence?.quote
+            );
+            if (!alreadyPresent) {
+              preserved.additionalEvidences = [...existingAddl, draft.sourceEvidence];
+            }
+          }
+          preservedDrafts.push(preserved);
+          continue;
+        }
+
+        // Unedited draft from same or prior job: retain server content version
+        preservedDrafts.push(rowToConceptDraft(existing));
+        continue;
+      }
+
+      // Brand new draft: insert
+      rowsToUpsert.push(conceptDraftContentUpsert(draft, jobId ?? null));
+    }
+
+    let insertedDrafts: ConceptDraft[] = [];
+    if (rowsToUpsert.length > 0) {
+      const { data, error } = await supabase
+        .from('concept_drafts')
+        .upsert(rowsToUpsert, { onConflict: 'id,user_id' })
+        .select('*');
+      if (error) return repoError(error.message);
+      insertedDrafts = ((data as ConceptDraftRow[]) ?? []).map(rowToConceptDraft);
+    }
+
+    const resultMap = new Map<string, ConceptDraft>();
+    for (const d of preservedDrafts) resultMap.set(d.id, d);
+    for (const d of insertedDrafts) resultMap.set(d.id, d);
+
+    const orderedResults = drafts
+      .map((d) => resultMap.get(d.id))
+      .filter((d): d is ConceptDraft => Boolean(d));
+
+    return repoOk(orderedResults);
   } catch (error) {
     return repoError(message(error, '개념 초안을 저장하지 못했습니다.'));
   }
@@ -136,13 +204,62 @@ export async function upsertProblemDrafts(
 ): Promise<RepoResult<ProblemDraft[]>> {
   try {
     if (drafts.length === 0) return repoOk([]);
-    const rows = drafts.map((draft) => problemDraftContentUpsert(draft, jobId ?? null));
-    const { data, error } = await supabase
+    const ids = drafts.map((d) => d.id);
+    const { data: existingRows, error: fetchErr } = await supabase
       .from('problem_drafts')
-      .upsert(rows, { onConflict: 'id,user_id' })
-      .select('*');
-    if (error) return repoError(error.message);
-    return repoOk(((data as ProblemDraftRow[]) ?? []).map(rowToProblemDraft));
+      .select('*')
+      .in('id', ids);
+
+    if (fetchErr) return repoError(fetchErr.message);
+
+    const existingMap = new Map<string, ProblemDraftRow>(
+      ((existingRows as ProblemDraftRow[]) ?? []).map((r) => [r.id, r])
+    );
+
+    const rowsToUpsert: ReturnType<typeof problemDraftContentUpsert>[] = [];
+    const preservedDrafts: ProblemDraft[] = [];
+
+    for (const draft of drafts) {
+      const existing = existingMap.get(draft.id);
+      if (existing) {
+        const payload = (existing.payload || {}) as Record<string, unknown>;
+        const isUserEdited = existing.edited_by_user || payload.editedByUser;
+        const isApprovedOrRejected =
+          existing.is_approved ||
+          existing.status === 'approved' ||
+          existing.status === 'rejected';
+
+        if (isUserEdited || isApprovedOrRejected) {
+          preservedDrafts.push(rowToProblemDraft(existing));
+          continue;
+        }
+
+        preservedDrafts.push(rowToProblemDraft(existing));
+        continue;
+      }
+
+      rowsToUpsert.push(problemDraftContentUpsert(draft, jobId ?? null));
+    }
+
+    let insertedDrafts: ProblemDraft[] = [];
+    if (rowsToUpsert.length > 0) {
+      const { data, error } = await supabase
+        .from('problem_drafts')
+        .upsert(rowsToUpsert, { onConflict: 'id,user_id' })
+        .select('*');
+      if (error) return repoError(error.message);
+      insertedDrafts = ((data as ProblemDraftRow[]) ?? []).map(rowToProblemDraft);
+    }
+
+    const resultMap = new Map<string, ProblemDraft>();
+    for (const d of preservedDrafts) resultMap.set(d.id, d);
+    for (const d of insertedDrafts) resultMap.set(d.id, d);
+
+    const orderedResults = drafts
+      .map((d) => resultMap.get(d.id))
+      .filter((d): d is ProblemDraft => Boolean(d));
+
+    return repoOk(orderedResults);
   } catch (error) {
     return repoError(message(error, '문제 초안을 저장하지 못했습니다.'));
   }

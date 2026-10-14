@@ -39,6 +39,15 @@ interface ConceptReviewModalProps {
   onOpenMaterialEditor?: (material: Material) => void;
   onTriggerAnalysis?: (material: Material) => void;
   isAnalyzing?: boolean;
+  analysisProgress?: {
+    totalChunks: number;
+    completedChunks: number;
+    pendingChunks: number;
+    failedChunks: number;
+    status: 'processing' | 'paused' | 'completed' | 'failed';
+  } | null;
+  onPauseAnalysis?: (material: Material) => void;
+  onResumeAnalysis?: (material: Material) => void;
   /** Server-backed approval (transactional RPC). When provided, the modal uses
    *  it instead of the local-only storage approval. */
   onApproveConceptDraft?: (draft: ConceptDraft) => Promise<boolean>;
@@ -58,6 +67,9 @@ export function ConceptReviewModal({
   onOpenMaterialEditor,
   onTriggerAnalysis,
   isAnalyzing = false,
+  analysisProgress = null,
+  onPauseAnalysis,
+  onResumeAnalysis,
   onApproveConceptDraft,
   onBatchApproveConceptDrafts,
   onUpdateConceptDraft,
@@ -308,7 +320,41 @@ export function ConceptReviewModal({
           </div>
 
           <div className="flex items-center gap-2">
-            {material && onTriggerAnalysis && (
+            {analysisProgress && (
+              <div className="flex items-center gap-2 bg-[#262421] px-2.5 py-1 rounded border border-[#3e3b36] text-[11px] font-academic-mono text-[#ded6c8]">
+                <span>
+                  진행: {analysisProgress.completedChunks}/{analysisProgress.totalChunks} 청크
+                </span>
+                {analysisProgress.status === 'paused' ? (
+                  <span className="text-amber-400 font-semibold">(일시 중단됨)</span>
+                ) : analysisProgress.status === 'processing' || isAnalyzing ? (
+                  <span className="text-emerald-400 font-semibold">(분석 중...)</span>
+                ) : null}
+              </div>
+            )}
+
+            {material && (analysisProgress?.status === 'processing' || isAnalyzing) && onPauseAnalysis && (
+              <button
+                onClick={() => onPauseAnalysis(material)}
+                className="px-2.5 py-1.5 bg-amber-700 hover:bg-amber-600 text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors"
+                title="AI 분석 일시 중단 (현재 완료된 청크 및 비용 보존)"
+              >
+                <span>일시 중단</span>
+              </button>
+            )}
+
+            {material && analysisProgress?.status === 'paused' && onResumeAnalysis && (
+              <button
+                onClick={() => onResumeAnalysis(material)}
+                disabled={isAnalyzing}
+                className="px-2.5 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                title="남은 청크 이어서 분석 재개"
+              >
+                <span>이어서 재개</span>
+              </button>
+            )}
+
+            {material && onTriggerAnalysis && !isAnalyzing && analysisProgress?.status !== 'paused' && (
               <button
                 onClick={() => onTriggerAnalysis(material)}
                 disabled={isAnalyzing}
@@ -316,7 +362,7 @@ export function ConceptReviewModal({
                 title="최신 Markdown 본문으로 AI 개념 재분석 실행"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${isAnalyzing ? 'animate-spin' : ''}`} />
-                <span>{isAnalyzing ? '분석 중...' : '재분석 실행'}</span>
+                <span>재분석 실행</span>
               </button>
             )}
 

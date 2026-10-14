@@ -31,6 +31,7 @@ export interface ConceptDraftRow {
   approved_concept_id: string | null;
   approval_state: string;
   approval_error: string | null;
+  edited_by_user?: boolean;
   payload: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
@@ -83,6 +84,7 @@ export interface ProblemDraftRow {
   approved_problem_id: string | null;
   approval_state: string;
   approval_error: string | null;
+  edited_by_user?: boolean;
   payload: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;

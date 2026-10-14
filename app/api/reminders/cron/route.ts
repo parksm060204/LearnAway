@@ -1,28 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@/lib/supabase/server';
+import { createAdminClient } from '../../../../lib/supabase/admin';
 import {
   rowToSubscription,
   getKstDateString,
   getKstHour,
   makeReminderIdempotencyKey,
   formatReviewReminderMessage,
-} from '@/lib/reviewNotifications';
+} from '../../../../lib/reviewNotifications';
 
 /**
  * Scheduled Cron Endpoint for Daily Review Notifications.
  * Intended to be invoked hourly by a cron runner (e.g. Vercel Cron, GitHub Actions, or crontab).
  *
  * Security: Authenticated via Authorization: Bearer <CRON_SECRET> or x-cron-secret header.
+ * Uses authoritative Server Admin Client (no user cookie dependency).
  */
 export async function POST(req: NextRequest) {
   const cronSecret = process.env.CRON_SECRET;
+  if (!cronSecret) {
+    return NextResponse.json(
+      { success: false, error: 'CRON_SECRET 환경 변수가 서버에 구성되지 않았습니다.' },
+      { status: 500 }
+    );
+  }
+
   const authHeader = req.headers.get('authorization');
   const customHeader = req.headers.get('x-cron-secret');
-
   const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : customHeader?.trim();
 
-  // If CRON_SECRET is configured in environment, require it
-  if (cronSecret && token !== cronSecret) {
+  if (token !== cronSecret) {
     return NextResponse.json(
       { success: false, error: '스케줄러 호출 인증에 실패했습니다.' },
       { status: 401 }
@@ -30,7 +36,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const supabase = await createClient();
+    const supabase = createAdminClient();
     const now = new Date();
     const currentKstHour = getKstHour(now);
     const todayKst = getKstDateString(now);
@@ -50,9 +56,14 @@ export async function POST(req: NextRequest) {
         .select('*')
         .eq('is_active', true)
         .eq('preferred_hour_kst', currentKstHour)
+        .order('id', { ascending: true })
         .range(page * pageSize, (page + 1) * pageSize - 1);
 
-      if (subError || !Array.isArray(subRows) || subRows.length === 0) {
+      if (subError) {
+        throw new Error(`구독 목록 조회 실패: ${subError.message}`);
+      }
+
+      if (!Array.isArray(subRows) || subRows.length === 0) {
         break;
       }
 
@@ -66,19 +77,20 @@ export async function POST(req: NextRequest) {
 
         // 1. Calculate actual due review items from database
         let dueCount = 0;
-        try {
-          const { data: planItems } = await supabase
-            .from('study_plan_items')
-            .select('id')
-            .eq('user_id', sub.userId)
-            .lte('assigned_date', todayKst)
-            .eq('status', 'pending');
+        const { data: planItems, error: planError } = await supabase
+          .from('study_plan_items')
+          .select('id')
+          .eq('user_id', sub.userId)
+          .lte('assigned_date', todayKst)
+          .eq('status', 'pending');
 
-          if (Array.isArray(planItems)) {
-            dueCount = planItems.length;
-          }
-        } catch {
-          dueCount = 0;
+        if (planError) {
+          failed++;
+          continue;
+        }
+
+        if (Array.isArray(planItems)) {
+          dueCount = planItems.length;
         }
 
         // Suppress dispatch if no actual due reviews exist
@@ -90,11 +102,12 @@ export async function POST(req: NextRequest) {
         const idempotencyKey = makeReminderIdempotencyKey(sub.userId, todayKst, sub.channel);
         const message = formatReviewReminderMessage(dueCount);
 
-        // 2. Atomic dispatch claim via Postgres RPC
+        // 2. Atomic dispatch claim via Server Admin RPC
         let logId: string | null = null;
+        let sendingToken: string | null = null;
         let claimOk = false;
 
-        const { data: claimData } = await supabase.rpc('claim_notification_dispatch', {
+        const { data: claimData, error: claimErr } = await supabase.rpc('claim_notification_dispatch', {
           p_user_id: sub.userId,
           p_idempotency_key: idempotencyKey,
           p_channel: sub.channel,
@@ -103,13 +116,14 @@ export async function POST(req: NextRequest) {
           p_is_test: false,
         });
 
-        if (claimData && typeof claimData === 'object') {
-          const c = claimData as { allowed?: boolean; log_id?: string };
+        if (!claimErr && claimData && typeof claimData === 'object') {
+          const c = claimData as { allowed?: boolean; log_id?: string; sending_token?: string };
           claimOk = Boolean(c.allowed);
           logId = c.log_id || null;
+          sendingToken = c.sending_token || null;
         }
 
-        if (!claimOk || !logId) {
+        if (!claimOk || !logId || !sendingToken) {
           skipped++;
           continue;
         }
@@ -118,9 +132,10 @@ export async function POST(req: NextRequest) {
         if (!webhookUrl) {
           await supabase.rpc('complete_notification_dispatch', {
             p_log_id: logId,
+            p_sending_token: sendingToken,
             p_status: 'failed',
             p_error: 'NOTIFICATION_WEBHOOK_URL_NOT_CONFIGURED',
-          }).catch(() => {});
+          });
           failed++;
           continue;
         }
@@ -144,26 +159,40 @@ export async function POST(req: NextRequest) {
           });
 
           if (res.ok) {
-            const status = res.status === 202 ? 'accepted' : 'delivered';
-            await supabase.rpc('complete_notification_dispatch', {
+            let isDeliveredProof = false;
+            try {
+              const resJson = await res.json();
+              if (resJson && resJson.delivered === true) isDeliveredProof = true;
+            } catch {
+              // Standard 200/202 acceptance
+            }
+            const status = isDeliveredProof ? 'delivered' : 'accepted';
+            const { error: compErr } = await supabase.rpc('complete_notification_dispatch', {
               p_log_id: logId,
+              p_sending_token: sendingToken,
               p_status: status,
-            }).catch(() => {});
-            dispatched++;
+            });
+            if (compErr) {
+              failed++;
+            } else {
+              dispatched++;
+            }
           } else {
             await supabase.rpc('complete_notification_dispatch', {
               p_log_id: logId,
+              p_sending_token: sendingToken,
               p_status: 'failed',
               p_error: `Provider HTTP error: ${res.status}`,
-            }).catch(() => {});
+            });
             failed++;
           }
         } catch (err) {
           await supabase.rpc('complete_notification_dispatch', {
             p_log_id: logId,
+            p_sending_token: sendingToken,
             p_status: 'failed',
             p_error: `Network error: ${err instanceof Error ? err.message : 'Unknown'}`,
-          }).catch(() => {});
+          });
           failed++;
         }
       }

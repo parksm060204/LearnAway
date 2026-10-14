@@ -293,6 +293,15 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [isConceptReviewOpen, setIsConceptReviewOpen] = useState(false);
   const [conceptReviewMaterial, setConceptReviewMaterial] = useState<Material | null>(null);
   const [isAiAnalyzing, setIsAiAnalyzing] = useState(false);
+  const [analysisProgress, setAnalysisProgress] = useState<{
+    jobKey: string;
+    materialId: string;
+    totalChunks: number;
+    completedChunks: number;
+    pendingChunks: number;
+    failedChunks: number;
+    status: 'processing' | 'paused' | 'completed' | 'failed';
+  } | null>(null);
 
   // Stage 3: AI Problem Generation & Review State
   const [problemDrafts, setProblemDrafts] = useState<ProblemDraft[]>([]);
@@ -1970,6 +1979,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         return;
       }
 
+      setAnalysisProgress({
+        jobKey: data.jobKey,
+        materialId: targetMaterial.id,
+        totalChunks: data.totalChunks || 1,
+        completedChunks: data.completedChunks || 0,
+        pendingChunks: data.pendingChunks || 0,
+        failedChunks: data.failedChunks || 0,
+        status: data.status || 'completed',
+      });
+
       let newDrafts: ConceptDraft[] = data.drafts || [];
       if (newDrafts.length === 0) {
         showToast('추출된 새로운 개념이 없습니다.');
@@ -2017,6 +2036,93 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       showToast(`[${targetMaterial.title}] 분석 완료! ${newDrafts.length}개 개념 초안이 생성되었습니다.`);
     } catch (err) {
       showToast(`네트워크 또는 서버 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
+    } finally {
+      setIsAiAnalyzing(false);
+    }
+  };
+
+  const handlePauseAiAnalysis = async (targetMaterial: Material) => {
+    if (!analysisProgress) return;
+    try {
+      const res = await fetch('/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'pause',
+          materialId: targetMaterial.id,
+          subjectId: targetMaterial.subjectId,
+          domain: activeSubject?.domain || 'mathematics',
+          markdown: targetMaterial.parsedMarkdown || '',
+          jobKey: analysisProgress.jobKey,
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setAnalysisProgress((prev) => (prev ? { ...prev, status: 'paused' } : null));
+        setIsAiAnalyzing(false);
+        showToast('AI 분석이 일시 중단되었습니다. 언제든 다시 재개할 수 있습니다.');
+      }
+    } catch {
+      showToast('일시 중단 요청에 실패했습니다.');
+    }
+  };
+
+  const handleResumeAiAnalysis = async (targetMaterial: Material) => {
+    if (!analysisProgress) return;
+    let markdown = targetMaterial.parsedMarkdown;
+    if (!markdown || !markdown.trim()) {
+      const loaded = await loadMaterialContent(targetMaterial.id);
+      markdown = loaded?.markdown;
+    }
+    if (!markdown || !markdown.trim()) {
+      showToast('이 기기에 자료 본문이 없습니다. 자료 화면에서 파일을 다시 연결해 주세요.');
+      return;
+    }
+
+    setIsAiAnalyzing(true);
+    setAnalysisProgress((prev) => (prev ? { ...prev, status: 'processing' } : null));
+    showToast(`[${targetMaterial.title}] AI 분석 재개 중...`);
+
+    try {
+      const res = await fetch('/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'resume',
+          materialId: targetMaterial.id,
+          subjectId: targetMaterial.subjectId,
+          domain: activeSubject?.domain || 'mathematics',
+          markdown,
+          jobKey: analysisProgress.jobKey,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        showToast(`분석 재개 실패: ${data.error || '오류 발생'}`);
+        return;
+      }
+
+      setAnalysisProgress({
+        jobKey: data.jobKey,
+        materialId: targetMaterial.id,
+        totalChunks: data.totalChunks || 1,
+        completedChunks: data.completedChunks || 0,
+        pendingChunks: data.pendingChunks || 0,
+        failedChunks: data.failedChunks || 0,
+        status: data.status || 'completed',
+      });
+
+      const newDrafts: ConceptDraft[] = data.drafts || [];
+      if (newDrafts.length > 0) {
+        const otherDrafts = conceptDrafts.filter((d) => d.materialId !== targetMaterial.id);
+        const updatedDrafts = [...newDrafts, ...otherDrafts];
+        setConceptDrafts(updatedDrafts);
+        saveStoredConceptDrafts(updatedDrafts);
+      }
+      showToast(`[${targetMaterial.title}] 분석이 정상적으로 재개되었습니다.`);
+    } catch (err) {
+      showToast(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
       setIsAiAnalyzing(false);
     }
@@ -3834,6 +3940,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }}
         onTriggerAnalysis={handleTriggerAiAnalysis}
         isAnalyzing={isAiAnalyzing}
+        analysisProgress={analysisProgress}
+        onPauseAnalysis={handlePauseAiAnalysis}
+        onResumeAnalysis={handleResumeAiAnalysis}
         onApproveConceptDraft={async (draft) => {
           const result = await approveConceptViaServer(draft, allConcepts, conceptDrafts);
           if (result.status === 'ok') {

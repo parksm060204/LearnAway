@@ -10,6 +10,7 @@ export interface ChunkProgressRecord {
   drafts: ConceptDraft[];
   attemptCount?: number;
   leaseWorkerId?: string | null;
+  leaseToken?: string | null;
   leaseExpiresAt?: string | null;
   error?: string;
   completedAt?: string;
@@ -18,9 +19,11 @@ export interface ChunkProgressRecord {
 export interface AnalysisSessionLedger {
   jobKey: string;
   userId: string;
+  subjectId: string;
   materialId: string;
   markdownHash: string;
   domain: string;
+  modelId: string;
   promptVersion: string;
   chunkingVersion: string;
   totalChunks: number;
@@ -32,8 +35,7 @@ export interface AnalysisSessionLedger {
 
 /**
  * Deterministically constructs an analysis job key from input parameters.
- * If user, material, markdown content, domain, prompt version or chunking version change,
- * a new distinct key is derived.
+ * Incorporates user, subject, material, markdown content, domain, model, prompt version, and chunking version.
  */
 export function makeAnalysisJobKey(
   userId: string,
@@ -41,9 +43,11 @@ export function makeAnalysisJobKey(
   markdownHash: string,
   domain: string,
   promptVersion = 'v2',
-  chunkingVersion = 'v1'
+  chunkingVersion = 'v1',
+  modelId = 'deepseek-v4.1-flash',
+  subjectId = ''
 ): string {
-  return `analysis_${userId}_${materialId}_${markdownHash}_${domain}_${promptVersion}_${chunkingVersion}`;
+  return `analysis_${userId}_${subjectId || 'nosub'}_${materialId}_${markdownHash}_${domain}_${modelId}_${promptVersion}_${chunkingVersion}`;
 }
 
 /**
@@ -84,14 +88,16 @@ function getUserRegistry(userId: string): Map<string, AnalysisSessionLedger> {
 
 /**
  * Validates ownership and input consistency of an existing analysis session.
- * Rejects mismatched materials, hashes or domains. Never reveals other users' sessions.
+ * Rejects mismatched materials, hashes, domains, subjects or models. Never reveals other users' sessions.
  */
 export function validateJobIdentity(
   session: AnalysisSessionLedger | null,
   userId: string,
   materialId: string,
   markdownHash: string,
-  domain: string
+  domain: string,
+  subjectId?: string,
+  modelId?: string
 ): { ok: true } | { ok: false; code: 'NOT_FOUND_OR_FORBIDDEN' | 'JOB_INPUT_MISMATCH'; message: string } {
   if (!session || session.userId !== userId) {
     return {
@@ -104,12 +110,14 @@ export function validateJobIdentity(
   if (
     session.materialId !== materialId ||
     session.markdownHash !== markdownHash ||
-    session.domain !== domain
+    session.domain !== domain ||
+    (subjectId && session.subjectId && session.subjectId !== subjectId) ||
+    (modelId && session.modelId && session.modelId !== modelId)
   ) {
     return {
       ok: false,
       code: 'JOB_INPUT_MISMATCH',
-      message: '동일한 작업 ID에 서로 다른 자료 식별자, 본문 해시, 또는 분야 설정을 전달할 수 없습니다.',
+      message: '동일한 작업 ID에 서로 다른 과목, 자료 식별자, 본문 해시, 모델, 또는 분야 설정을 전달할 수 없습니다.',
     };
   }
 
@@ -125,7 +133,9 @@ export function getOrCreateSessionLedger(
   totalChunks: number,
   chunkContexts?: Array<{ chunkIndex: number; sourceContext: string }>,
   promptVersion = 'v2',
-  chunkingVersion = 'v1'
+  chunkingVersion = 'v1',
+  subjectId = '',
+  modelId = 'deepseek-v4.1-flash'
 ): AnalysisSessionLedger {
   const reg = getUserRegistry(userId);
   let session = reg.get(jobKey);
@@ -152,9 +162,11 @@ export function getOrCreateSessionLedger(
     session = {
       jobKey,
       userId,
+      subjectId,
       materialId,
       markdownHash,
       domain,
+      modelId,
       promptVersion,
       chunkingVersion,
       totalChunks,
@@ -177,6 +189,7 @@ export function findSessionLedger(userId: string, jobKey: string): AnalysisSessi
 export interface LeaseAcquireResult {
   acquired: boolean;
   reason: 'already_completed' | 'locked' | 'acquired' | 'not_found' | 'paused';
+  leaseToken?: string;
   record?: ChunkProgressRecord;
 }
 
@@ -184,7 +197,7 @@ export interface LeaseAcquireResult {
  * Atomically acquires a worker lease on a chunk.
  * If already completed: returns already_completed (skips AI re-call).
  * If actively locked by another worker: returns locked (prevents concurrent duplicate).
- * If lease expired or pending/failed: grants lease to workerId.
+ * If lease expired or pending/failed: grants lease to workerId with a unique leaseToken.
  */
 export function acquireChunkLease(
   session: AnalysisSessionLedger,
@@ -213,14 +226,16 @@ export function acquireChunkLease(
 
   // Acquire lease
   const expiresAt = new Date(nowMs + leaseMs).toISOString();
+  const leaseToken = `tok_${nowMs}_${Math.random().toString(36).substring(2, 10)}`;
   chunk.status = 'running';
   chunk.leaseWorkerId = workerId;
+  chunk.leaseToken = leaseToken;
   chunk.leaseExpiresAt = expiresAt;
   chunk.attemptCount = (chunk.attemptCount || 0) + 1;
   session.status = 'processing';
   session.updatedAt = new Date().toISOString();
 
-  return { acquired: true, reason: 'acquired', record: chunk };
+  return { acquired: true, reason: 'acquired', leaseToken, record: chunk };
 }
 
 export interface CommitChunkResult {
@@ -240,8 +255,17 @@ export function commitChunkResult(
   status: 'completed' | 'failed',
   drafts: ConceptDraft[],
   error?: string,
-  now = new Date()
+  nowOrLeaseToken?: Date | string,
+  leaseToken?: string
 ): CommitChunkResult {
+  let now = new Date();
+  let token = leaseToken;
+  if (typeof nowOrLeaseToken === 'string') {
+    token = nowOrLeaseToken;
+  } else if (nowOrLeaseToken instanceof Date) {
+    now = nowOrLeaseToken;
+  }
+
   const chunk = session.chunks[chunkIndex];
   if (!chunk) return { committed: false, reason: 'not_found' };
 
@@ -251,6 +275,10 @@ export function commitChunkResult(
 
   // Reject late write if worker does not hold the active lease
   if (chunk.leaseWorkerId !== workerId) {
+    return { committed: false, reason: 'worker_mismatch' };
+  }
+
+  if (token && chunk.leaseToken && chunk.leaseToken !== token) {
     return { committed: false, reason: 'worker_mismatch' };
   }
 
@@ -265,6 +293,7 @@ export function commitChunkResult(
   chunk.drafts = status === 'completed' ? drafts : [];
   chunk.error = error;
   chunk.leaseWorkerId = null;
+  chunk.leaseToken = null;
   chunk.leaseExpiresAt = null;
   if (status === 'completed') {
     chunk.completedAt = now.toISOString();

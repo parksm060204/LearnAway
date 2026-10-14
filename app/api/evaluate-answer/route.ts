@@ -15,7 +15,10 @@ import {
 } from '../../../lib/types';
 
 export interface EvaluateAnswerRequest {
-  problemId: string;
+  problemId?: string;
+  problemVersion?: number;
+  mockExamSessionId?: string;
+  isProvisionalLocal?: boolean;
   conceptId: string;
   conceptIds?: string[];
   subjectId: string;
@@ -166,61 +169,169 @@ export async function POST(req: NextRequest) {
 
     const supabase = await createClient();
 
-    // 2. Trust Boundary Enforcement: Resolve authoritative problem from server DB if problemId is present.
+    // 2. Trust Boundary Enforcement: Resolve authoritative problem from server DB / frozen snapshots.
     // Client-supplied modelAnswer or rubric tampering must not override server source-of-truth.
     let verifiedPrompt = problemPrompt;
     let verifiedModelAnswer = modelAnswer;
     let verifiedRubric = rubric;
+    let verifiedMathFormula = mathFormula;
+    let verifiedCodeSnippet = codeSnippet;
+    let verifiedAppliedCondition = appliedConditionNote;
     let qualityStatusNotice: string | undefined = undefined;
+    let isProvisional = false;
 
-    if (problemId && typeof supabase.from === 'function') {
-      try {
-        const { data: serverProb, error: probErr } = await supabase
-          .from('problems')
-          .select('*')
-          .eq('id', problemId)
-          .maybeSingle();
+    const hasDb = Boolean(supabase && typeof supabase.from === 'function');
 
-        if (!probErr && serverProb) {
-          // Strict Account & Problem Isolation: reject foreign problems
-          if (serverProb.user_id && serverProb.user_id !== auth.user.id && !serverProb.is_demo) {
+    if (body.mockExamSessionId && hasDb) {
+      // 2A. Mock Exam Immutable Snapshot: past exams are evaluated against their frozen snapshot
+      const { data: examRow, error: examErr } = await supabase
+        .from('mock_exam_sessions')
+        .select('*')
+        .eq('id', body.mockExamSessionId)
+        .eq('user_id', auth.user.id)
+        .maybeSingle();
+
+      if (examErr) {
+        return NextResponse.json(
+          { success: false, error: `모의시험 세션 조회 실패: ${examErr.message}. DB 오류로 평가를 중단합니다.` },
+          { status: 500 }
+        );
+      }
+      if (!examRow) {
+        return NextResponse.json(
+          { success: false, error: '모의시험 세션을 찾을 수 없거나 접근 권한이 없습니다.' },
+          { status: 404 }
+        );
+      }
+
+      const examPayload = (examRow.payload || {}) as Record<string, unknown>;
+      const frozenProblems = Array.isArray(examPayload.problems)
+        ? (examPayload.problems as Array<Record<string, unknown>>)
+        : [];
+      const frozenProb = frozenProblems.find((p) => p.id === problemId || p.problemId === problemId);
+
+      if (frozenProb) {
+        if (typeof frozenProb.promptText === 'string' && frozenProb.promptText.trim()) verifiedPrompt = frozenProb.promptText;
+        if (typeof frozenProb.modelAnswer === 'string' && frozenProb.modelAnswer.trim()) verifiedModelAnswer = frozenProb.modelAnswer;
+        if (Array.isArray(frozenProb.rubric) && frozenProb.rubric.length > 0) verifiedRubric = frozenProb.rubric as RubricCriterion[];
+        if (typeof frozenProb.mathFormula === 'string') verifiedMathFormula = frozenProb.mathFormula;
+        if (typeof frozenProb.codeSnippet === 'string') verifiedCodeSnippet = frozenProb.codeSnippet;
+        if (typeof frozenProb.appliedConditionNote === 'string') verifiedAppliedCondition = frozenProb.appliedConditionNote;
+      } else {
+        return NextResponse.json(
+          { success: false, error: '해당 모의시험 세션의 문제 스냅샷에 포함되지 않은 문항입니다.' },
+          { status: 404 }
+        );
+      }
+    } else if (problemId) {
+      // 2B. Problem Version Snapshot or Authoritative Problem Resolution
+      if (hasDb) {
+        let resolvedPayload: Record<string, unknown> | null = null;
+        let problemOwner: string | null = null;
+        let isDemo = false;
+        let qualityStatus = 'normal';
+
+        if (typeof body.problemVersion === 'number') {
+          const { data: versionRow, error: versionErr } = await supabase
+            .from('problem_versions')
+            .select('*')
+            .eq('problem_id', problemId)
+            .eq('version', body.problemVersion)
+            .maybeSingle();
+
+          if (versionErr) {
             return NextResponse.json(
-              {
-                success: false,
-                error: '해당 문제에 대한 접근 권한이 없거나 다른 사용자의 문제입니다.',
-              },
+              { success: false, error: `문제 버전 이력 조회 실패: ${versionErr.message}. DB 오류로 평가를 중단합니다.` },
+              { status: 500 }
+            );
+          }
+
+          if (versionRow) {
+            if (versionRow.user_id && versionRow.user_id !== auth.user.id) {
+              return NextResponse.json(
+                { success: false, error: '해당 문제 버전에 대한 접근 권한이 없습니다.' },
+                { status: 404 }
+              );
+            }
+            resolvedPayload = (versionRow.snapshot || {}) as Record<string, unknown>;
+          }
+        }
+
+        if (!resolvedPayload) {
+          const { data: serverProb, error: probErr } = await supabase
+            .from('problems')
+            .select('*')
+            .eq('id', problemId)
+            .maybeSingle();
+
+          if (probErr) {
+            return NextResponse.json(
+              { success: false, error: `문제 조회 실패: ${probErr.message}. DB 오류로 평가를 중단합니다.` },
+              { status: 500 }
+            );
+          }
+
+          if (!serverProb) {
+            return NextResponse.json(
+              { success: false, error: '해당 문제를 찾을 수 없습니다.' },
               { status: 404 }
             );
           }
 
-          // Authoritative server payload replaces client-supplied text / rubric
-          const payload = (serverProb.payload || {}) as Record<string, unknown>;
-          if (typeof payload.promptText === 'string' && payload.promptText.trim()) {
-            verifiedPrompt = payload.promptText;
-          }
-          if (typeof payload.modelAnswer === 'string' && payload.modelAnswer.trim()) {
-            verifiedModelAnswer = payload.modelAnswer;
-          }
-          if (Array.isArray(payload.rubric) && payload.rubric.length > 0) {
-            verifiedRubric = payload.rubric as RubricCriterion[];
-          }
-
-          // Quality status check: distinguish verified from unverified/provisional problems
-          if (serverProb.quality_status !== 'verified') {
-            qualityStatusNotice =
-              '본 문항은 정답성 및 난이도에 대한 표본 검증 또는 교수자 자문이 진행 중인 문항입니다. AI 평가는 학습 참고용으로 제공됩니다.';
-          }
-        } else {
-          qualityStatusNotice =
-            '서버에 공인 등록되지 않은 로컬·초안 문항입니다. 정답성 및 난이도가 공인 검증되지 않았으므로 참고용으로 활용하세요.';
+          problemOwner = serverProb.user_id;
+          isDemo = Boolean(serverProb.is_demo);
+          qualityStatus = serverProb.quality_status;
+          resolvedPayload = (serverProb.payload || {}) as Record<string, unknown>;
         }
-      } catch {
-        qualityStatusNotice =
-          '문항 정답성 및 난이도 검증 상태를 확인하지 못했습니다. 평가는 참고용으로 제공됩니다.';
+
+        if (problemOwner && problemOwner !== auth.user.id && !isDemo) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: '해당 문제에 대한 접근 권한이 없거나 다른 사용자의 문제입니다.',
+            },
+            { status: 404 }
+          );
+        }
+
+        if (typeof resolvedPayload.promptText === 'string' && resolvedPayload.promptText.trim()) {
+          verifiedPrompt = resolvedPayload.promptText;
+        }
+        if (typeof resolvedPayload.modelAnswer === 'string' && resolvedPayload.modelAnswer.trim()) {
+          verifiedModelAnswer = resolvedPayload.modelAnswer;
+        }
+        if (Array.isArray(resolvedPayload.rubric) && resolvedPayload.rubric.length > 0) {
+          verifiedRubric = resolvedPayload.rubric as RubricCriterion[];
+        }
+        if (typeof resolvedPayload.mathFormula === 'string') {
+          verifiedMathFormula = resolvedPayload.mathFormula;
+        }
+        if (typeof resolvedPayload.codeSnippet === 'string') {
+          verifiedCodeSnippet = resolvedPayload.codeSnippet;
+        }
+        if (typeof resolvedPayload.appliedConditionNote === 'string') {
+          verifiedAppliedCondition = resolvedPayload.appliedConditionNote;
+        }
+
+        if (qualityStatus !== 'verified') {
+          qualityStatusNotice =
+            '본 문항은 정답성 및 난이도에 대한 표본 검증 또는 교수자 자문이 진행 중인 문항입니다. AI 평가는 학습 참고용으로 제공됩니다.';
+        }
       }
     } else {
+      // 2C. No problemId: Unregistered local item requires explicit isProvisionalLocal
+      if (!body.isProvisionalLocal) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '공식 평가를 진행하려면 문제 식별자(problemId)가 필요합니다. 미등록 로컬 문항을 평가하려면 isProvisionalLocal을 true로 설정하십시오.',
+          },
+          { status: 400 }
+        );
+      }
+      isProvisional = true;
       qualityStatusNotice =
-        '식별자가 없는 임시 문항입니다. 공인 검증을 거치지 않았으므로 참고용으로 활용하세요.';
+        '서버에 공인 등록되지 않은 로컬·초안 문항입니다. 정답성 및 난이도가 공인 검증되지 않았으므로 참고용으로 활용하세요.';
     }
 
     let checkedRubric: RubricCriterion[];
@@ -381,11 +492,11 @@ export async function POST(req: NextRequest) {
 - 문제 제목: ${problemTitle}
 - 문제 본문:
 ${verifiedPrompt}
-${mathFormula ? `- 주요 수식: ${mathFormula}\n` : ''}${
-      codeSnippet ? `- 코드 스니펫:\n${codeSnippet}\n` : ''
+${verifiedMathFormula ? `- 주요 수식: ${verifiedMathFormula}\n` : ''}${
+      verifiedCodeSnippet ? `- 코드 스니펫:\n${verifiedCodeSnippet}\n` : ''
     }${
-      appliedConditionNote
-        ? `- AI 설계 심화 응용 조건: ${appliedConditionNote}\n`
+      verifiedAppliedCondition
+        ? `- AI 설계 심화 응용 조건: ${verifiedAppliedCondition}\n`
         : ''
     }
 - 출제자가 제시한 모범 답안:
@@ -552,6 +663,7 @@ ${
       conceptId,
       conceptIds,
       subjectId,
+      isProvisionalLocal: isProvisional,
     });
   } catch (err) {
     return NextResponse.json(

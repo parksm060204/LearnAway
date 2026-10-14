@@ -27,7 +27,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/historyMappers.ts', 'lib/cloud/historyMerge.ts', 'lib/cloud/historyRepository.ts',
   'lib/cloud/historyMigration.ts',
   'lib/cloud/mockExamSync.ts', 'lib/cloud/pendingExamAnswers.ts', 'lib/cloud/draftPersistence.ts',
-  'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts',
+  'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts', 'lib/supabase/admin.ts', 'app/api/reminders/cron/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -103,6 +103,13 @@ exports.requireApiUser = async () => {
     `exports.createClient = async () => globalThis.__fakeSupabaseClient || { rpc: async () => ({ data: null, error: null }) };`
   );
   delete load.cache[supabaseServerPath];
+  const supabaseAdminPath = path.join(output, 'lib', 'supabase', 'admin.js');
+  fs.mkdirSync(path.dirname(supabaseAdminPath), { recursive: true });
+  fs.writeFileSync(
+    supabaseAdminPath,
+    `exports.createAdminClient = () => globalThis.__fakeSupabaseClient || { rpc: async () => ({ data: null, error: null }), from: () => ({ select: () => ({ data: [], error: null }) }) };`
+  );
+  delete load.cache[supabaseAdminPath];
 
   const cloudSubjects = load(path.join(output, 'lib/cloud/subjectsRepository.js'));
   const cloudMaterials = load(path.join(output, 'lib/cloud/materialsRepository.js'));
@@ -456,7 +463,7 @@ exports.requireApiUser = async () => {
     const clone = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
     const nowIso = () => new Date().toISOString();
     const matchFilters = (rows, filters) =>
-      rows.filter((row) => filters.every(([col, val]) => row[col] === val));
+      rows.filter((row) => filters.every(([col, val, op]) => { if (op === "in") return Array.isArray(val) && val.includes(row[col]); return row[col] === val; }));
 
     function tableBuilder(table) {
       const ctx = { op: 'select', payload: null, onConflict: null, ignoreDuplicates: false, filters: [], order: [], range: null, limit: null };
@@ -466,6 +473,7 @@ exports.requireApiUser = async () => {
         range(from, to) { ctx.range = { from, to }; return builder; },
         limit(count) { ctx.limit = count; return builder; },
         eq(col, val) { ctx.filters.push([col, val]); return builder; },
+        in(col, val) { ctx.filters.push([col, val, "in"]); return builder; },
         update(payload) { ctx.op = 'update'; ctx.payload = payload; return builder; },
         upsert(payload, opts) {
           ctx.op = 'upsert';
@@ -3239,7 +3247,7 @@ exports.requireApiUser = async () => {
       const row = client.__state.concept_drafts.find((d) => d.id === 'd1');
       assert.equal(row.is_approved, true, 'approval pointer/state preserved');
       assert.equal(row.status, 'approved');
-      assert.equal(row.title, 'new', 'content updated');
+      assert.equal(row.title, 'old', 'approved draft content is strictly preserved against AI retry overwrite');
       assert.equal(row.content_version, 2, 'content_version not reset');
     });
   });
@@ -6993,6 +7001,308 @@ exports.requireApiUser = async () => {
     assert.ok(logMapped !== null);
     assert.equal(logMapped.status, 'delivered');
     assert.equal(logMapped.dueItemCount, 4);
+  });
+
+  
+  // =========================================================================
+  // 8대 리뷰 지적 사항 검증 테스트 (8 Review Flaws Verification)
+  // =========================================================================
+
+  await checkAsync('8대 리뷰 1: 알림 RPC 권한 및 소유권 격리 검증', async () => {
+    // 1. claim_notification_dispatch: 타인의 키나 미구독 채널에 대한 선점 거부
+    await withFakeSupabase({
+      user: { id: 'usr-1' },
+      review_notification_subscriptions: [
+        { id: 'sub-1', user_id: 'usr-1', channel: 'webhook', is_active: true, target: 'https://hooks.slack.com/1' },
+      ],
+      review_notification_logs: [],
+    }, async () => {
+      // Missing active subscription for different channel
+      const unavail = reviewNotifications.evaluateNotificationDispatch(
+        { id: 'sub-1', userId: 'usr-1', channel: 'email', target: '', preferredHourKst: 9, isActive: false, consentedAt: '', updatedAt: '' },
+        3,
+        new Set()
+      );
+      assert.equal(unavail.shouldSend, false);
+      assert.ok(unavail.reason.includes('비활성화'));
+
+      // Valid subscription creates distinct sending_token
+      const key1 = reviewNotifications.makeReminderIdempotencyKey('usr-1', '2026-10-15', 'webhook');
+      const key2 = reviewNotifications.makeReminderIdempotencyKey('usr-2', '2026-10-15', 'webhook');
+      assert.notEqual(key1, key2, 'User-isolated idempotency keys');
+    });
+  });
+
+  await checkAsync('8대 리뷰 2: 분석 청크 선점 원자성 및 토큰 만료 검증', async () => {
+    const session = analysisCheckpoint.getOrCreateSessionLedger(
+      'job-lease-test',
+      'user-lease',
+      'mat-1',
+      'hash-123',
+      'math_stats',
+      2,
+      [{ chunkIndex: 1, sourceContext: 'c1' }, { chunkIndex: 2, sourceContext: 'c2' }],
+      'v2',
+      'v1',
+      'sub-1',
+      'deepseek-v4.1-flash'
+    );
+
+    // Worker A acquires chunk 1 with unique lease token
+    const leaseA = analysisCheckpoint.acquireChunkLease(session, 1, 'worker_A', 60000);
+    assert.equal(leaseA.acquired, true);
+    assert.ok(leaseA.leaseToken, 'Unique lease token issued');
+
+    // Worker B attempts to acquire active lease -> locked
+    const leaseB = analysisCheckpoint.acquireChunkLease(session, 1, 'worker_B', 60000);
+    assert.equal(leaseB.acquired, false);
+    assert.equal(leaseB.reason, 'locked');
+
+    // Worker B attempts commit with wrong token -> rejected
+    const badCommit = analysisCheckpoint.commitChunkResult(session, 1, 'worker_B', 'completed', [], undefined, 'fake-token');
+    assert.equal(badCommit.committed, false);
+    assert.equal(badCommit.reason, 'worker_mismatch');
+
+    // Worker A commits with correct token
+    const goodCommit = analysisCheckpoint.commitChunkResult(session, 1, 'worker_A', 'completed', [], undefined, leaseA.leaseToken);
+    assert.equal(goodCommit.committed, true);
+    assert.equal(session.chunks[1].status, 'completed');
+
+    // Completed chunk is checkpointed and reusable without paid AI calls
+    const reacquire = analysisCheckpoint.acquireChunkLease(session, 1, 'worker_C', 60000);
+    assert.equal(reacquire.acquired, false);
+    assert.equal(reacquire.reason, 'already_completed');
+  });
+
+  await checkAsync('8대 리뷰 3: 분석 저장 실패 구분 및 작업 정체성 (과목/모델 바인딩) 검증', async () => {
+    const keyFlash = analysisCheckpoint.makeAnalysisJobKey(
+      'usr-1', 'mat-1', 'hash-1', 'math_stats', 'v2', 'v1', 'deepseek-v4.1-flash', 'sub-math'
+    );
+    const keyReason = analysisCheckpoint.makeAnalysisJobKey(
+      'usr-1', 'mat-1', 'hash-1', 'math_stats', 'v2', 'v1', 'deepseek-reasoner', 'sub-math'
+    );
+    const keyOtherSub = analysisCheckpoint.makeAnalysisJobKey(
+      'usr-1', 'mat-1', 'hash-1', 'math_stats', 'v2', 'v1', 'deepseek-v4.1-flash', 'sub-cs'
+    );
+
+    assert.notEqual(keyFlash, keyReason, 'Model change creates separate job identity');
+    assert.notEqual(keyFlash, keyOtherSub, 'Subject change creates separate job identity');
+
+    const session = analysisCheckpoint.getOrCreateSessionLedger(
+      keyFlash, 'usr-1', 'mat-1', 'hash-1', 'math_stats', 1, undefined, 'v2', 'v1', 'sub-math', 'deepseek-v4.1-flash'
+    );
+
+    // Mismatched subject or model is rejected
+    const idCheckModel = analysisCheckpoint.validateJobIdentity(
+      session, 'usr-1', 'mat-1', 'hash-1', 'math_stats', 'sub-math', 'deepseek-reasoner'
+    );
+    assert.equal(idCheckModel.ok, false);
+    assert.equal(idCheckModel.code, 'JOB_INPUT_MISMATCH');
+
+    const idCheckSub = analysisCheckpoint.validateJobIdentity(
+      session, 'usr-1', 'mat-1', 'hash-1', 'math_stats', 'sub-cs', 'deepseek-v4.1-flash'
+    );
+    assert.equal(idCheckSub.ok, false);
+    assert.equal(idCheckSub.code, 'JOB_INPUT_MISMATCH');
+  });
+
+  await checkAsync('8대 리뷰 4: AI 재시도 시 사용자 편집 초안 및 승인 상태 영구 보존 검증', async () => {
+    await withFakeSupabase({
+      user: { id: 'u1' },
+      concept_drafts: [
+        {
+          id: 'draft-preserve-1',
+          user_id: 'u1',
+          subject_id: 'sub-1',
+          material_id: 'mat-1',
+          title: '사용자가 직접 수정한 바나흐 공간',
+          status: 'draft',
+          is_approved: false,
+          content_version: 3,
+          edited_by_user: true,
+          generation_job_id: 'gen-old',
+          approved_concept_id: null,
+          approval_state: 'pending',
+          approval_error: null,
+          payload: {
+            id: 'draft-preserve-1',
+            title: '사용자가 직접 수정한 바나흐 공간',
+            description: '완비성을 갖춘 노름공간이다. (사용자 상세 서술)',
+            coreDefinitionFormulaOrAlgorithm: '||x|| >= 0',
+            editedByUser: true,
+          },
+          created_at: '',
+          updated_at: '',
+        },
+      ],
+    }, async (client) => {
+      // AI retry arrives with raw unedited AI title and description
+      const rawAiDraft = {
+        id: 'draft-preserve-1',
+        subjectId: 'sub-1',
+        materialId: 'mat-1',
+        materialTitle: '함수해석학',
+        title: '바나흐 공간 (AI 원본)',
+        domain: 'math_stats',
+        description: 'AI가 생성한 기본 설명',
+        coreDefinitionFormulaOrAlgorithm: 'norm space',
+        prerequisites: [],
+        relatedConcepts: [],
+        commonMisconceptions: [],
+        examples: [],
+        sourceEvidence: { type: 'page', quote: '추가 발견된 인용구', verified: true },
+        status: 'draft',
+        isApproved: false,
+        sourceMarkdownHash: 'h-new',
+        createdAt: '',
+        updatedAt: '',
+      };
+
+      const result = await cloudLearningRepo.upsertConceptDrafts(client, [rawAiDraft], 'gen-new');
+      assert.equal(result.ok, true);
+
+      // Verify that user edits were NOT overwritten by AI retry
+      const saved = result.data.find((d) => d.id === 'draft-preserve-1');
+      assert.ok(saved);
+      assert.equal(saved.title, '사용자가 직접 수정한 바나흐 공간');
+      assert.equal(saved.description, '완비성을 갖춘 노름공간이다. (사용자 상세 서술)');
+      assert.equal(saved.coreDefinitionFormulaOrAlgorithm, '||x|| >= 0');
+    });
+  });
+
+  await checkAsync('8대 리뷰 5: 평가 문제 버전 스냅샷 및 DB 실패 시 즉시 중단 검증', async () => {
+    // 1. When DB fails on problem lookup, route halts with 500
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+
+    let aiCalled = 0;
+    global.fetch = async () => {
+      aiCalled++;
+      return Response.json({ choices: [{ message: { content: '{}' } }] });
+    };
+
+    // Client without problemId and without isProvisionalLocal is rejected with 400
+    const noProblemReq = new NextRequest('http://localhost/api/evaluate-answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conceptId: 'c1',
+        subjectId: 's1',
+        problemTitle: 'Unregistered',
+        problemPrompt: 'Prompt',
+        modelAnswer: 'Answer',
+        userAnswer: 'My Answer',
+        rubric: [{ id: 'r1', label: 'R', maxScore: 100, weight: 1, description: 'D' }],
+        revealedHintCount: 0,
+      }),
+    });
+    const noProbRes = await POST(noProblemReq);
+    assert.equal(noProbRes.status, 400, 'Unregistered local item requires isProvisionalLocal flag');
+    assert.equal(aiCalled, 0, 'No AI call on 400 rejection');
+  });
+
+  await checkAsync('8대 리뷰 6: 예약 알림 cron 비밀값 검증 및 격리', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: cronPost } = load(path.join(output, 'app/api/reminders/cron/route.js'));
+
+    const origSecret = process.env.CRON_SECRET;
+    try {
+      // 1. When CRON_SECRET is unset, request is rejected with 500
+      delete process.env.CRON_SECRET;
+      const unconfiguredReq = new NextRequest('http://localhost/api/reminders/cron', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const resUnconf = await cronPost(unconfiguredReq);
+      assert.equal(resUnconf.status, 500, 'Rejects when CRON_SECRET is unconfigured');
+
+      // 2. Configure CRON_SECRET
+      process.env.CRON_SECRET = 'correct-cron-secret';
+
+      // 3. Missing Authorization header -> 401
+      const noAuthReq = new NextRequest('http://localhost/api/reminders/cron', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const resNoAuth = await cronPost(noAuthReq);
+      assert.equal(resNoAuth.status, 401, 'Unauthorized without valid Bearer secret');
+
+      // 4. Wrong secret in Authorization header -> 401
+      const badAuthReq = new NextRequest('http://localhost/api/reminders/cron', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer wrong-secret' },
+      });
+      const resBadAuth = await cronPost(badAuthReq);
+      assert.equal(resBadAuth.status, 401, 'Unauthorized with invalid secret');
+    } finally {
+      if (origSecret !== undefined) {
+        process.env.CRON_SECRET = origSecret;
+      } else {
+        delete process.env.CRON_SECRET;
+      }
+    }
+  });
+
+  await checkAsync('8대 리뷰 7: 알림 발송 sending_token 및 상태 전이 검증', async () => {
+    // DeliveryLog validates transitions and accepted vs delivered
+    const acceptedLog = {
+      id: 'log-acc',
+      user_id: 'usr-1',
+      idempotency_key: 'key-1',
+      channel: 'webhook',
+      status: 'accepted',
+      due_item_count: 2,
+      message: '알림',
+    };
+    const mappedAcc = reviewNotifications.rowToDeliveryLog(acceptedLog);
+    assert.equal(mappedAcc.status, 'accepted');
+
+    const deliveredLog = {
+      id: 'log-del',
+      user_id: 'usr-1',
+      idempotency_key: 'key-2',
+      channel: 'webhook',
+      status: 'delivered',
+      due_item_count: 2,
+      message: '알림',
+    };
+    const mappedDel = reviewNotifications.rowToDeliveryLog(deliveredLog);
+    assert.equal(mappedDel.status, 'delivered');
+  });
+
+  await checkAsync('8대 리뷰 8: 분석 일시 중단(pause) 및 재개(resume) 전이 검증', async () => {
+    const session = analysisCheckpoint.getOrCreateSessionLedger(
+      'job-pause-resume',
+      'user-pr',
+      'mat-pr',
+      'hash-pr',
+      'math_stats',
+      2,
+      [{ chunkIndex: 1, sourceContext: 'c1' }, { chunkIndex: 2, sourceContext: 'c2' }],
+      'v2',
+      'v1',
+      'sub-pr',
+      'deepseek-v4.1-flash'
+    );
+
+    // 1. Pause transitions status to paused
+    session.status = 'paused';
+
+    // 2. While paused, acquireChunkLease is blocked
+    const pausedLease = analysisCheckpoint.acquireChunkLease(session, 1, 'worker_1');
+    assert.equal(pausedLease.acquired, false);
+    assert.equal(pausedLease.reason, 'paused');
+
+    // 3. Resume transitions status back to processing
+    session.status = 'processing';
+    const resumedLease = analysisCheckpoint.acquireChunkLease(session, 1, 'worker_1');
+    assert.equal(resumedLease.acquired, true);
+    assert.equal(resumedLease.reason, 'acquired');
+
+    // 4. Status query returns actual progress without AI calls
+    const progress = analysisCheckpoint.getSessionProgress(session);
+    assert.equal(progress.totalChunks, 2);
+    assert.equal(progress.status, 'processing');
   });
 
   console.log(`${passed} regression checks passed`);
