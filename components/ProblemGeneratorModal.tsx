@@ -3,6 +3,7 @@
 import React, { useState, useMemo } from 'react';
 import { Subject, Concept, Material, ProblemType, ProblemDifficulty, ProblemDraft } from '../lib/types';
 import { collectProblemSources } from '../lib/problemSources';
+import { getStorageScopeId } from '../lib/storageScope';
 import { X, Sparkles, AlertCircle, BrainCircuit, Loader2 } from 'lucide-react';
 
 interface ProblemGeneratorModalProps {
@@ -145,6 +146,7 @@ export function ProblemGeneratorModal({
 
     const targetConcepts = eligibleConcepts.filter((c) => selectedConceptIds.includes(c.id));
 
+    const scopeAtStart = getStorageScopeId();
     setIsGenerating(true);
     setErrorMessage(null);
 
@@ -174,6 +176,7 @@ export function ProblemGeneratorModal({
       });
 
       const data = await response.json();
+      if (getStorageScopeId() !== scopeAtStart) return;
 
       if (!response.ok || !data.success) {
         const errorMsg = data.error || 'AI 문제 생성에 실패했습니다.';
@@ -197,6 +200,7 @@ export function ProblemGeneratorModal({
             body: JSON.stringify({ kind: 'problem', generationJobId: data.generationJobId, drafts: generatedDrafts }),
           });
           const retryData = await retry.json();
+          if (getStorageScopeId() !== scopeAtStart) return;
           if (retry.ok && retryData.persisted && Array.isArray(retryData.drafts)) {
             generatedDrafts = retryData.drafts as ProblemDraft[];
           }
@@ -204,6 +208,8 @@ export function ProblemGeneratorModal({
           // Keep the locally-generated drafts; persistence can be retried later.
         }
       }
+
+      if (getStorageScopeId() !== scopeAtStart) return;
 
       onGenerateSuccess(generatedDrafts);
       onClose();

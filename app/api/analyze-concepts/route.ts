@@ -1,15 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
-import { callAiChat, httpStatusForAiError } from '@/lib/aiClient';
-import { resolveAiConfigForUser } from '@/lib/aiCredentials';
-import { createClient } from '@/lib/supabase/server';
-import { persistConceptDraftsForResponse } from '@/lib/cloud/draftPersistence';
-import { ConceptDraft, ConceptEvidence } from '@/lib/types';
+import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
+import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { createClient } from '../../../lib/supabase/server';
+import { persistConceptDraftsForResponse } from '../../../lib/cloud/draftPersistence';
+import { ConceptDraft, ConceptEvidence } from '../../../lib/types';
 import {
   computeMarkdownHash,
   chunkMarkdownForAnalysis,
   verifySourceCitation,
-} from '@/lib/markdownUtils';
+  MarkdownChunk,
+} from '../../../lib/markdownUtils';
 import {
   makeAnalysisJobKey,
   makeConceptDraftId,
@@ -18,9 +19,12 @@ import {
   validateJobIdentity,
   acquireChunkLease,
   commitChunkResult,
+  syncDbLeaseToLedger,
+  recordAuthoritativeChunkResult,
   getSessionProgress,
   AnalysisSessionLedger,
-} from '@/lib/analysisCheckpoint';
+  ChunkProgressRecord,
+} from '../../../lib/analysisCheckpoint';
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -129,7 +133,7 @@ async function syncJobToSupabase(
       return { ok: false, error: `분석 작업 저장 실패: ${jobErr.message}` };
     }
 
-    const chunkInserts = Object.values(session.chunks).map((c) => ({
+    const chunkInserts = Object.values(session.chunks).map((c: ChunkProgressRecord) => ({
       job_id: session.jobKey,
       chunk_index: c.chunkIndex,
       source_context: c.sourceContext,
@@ -252,7 +256,7 @@ export async function POST(req: NextRequest) {
     const resolvedModelId = cred.ok ? cred.config.model : 'deepseek-v4.1-flash';
 
     const markdownHash = computeMarkdownHash(markdown);
-    const chunks = chunkMarkdownForAnalysis(markdown, 4500);
+    const chunks: MarkdownChunk[] = chunkMarkdownForAnalysis(markdown, 4500);
 
     // Strict Account Isolation & Job Identity Determination
     const promptVersion = 'v2';
@@ -330,24 +334,132 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Handle user pause action
-    if (action === 'pause') {
-      session.status = 'paused';
+    // Handle job initialization: creates persistent DB job/chunks without calling AI
+    if (action === 'init') {
       if (supabaseClient) {
-        try {
-          await supabaseClient.rpc('pause_analysis_job', {
-            p_job_id: jobKey,
-            p_user_id: auth.user.id,
-          });
-        } catch {
-          // fallback if RPC unavailable in dev/test
+        const initJobRes = await syncJobToSupabase(supabaseClient, auth.user.id, session);
+        if (!initJobRes.ok) {
+          return NextResponse.json(
+            { success: false, error: `${initJobRes.error}. DB 작업 레코드 생성 실패로 초기화를 완료하지 못했습니다.` },
+            { status: 500 }
+          );
         }
       }
       const progress = getSessionProgress(session);
       return NextResponse.json({
         success: true,
+        initialized: true,
+        jobKey,
+        totalChunks: progress.totalChunks,
+        completedChunks: progress.completedChunks,
+        pendingChunks: progress.pendingChunks,
+        failedChunks: progress.failedChunks,
+        isAllComplete: progress.isAllComplete,
+        status: progress.status,
+      });
+    }
+
+    // Handle retry save: persist already-generated AI chunk results without re-calling paid AI
+    if (action === 'retry_save') {
+      const targetChunkIndex = typeof payload.chunkIndex === 'number' ? payload.chunkIndex : 1;
+      const targetWorkerId = asString(payload.workerId);
+      const targetLeaseToken = asString(payload.leaseToken);
+      const targetDrafts = Array.isArray(payload.drafts) ? (payload.drafts as ConceptDraft[]) : [];
+
+      if (!targetChunkIndex || !targetLeaseToken) {
+        return NextResponse.json(
+          { success: false, error: '저장 재시도에 필요한 청크 식별자 또는 선점 토큰이 누락되었습니다.' },
+          { status: 400 }
+        );
+      }
+
+      if (supabaseClient) {
+        const { data: commitRes, error: commitErr } = await supabaseClient.rpc(
+          'commit_analysis_chunk_result',
+          {
+            p_job_id: jobKey,
+            p_chunk_index: targetChunkIndex,
+            p_worker_id: targetWorkerId,
+            p_lease_token: targetLeaseToken,
+            p_status: 'completed',
+            p_drafts: targetDrafts,
+          }
+        );
+
+        if (commitErr || (!commitRes?.committed && commitRes?.reason !== 'already_completed')) {
+          const isMismatch = commitRes?.reason === 'token_mismatch_or_expired';
+          return NextResponse.json(
+            {
+              success: false,
+              error: isMismatch
+                ? '선점 유효 시간이 만료되었거나 다른 작업자와 충돌하여 안전한 복구가 불가능합니다.'
+                : `DB 저장 재시도 실패: ${commitErr?.message || commitRes?.reason}`,
+              canRetrySave: !isMismatch,
+              jobKey,
+              chunkIndex: targetChunkIndex,
+            },
+            { status: 500 }
+          );
+        }
+      }
+
+      recordAuthoritativeChunkResult(session, targetChunkIndex, 'completed', targetDrafts);
+      const progress = getSessionProgress(session);
+
+      let outcome: { persisted: boolean; drafts: ConceptDraft[]; persistError?: string } = {
+        persisted: false,
+        drafts: progress.allDrafts,
+        persistError: undefined,
+      };
+
+      if (supabaseClient && progress.allDrafts.length > 0) {
+        try {
+          outcome = await persistConceptDraftsForResponse(
+            supabaseClient,
+            progress.allDrafts,
+            `gen_${jobKey}`
+          );
+        } catch (e) {
+          outcome = {
+            persisted: false,
+            drafts: progress.allDrafts,
+            persistError: e instanceof Error ? e.message : '초안 저장 실패',
+          };
+        }
+      }
+
+      return NextResponse.json({
+        success: true,
+        retried: true,
+        drafts: outcome.drafts,
+        count: outcome.drafts.length,
+        jobKey,
+        persisted: outcome.persisted,
+        persistError: outcome.persistError,
+        status: progress.status,
+      });
+    }
+
+    // Handle user pause action
+    if (action === 'pause') {
+      if (supabaseClient) {
+        const { data: pauseData, error: pauseErr } = await supabaseClient.rpc('pause_analysis_job', {
+          p_job_id: jobKey,
+          p_user_id: auth.user.id,
+        });
+        if (pauseErr || (pauseData && !pauseData.success)) {
+          return NextResponse.json(
+            { success: false, error: pauseErr?.message || pauseData?.error || '일시 중단 요청 실패' },
+            { status: 500 }
+          );
+        }
+      }
+      session.status = 'paused';
+      const progress = getSessionProgress(session);
+      return NextResponse.json({
+        success: true,
         paused: true,
-        message: '분석이 일시 중단되었습니다. 이미 분석된 청크와 발생한 AI 비용은 보존되며 언제든 재개할 수 있습니다.',
+        message: '분석이 일시 중단되었습니다. 이미 분석된 청크 결과는 보존되며(이미 진행된 호출 비용은 취소되지 않음), 언제든 남은 청크를 재개할 수 있습니다.',
         totalChunks: progress.totalChunks,
         completedChunks: progress.completedChunks,
         pendingChunks: progress.pendingChunks,
@@ -360,21 +472,32 @@ export async function POST(req: NextRequest) {
 
     // Handle user resume action
     if (action === 'resume') {
-      session.status = 'processing';
       if (supabaseClient) {
-        try {
-          await supabaseClient.rpc('resume_analysis_job', {
-            p_job_id: jobKey,
-            p_user_id: auth.user.id,
-          });
-        } catch {
-          // fallback if RPC unavailable
+        const { data: resumeData, error: resumeErr } = await supabaseClient.rpc('resume_analysis_job', {
+          p_job_id: jobKey,
+          p_user_id: auth.user.id,
+        });
+        if (resumeErr || (resumeData && !resumeData.success)) {
+          return NextResponse.json(
+            { success: false, error: resumeErr?.message || resumeData?.error || '분석 재개 요청 실패' },
+            { status: 500 }
+          );
         }
       }
+      session.status = 'processing';
     }
 
     // Handle read-only status query: MUST NOT trigger new AI calls or chunk leases
     if (action === 'status') {
+      if (supabaseClient) {
+        const syncRes = await syncFromSupabase(supabaseClient, auth.user.id, jobKey, session);
+        if (!syncRes.ok && !syncRes.notFound) {
+          return NextResponse.json(
+            { success: false, error: syncRes.error },
+            { status: 500 }
+          );
+        }
+      }
       const progress = getSessionProgress(session);
       return NextResponse.json({
         success: true,
@@ -501,7 +624,7 @@ export async function POST(req: NextRequest) {
             if (leaseData.reason === 'already_completed') {
               // Reuse checkpointed result from DB - DO NOT call paid AI again
               const drafts = Array.isArray(leaseData.drafts) ? (leaseData.drafts as ConceptDraft[]) : [];
-              commitChunkResult(session, chunk.chunkIndex, workerId, 'completed', drafts);
+              recordAuthoritativeChunkResult(session, chunk.chunkIndex, 'completed', drafts);
               continue;
             }
             if (leaseData.reason === 'JOB_PAUSED') {
@@ -516,9 +639,22 @@ export async function POST(req: NextRequest) {
 
           if (leaseData && leaseData.acquired) {
             activeLeaseToken = leaseData.lease_token;
+            syncDbLeaseToLedger(session, chunk.chunkIndex, workerId, leaseData.lease_token);
           }
-        } catch {
-          // Fall back to memory lease if DB RPC is not deployed in test
+        } catch (rpcErr) {
+          // If Supabase RPC is genuinely not defined in offline mock, fall back to memory lease.
+          // Otherwise return explicit DB error to prevent silent permission/lease divergence.
+          if (typeof supabaseClient.rpc === 'function') {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `청크 선점 RPC 호출 실패: ${rpcErr instanceof Error ? rpcErr.message : 'DB 오류'}`,
+                chunkIndex: chunk.chunkIndex,
+                jobKey,
+              },
+              { status: 500 }
+            );
+          }
           const memLease = acquireChunkLease(session, chunk.chunkIndex, workerId);
           if (memLease.reason === 'already_completed') continue;
           if (memLease.reason === 'locked' || memLease.reason === 'paused') continue;
@@ -693,45 +829,64 @@ ${chunk.text}
           );
 
           if (commitErr || !commitRes?.committed) {
-            // DB commit failed or expired lease: retain AI results in memory ledger
-            commitChunkResult(
-              session,
-              chunk.chunkIndex,
-              workerId,
-              'completed',
-              chunkDrafts,
-              undefined,
-              activeLeaseToken
-            );
             const isMismatch = commitRes?.reason === 'token_mismatch_or_expired';
             return NextResponse.json(
               {
                 success: false,
                 error: isMismatch
-                  ? '청크 처리 중 선점 유효 시간이 만료되어 결과가 커밋되지 않았습니다.'
+                  ? '청크 처리 중 선점 유효 시간이 만료되어 결과가 커밋되지 않았습니다. AI 재호출 없는 복구가 불가능합니다.'
                   : `AI 분석 결과가 생성되었으나 DB 저장에 실패했습니다. AI 재호출 없이 저장만 다시 시도할 수 있습니다. (${commitErr?.message || commitRes?.reason})`,
                 canRetrySave: !isMismatch,
                 drafts: chunkDrafts,
+                chunkIndex: chunk.chunkIndex,
+                workerId,
+                leaseToken: activeLeaseToken,
+                jobKey,
+                generationJobId,
+              },
+              { status: 500 }
+            );
+          }
+
+          // Authoritative DB commit succeeded: sync directly into session ledger
+          recordAuthoritativeChunkResult(session, chunk.chunkIndex, 'completed', chunkDrafts);
+        } catch (commitRpcErr) {
+          if (typeof supabaseClient.rpc === 'function') {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `결과 저장 RPC 호출 실패: ${commitRpcErr instanceof Error ? commitRpcErr.message : 'DB 오류'}`,
                 chunkIndex: chunk.chunkIndex,
                 jobKey,
               },
               { status: 500 }
             );
           }
-        } catch {
-          // If RPC not available, continue with ledger commit
+          recordAuthoritativeChunkResult(session, chunk.chunkIndex, 'completed', chunkDrafts);
+        }
+      } else {
+        // Memory-only fallback for offline unit tests without DB
+        const memRes = commitChunkResult(
+          session,
+          chunk.chunkIndex,
+          workerId,
+          'completed',
+          chunkDrafts,
+          undefined,
+          activeLeaseToken || undefined
+        );
+        if (!memRes.committed && memRes.reason !== 'already_completed') {
+          return NextResponse.json(
+            {
+              success: false,
+              error: `메모리 렛저 커밋 실패: ${memRes.reason}`,
+              chunkIndex: chunk.chunkIndex,
+              jobKey,
+            },
+            { status: 500 }
+          );
         }
       }
-
-      commitChunkResult(
-        session,
-        chunk.chunkIndex,
-        workerId,
-        'completed',
-        chunkDrafts,
-        undefined,
-        activeLeaseToken || undefined
-      );
     }
 
     // 8. Aggregate progress across the session ledger

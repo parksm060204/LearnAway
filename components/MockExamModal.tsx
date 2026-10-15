@@ -829,7 +829,9 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            mockExamSessionId: session.id,
             problemId: problem.id,
+            problemVersion: problem.version ?? 1,
             conceptId: problem.conceptIds[0],
             conceptIds: problem.conceptIds,
             subjectId: subject.id,

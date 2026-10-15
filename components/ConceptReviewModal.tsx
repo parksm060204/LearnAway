@@ -40,12 +40,15 @@ interface ConceptReviewModalProps {
   onTriggerAnalysis?: (material: Material) => void;
   isAnalyzing?: boolean;
   analysisProgress?: {
+    materialId?: string;
     totalChunks: number;
     completedChunks: number;
     pendingChunks: number;
     failedChunks: number;
     status: 'processing' | 'paused' | 'completed' | 'failed';
   } | null;
+  saveFailedInfo?: { message: string; canRetry: boolean } | null;
+  onRetrySaveAnalysis?: (material: Material) => void;
   onPauseAnalysis?: (material: Material) => void;
   onResumeAnalysis?: (material: Material) => void;
   /** Server-backed approval (transactional RPC). When provided, the modal uses
@@ -68,6 +71,8 @@ export function ConceptReviewModal({
   onTriggerAnalysis,
   isAnalyzing = false,
   analysisProgress = null,
+  saveFailedInfo = null,
+  onRetrySaveAnalysis,
   onPauseAnalysis,
   onResumeAnalysis,
   onApproveConceptDraft,
@@ -320,7 +325,7 @@ export function ConceptReviewModal({
           </div>
 
           <div className="flex items-center gap-2">
-            {analysisProgress && (
+            {analysisProgress && (!analysisProgress.materialId || analysisProgress.materialId === material?.id) && (
               <div className="flex items-center gap-2 bg-[#262421] px-2.5 py-1 rounded border border-[#3e3b36] text-[11px] font-academic-mono text-[#ded6c8]">
                 <span>
                   진행: {analysisProgress.completedChunks}/{analysisProgress.totalChunks} 청크
@@ -333,11 +338,22 @@ export function ConceptReviewModal({
               </div>
             )}
 
+            {saveFailedInfo && saveFailedInfo.canRetry && material && onRetrySaveAnalysis && (
+              <button
+                onClick={() => onRetrySaveAnalysis(material)}
+                disabled={isAnalyzing}
+                className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors shadow-xs animate-pulse disabled:opacity-50"
+                title="AI 재호출 없이 생성 완료된 초안만 DB에 다시 저장합니다."
+              >
+                <span>생성 완료, 저장 실패 - 저장 재시도</span>
+              </button>
+            )}
+
             {material && (analysisProgress?.status === 'processing' || isAnalyzing) && onPauseAnalysis && (
               <button
                 onClick={() => onPauseAnalysis(material)}
                 className="px-2.5 py-1.5 bg-amber-700 hover:bg-amber-600 text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors"
-                title="AI 분석 일시 중단 (현재 완료된 청크 및 비용 보존)"
+                title="AI 분석 일시 중단 (이미 진행된 AI 호출 비용은 취소되지 않으며, 남은 청크의 분석이 보류됩니다)"
               >
                 <span>일시 중단</span>
               </button>

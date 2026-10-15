@@ -472,3 +472,60 @@ export function deduplicateConceptDrafts(drafts: ConceptDraft[]): ConceptDraft[]
   }
   return deduplicated;
 }
+
+/**
+ * Synchronizes an authoritative DB chunk lease into the session ledger.
+ */
+export function syncDbLeaseToLedger(
+  session: AnalysisSessionLedger,
+  chunkIndex: number,
+  workerId: string,
+  leaseToken: string,
+  leaseExpiresAt?: string
+): void {
+  const chunk = session.chunks[chunkIndex];
+  if (!chunk) return;
+  chunk.status = 'running';
+  chunk.leaseWorkerId = workerId;
+  chunk.leaseToken = leaseToken;
+  chunk.leaseExpiresAt = leaseExpiresAt || new Date(Date.now() + 90000).toISOString();
+  chunk.attemptCount = (chunk.attemptCount || 0) + 1;
+  session.status = 'processing';
+  session.updatedAt = new Date().toISOString();
+}
+
+/**
+ * Directly records an authoritative completed/failed DB result into the session ledger.
+ */
+export function recordAuthoritativeChunkResult(
+  session: AnalysisSessionLedger,
+  chunkIndex: number,
+  status: 'completed' | 'failed',
+  drafts: ConceptDraft[],
+  error?: string
+): void {
+  const chunk = session.chunks[chunkIndex];
+  if (!chunk) return;
+  chunk.status = status;
+  chunk.drafts = status === 'completed' ? drafts : [];
+  chunk.error = error;
+  chunk.leaseWorkerId = null;
+  chunk.leaseToken = null;
+  chunk.leaseExpiresAt = null;
+  if (status === 'completed') {
+    chunk.completedAt = new Date().toISOString();
+  }
+  session.updatedAt = new Date().toISOString();
+
+  let allDone = true;
+  for (let i = 1; i <= session.totalChunks; i++) {
+    if (session.chunks[i]?.status !== 'completed') {
+      allDone = false;
+      break;
+    }
+  }
+  if (allDone) {
+    session.status = 'completed';
+  }
+}
+

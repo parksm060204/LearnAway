@@ -359,6 +359,7 @@ export function ProblemSessionModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           problemId: problem.id,
+          problemVersion: problem.version ?? 1,
           conceptId: concept.id,
           conceptIds: problem.conceptIds || [concept.id],
           subjectId: subject.id,

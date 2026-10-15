@@ -302,6 +302,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     failedChunks: number;
     status: 'processing' | 'paused' | 'completed' | 'failed';
   } | null>(null);
+  const [saveFailedState, setSaveFailedState] = useState<{
+    jobKey: string;
+    chunkIndex: number;
+    workerId: string;
+    leaseToken: string;
+    drafts: ConceptDraft[];
+    materialId: string;
+    canRetrySave: boolean;
+    message: string;
+  } | null>(null);
 
   // Stage 3: AI Problem Generation & Review State
   const [problemDrafts, setProblemDrafts] = useState<ProblemDraft[]>([]);
@@ -1954,25 +1964,77 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       return;
     }
 
+    const scopeAtStart = getStorageScopeId();
     setIsAiAnalyzing(true);
-    showToast(`[${targetMaterial.title}] AI 개념 분석 시작... (AI 처리 중)`);
+    setSaveFailedState(null);
+    showToast(`[${targetMaterial.title}] AI 개념 분석 시작...`);
 
     try {
+      // 1. Separate job creation from chunk processing to secure jobKey upfront for instant pause
+      let initialJobKey: string | undefined = undefined;
+      try {
+        const initRes = await fetch('/api/analyze-concepts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'init',
+            materialId: targetMaterial.id,
+            subjectId: targetMaterial.subjectId,
+            domain: activeSubject?.domain || 'mathematics',
+            markdown,
+          }),
+        });
+        const initData = await initRes.json();
+        if (initRes.ok && initData.success) {
+          if (getStorageScopeId() !== scopeAtStart) return;
+          initialJobKey = initData.jobKey;
+          setAnalysisProgress({
+            jobKey: initData.jobKey,
+            materialId: targetMaterial.id,
+            totalChunks: initData.totalChunks || 1,
+            completedChunks: initData.completedChunks || 0,
+            pendingChunks: initData.pendingChunks || 0,
+            failedChunks: 0,
+            status: 'processing',
+          });
+        }
+      } catch {
+        // Fall back to standard processing if init fails
+      }
+
       const res = await fetch('/api/analyze-concepts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          action: 'process',
           materialId: targetMaterial.id,
           subjectId: targetMaterial.subjectId,
           domain: activeSubject?.domain || 'mathematics',
           markdown,
+          jobKey: initialJobKey,
           sourceRefs: targetMaterial.sourceRefs || [],
           materialTitle: targetMaterial.title,
         }),
       });
 
       const data = await res.json();
+      if (getStorageScopeId() !== scopeAtStart) return;
+
       if (!res.ok || !data.success) {
+        if (data.canRetrySave && Array.isArray(data.drafts) && data.drafts.length > 0) {
+          setSaveFailedState({
+            jobKey: data.jobKey || initialJobKey || '',
+            chunkIndex: data.chunkIndex || 1,
+            workerId: data.workerId || '',
+            leaseToken: data.leaseToken || '',
+            drafts: data.drafts,
+            materialId: targetMaterial.id,
+            canRetrySave: true,
+            message: data.error || '생성 완료, 저장 실패',
+          });
+          showToast('AI 개념 추출은 완료되었으나 DB 저장에 실패했습니다. AI 재호출 없이 저장만 다시 시도할 수 있습니다.');
+          return;
+        }
         const errMsg = data.error || 'AI 개념 분석에 실패했습니다.';
         const details = data.details ? ` (${data.details})` : '';
         showToast(`분석 실패: ${errMsg}${details}`);
@@ -1996,7 +2058,6 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       }
 
       if (data.persisted === false) {
-        // Retry saving the already-generated drafts WITHOUT re-calling the AI.
         try {
           const retry = await fetch('/api/persist-drafts', {
             method: 'POST',
@@ -2004,12 +2065,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             body: JSON.stringify({ kind: 'concept', generationJobId: data.generationJobId, drafts: newDrafts }),
           });
           const retryData = await retry.json();
+          if (getStorageScopeId() !== scopeAtStart) return;
           if (!retry.ok || !retryData.persisted) {
             showToast(
               `개념 초안을 서버에 저장하지 못했습니다. 로컬에 보관했으며 다시 시도할 수 있습니다. (${data.persistError || retryData.error || '오류'})`
             );
           } else if (Array.isArray(retryData.drafts)) {
-            // Adopt the server drafts (DB updatedAt/contentVersion/approval).
             newDrafts = retryData.drafts as ConceptDraft[];
           }
         } catch {
@@ -2017,20 +2078,19 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }
       }
 
-      // Replace or prepend drafts for this material, preserving drafts for other materials
+      if (getStorageScopeId() !== scopeAtStart) return;
+
       const otherDrafts = conceptDrafts.filter((d) => d.materialId !== targetMaterial.id);
       const updatedDrafts = [...newDrafts, ...otherDrafts];
       setConceptDrafts(updatedDrafts);
       saveStoredConceptDrafts(updatedDrafts);
 
-      // Update material hasAiConcepts flag
       const updatedMaterials = materials.map((m) =>
         m.id === targetMaterial.id ? { ...m, hasAiConcepts: true } : m
       );
       setMaterials(updatedMaterials);
       saveStoredMaterials(updatedMaterials);
 
-      // Select and open review modal
       setConceptReviewMaterial(targetMaterial);
       setIsConceptReviewOpen(true);
       showToast(`[${targetMaterial.title}] 분석 완료! ${newDrafts.length}개 개념 초안이 생성되었습니다.`);
@@ -2041,8 +2101,51 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     }
   };
 
+  const handleRetrySaveAnalysis = async (targetMaterial: Material) => {
+    if (!saveFailedState || saveFailedState.materialId !== targetMaterial.id) return;
+    const scopeAtStart = getStorageScopeId();
+    setIsAiAnalyzing(true);
+    showToast(`[${targetMaterial.title}] AI 분석 결과 저장 재시도 중... (AI 재호출 없음)`);
+    try {
+      const res = await fetch('/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: saveFailedState.jobKey,
+          chunkIndex: saveFailedState.chunkIndex,
+          workerId: saveFailedState.workerId,
+          leaseToken: saveFailedState.leaseToken,
+          drafts: saveFailedState.drafts,
+          materialId: targetMaterial.id,
+          subjectId: targetMaterial.subjectId,
+          markdown: targetMaterial.parsedMarkdown || '',
+        }),
+      });
+      const data = await res.json();
+      if (getStorageScopeId() !== scopeAtStart) return;
+
+      if (!res.ok || !data.success) {
+        showToast(`저장 재시도 실패: ${data.error || '오류 발생'}`);
+        return;
+      }
+      setSaveFailedState(null);
+      const newDrafts: ConceptDraft[] = data.drafts || saveFailedState.drafts;
+      const otherDrafts = conceptDrafts.filter((d) => d.materialId !== targetMaterial.id);
+      const updatedDrafts = [...newDrafts, ...otherDrafts];
+      setConceptDrafts(updatedDrafts);
+      saveStoredConceptDrafts(updatedDrafts);
+      showToast(`[${targetMaterial.title}] 저장 완료! AI 재호출 없이 ${newDrafts.length}개 초안이 안전하게 저장되었습니다.`);
+    } catch (err) {
+      showToast(`저장 재시도 네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
+    } finally {
+      setIsAiAnalyzing(false);
+    }
+  };
+
   const handlePauseAiAnalysis = async (targetMaterial: Material) => {
     if (!analysisProgress) return;
+    const scopeAtStart = getStorageScopeId();
     try {
       const res = await fetch('/api/analyze-concepts', {
         method: 'POST',
@@ -2057,10 +2160,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }),
       });
       const data = await res.json();
+      if (getStorageScopeId() !== scopeAtStart) return;
       if (data.success) {
         setAnalysisProgress((prev) => (prev ? { ...prev, status: 'paused' } : null));
         setIsAiAnalyzing(false);
-        showToast('AI 분석이 일시 중단되었습니다. 언제든 다시 재개할 수 있습니다.');
+        showToast('AI 분석이 일시 중단되었습니다. 이미 분석된 청크와 발생한 AI 비용은 유지되며(호출 비용 취소 불가), 언제든 재개할 수 있습니다.');
+      } else {
+        showToast(`일시 중단 실패: ${data.error || '오류 발생'}`);
       }
     } catch {
       showToast('일시 중단 요청에 실패했습니다.');
@@ -2079,6 +2185,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       return;
     }
 
+    const scopeAtStart = getStorageScopeId();
     setIsAiAnalyzing(true);
     setAnalysisProgress((prev) => (prev ? { ...prev, status: 'processing' } : null));
     showToast(`[${targetMaterial.title}] AI 분석 재개 중...`);
@@ -2098,6 +2205,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       });
 
       const data = await res.json();
+      if (getStorageScopeId() !== scopeAtStart) return;
+
       if (!res.ok || !data.success) {
         showToast(`분석 재개 실패: ${data.error || '오류 발생'}`);
         return;
@@ -2127,6 +2236,54 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       setIsAiAnalyzing(false);
     }
   };
+
+  // Restore analysis progress and checkpointed drafts when opening concept review modal (e.g. after reload)
+  useEffect(() => {
+    if (!conceptReviewMaterial || !isConceptReviewOpen) return;
+    let isCancelled = false;
+    const fetchExistingProgress = async () => {
+      let md = conceptReviewMaterial.parsedMarkdown;
+      if (!md || !md.trim()) {
+        const loaded = await loadMaterialContent(conceptReviewMaterial.id);
+        md = loaded?.markdown;
+      }
+      if (!md || !md.trim()) return;
+      try {
+        const res = await fetch('/api/analyze-concepts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'status',
+            materialId: conceptReviewMaterial.id,
+            subjectId: conceptReviewMaterial.subjectId,
+            domain: activeSubject?.domain || 'mathematics',
+            markdown: md,
+          }),
+        });
+        const data = await res.json();
+        if (isCancelled) return;
+        if (res.ok && data.success && data.jobKey) {
+          if (data.status === 'processing' || data.status === 'paused') {
+            setAnalysisProgress({
+              jobKey: data.jobKey,
+              materialId: conceptReviewMaterial.id,
+              totalChunks: data.totalChunks || 1,
+              completedChunks: data.completedChunks || 0,
+              pendingChunks: data.pendingChunks || 0,
+              failedChunks: data.failedChunks || 0,
+              status: data.status,
+            });
+          }
+        }
+      } catch {
+        // ignore background status restoration errors
+      }
+    };
+    fetchExistingProgress();
+    return () => {
+      isCancelled = true;
+    };
+  }, [conceptReviewMaterial, isConceptReviewOpen, activeSubject?.domain]);
 
   // Stage 3: AI Problem Generation & Review Handlers
   const handleProblemGenerateSuccess = (newDrafts: ProblemDraft[]) => {
@@ -3941,6 +4098,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         onTriggerAnalysis={handleTriggerAiAnalysis}
         isAnalyzing={isAiAnalyzing}
         analysisProgress={analysisProgress}
+        saveFailedInfo={
+          saveFailedState && saveFailedState.materialId === conceptReviewMaterial?.id
+            ? { message: saveFailedState.message, canRetry: saveFailedState.canRetrySave }
+            : null
+        }
+        onRetrySaveAnalysis={handleRetrySaveAnalysis}
         onPauseAnalysis={handlePauseAiAnalysis}
         onResumeAnalysis={handleResumeAiAnalysis}
         onApproveConceptDraft={async (draft) => {

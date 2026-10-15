@@ -118,7 +118,6 @@ export async function POST(req: NextRequest) {
     } = body;
 
     const boundedStrings =
-      typeof problemTitle === 'string' &&
       isStringWithin(problemTitle, 300) &&
       isStringWithin(problemPrompt, MAX_PROMPT_CHARS) &&
       isStringWithin(modelAnswer, MAX_MODEL_ANSWER_CHARS) &&
@@ -157,14 +156,16 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (typeof problemPrompt !== 'string' || !problemPrompt.trim() || typeof modelAnswer !== 'string' || !modelAnswer.trim()) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: '문제 지문, 모범 답안, 또는 채점 기준(루브릭) 정보가 누락되었습니다.',
-        },
-        { status: 400 }
-      );
+    if (!body.mockExamSessionId && !problemId) {
+      if (typeof problemPrompt !== 'string' || !problemPrompt.trim() || typeof modelAnswer !== 'string' || !modelAnswer.trim()) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '문제 지문, 모범 답안, 또는 채점 기준(루브릭) 정보가 누락되었습니다.',
+          },
+          { status: 400 }
+        );
+      }
     }
 
     const supabase = await createClient();
@@ -204,85 +205,72 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      if (examRow.status !== 'submitted' && examRow.status !== 'graded') {
+        return NextResponse.json(
+          { success: false, error: `제출되지 않았거나 취소된 모의시험은 평가할 수 없습니다. (상태: ${examRow.status})` },
+          { status: 400 }
+        );
+      }
+
       const examPayload = (examRow.payload || {}) as Record<string, unknown>;
       const frozenProblems = Array.isArray(examPayload.problems)
         ? (examPayload.problems as Array<Record<string, unknown>>)
         : [];
       const frozenProb = frozenProblems.find((p) => p.id === problemId || p.problemId === problemId);
 
-      if (frozenProb) {
-        if (typeof frozenProb.promptText === 'string' && frozenProb.promptText.trim()) verifiedPrompt = frozenProb.promptText;
-        if (typeof frozenProb.modelAnswer === 'string' && frozenProb.modelAnswer.trim()) verifiedModelAnswer = frozenProb.modelAnswer;
-        if (Array.isArray(frozenProb.rubric) && frozenProb.rubric.length > 0) verifiedRubric = frozenProb.rubric as RubricCriterion[];
-        if (typeof frozenProb.mathFormula === 'string') verifiedMathFormula = frozenProb.mathFormula;
-        if (typeof frozenProb.codeSnippet === 'string') verifiedCodeSnippet = frozenProb.codeSnippet;
-        if (typeof frozenProb.appliedConditionNote === 'string') verifiedAppliedCondition = frozenProb.appliedConditionNote;
-      } else {
+      if (!frozenProb) {
         return NextResponse.json(
           { success: false, error: '해당 모의시험 세션의 문제 스냅샷에 포함되지 않은 문항입니다.' },
           { status: 404 }
         );
       }
+
+      if (
+        typeof frozenProb.promptText !== 'string' || !frozenProb.promptText.trim() ||
+        typeof frozenProb.modelAnswer !== 'string' || !frozenProb.modelAnswer.trim() ||
+        !Array.isArray(frozenProb.rubric) || frozenProb.rubric.length === 0
+      ) {
+        return NextResponse.json(
+          { success: false, error: '모의시험 문제 스냅샷의 필수 정보(지문, 모범답안, 루브릭)가 누락되었습니다.' },
+          { status: 500 }
+        );
+      }
+
+      verifiedPrompt = frozenProb.promptText;
+      verifiedModelAnswer = frozenProb.modelAnswer;
+      verifiedRubric = frozenProb.rubric as RubricCriterion[];
+      verifiedMathFormula = typeof frozenProb.mathFormula === 'string' ? frozenProb.mathFormula : undefined;
+      verifiedCodeSnippet = typeof frozenProb.codeSnippet === 'string' ? frozenProb.codeSnippet : undefined;
+      verifiedAppliedCondition = typeof frozenProb.appliedConditionNote === 'string' ? frozenProb.appliedConditionNote : undefined;
     } else if (problemId) {
       // 2B. Problem Version Snapshot or Authoritative Problem Resolution
       if (hasDb) {
         let resolvedPayload: Record<string, unknown> | null = null;
-        let problemOwner: string | null = null;
-        let isDemo = false;
         let qualityStatus = 'normal';
 
-        if (typeof body.problemVersion === 'number') {
-          const { data: versionRow, error: versionErr } = await supabase
-            .from('problem_versions')
-            .select('*')
-            .eq('problem_id', problemId)
-            .eq('version', body.problemVersion)
-            .maybeSingle();
+        const { data: serverProb, error: probErr } = await supabase
+          .from('problems')
+          .select('*')
+          .eq('id', problemId)
+          .maybeSingle();
 
-          if (versionErr) {
-            return NextResponse.json(
-              { success: false, error: `문제 버전 이력 조회 실패: ${versionErr.message}. DB 오류로 평가를 중단합니다.` },
-              { status: 500 }
-            );
-          }
-
-          if (versionRow) {
-            if (versionRow.user_id && versionRow.user_id !== auth.user.id) {
-              return NextResponse.json(
-                { success: false, error: '해당 문제 버전에 대한 접근 권한이 없습니다.' },
-                { status: 404 }
-              );
-            }
-            resolvedPayload = (versionRow.snapshot || {}) as Record<string, unknown>;
-          }
+        if (probErr) {
+          return NextResponse.json(
+            { success: false, error: `문제 조회 실패: ${probErr.message}. DB 오류로 평가를 중단합니다.` },
+            { status: 500 }
+          );
         }
 
-        if (!resolvedPayload) {
-          const { data: serverProb, error: probErr } = await supabase
-            .from('problems')
-            .select('*')
-            .eq('id', problemId)
-            .maybeSingle();
-
-          if (probErr) {
-            return NextResponse.json(
-              { success: false, error: `문제 조회 실패: ${probErr.message}. DB 오류로 평가를 중단합니다.` },
-              { status: 500 }
-            );
-          }
-
-          if (!serverProb) {
-            return NextResponse.json(
-              { success: false, error: '해당 문제를 찾을 수 없습니다.' },
-              { status: 404 }
-            );
-          }
-
-          problemOwner = serverProb.user_id;
-          isDemo = Boolean(serverProb.is_demo);
-          qualityStatus = serverProb.quality_status;
-          resolvedPayload = (serverProb.payload || {}) as Record<string, unknown>;
+        if (!serverProb) {
+          return NextResponse.json(
+            { success: false, error: '해당 문제를 찾을 수 없습니다.' },
+            { status: 404 }
+          );
         }
+
+        const problemOwner = serverProb.user_id;
+        const isDemo = Boolean(serverProb.is_demo);
+        qualityStatus = serverProb.quality_status;
 
         if (problemOwner && problemOwner !== auth.user.id && !isDemo) {
           return NextResponse.json(
@@ -294,24 +282,64 @@ export async function POST(req: NextRequest) {
           );
         }
 
-        if (typeof resolvedPayload.promptText === 'string' && resolvedPayload.promptText.trim()) {
-          verifiedPrompt = resolvedPayload.promptText;
+        const requestedVersion = typeof body.problemVersion === 'number' ? body.problemVersion : undefined;
+        const currentProblemVersion = typeof serverProb.version === 'number' ? serverProb.version : 1;
+
+        if (requestedVersion !== undefined && requestedVersion !== currentProblemVersion) {
+          // Explicit version requested differs from current problem: lookup immutable snapshot
+          const { data: versionRow, error: versionErr } = await supabase
+            .from('problem_versions')
+            .select('*')
+            .eq('problem_id', problemId)
+            .eq('version', requestedVersion)
+            .maybeSingle();
+
+          if (versionErr) {
+            return NextResponse.json(
+              { success: false, error: `문제 버전 이력 조회 실패: ${versionErr.message}. DB 오류로 평가를 중단합니다.` },
+              { status: 500 }
+            );
+          }
+
+          if (!versionRow) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `요청한 문제 버전(${requestedVersion})의 스냅샷을 찾을 수 없습니다. 최신 문제로 대체할 수 없습니다.`,
+              },
+              { status: 404 }
+            );
+          }
+
+          if (versionRow.user_id && versionRow.user_id !== auth.user.id) {
+            return NextResponse.json(
+              { success: false, error: '해당 문제 버전에 대한 접근 권한이 없습니다.' },
+              { status: 404 }
+            );
+          }
+
+          resolvedPayload = (versionRow.snapshot || {}) as Record<string, unknown>;
+        } else {
+          resolvedPayload = (serverProb.payload || {}) as Record<string, unknown>;
         }
-        if (typeof resolvedPayload.modelAnswer === 'string' && resolvedPayload.modelAnswer.trim()) {
-          verifiedModelAnswer = resolvedPayload.modelAnswer;
+
+        if (
+          typeof resolvedPayload.promptText !== 'string' || !resolvedPayload.promptText.trim() ||
+          typeof resolvedPayload.modelAnswer !== 'string' || !resolvedPayload.modelAnswer.trim() ||
+          !Array.isArray(resolvedPayload.rubric) || resolvedPayload.rubric.length === 0
+        ) {
+          return NextResponse.json(
+            { success: false, error: '서버 문제 스냅샷의 필수 정보(지문, 모범답안, 루브릭)가 누락되었습니다.' },
+            { status: 500 }
+          );
         }
-        if (Array.isArray(resolvedPayload.rubric) && resolvedPayload.rubric.length > 0) {
-          verifiedRubric = resolvedPayload.rubric as RubricCriterion[];
-        }
-        if (typeof resolvedPayload.mathFormula === 'string') {
-          verifiedMathFormula = resolvedPayload.mathFormula;
-        }
-        if (typeof resolvedPayload.codeSnippet === 'string') {
-          verifiedCodeSnippet = resolvedPayload.codeSnippet;
-        }
-        if (typeof resolvedPayload.appliedConditionNote === 'string') {
-          verifiedAppliedCondition = resolvedPayload.appliedConditionNote;
-        }
+
+        verifiedPrompt = resolvedPayload.promptText;
+        verifiedModelAnswer = resolvedPayload.modelAnswer;
+        verifiedRubric = resolvedPayload.rubric as RubricCriterion[];
+        verifiedMathFormula = typeof resolvedPayload.mathFormula === 'string' ? resolvedPayload.mathFormula : undefined;
+        verifiedCodeSnippet = typeof resolvedPayload.codeSnippet === 'string' ? resolvedPayload.codeSnippet : undefined;
+        verifiedAppliedCondition = typeof resolvedPayload.appliedConditionNote === 'string' ? resolvedPayload.appliedConditionNote : undefined;
 
         if (qualityStatus !== 'verified') {
           qualityStatusNotice =

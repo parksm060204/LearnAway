@@ -402,6 +402,7 @@ export function LogicStrengthenModal({
         signal: controller.signal,
         body: JSON.stringify({
           problemId: base.problemId,
+          problemVersion: base.problemVersion ?? problem.version ?? 1,
           conceptId: base.conceptId,
           conceptIds: problem.conceptIds || [base.conceptId],
           subjectId: base.subjectId,

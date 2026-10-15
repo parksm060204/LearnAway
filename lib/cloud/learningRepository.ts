@@ -169,26 +169,35 @@ export async function upsertConceptDrafts(
         continue;
       }
 
-      // Brand new draft: insert
+      // Brand new draft: insert without overwriting on conflict
       rowsToUpsert.push(conceptDraftContentUpsert(draft, jobId ?? null));
     }
 
-    let insertedDrafts: ConceptDraft[] = [];
     if (rowsToUpsert.length > 0) {
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from('concept_drafts')
-        .upsert(rowsToUpsert, { onConflict: 'id,user_id' })
-        .select('*');
+        .upsert(rowsToUpsert, { onConflict: 'id,user_id', ignoreDuplicates: true });
       if (error) return repoError(error.message);
-      insertedDrafts = ((data as ConceptDraftRow[]) ?? []).map(rowToConceptDraft);
     }
 
-    const resultMap = new Map<string, ConceptDraft>();
-    for (const d of preservedDrafts) resultMap.set(d.id, d);
-    for (const d of insertedDrafts) resultMap.set(d.id, d);
+    // Authoritative re-query of all requested drafts to guarantee that any concurrent
+    // user edits, approvals, or existing server state are fully preserved without overwrite.
+    const { data: finalRows, error: finalErr } = await supabase
+      .from('concept_drafts')
+      .select('*')
+      .in('id', ids);
+
+    if (finalErr) return repoError(finalErr.message);
+
+    const finalMap = new Map<string, ConceptDraftRow>(
+      ((finalRows as ConceptDraftRow[]) ?? []).map((r) => [r.id, r])
+    );
 
     const orderedResults = drafts
-      .map((d) => resultMap.get(d.id))
+      .map((d) => {
+        const row = finalMap.get(d.id);
+        return row ? rowToConceptDraft(row) : undefined;
+      })
       .filter((d): d is ConceptDraft => Boolean(d));
 
     return repoOk(orderedResults);
@@ -217,46 +226,39 @@ export async function upsertProblemDrafts(
     );
 
     const rowsToUpsert: ReturnType<typeof problemDraftContentUpsert>[] = [];
-    const preservedDrafts: ProblemDraft[] = [];
 
     for (const draft of drafts) {
       const existing = existingMap.get(draft.id);
       if (existing) {
-        const payload = (existing.payload || {}) as Record<string, unknown>;
-        const isUserEdited = existing.edited_by_user || payload.editedByUser;
-        const isApprovedOrRejected =
-          existing.is_approved ||
-          existing.status === 'approved' ||
-          existing.status === 'rejected';
-
-        if (isUserEdited || isApprovedOrRejected) {
-          preservedDrafts.push(rowToProblemDraft(existing));
-          continue;
-        }
-
-        preservedDrafts.push(rowToProblemDraft(existing));
         continue;
       }
 
       rowsToUpsert.push(problemDraftContentUpsert(draft, jobId ?? null));
     }
 
-    let insertedDrafts: ProblemDraft[] = [];
     if (rowsToUpsert.length > 0) {
-      const { data, error } = await supabase
+      const { error } = await supabase
         .from('problem_drafts')
-        .upsert(rowsToUpsert, { onConflict: 'id,user_id' })
-        .select('*');
+        .upsert(rowsToUpsert, { onConflict: 'id,user_id', ignoreDuplicates: true });
       if (error) return repoError(error.message);
-      insertedDrafts = ((data as ProblemDraftRow[]) ?? []).map(rowToProblemDraft);
     }
 
-    const resultMap = new Map<string, ProblemDraft>();
-    for (const d of preservedDrafts) resultMap.set(d.id, d);
-    for (const d of insertedDrafts) resultMap.set(d.id, d);
+    const { data: finalRows, error: finalErr } = await supabase
+      .from('problem_drafts')
+      .select('*')
+      .in('id', ids);
+
+    if (finalErr) return repoError(finalErr.message);
+
+    const finalMap = new Map<string, ProblemDraftRow>(
+      ((finalRows as ProblemDraftRow[]) ?? []).map((r) => [r.id, r])
+    );
 
     const orderedResults = drafts
-      .map((d) => resultMap.get(d.id))
+      .map((d) => {
+        const row = finalMap.get(d.id);
+        return row ? rowToProblemDraft(row) : undefined;
+      })
       .filter((d): d is ProblemDraft => Boolean(d));
 
     return repoOk(orderedResults);
