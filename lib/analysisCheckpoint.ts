@@ -360,6 +360,7 @@ export function recordChunkResult(
 export function getSessionProgress(session: AnalysisSessionLedger): {
   totalChunks: number;
   completedChunks: number;
+  runningChunks: number;
   failedChunks: number;
   pendingChunks: number;
   isAllComplete: boolean;
@@ -368,6 +369,7 @@ export function getSessionProgress(session: AnalysisSessionLedger): {
 } {
   let completed = 0;
   let failed = 0;
+  let running = 0;
   let pending = 0;
   const allDraftsRaw: ConceptDraft[] = [];
 
@@ -378,6 +380,8 @@ export function getSessionProgress(session: AnalysisSessionLedger): {
     } else if (chunk.status === 'completed') {
       completed++;
       allDraftsRaw.push(...chunk.drafts);
+    } else if (chunk.status === 'running') {
+      running++;
     } else if (chunk.status === 'failed') {
       failed++;
     } else {
@@ -386,13 +390,25 @@ export function getSessionProgress(session: AnalysisSessionLedger): {
   }
 
   const isAllComplete = completed === session.totalChunks && session.totalChunks > 0;
+  let computedStatus = session.status;
+  if (isAllComplete) {
+    computedStatus = 'completed';
+  } else if (session.status === 'paused') {
+    computedStatus = 'paused';
+  } else if (running > 0 || (completed > 0 && !isAllComplete)) {
+    computedStatus = 'processing';
+  } else if (failed === session.totalChunks && session.totalChunks > 0) {
+    computedStatus = 'failed';
+  }
+
   return {
     totalChunks: session.totalChunks,
     completedChunks: completed,
+    runningChunks: running,
     failedChunks: failed,
     pendingChunks: pending,
     isAllComplete,
-    status: isAllComplete ? 'completed' : session.status,
+    status: computedStatus,
     allDrafts: deduplicateConceptDrafts(allDraftsRaw),
   };
 }
@@ -413,12 +429,12 @@ export function deduplicateConceptDrafts(drafts: ConceptDraft[]): ConceptDraft[]
       const existing = deduplicated[existingIdx];
 
       // Merge prerequisites and related concepts
-      existing.prerequisites = Array.from(new Set([...existing.prerequisites, ...draft.prerequisites]));
-      existing.relatedConcepts = Array.from(new Set([...existing.relatedConcepts, ...draft.relatedConcepts]));
+      existing.prerequisites = Array.from(new Set([...(existing.prerequisites || []), ...(draft.prerequisites || [])]));
+      existing.relatedConcepts = Array.from(new Set([...(existing.relatedConcepts || []), ...(draft.relatedConcepts || [])]));
       existing.commonMisconceptions = Array.from(
-        new Set([...existing.commonMisconceptions, ...draft.commonMisconceptions])
+        new Set([...(existing.commonMisconceptions || []), ...(draft.commonMisconceptions || [])])
       );
-      existing.examples = Array.from(new Set([...existing.examples, ...draft.examples]));
+      existing.examples = Array.from(new Set([...(existing.examples || []), ...(draft.examples || [])]));
 
       // Keep richer description
       if (draft.description.length > existing.description.length) {

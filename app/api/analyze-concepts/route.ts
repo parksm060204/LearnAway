@@ -16,7 +16,6 @@ import {
   makeConceptDraftId,
   getOrCreateSessionLedger,
   findSessionLedger,
-  validateJobIdentity,
   acquireChunkLease,
   commitChunkResult,
   syncDbLeaseToLedger,
@@ -25,6 +24,7 @@ import {
   AnalysisSessionLedger,
   ChunkProgressRecord,
 } from '../../../lib/analysisCheckpoint';
+import { signRecoveryToken, verifyRecoveryToken } from '../../../lib/recoveryToken';
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -70,6 +70,16 @@ async function syncFromSupabase(
       session.status = 'paused';
     } else if (dbJob.status === 'completed') {
       session.status = 'completed';
+    } else if (dbJob.status === 'processing') {
+      session.status = 'processing';
+    } else if (dbJob.status === 'failed') {
+      session.status = 'failed';
+    } else if (dbJob.status === 'pending') {
+      session.status = 'pending';
+    }
+
+    if (typeof dbJob.total_chunks === 'number' && dbJob.total_chunks > 0) {
+      session.totalChunks = dbJob.total_chunks;
     }
 
     const { data: dbChunks, error: chunkErr } = await supabase
@@ -84,21 +94,58 @@ async function syncFromSupabase(
     if (Array.isArray(dbChunks)) {
       for (const c of dbChunks) {
         const idx = Number(c.chunk_index);
-        if (session.chunks[idx]) {
-          if (c.status === 'completed') {
-            session.chunks[idx].status = 'completed';
-            session.chunks[idx].drafts = Array.isArray(c.drafts) ? (c.drafts as ConceptDraft[]) : [];
-            session.chunks[idx].completedAt = c.completed_at || undefined;
+        if (!session.chunks[idx]) {
+          session.chunks[idx] = {
+            chunkIndex: idx,
+            totalChunks: session.totalChunks,
+            sourceContext: c.source_context || `청크 ${idx}`,
+            status: 'pending',
+            drafts: [],
+            attemptCount: c.attempt_count || 0,
+          };
+        }
+        if (c.status === 'completed') {
+          session.chunks[idx].status = 'completed';
+          session.chunks[idx].drafts = Array.isArray(c.drafts) ? (c.drafts as ConceptDraft[]) : [];
+          session.chunks[idx].completedAt = c.completed_at || undefined;
+          session.chunks[idx].leaseWorkerId = null;
+          session.chunks[idx].leaseToken = null;
+          session.chunks[idx].leaseExpiresAt = null;
+        } else if (c.status === 'running') {
+          const nowMs = Date.now();
+          const expiresMs = c.lease_expires_at ? new Date(c.lease_expires_at).getTime() : 0;
+          if (expiresMs > nowMs) {
+            session.chunks[idx].status = 'running';
+            session.chunks[idx].leaseWorkerId = c.lease_worker_id;
+            session.chunks[idx].leaseToken = c.lease_token;
+            session.chunks[idx].leaseExpiresAt = c.lease_expires_at;
+          } else {
+            session.chunks[idx].status = 'pending';
             session.chunks[idx].leaseWorkerId = null;
             session.chunks[idx].leaseToken = null;
             session.chunks[idx].leaseExpiresAt = null;
-          } else if (c.status === 'failed') {
-            session.chunks[idx].status = 'failed';
-            session.chunks[idx].error = c.last_error || undefined;
           }
+        } else if (c.status === 'failed') {
+          session.chunks[idx].status = 'failed';
+          session.chunks[idx].error = c.last_error || undefined;
+        } else if (c.status === 'pending') {
+          session.chunks[idx].status = 'pending';
         }
       }
     }
+
+    // Recalculate session status if all chunks in DB are completed
+    let allDone = true;
+    for (let i = 1; i <= session.totalChunks; i++) {
+      if (session.chunks[i]?.status !== 'completed') {
+        allDone = false;
+        break;
+      }
+    }
+    if (allDone && session.totalChunks > 0) {
+      session.status = 'completed';
+    }
+
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'DB 동기화 중 오류' };
@@ -182,17 +229,68 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const subjectId = asString(payload.subjectId);
-    const materialId = asString(payload.materialId);
+    let subjectId = asString(payload.subjectId);
+    let materialId = asString(payload.materialId);
     const materialTitle = asString(payload.materialTitle, '학습 자료');
-    const domain: 'math_stats' | 'computer_science' =
+    let domain: 'math_stats' | 'computer_science' =
       payload.domain === 'computer_science' ? 'computer_science' : 'math_stats';
     const markdown = asString(payload.markdown);
     const clientJobKey = asString(payload.jobKey);
-    const action = asString(payload.action, 'process'); // 'process' | 'status' | 'pause'
+    const action = asString(payload.action, 'process'); // 'process' | 'status' | 'pause' | 'resume' | 'init' | 'retry_save'
 
-    // 1. Validation: Material and Markdown
-    if (!markdown.trim()) {
+    let supabaseClient: Awaited<ReturnType<typeof createClient>> | null = null;
+    try {
+      supabaseClient = await createClient();
+    } catch {
+      // In-memory / mock operation
+    }
+
+    // 1. Authoritative Job Identity Recovery
+    // For status, retry_save, pause, or resume with an existing clientJobKey:
+    // We recover the original job identity (domain, subjectId, materialId, markdownHash) directly from DB or memory ledger.
+    // This ensures computer_science jobs never regress to math_stats, and avoids re-uploading entire raw markdown.
+    let dbJobForIdentity: Record<string, unknown> | null = null;
+    if (clientJobKey && supabaseClient && typeof supabaseClient.from === 'function') {
+      try {
+        const { data: dj } = await supabaseClient
+          .from('analysis_jobs')
+          .select('*')
+          .eq('id', clientJobKey)
+          .eq('user_id', auth.user.id)
+          .maybeSingle();
+        if (dj) dbJobForIdentity = dj;
+      } catch {
+        // best effort lookup
+      }
+    }
+
+    if (!dbJobForIdentity && clientJobKey) {
+      const memSession = findSessionLedger(auth.user.id, clientJobKey);
+      if (memSession) {
+        dbJobForIdentity = {
+          id: memSession.jobKey,
+          subject_id: memSession.subjectId,
+          material_id: memSession.materialId,
+          domain: memSession.domain,
+          markdown_hash: memSession.markdownHash,
+          model_id: memSession.modelId,
+          prompt_version: memSession.promptVersion,
+          chunking_version: memSession.chunkingVersion,
+          total_chunks: memSession.totalChunks,
+        };
+      }
+    }
+
+    if (dbJobForIdentity) {
+      if (dbJobForIdentity.subject_id) subjectId = dbJobForIdentity.subject_id as string;
+      if (dbJobForIdentity.material_id) materialId = dbJobForIdentity.material_id as string;
+      if (dbJobForIdentity.domain === 'computer_science' || dbJobForIdentity.domain === 'math_stats') {
+        domain = dbJobForIdentity.domain as 'math_stats' | 'computer_science';
+      }
+    }
+
+    // Validation: Material and Markdown
+    if (!markdown.trim() && action !== 'status' && action !== 'retry_save' && action !== 'pause' && action !== 'resume') {
       return NextResponse.json(
         {
           success: false,
@@ -212,10 +310,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    let supabaseClient: Awaited<ReturnType<typeof createClient>> | null = null;
-    try {
-      supabaseClient = await createClient();
-      if (supabaseClient && typeof supabaseClient.from === 'function') {
+    if (supabaseClient && typeof supabaseClient.from === 'function') {
+      try {
         const { data: matRow, error: matErr } = await supabaseClient
           .from('materials')
           .select('id, user_id, subject_id')
@@ -234,14 +330,14 @@ export async function POST(req: NextRequest) {
             );
           }
         }
+      } catch {
+        // In-memory / mock operation
       }
-    } catch {
-      // In-memory / mock operation
     }
 
     // 2. Resolve AI credentials early to bind actual model ID into job identity
     const cred = await resolveAiConfigForUser(auth.user.id);
-    if (!cred.ok && action !== 'status') {
+    if (!cred.ok && action !== 'status' && action !== 'retry_save' && action !== 'pause') {
       const needsAiConnection = cred.code === 'no_credentials';
       return NextResponse.json(
         {
@@ -253,54 +349,50 @@ export async function POST(req: NextRequest) {
         { status: needsAiConnection ? 400 : 502 }
       );
     }
-    const resolvedModelId = cred.ok ? cred.config.model : 'deepseek-v4.1-flash';
+    const resolvedModelId =
+      (dbJobForIdentity?.model_id as string) || (cred.ok ? cred.config.model : 'deepseek-v4.1-flash');
 
-    const markdownHash = computeMarkdownHash(markdown);
-    const chunks: MarkdownChunk[] = chunkMarkdownForAnalysis(markdown, 4500);
+    const markdownHash =
+      (dbJobForIdentity?.markdown_hash as string) || (markdown ? computeMarkdownHash(markdown) : '');
+    if (markdown.trim() && dbJobForIdentity?.markdown_hash && computeMarkdownHash(markdown) !== dbJobForIdentity.markdown_hash) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: '자료 본문이 변경되어 기존 분석 작업의 본문 해시와 일치하지 않습니다. 기존 작업과 섞이지 않도록 새 분석을 시작해 주세요.',
+          errorCode: 'MARKDOWN_HASH_MISMATCH',
+        },
+        { status: 400 }
+      );
+    }
 
-    // Strict Account Isolation & Job Identity Determination
-    const promptVersion = 'v2';
-    const chunkingVersion = 'v1';
-    const expectedJobKey = makeAnalysisJobKey(
-      auth.user.id,
-      materialId,
-      markdownHash,
-      domain,
-      promptVersion,
-      chunkingVersion,
-      resolvedModelId,
-      subjectId
-    );
+    const promptVersion = (dbJobForIdentity?.prompt_version as string) || 'v2';
+    const chunkingVersion = (dbJobForIdentity?.chunking_version as string) || 'v1';
 
-    // If client supplied a jobKey, it MUST belong to the authenticated user and match parameters
-    if (clientJobKey) {
-      const existingSession = findSessionLedger(auth.user.id, clientJobKey);
-      if (existingSession) {
-        const idCheck = validateJobIdentity(
-          existingSession,
+    const chunks: MarkdownChunk[] = markdown.trim() ? chunkMarkdownForAnalysis(markdown, 4500) : [];
+    const totalChunksCount = (dbJobForIdentity?.total_chunks as number) || chunks.length || 1;
+
+    const expectedJobKey = clientJobKey && dbJobForIdentity
+      ? clientJobKey
+      : makeAnalysisJobKey(
           auth.user.id,
           materialId,
           markdownHash,
           domain,
-          subjectId,
-          resolvedModelId
+          promptVersion,
+          chunkingVersion,
+          resolvedModelId,
+          subjectId
         );
-        if (!idCheck.ok) {
-          return NextResponse.json(
-            { success: false, error: idCheck.message, errorCode: idCheck.code },
-            { status: idCheck.code === 'NOT_FOUND_OR_FORBIDDEN' ? 404 : 400 }
-          );
-        }
-      } else if (clientJobKey !== expectedJobKey) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: '작업을 찾을 수 없거나 접근 권한이 없습니다.',
-            errorCode: 'NOT_FOUND_OR_FORBIDDEN',
-          },
-          { status: 404 }
-        );
-      }
+
+    if (clientJobKey && !dbJobForIdentity && clientJobKey !== expectedJobKey) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: '작업을 찾을 수 없거나 접근 권한이 없습니다.',
+          errorCode: 'NOT_FOUND_OR_FORBIDDEN',
+        },
+        { status: 404 }
+      );
     }
 
     const jobKey = expectedJobKey;
@@ -312,7 +404,7 @@ export async function POST(req: NextRequest) {
       materialId,
       markdownHash,
       domain,
-      chunks.length,
+      totalChunksCount,
       chunks.map((c) => ({ chunkIndex: c.chunkIndex, sourceContext: c.sourceContext })),
       promptVersion,
       chunkingVersion,
@@ -365,45 +457,151 @@ export async function POST(req: NextRequest) {
       const targetWorkerId = asString(payload.workerId);
       const targetLeaseToken = asString(payload.leaseToken);
       const targetDrafts = Array.isArray(payload.drafts) ? (payload.drafts as ConceptDraft[]) : [];
+      const signedRecoveryToken = asString(payload.signedRecoveryToken);
 
-      if (!targetChunkIndex || !targetLeaseToken) {
+      if (!targetChunkIndex) {
         return NextResponse.json(
-          { success: false, error: '저장 재시도에 필요한 청크 식별자 또는 선점 토큰이 누락되었습니다.' },
+          { success: false, error: '저장 재시도에 필요한 청크 식별자가 누락되었습니다.' },
           { status: 400 }
         );
       }
 
-      if (supabaseClient) {
-        const { data: commitRes, error: commitErr } = await supabaseClient.rpc(
-          'commit_analysis_chunk_result',
-          {
-            p_job_id: jobKey,
-            p_chunk_index: targetChunkIndex,
-            p_worker_id: targetWorkerId,
-            p_lease_token: targetLeaseToken,
-            p_status: 'completed',
-            p_drafts: targetDrafts,
-          }
-        );
+      let authoritativeDrafts: ConceptDraft[] = targetDrafts;
 
-        if (commitErr || (!commitRes?.committed && commitRes?.reason !== 'already_completed')) {
-          const isMismatch = commitRes?.reason === 'token_mismatch_or_expired';
-          return NextResponse.json(
+      if (supabaseClient) {
+        // 1. Check if this chunk is ALREADY completed in the authoritative DB
+        const { data: chunkRow } = await supabaseClient
+          .from('analysis_job_chunks')
+          .select('*')
+          .eq('job_id', jobKey)
+          .eq('chunk_index', targetChunkIndex)
+          .maybeSingle();
+
+        if (chunkRow && chunkRow.status === 'completed') {
+          // Chunk is already completed in DB! Use authoritative DB drafts ONLY.
+          // Discard any client-supplied drafts to prevent forgery or state corruption.
+          authoritativeDrafts = Array.isArray(chunkRow.drafts) ? (chunkRow.drafts as ConceptDraft[]) : [];
+        } else {
+          // Chunk not completed in DB: require cryptographic verification of drafts
+          if (!signedRecoveryToken) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: '서버가 발급한 서명된 복구 데이터(signedRecoveryToken)가 누락되었습니다. 미검증 초안은 저장할 수 없습니다.',
+                canRetrySave: false,
+              },
+              { status: 403 }
+            );
+          }
+
+          const verifyRes = verifyRecoveryToken(signedRecoveryToken, {
+            userId: auth.user.id,
+            jobId: jobKey,
+            materialId,
+            subjectId,
+            domain,
+            chunkIndex: targetChunkIndex,
+            markdownHash: session.markdownHash,
+            drafts: targetDrafts,
+          });
+
+          if (!verifyRes.ok) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `복구 데이터 검증 실패: ${verifyRes.error}`,
+                errorCode: verifyRes.code,
+                canRetrySave: false,
+              },
+              { status: 403 }
+            );
+          }
+
+          if (!targetLeaseToken) {
+            return NextResponse.json(
+              { success: false, error: '선점 토큰이 누락되었습니다.', canRetrySave: false },
+              { status: 400 }
+            );
+          }
+
+          // Call hardened RPC
+          const { data: commitRes, error: commitErr } = await supabaseClient.rpc(
+            'commit_analysis_chunk_result',
             {
-              success: false,
-              error: isMismatch
-                ? '선점 유효 시간이 만료되었거나 다른 작업자와 충돌하여 안전한 복구가 불가능합니다.'
-                : `DB 저장 재시도 실패: ${commitErr?.message || commitRes?.reason}`,
-              canRetrySave: !isMismatch,
-              jobKey,
-              chunkIndex: targetChunkIndex,
-            },
-            { status: 500 }
+              p_job_id: jobKey,
+              p_chunk_index: targetChunkIndex,
+              p_worker_id: targetWorkerId,
+              p_lease_token: targetLeaseToken,
+              p_status: 'completed',
+              p_drafts: targetDrafts,
+            }
           );
+
+          if (commitErr || (!commitRes?.committed && commitRes?.reason !== 'already_completed')) {
+            const isMismatch = commitRes?.reason === 'token_mismatch_or_expired';
+            return NextResponse.json(
+              {
+                success: false,
+                checkpointCommitted: false,
+                persisted: false,
+                error: isMismatch
+                  ? '선점 유효 시간이 만료되었거나 다른 작업자와 충돌하여 안전한 복구가 불가능합니다.'
+                  : `DB 저장 재시도 실패: ${commitErr?.message || commitRes?.reason}`,
+                canRetrySave: !isMismatch,
+                jobKey,
+                chunkIndex: targetChunkIndex,
+              },
+              { status: 500 }
+            );
+          }
+
+          if (commitRes?.reason === 'already_completed') {
+            if (Array.isArray(commitRes.drafts)) {
+              authoritativeDrafts = commitRes.drafts as ConceptDraft[];
+            } else {
+              const { data: recheckChunk } = await supabaseClient
+                .from('analysis_job_chunks')
+                .select('drafts')
+                .eq('job_id', jobKey)
+                .eq('chunk_index', targetChunkIndex)
+                .maybeSingle();
+              authoritativeDrafts = Array.isArray(recheckChunk?.drafts)
+                ? (recheckChunk.drafts as ConceptDraft[])
+                : [];
+            }
+          } else {
+            authoritativeDrafts = targetDrafts;
+          }
+        }
+      } else {
+        // In-memory mock
+        const memChunk = session.chunks[targetChunkIndex];
+        if (memChunk && memChunk.status === 'completed') {
+          authoritativeDrafts = memChunk.drafts;
+        } else {
+          if (signedRecoveryToken) {
+            const verifyRes = verifyRecoveryToken(signedRecoveryToken, {
+              userId: auth.user.id,
+              jobId: jobKey,
+              materialId,
+              subjectId,
+              domain,
+              chunkIndex: targetChunkIndex,
+              markdownHash: session.markdownHash,
+              drafts: targetDrafts,
+            });
+            if (!verifyRes.ok) {
+              return NextResponse.json(
+                { success: false, error: verifyRes.error, canRetrySave: false },
+                { status: 403 }
+              );
+            }
+          }
+          authoritativeDrafts = targetDrafts;
         }
       }
 
-      recordAuthoritativeChunkResult(session, targetChunkIndex, 'completed', targetDrafts);
+      recordAuthoritativeChunkResult(session, targetChunkIndex, 'completed', authoritativeDrafts);
       const progress = getSessionProgress(session);
 
       let outcome: { persisted: boolean; drafts: ConceptDraft[]; persistError?: string } = {
@@ -426,16 +624,37 @@ export async function POST(req: NextRequest) {
             persistError: e instanceof Error ? e.message : '초안 저장 실패',
           };
         }
+      } else if (!supabaseClient) {
+        outcome = { persisted: true, drafts: progress.allDrafts };
+      }
+
+      if (outcome.persisted === false) {
+        return NextResponse.json(
+          {
+            success: false,
+            checkpointCommitted: true,
+            persisted: false,
+            canRetrySave: true,
+            error: `체크포인트는 완료되었으나 concept_drafts 테이블 저장에 실패했습니다. (${outcome.persistError || '초안 저장 오류'}). AI 재호출 없이 초안 저장만 다시 시도할 수 있습니다.`,
+            persistError: outcome.persistError,
+            drafts: outcome.drafts,
+            count: outcome.drafts.length,
+            jobKey,
+            chunkIndex: targetChunkIndex,
+            status: progress.status,
+          },
+          { status: 500 }
+        );
       }
 
       return NextResponse.json({
         success: true,
+        checkpointCommitted: true,
+        persisted: true,
         retried: true,
         drafts: outcome.drafts,
         count: outcome.drafts.length,
         jobKey,
-        persisted: outcome.persisted,
-        persistError: outcome.persistError,
         status: progress.status,
       });
     }
@@ -453,6 +672,11 @@ export async function POST(req: NextRequest) {
             { status: 500 }
           );
         }
+        await supabaseClient
+          .from('analysis_jobs')
+          .update({ status: 'paused', updated_at: new Date().toISOString() })
+          .eq('id', jobKey)
+          .eq('user_id', auth.user.id);
       }
       session.status = 'paused';
       const progress = getSessionProgress(session);
@@ -483,6 +707,11 @@ export async function POST(req: NextRequest) {
             { status: 500 }
           );
         }
+        await supabaseClient
+          .from('analysis_jobs')
+          .update({ status: 'processing', updated_at: new Date().toISOString() })
+          .eq('id', jobKey)
+          .eq('user_id', auth.user.id);
       }
       session.status = 'processing';
     }
@@ -503,6 +732,7 @@ export async function POST(req: NextRequest) {
         success: true,
         totalChunks: progress.totalChunks,
         completedChunks: progress.completedChunks,
+        runningChunks: progress.runningChunks,
         pendingChunks: progress.pendingChunks,
         failedChunks: progress.failedChunks,
         isAllComplete: progress.isAllComplete,
@@ -830,19 +1060,40 @@ ${chunk.text}
 
           if (commitErr || !commitRes?.committed) {
             const isMismatch = commitRes?.reason === 'token_mismatch_or_expired';
+            const signedRecoveryToken = !isMismatch
+              ? signRecoveryToken({
+                  userId: auth.user.id,
+                  jobId: jobKey,
+                  materialId,
+                  subjectId,
+                  domain,
+                  chunkIndex: chunk.chunkIndex,
+                  markdownHash,
+                  modelId: responseModel,
+                  drafts: chunkDrafts,
+                })
+              : undefined;
+
             return NextResponse.json(
               {
                 success: false,
+                checkpointCommitted: false,
+                persisted: false,
                 error: isMismatch
                   ? '청크 처리 중 선점 유효 시간이 만료되어 결과가 커밋되지 않았습니다. AI 재호출 없는 복구가 불가능합니다.'
                   : `AI 분석 결과가 생성되었으나 DB 저장에 실패했습니다. AI 재호출 없이 저장만 다시 시도할 수 있습니다. (${commitErr?.message || commitRes?.reason})`,
                 canRetrySave: !isMismatch,
                 drafts: chunkDrafts,
+                signedRecoveryToken,
                 chunkIndex: chunk.chunkIndex,
                 workerId,
                 leaseToken: activeLeaseToken,
                 jobKey,
                 generationJobId,
+                domain,
+                subjectId,
+                materialId,
+                markdownHash,
               },
               { status: 500 }
             );
@@ -913,10 +1164,56 @@ ${chunk.text}
           persistError: e instanceof Error ? e.message : '초안 저장에 실패했습니다.',
         };
       }
+    } else if (!supabaseClient) {
+      outcome = { persisted: true, drafts: progress.allDrafts };
+    }
+
+    if (outcome.persisted === false && progress.allDrafts.length > 0) {
+      const signedRecoveryToken = signRecoveryToken({
+        userId: auth.user.id,
+        jobId: jobKey,
+        materialId,
+        subjectId,
+        domain,
+        chunkIndex: targetChunks[0]?.chunkIndex || 1,
+        markdownHash,
+        modelId: responseModel,
+        drafts: outcome.drafts,
+      });
+
+      return NextResponse.json(
+        {
+          success: false,
+          checkpointCommitted: true,
+          persisted: false,
+          canRetrySave: true,
+          error: `AI 개념 추출 및 체크포인트 커밋은 완료되었으나, concept_drafts 테이블 저장에 실패했습니다. (${outcome.persistError || '초안 저장 오류'}). AI 재호출 없이 초안 저장만 다시 시도할 수 있습니다.`,
+          persistError: outcome.persistError,
+          drafts: outcome.drafts,
+          signedRecoveryToken,
+          count: outcome.drafts.length,
+          markdownHash,
+          model: responseModel,
+          totalChunks: progress.totalChunks,
+          completedChunks: progress.completedChunks,
+          pendingChunks: progress.pendingChunks,
+          failedChunks: progress.failedChunks,
+          isAllComplete: progress.isAllComplete,
+          status: progress.status,
+          jobKey,
+          generationJobId,
+          domain,
+          subjectId,
+          materialId,
+        },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({
       success: true,
+      checkpointCommitted: true,
+      persisted: true,
       drafts: outcome.drafts,
       count: outcome.drafts.length,
       markdownHash,
@@ -929,8 +1226,9 @@ ${chunk.text}
       status: progress.status,
       jobKey,
       generationJobId,
-      persisted: outcome.persisted,
-      persistError: outcome.persistError,
+      domain,
+      subjectId,
+      materialId,
     });
   } catch (err) {
     console.error('AI Analysis Route Exception:', err);

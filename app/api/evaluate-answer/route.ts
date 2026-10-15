@@ -109,9 +109,11 @@ export async function POST(req: NextRequest) {
       codeSnippet,
       modelAnswer,
       rubric = [],
-      userAnswer,
       revealedHintCount = 0,
       hints = [],
+    } = body;
+    let {
+      userAnswer,
       solvingReason,
       isReasonNotApplicable = false,
       reasonNotApplicableJustification,
@@ -184,6 +186,14 @@ export async function POST(req: NextRequest) {
     const hasDb = Boolean(supabase && typeof supabase.from === 'function');
 
     if (body.mockExamSessionId && hasDb) {
+      if (!problemId) {
+        return NextResponse.json(
+          { success: false, error: '모의시험 평가에는 problemId가 필수입니다.' },
+          { status: 400 }
+        );
+      }
+      const targetProblemId = problemId;
+
       // 2A. Mock Exam Immutable Snapshot: past exams are evaluated against their frozen snapshot
       const { data: examRow, error: examErr } = await supabase
         .from('mock_exam_sessions')
@@ -216,7 +226,7 @@ export async function POST(req: NextRequest) {
       const frozenProblems = Array.isArray(examPayload.problems)
         ? (examPayload.problems as Array<Record<string, unknown>>)
         : [];
-      const frozenProb = frozenProblems.find((p) => p.id === problemId || p.problemId === problemId);
+      const frozenProb = frozenProblems.find((p) => p.id === targetProblemId || p.problemId === targetProblemId);
 
       if (!frozenProb) {
         return NextResponse.json(
@@ -234,6 +244,59 @@ export async function POST(req: NextRequest) {
           { success: false, error: '모의시험 문제 스냅샷의 필수 정보(지문, 모범답안, 루브릭)가 누락되었습니다.' },
           { status: 500 }
         );
+      }
+
+      // 1. Authoritative Server Submitted Answer Resolution
+      const serverAnswers = (examPayload.answers || {}) as Record<string, string>;
+      const serverAnswer = typeof serverAnswers[targetProblemId] === 'string' ? serverAnswers[targetProblemId].trim() : '';
+
+      if (!serverAnswer) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '서버에 제출된 확정 답안이 없습니다. 미제출 문항은 평가할 수 없습니다.',
+          },
+          { status: 400 }
+        );
+      }
+
+      // If client sent an explicit userAnswer, verify it strictly matches the submitted answer
+      if (typeof body.userAnswer === 'string' && body.userAnswer.trim() && body.userAnswer.trim() !== serverAnswer) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '클라이언트 요청 답안이 서버 제출 답안과 일치하지 않습니다. 모의시험 평가는 서버에 확정된 공식 제출 답안만 사용합니다.',
+          },
+          { status: 400 }
+        );
+      }
+
+      userAnswer = serverAnswer;
+
+      // 2. Authoritative Method Selection Details Resolution
+      const serverReasons = (examPayload.reasons || {}) as Record<string, string>;
+      const serverIsNotApplicableMap = (examPayload.isReasonNotApplicable || {}) as Record<string, boolean>;
+      const serverJustifications = (examPayload.reasonNotApplicableJustification || {}) as Record<string, string>;
+
+      solvingReason = typeof serverReasons[targetProblemId] === 'string' ? serverReasons[targetProblemId].trim() : '';
+      isReasonNotApplicable = Boolean(serverIsNotApplicableMap[targetProblemId]);
+      reasonNotApplicableJustification =
+        typeof serverJustifications[targetProblemId] === 'string' ? serverJustifications[targetProblemId].trim() : undefined;
+
+      // 3. Cache Check: If already evaluated, return confirmed evaluation without calling AI
+      const existingEvaluations = (examPayload.evaluations || {}) as Record<string, unknown>;
+      const existingEval = existingEvaluations[targetProblemId] as EvaluationResult | undefined;
+      if (existingEval && typeof existingEval.calculatedScore === 'number' && Array.isArray(existingEval.rubricResults)) {
+        return NextResponse.json({
+          success: true,
+          cached: true,
+          evaluation: existingEval,
+          problemId: targetProblemId,
+          conceptId,
+          conceptIds,
+          subjectId,
+          isProvisionalLocal: false,
+        });
       }
 
       verifiedPrompt = frozenProb.promptText;
@@ -683,6 +746,33 @@ ${
 
     evaluationResult.methodSelectionDiagnosis = verifiedDiagnosis;
     evaluationResult.qualityStatusNotice = qualityStatusNotice;
+
+    if (body.mockExamSessionId && hasDb && supabase && auth?.user && problemId) {
+      try {
+        const { data: currentExam } = await supabase
+          .from('mock_exam_sessions')
+          .select('payload')
+          .eq('id', body.mockExamSessionId)
+          .eq('user_id', auth.user.id)
+          .maybeSingle();
+
+        const curPayload = ((currentExam?.payload || {}) as Record<string, unknown>);
+        const curEvals = { ...((curPayload.evaluations || {}) as Record<string, unknown>) };
+        curEvals[problemId] = evaluationResult;
+        curPayload.evaluations = curEvals;
+
+        await supabase
+          .from('mock_exam_sessions')
+          .update({
+            payload: curPayload,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', body.mockExamSessionId)
+          .eq('user_id', auth.user.id);
+      } catch (cacheErr) {
+        console.warn('Failed to persist mock exam evaluation cache into mock_exam_sessions:', cacheErr);
+      }
+    }
 
     return NextResponse.json({
       success: true,

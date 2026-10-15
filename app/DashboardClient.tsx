@@ -172,6 +172,13 @@ import {
 } from '../lib/materialStorage';
 import { computeMarkdownHash } from '../lib/markdownUtils';
 import {
+  saveAnalysisRecovery,
+  loadAnalysisRecovery,
+  deleteAnalysisRecovery,
+  exportAnalysisRecoveryAsJson,
+  AnalysisRecoveryRecord,
+} from '../lib/analysisRecovery';
+import {
   recordMaterialBodyHash,
   resolveStoredMaterialBodyHash,
   removeStoredMaterialBodyHash,
@@ -302,16 +309,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     failedChunks: number;
     status: 'processing' | 'paused' | 'completed' | 'failed';
   } | null>(null);
-  const [saveFailedState, setSaveFailedState] = useState<{
-    jobKey: string;
-    chunkIndex: number;
-    workerId: string;
-    leaseToken: string;
-    drafts: ConceptDraft[];
-    materialId: string;
+  const [saveFailedState, setSaveFailedState] = useState<(AnalysisRecoveryRecord & {
     canRetrySave: boolean;
     message: string;
-  } | null>(null);
+  }) | null>(null);
 
   // Stage 3: AI Problem Generation & Review State
   const [problemDrafts, setProblemDrafts] = useState<ProblemDraft[]>([]);
@@ -2022,16 +2023,27 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
       if (!res.ok || !data.success) {
         if (data.canRetrySave && Array.isArray(data.drafts) && data.drafts.length > 0) {
-          setSaveFailedState({
+          const failedObj: AnalysisRecoveryRecord & { canRetrySave: boolean; message: string } = {
             jobKey: data.jobKey || initialJobKey || '',
             chunkIndex: data.chunkIndex || 1,
             workerId: data.workerId || '',
             leaseToken: data.leaseToken || '',
             drafts: data.drafts,
             materialId: targetMaterial.id,
+            subjectId: targetMaterial.subjectId,
+            domain: activeSubject?.domain || 'mathematics',
+            markdownHash: data.markdownHash || computeMarkdownHash(markdown),
+            signedRecoveryToken: data.signedRecoveryToken,
+            checkpointStatus: data.checkpointCommitted ? 'committed' : 'pending',
+            draftsPersistStatus: data.persisted ? 'persisted' : 'failed',
+            savedAt: new Date().toISOString(),
             canRetrySave: true,
             message: data.error || '생성 완료, 저장 실패',
-          });
+          };
+          setSaveFailedState(failedObj);
+          await saveAnalysisRecovery(getStorageScopeId(), failedObj);
+          setConceptReviewMaterial(targetMaterial);
+          setIsConceptReviewOpen(true);
           showToast('AI 개념 추출은 완료되었으나 DB 저장에 실패했습니다. AI 재호출 없이 저장만 다시 시도할 수 있습니다.');
           return;
         }
@@ -2058,6 +2070,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       }
 
       if (data.persisted === false) {
+        let persistSuccess = false;
         try {
           const retry = await fetch('/api/persist-drafts', {
             method: 'POST',
@@ -2066,15 +2079,42 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           });
           const retryData = await retry.json();
           if (getStorageScopeId() !== scopeAtStart) return;
-          if (!retry.ok || !retryData.persisted) {
-            showToast(
-              `개념 초안을 서버에 저장하지 못했습니다. 로컬에 보관했으며 다시 시도할 수 있습니다. (${data.persistError || retryData.error || '오류'})`
-            );
-          } else if (Array.isArray(retryData.drafts)) {
-            newDrafts = retryData.drafts as ConceptDraft[];
+          if (retry.ok && retryData.persisted) {
+            persistSuccess = true;
+            if (Array.isArray(retryData.drafts)) {
+              newDrafts = retryData.drafts as ConceptDraft[];
+            }
           }
         } catch {
-          showToast('개념 초안 서버 저장 재시도에 실패했습니다. 로컬에 보관되어 있습니다.');
+          persistSuccess = false;
+        }
+
+        if (!persistSuccess) {
+          const failedObj: AnalysisRecoveryRecord & { canRetrySave: boolean; message: string } = {
+            jobKey: data.jobKey || initialJobKey || '',
+            chunkIndex: data.completedChunks || 1,
+            workerId: data.workerId || '',
+            leaseToken: data.leaseToken || '',
+            drafts: newDrafts,
+            materialId: targetMaterial.id,
+            subjectId: targetMaterial.subjectId,
+            domain: activeSubject?.domain || 'mathematics',
+            markdownHash: data.markdownHash || computeMarkdownHash(markdown),
+            signedRecoveryToken: data.signedRecoveryToken,
+            checkpointStatus: 'committed',
+            draftsPersistStatus: 'failed',
+            savedAt: new Date().toISOString(),
+            canRetrySave: true,
+            message: '체크포인트는 완료되었으나 초안 테이블 저장에 실패했습니다. (부분 완료)',
+          };
+          setSaveFailedState(failedObj);
+          await saveAnalysisRecovery(getStorageScopeId(), failedObj);
+          setConceptReviewMaterial(targetMaterial);
+          setIsConceptReviewOpen(true);
+          showToast(
+            '체크포인트는 저장되었으나 초안 테이블 영속 저장에 실패했습니다. AI 재호출 없이 초안 저장을 재시도할 수 있습니다.'
+          );
+          return;
         }
       }
 
@@ -2107,6 +2147,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     setIsAiAnalyzing(true);
     showToast(`[${targetMaterial.title}] AI 분석 결과 저장 재시도 중... (AI 재호출 없음)`);
     try {
+      let md = targetMaterial.parsedMarkdown;
+      if (!md || !md.trim()) {
+        const loaded = await loadMaterialContent(targetMaterial.id);
+        md = loaded?.markdown;
+      }
+
       const res = await fetch('/api/analyze-concepts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2118,18 +2164,40 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           leaseToken: saveFailedState.leaseToken,
           drafts: saveFailedState.drafts,
           materialId: targetMaterial.id,
-          subjectId: targetMaterial.subjectId,
-          markdown: targetMaterial.parsedMarkdown || '',
+          subjectId: saveFailedState.subjectId || targetMaterial.subjectId,
+          domain: saveFailedState.domain || activeSubject?.domain || 'mathematics',
+          markdownHash: saveFailedState.markdownHash,
+          signedRecoveryToken: saveFailedState.signedRecoveryToken,
+          markdown: md || '',
         }),
       });
       const data = await res.json();
       if (getStorageScopeId() !== scopeAtStart) return;
 
-      if (!res.ok || !data.success) {
-        showToast(`저장 재시도 실패: ${data.error || '오류 발생'}`);
+      if (!res.ok || !data.success || data.persisted === false) {
+        showToast(
+          data.persisted === false
+            ? `체크포인트는 확인되었으나 초안 테이블 영속 저장에 실패했습니다: ${data.error || '다시 시도해주세요'}`
+            : `저장 재시도 실패: ${data.error || '오류 발생'}`
+        );
+        if (data.checkpointCommitted) {
+          const updatedFail: AnalysisRecoveryRecord & { canRetrySave: boolean; message: string } = {
+            ...saveFailedState,
+            checkpointStatus: 'committed',
+            draftsPersistStatus: 'failed',
+            savedAt: new Date().toISOString(),
+            signedRecoveryToken: data.signedRecoveryToken || saveFailedState.signedRecoveryToken,
+          };
+          setSaveFailedState(updatedFail);
+          await saveAnalysisRecovery(getStorageScopeId(), updatedFail);
+        }
         return;
       }
+
+      // ONLY cleared when both checkpoint AND drafts are confirmed persisted!
       setSaveFailedState(null);
+      await deleteAnalysisRecovery(getStorageScopeId(), targetMaterial.id);
+
       const newDrafts: ConceptDraft[] = data.drafts || saveFailedState.drafts;
       const otherDrafts = conceptDrafts.filter((d) => d.materialId !== targetMaterial.id);
       const updatedDrafts = [...newDrafts, ...otherDrafts];
@@ -2241,13 +2309,30 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   useEffect(() => {
     if (!conceptReviewMaterial || !isConceptReviewOpen) return;
     let isCancelled = false;
-    const fetchExistingProgress = async () => {
-      let md = conceptReviewMaterial.parsedMarkdown;
-      if (!md || !md.trim()) {
-        const loaded = await loadMaterialContent(conceptReviewMaterial.id);
-        md = loaded?.markdown;
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let latestSeq = 0;
+
+    const restoreRecoveryItem = async () => {
+      try {
+        const item = await loadAnalysisRecovery(getStorageScopeId(), conceptReviewMaterial.id);
+        if (!isCancelled && item) {
+          setSaveFailedState({
+            ...item,
+            canRetrySave: true,
+            message:
+              item.checkpointStatus === 'committed' && item.draftsPersistStatus === 'failed'
+                ? '체크포인트 완료 / 초안 테이블 저장 실패 (부분 완료)'
+                : 'AI 생성 완료 / DB 저장 실패',
+          });
+        }
+      } catch (err) {
+        console.warn('Failed to load analysis recovery from IndexedDB:', err);
       }
-      if (!md || !md.trim()) return;
+    };
+    restoreRecoveryItem();
+
+    const fetchStatus = async () => {
+      const currentSeq = ++latestSeq;
       try {
         const res = await fetch('/api/analyze-concepts', {
           method: 'POST',
@@ -2257,31 +2342,49 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             materialId: conceptReviewMaterial.id,
             subjectId: conceptReviewMaterial.subjectId,
             domain: activeSubject?.domain || 'mathematics',
-            markdown: md,
           }),
         });
         const data = await res.json();
-        if (isCancelled) return;
-        if (res.ok && data.success && data.jobKey) {
-          if (data.status === 'processing' || data.status === 'paused') {
-            setAnalysisProgress({
-              jobKey: data.jobKey,
-              materialId: conceptReviewMaterial.id,
-              totalChunks: data.totalChunks || 1,
-              completedChunks: data.completedChunks || 0,
-              pendingChunks: data.pendingChunks || 0,
-              failedChunks: data.failedChunks || 0,
-              status: data.status,
-            });
+        if (isCancelled || currentSeq < latestSeq) return;
+        if (res.ok && data.success && data.jobKey && data.materialId === conceptReviewMaterial.id) {
+          setAnalysisProgress({
+            jobKey: data.jobKey,
+            materialId: conceptReviewMaterial.id,
+            totalChunks: data.totalChunks || 1,
+            completedChunks: data.completedChunks || 0,
+            pendingChunks: data.pendingChunks || 0,
+            failedChunks: data.failedChunks || 0,
+            status: data.status,
+          });
+
+          if (data.status === 'completed') {
+            if (Array.isArray(data.drafts) && data.drafts.length > 0) {
+              setConceptDrafts((prevDrafts) => {
+                const currentMaterialDrafts = prevDrafts.filter((d) => d.materialId === conceptReviewMaterial.id);
+                if (currentMaterialDrafts.length === 0) {
+                  const otherDrafts = prevDrafts.filter((d) => d.materialId !== conceptReviewMaterial.id);
+                  const updatedDrafts = [...data.drafts, ...otherDrafts];
+                  saveStoredConceptDrafts(updatedDrafts);
+                  return updatedDrafts;
+                }
+                return prevDrafts;
+              });
+            }
+            deleteAnalysisRecovery(getStorageScopeId(), conceptReviewMaterial.id);
+            setSaveFailedState((prev) => (prev?.materialId === conceptReviewMaterial.id ? null : prev));
+          } else if (data.status === 'processing') {
+            pollTimer = setTimeout(fetchStatus, 2500);
           }
         }
       } catch {
         // ignore background status restoration errors
       }
     };
-    fetchExistingProgress();
+    fetchStatus();
+
     return () => {
       isCancelled = true;
+      if (pollTimer) clearTimeout(pollTimer);
     };
   }, [conceptReviewMaterial, isConceptReviewOpen, activeSubject?.domain]);
 
@@ -4100,9 +4203,21 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         analysisProgress={analysisProgress}
         saveFailedInfo={
           saveFailedState && saveFailedState.materialId === conceptReviewMaterial?.id
-            ? { message: saveFailedState.message, canRetry: saveFailedState.canRetrySave }
+            ? {
+                message: saveFailedState.message,
+                canRetry: saveFailedState.canRetrySave,
+                checkpointStatus: saveFailedState.checkpointStatus,
+                draftsPersistStatus: saveFailedState.draftsPersistStatus,
+                drafts: saveFailedState.drafts,
+              }
             : null
         }
+        onExportRecoveryJson={() => {
+          if (saveFailedState && conceptReviewMaterial) {
+            exportAnalysisRecoveryAsJson(saveFailedState, conceptReviewMaterial.title);
+            showToast('복구 데이터가 JSON 파일로 다운로드되었습니다.');
+          }
+        }}
         onRetrySaveAnalysis={handleRetrySaveAnalysis}
         onPauseAnalysis={handlePauseAiAnalysis}
         onResumeAnalysis={handleResumeAiAnalysis}

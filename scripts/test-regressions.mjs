@@ -13,7 +13,7 @@ const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts', 'lib/materialRestore.ts',
   'lib/materialDraft.ts', 'lib/materialEditSave.ts', 'lib/materialIngestion.ts', 'lib/analysisCheckpoint.ts', 'lib/reviewNotifications.ts', 'lib/dashboardUrl.ts',
-  'lib/practiceAnswerDraft.ts', 'lib/sessionAffiliation.ts',
+  'lib/practiceAnswerDraft.ts', 'lib/sessionAffiliation.ts', 'lib/analysisRecovery.ts', 'lib/recoveryToken.ts',
   'lib/todayStudy.ts', 'lib/reviewStats.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
@@ -426,12 +426,17 @@ exports.requireApiUser = async () => {
 
   const withFakeIndexedDB = async (fn) => {
     const fake = createFakeIndexedDB();
-    window.indexedDB = fake;
+    if (typeof global.window === 'undefined') {
+      global.window = {};
+    }
+    global.window.indexedDB = fake;
+    global.indexedDB = fake;
     try {
       return await fn(fake);
     } finally {
       storageScope.setStorageScope({ kind: 'legacy' });
-      delete window.indexedDB;
+      if (global.window) delete global.window.indexedDB;
+      delete global.indexedDB;
     }
   };
 
@@ -7307,6 +7312,9 @@ exports.requireApiUser = async () => {
                 version: 1,
               },
             ],
+            answers: {
+              'prob-frozen-1': '답안 제출',
+            },
           },
         },
       ],
@@ -7443,6 +7451,7 @@ exports.requireApiUser = async () => {
           workerId: failData.workerId,
           leaseToken: failData.leaseToken,
           drafts: failData.drafts,
+          signedRecoveryToken: failData.signedRecoveryToken,
           materialId: 'mat-top-1',
           subjectId: 'sub-top',
           markdown: fakeMarkdown,
@@ -7575,6 +7584,775 @@ exports.requireApiUser = async () => {
       if (origCronSecret !== undefined) process.env.CRON_SECRET = origCronSecret;
       else delete process.env.CRON_SECRET;
     }
+  });
+
+  // =========================================================================
+  // 6대 핵심 결함 회귀 테스트 (REDCALL Production Hardening)
+  // =========================================================================
+
+  await checkAsync('문제 1: retry_save에서 클라이언트 변조 drafts 거부 및 완료 청크 DB 권한 강제', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const { signRecoveryToken } = load(path.join(output, 'lib/recoveryToken.js'));
+    const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
+
+    const testUser = { id: 'test-user' };
+    const md = '# 선형대수\n행렬의 계수와 차원 정리 [PAGE 1]';
+    const mdHash = computeMarkdownHash(md);
+
+    const authoritativeDraft = {
+      id: 'draft-auth-1',
+      subjectId: 'sub-la',
+      materialId: 'mat-la',
+      title: '차원 정리 (Dimension Theorem)',
+      domain: 'math_stats',
+      description: '선형변환에서 핵의 차원과 상의 차원의 합은 정의역의 차원과 같다.',
+      coreDefinitionFormulaOrAlgorithm: 'dim(V) = dim(ker T) + dim(im T)',
+      sourceEvidence: { type: 'quote', pageNumber: 1, quote: '차원 정리' },
+    };
+
+    const forgedDraft = {
+      id: 'draft-forged-99',
+      subjectId: 'sub-la',
+      materialId: 'mat-la',
+      title: '변조된 초안: 비인가 내용',
+      domain: 'math_stats',
+      description: '악의적 공격자가 임의로 주입한 초안',
+      coreDefinitionFormulaOrAlgorithm: 'x = 0',
+      sourceEvidence: { type: 'quote', pageNumber: 1, quote: '변조' },
+    };
+
+    await withFakeSupabase({
+      user: testUser,
+      materials: [{ id: 'mat-la', user_id: testUser.id, subject_id: 'sub-la' }],
+      analysis_jobs: [
+        {
+          id: 'job-trust-1',
+          user_id: testUser.id,
+          subject_id: 'sub-la',
+          material_id: 'mat-la',
+          domain: 'math_stats',
+          markdown_hash: mdHash,
+          status: 'processing',
+          total_chunks: 2,
+        },
+      ],
+      analysis_job_chunks: [
+        {
+          job_id: 'job-trust-1',
+          chunk_index: 1,
+          status: 'completed',
+          drafts: [authoritativeDraft],
+          completed_at: new Date().toISOString(),
+        },
+        {
+          job_id: 'job-trust-1',
+          chunk_index: 2,
+          status: 'pending',
+          drafts: [],
+        },
+      ],
+      rpcImpl: (fn, args) => {
+        if (fn === 'commit_analysis_chunk_result') {
+          if (args && args.p_chunk_index === 1) {
+            return { data: { committed: false, reason: 'already_completed', drafts: [authoritativeDraft] }, error: null };
+          }
+          return { data: { committed: true, reason: 'committed' }, error: null };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      // 1) 완료된 청크(chunk 1)에 변조한 drafts를 보내도 기존 DB 확정 결과만 반환
+      const tamperedReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: 'job-trust-1',
+          chunkIndex: 1,
+          workerId: 'worker-malicious',
+          leaseToken: 'token-malicious',
+          drafts: [forgedDraft], // 변조된 초안 전송
+          materialId: 'mat-la',
+          subjectId: 'sub-la',
+          domain: 'math_stats',
+          markdown: md,
+        }),
+      });
+
+      const res1 = await analyzePost(tamperedReq);
+      assert.equal(res1.status, 200);
+      const data1 = await res1.json();
+      assert.equal(data1.success, true);
+      assert.equal(data1.drafts.length, 1);
+      assert.equal(data1.drafts[0].id, 'draft-auth-1', '변조된 초안 대신 DB의 확정 초안이 반환됨');
+      assert.equal(data1.drafts[0].title, '차원 정리 (Dimension Theorem)');
+
+      // 2) 미완료 청크(chunk 2)에 위조/서명 없는 초안 전송 시 403 거부
+      const unsignedReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: 'job-trust-1',
+          chunkIndex: 2,
+          workerId: 'worker-1',
+          leaseToken: 'token-1',
+          drafts: [forgedDraft],
+          materialId: 'mat-la',
+          subjectId: 'sub-la',
+          domain: 'math_stats',
+          markdown: md,
+        }),
+      });
+      const resUnsigned = await analyzePost(unsignedReq);
+      assert.equal(resUnsigned.status, 403, '서명 없는 클라이언트 초안 재시도는 403 거부');
+
+      // 3) 다른 사용자/계정의 서명 토큰 재사용 거부
+      const otherUserToken = signRecoveryToken({
+        userId: 'other-attacker-id',
+        jobId: 'job-trust-1',
+        materialId: 'mat-la',
+        subjectId: 'sub-la',
+        domain: 'math_stats',
+        chunkIndex: 2,
+        markdownHash: mdHash,
+        modelId: 'deepseek-v4.1-flash',
+        drafts: [forgedDraft],
+        expiresInSeconds: 3600,
+      });
+
+      const replayReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: 'job-trust-1',
+          chunkIndex: 2,
+          workerId: 'worker-1',
+          leaseToken: 'token-1',
+          drafts: [forgedDraft],
+          signedRecoveryToken: otherUserToken,
+          materialId: 'mat-la',
+          subjectId: 'sub-la',
+          domain: 'math_stats',
+          markdown: md,
+        }),
+      });
+      const resReplay = await analyzePost(replayReq);
+      assert.equal(resReplay.status, 403, '타 계정의 복구 토큰 재사용은 403 거부');
+
+      // 4) 올바른 서명 토큰을 가진 복구 요청은 정상 저장 완료
+      const validToken = signRecoveryToken({
+        userId: testUser.id,
+        jobId: 'job-trust-1',
+        materialId: 'mat-la',
+        subjectId: 'sub-la',
+        domain: 'math_stats',
+        chunkIndex: 2,
+        markdownHash: mdHash,
+        modelId: 'deepseek-v4.1-flash',
+        drafts: [authoritativeDraft],
+        expiresInSeconds: 3600,
+      });
+
+      const validReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: 'job-trust-1',
+          chunkIndex: 2,
+          workerId: 'worker-1',
+          leaseToken: 'token-1',
+          drafts: [authoritativeDraft],
+          signedRecoveryToken: validToken,
+          materialId: 'mat-la',
+          subjectId: 'sub-la',
+          domain: 'math_stats',
+          markdown: md,
+        }),
+      });
+      const resValid = await analyzePost(validReq);
+      assert.equal(resValid.status, 200, '유효한 서명 토큰으로 AI 호출 없이 복구 성공');
+      const validData = await resValid.json();
+      assert.equal(validData.success, true);
+      assert.equal(validData.checkpointCommitted, true);
+    });
+  });
+
+  await checkAsync('문제 2: persisted:false 발생 시 부분 실패 명확화 및 가짜 저장 완료 방지', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const { signRecoveryToken } = load(path.join(output, 'lib/recoveryToken.js'));
+    const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
+
+    const testUser = { id: 'test-user' };
+    const md = '# 위상수학\n컴팩트 공간의 성질 [PAGE 1]';
+    const mdHash = computeMarkdownHash(md);
+
+    const testDraft = {
+      id: 'draft-top-1',
+      subjectId: 'sub-top',
+      materialId: 'mat-top',
+      title: '컴팩트성 (Compactness)',
+      domain: 'math_stats',
+      description: '임의의 열린 덮개가 유한 부분 덮개를 가진다.',
+      coreDefinitionFormulaOrAlgorithm: 'Every open cover has a finite subcover',
+      sourceEvidence: { type: 'quote', pageNumber: 1, quote: '컴팩트' },
+    };
+
+    const recoveryToken = signRecoveryToken({
+      userId: testUser.id,
+      jobId: 'job-partial-1',
+      materialId: 'mat-top',
+      subjectId: 'sub-top',
+      domain: 'math_stats',
+      chunkIndex: 1,
+      markdownHash: mdHash,
+      modelId: 'deepseek-v4.1-flash',
+      drafts: [testDraft],
+      expiresInSeconds: 3600,
+    });
+
+    let failConceptDraftsTable = true;
+
+    await withFakeSupabase({
+      user: testUser,
+      materials: [{ id: 'mat-top', user_id: testUser.id, subject_id: 'sub-top' }],
+      analysis_jobs: [
+        {
+          id: 'job-partial-1',
+          user_id: testUser.id,
+          subject_id: 'sub-top',
+          material_id: 'mat-top',
+          domain: 'math_stats',
+          markdown_hash: mdHash,
+          status: 'processing',
+          total_chunks: 1,
+        },
+      ],
+      concept_drafts: [],
+      rpcImpl: (fn) => {
+        if (fn === 'commit_analysis_chunk_result') {
+          return { data: { committed: true, reason: 'committed' }, error: null };
+        }
+        return { data: null, error: null };
+      },
+    }, async (fakeClient) => {
+      // Mock concept_drafts insertion failure
+      const origFrom = fakeClient.from.bind(fakeClient);
+      fakeClient.from = (table) => {
+        const query = origFrom(table);
+        if (table === 'concept_drafts' && failConceptDraftsTable) {
+          query.upsert = async () => ({ data: null, error: { message: '초안 테이블 용량 초과 또는 네트워크 단절' } });
+        }
+        return query;
+      };
+
+      const retryReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: 'job-partial-1',
+          chunkIndex: 1,
+          workerId: 'worker-1',
+          leaseToken: 'token-1',
+          drafts: [testDraft],
+          signedRecoveryToken: recoveryToken,
+          materialId: 'mat-top',
+          subjectId: 'sub-top',
+          domain: 'math_stats',
+          markdown: md,
+        }),
+      });
+
+      const res = await analyzePost(retryReq);
+      assert.equal(res.status, 500);
+      const data = await res.json();
+      assert.equal(data.success, false, '초안 저장 실패 시 success: false 반환');
+      assert.equal(data.checkpointCommitted, true, '체크포인트는 커밋되었음을 명시');
+      assert.equal(data.persisted, false, 'persisted: false 명확 계약');
+      assert.equal(data.canRetrySave, true, 'AI 재호출 없이 초안 저장만 다시 시도 가능');
+      assert.ok(data.error.includes('concept_drafts'), '에러 문구에 실패 단계 명시');
+    });
+  });
+
+  await checkAsync('문제 3: 서버 재시작 후 processing/running 상태 복원 및 완료 결과 AI 미호출 복원', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
+
+    const testUser = { id: 'test-user' };
+    const md = '# 알고리즘\n그래프 탐색과 다익스트라 최단경로 [PAGE 1]';
+    const mdHash = computeMarkdownHash(md);
+
+    const completedDraft = {
+      id: 'draft-dijkstra-1',
+      subjectId: 'sub-cs',
+      materialId: 'mat-cs',
+      title: '다익스트라 알고리즘',
+      domain: 'computer_science',
+      description: '단일 출발지 최단 경로 알고리즘',
+      coreDefinitionFormulaOrAlgorithm: 'O((V + E) log V)',
+      sourceEvidence: { type: 'quote', pageNumber: 1, quote: '다익스트라' },
+    };
+
+    // 1. Processing job with running chunk (lease valid for 60s)
+    await withFakeSupabase({
+      user: testUser,
+      materials: [{ id: 'mat-cs', user_id: testUser.id, subject_id: 'sub-cs' }],
+      analysis_jobs: [
+        {
+          id: 'job-restore-proc',
+          user_id: testUser.id,
+          subject_id: 'sub-cs',
+          material_id: 'mat-cs',
+          domain: 'computer_science',
+          markdown_hash: mdHash,
+          status: 'processing',
+          total_chunks: 2,
+        },
+      ],
+      analysis_job_chunks: [
+        {
+          job_id: 'job-restore-proc',
+          chunk_index: 1,
+          status: 'completed',
+          drafts: [completedDraft],
+        },
+        {
+          job_id: 'job-restore-proc',
+          chunk_index: 2,
+          status: 'running',
+          lease_worker_id: 'active-worker',
+          lease_token: 'active-token',
+          lease_expires_at: new Date(Date.now() + 60000).toISOString(),
+        },
+      ],
+    }, async () => {
+      const statusReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'status',
+          jobKey: 'job-restore-proc',
+          materialId: 'mat-cs',
+          subjectId: 'sub-cs',
+          domain: 'computer_science',
+        }),
+      });
+
+      const res = await analyzePost(statusReq);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.status, 'processing', 'DB의 processing 및 유효 running 청크를 정확히 복원');
+      assert.equal(data.completedChunks, 1);
+      assert.equal(data.runningChunks, 1);
+      assert.equal(data.totalChunks, 2);
+    });
+
+    // 2. Fully completed job restores results without triggering AI
+    await withFakeSupabase({
+      user: testUser,
+      materials: [{ id: 'mat-cs', user_id: testUser.id, subject_id: 'sub-cs' }],
+      analysis_jobs: [
+        {
+          id: 'job-restore-done',
+          user_id: testUser.id,
+          subject_id: 'sub-cs',
+          material_id: 'mat-cs',
+          domain: 'computer_science',
+          markdown_hash: mdHash,
+          status: 'completed',
+          total_chunks: 1,
+        },
+      ],
+      analysis_job_chunks: [
+        {
+          job_id: 'job-restore-done',
+          chunk_index: 1,
+          status: 'completed',
+          drafts: [completedDraft],
+        },
+      ],
+    }, async () => {
+      const statusReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'status',
+          jobKey: 'job-restore-done',
+          materialId: 'mat-cs',
+          subjectId: 'sub-cs',
+          domain: 'computer_science',
+        }),
+      });
+
+      const res = await analyzePost(statusReq);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.status, 'completed');
+      assert.equal(data.drafts.length, 1);
+      assert.equal(data.drafts[0].title, '다익스트라 알고리즘', '완료된 작업의 결과가 재분석 없이 즉시 복원됨');
+    });
+  });
+
+  await checkAsync('문제 4: 코딩 과목(computer_science) 도메인 정체성 보존 및 본문 해시 검증', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const { signRecoveryToken } = load(path.join(output, 'lib/recoveryToken.js'));
+    const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
+
+    const testUser = { id: 'test-user' };
+    const csMarkdown = '# 운영체제\n가상 메모리와 페이지 교체 알고리즘 (LRU) [PAGE 1]';
+    const csHash = computeMarkdownHash(csMarkdown);
+
+    const csDraft = {
+      id: 'draft-os-1',
+      subjectId: 'sub-os',
+      materialId: 'mat-os',
+      title: 'LRU 페이지 교체 알고리즘',
+      domain: 'computer_science',
+      description: '가장 오랫동안 사용되지 않은 페이지를 교체 대상으로 선정한다.',
+      coreDefinitionFormulaOrAlgorithm: 'Least Recently Used Page Replacement',
+      sourceEvidence: { type: 'quote', pageNumber: 1, quote: 'LRU' },
+    };
+
+    const csToken = signRecoveryToken({
+      userId: testUser.id,
+      jobId: 'job-cs-identity',
+      materialId: 'mat-os',
+      subjectId: 'sub-os',
+      domain: 'computer_science',
+      chunkIndex: 1,
+      markdownHash: csHash,
+      modelId: 'deepseek-v4.1-flash',
+      drafts: [csDraft],
+      expiresInSeconds: 3600,
+    });
+
+    await withFakeSupabase({
+      user: testUser,
+      materials: [{ id: 'mat-os', user_id: testUser.id, subject_id: 'sub-os' }],
+      analysis_jobs: [
+        {
+          id: 'job-cs-identity',
+          user_id: testUser.id,
+          subject_id: 'sub-os',
+          material_id: 'mat-os',
+          domain: 'computer_science',
+          markdown_hash: csHash,
+          status: 'processing',
+          total_chunks: 1,
+        },
+      ],
+      analysis_job_chunks: [],
+      rpcImpl: (fn) => {
+        if (fn === 'commit_analysis_chunk_result') {
+          return { data: { committed: true, reason: 'committed' }, error: null };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      // 1. Client calls retry_save WITHOUT domain (simulating DashboardClient previous bug)
+      // Server must recover 'computer_science' from DB analysis_jobs
+      const retryReqNoDomain = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: 'job-cs-identity',
+          chunkIndex: 1,
+          workerId: 'worker-cs',
+          leaseToken: 'token-cs',
+          drafts: [csDraft],
+          signedRecoveryToken: csToken,
+          materialId: 'mat-os',
+          // domain omitted on purpose
+        }),
+      });
+
+      const res = await analyzePost(retryReqNoDomain);
+      assert.equal(res.status, 200, 'domain 누락 요청도 DB 작업 정체성으로부터 computer_science 복구');
+      const data = await res.json();
+      assert.equal(data.success, true);
+
+      // 2. Client passes altered markdown that mismatches the original job's hash
+      const mismatchReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: 'job-cs-identity',
+          chunkIndex: 1,
+          workerId: 'worker-cs',
+          leaseToken: 'token-cs',
+          drafts: [csDraft],
+          signedRecoveryToken: csToken,
+          materialId: 'mat-os',
+          markdown: '# 완전히 다른 본문: 선형대수 행렬식',
+        }),
+      });
+      const resMismatch = await analyzePost(mismatchReq);
+      assert.ok(resMismatch.status === 400 || resMismatch.status === 403, '최초 작업과 다른 본문 전달 시 불일치 거부');
+      const dataMismatch = await resMismatch.json();
+      assert.equal(dataMismatch.success, false);
+      assert.equal(dataMismatch.errorCode, 'MARKDOWN_HASH_MISMATCH');
+    });
+  });
+
+  await checkAsync('문제 5: 모의시험 평가 답안을 서버 제출본으로 고정 및 변조 거부와 평가 캐시', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: evaluatePost } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+
+    const testUser = { id: 'test-user' };
+    const frozenRubric = [
+      { id: 'r1', label: '정리 이해도', description: '체비쇼프 부등식의 전제조건', maxScore: 100, weight: 1 },
+    ];
+
+    let evaluateAiCalls = 0;
+    global.fetch = async () => {
+      evaluateAiCalls++;
+      return Response.json({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              overallScore: 95,
+              feedback: '체비쇼프 부등식 증명이 정확합니다.',
+              rubricResults: [{ criterionId: 'r1', score: 95, evidenceQuote: '마르코프 부등식을 적용', feedback: '우수' }],
+              methodSelectionDiagnosis: { isApplicable: true, criteria: [] },
+              needsReview: false,
+            }),
+          },
+        }],
+      });
+    };
+
+    const cachedEvaluation = {
+      score: 100,
+      calculatedScore: 100,
+      rubricResults: [{ criterionId: 'r1', score: 100, feedback: '완벽한 풀이' }],
+      generalFeedback: '서버 캐시된 평가 결과',
+    };
+
+    await withFakeSupabase({
+      user: testUser,
+      mock_exam_sessions: [
+        {
+          id: 'exam-secure-1',
+          user_id: testUser.id,
+          status: 'submitted',
+          payload: {
+            problems: [
+              {
+                id: 'prob-eval-1',
+                promptText: '체비쇼프 부등식을 증명하라.',
+                modelAnswer: 'P(|X - mu| >= k*sigma) <= 1/k^2',
+                rubric: frozenRubric,
+                version: 1,
+              },
+              {
+                id: 'prob-cached-9',
+                promptText: '라돈-니코딤 정리 문제',
+                modelAnswer: '라돈-니코딤 모범답안',
+                rubric: frozenRubric,
+                version: 1,
+              },
+            ],
+            answers: {
+              'prob-eval-1': '서버제출답안: 마르코프 부등식을 (X - mu)^2에 적용함.',
+              'prob-cached-9': '서버제출답안: 절대연속 측도에 대한 밀도함수',
+            },
+            reasons: {
+              'prob-eval-1': '모멘트 생성함수가 주어지지 않았으므로 2차 모멘트 기반 체비쇼프를 선택함.',
+            },
+            evaluations: {
+              'prob-cached-9': cachedEvaluation,
+            },
+          },
+        },
+      ],
+      problems: [
+        {
+          id: 'prob-eval-1',
+          user_id: testUser.id,
+          version: 2,
+          promptText: '문제 v2 (시험 제출 후 변경됨)',
+          modelAnswer: 'v2 모범답안',
+          rubric: frozenRubric,
+        },
+      ],
+    }, async () => {
+      // 1) 클라이언트가 서버 제출 답안과 다른 답안 전송 시 400 거부
+      const tamperedReq = new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mockExamSessionId: 'exam-secure-1',
+          problemId: 'prob-eval-1',
+          conceptId: 'c-stat',
+          subjectId: 's-stat',
+          domain: 'math_stats',
+          userAnswer: '클라이언트변조답안: 꼼수 답변',
+          revealedHintCount: 0,
+        }),
+      });
+      const resTampered = await evaluatePost(tamperedReq);
+      assert.equal(resTampered.status, 400, '제출 답안과 다른 답안 전송 시 거부');
+      const dataTampered = await resTampered.json();
+      assert.ok(dataTampered.error.includes('일치하지 않습니다'));
+
+      // 2) 서버 제출 답안과 일치하거나 생략된 경우 서버 제출본으로 평가 진행
+      const validReq = new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mockExamSessionId: 'exam-secure-1',
+          problemId: 'prob-eval-1',
+          conceptId: 'c-stat',
+          subjectId: 's-stat',
+          domain: 'math_stats',
+          userAnswer: '서버제출답안: 마르코프 부등식을 (X - mu)^2에 적용함.',
+          revealedHintCount: 0,
+        }),
+      });
+      const resValid = await evaluatePost(validReq);
+      assert.equal(resValid.status, 200, '서버 공식 제출본으로 정상 평가');
+
+      // 3) 이미 완료된 평가 요청 시 AI 호출 없이 캐시 반환
+      const cachedReq = new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mockExamSessionId: 'exam-secure-1',
+          problemId: 'prob-cached-9',
+          conceptId: 'c-stat',
+          subjectId: 's-stat',
+          domain: 'math_stats',
+          userAnswer: '서버제출답안: 절대연속 측도에 대한 밀도함수',
+          revealedHintCount: 0,
+        }),
+      });
+      const resCached = await evaluatePost(cachedReq);
+      assert.equal(resCached.status, 200);
+      const dataCached = await resCached.json();
+      assert.equal(dataCached.cached, true, '캐시된 평가는 AI 재호출 없이 즉시 반환');
+      assert.equal(dataCached.evaluation.calculatedScore, 100);
+      assert.equal(evaluateAiCalls, 1, '유료 AI 호출은 캐시되지 않은 평가 1회만 발생');
+
+      // 4) 타 사용자의 시험 세션 접근 시 404 거부
+      const otherUserReq = new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mockExamSessionId: 'exam-other-user',
+          problemId: 'prob-eval-1',
+          conceptId: 'c-stat',
+          subjectId: 's-stat',
+          domain: 'math_stats',
+          userAnswer: '답안',
+        }),
+      });
+      const resOther = await evaluatePost(otherUserReq);
+      assert.equal(resOther.status, 404, '타 사용자의 시험 세션은 404 차단');
+    });
+  });
+
+  await checkAsync('문제 6: 새로고침 대비 IndexedDB 계정별 복구 데이터 보존 및 JSON 백업 폴백', async () => {
+    const {
+      saveAnalysisRecovery,
+      loadAnalysisRecovery,
+      deleteAnalysisRecovery,
+      exportAnalysisRecoveryAsJson,
+    } = load(path.join(output, 'lib/analysisRecovery.js'));
+
+    await withFakeIndexedDB(async () => {
+      const recordUserA = {
+        materialId: 'mat-persist-1',
+        jobKey: 'job-persist-1',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-abc',
+        chunkIndex: 1,
+        workerId: 'worker-1',
+        leaseToken: 'token-1',
+        drafts: [
+          {
+            id: 'draft-p1',
+            subjectId: 'sub-1',
+            materialId: 'mat-persist-1',
+            title: '코시-슈바르츠 부등식',
+            domain: 'math_stats',
+            description: '내적 공간에서의 절대 부등식',
+            coreDefinitionFormulaOrAlgorithm: '|<u, v>|^2 <= <u, u> <v, v>',
+            sourceEvidence: { type: 'quote', pageNumber: 1, quote: '코시' },
+          },
+        ],
+        signedRecoveryToken: 'signed-token-123',
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: new Date().toISOString(),
+        errorMessage: '초안 테이블 영속 저장 실패',
+      };
+
+      // 1. Save and immediate read-back verification
+      const saveRes = await saveAnalysisRecovery('u_userA', recordUserA);
+      assert.equal(saveRes.ok, true, 'IndexedDB 저장 성공 및 읽기 검증 통과');
+
+      // 2. Account isolation: user B cannot read user A's recovery
+      const loadedUserB = await loadAnalysisRecovery('u_userB', 'mat-persist-1');
+      assert.equal(loadedUserB, null, '계정별 IndexedDB 격리로 타 계정 복구 데이터 열람 불가');
+
+      // 3. User A reloads and retrieves preserved recovery data
+      const loadedUserA = await loadAnalysisRecovery('u_userA', 'mat-persist-1');
+      assert.ok(loadedUserA, '사용자 A는 새로고침 후에도 복구 데이터 로드 성공');
+      assert.equal(loadedUserA.jobKey, 'job-persist-1');
+      assert.equal(loadedUserA.drafts.length, 1);
+      assert.equal(loadedUserA.checkpointStatus, 'committed');
+
+      // 4. JSON export fallback validation (simulating browser environment)
+      let downloadedBlobContent = '';
+      global.window = {
+        indexedDB: globalThis.indexedDB,
+      };
+      global.document = {
+        body: {
+          appendChild: () => {},
+          removeChild: () => {},
+        },
+        createElement: (tag) => {
+          if (tag === 'a') {
+            return {
+              href: '',
+              download: '',
+              click: () => {},
+            };
+          }
+          return {};
+        },
+      };
+      global.URL = {
+        createObjectURL: (blob) => {
+          downloadedBlobContent = blob;
+          return 'blob:mock-url';
+        },
+        revokeObjectURL: () => {},
+      };
+
+      exportAnalysisRecoveryAsJson(recordUserA, '미적분학_교안');
+      assert.ok(downloadedBlobContent, 'DB 영구 불가 시 JSON 파일 다운로드 내보내기 폴백 정상 생성');
+
+      // 5. Cleanup on successful recovery
+      await deleteAnalysisRecovery('u_userA', 'mat-persist-1');
+      const loadedAfterClean = await loadAnalysisRecovery('u_userA', 'mat-persist-1');
+      assert.equal(loadedAfterClean, null, '저장 완료 후 복구 데이터가 안전하게 정리됨');
+
+      delete global.window;
+      delete global.document;
+      delete global.URL;
+    });
   });
 
   console.log(`${passed} regression checks passed`);

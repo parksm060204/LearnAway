@@ -47,8 +47,15 @@ interface ConceptReviewModalProps {
     failedChunks: number;
     status: 'processing' | 'paused' | 'completed' | 'failed';
   } | null;
-  saveFailedInfo?: { message: string; canRetry: boolean } | null;
+  saveFailedInfo?: {
+    message: string;
+    canRetry: boolean;
+    checkpointStatus?: 'pending' | 'committed' | 'already_completed';
+    draftsPersistStatus?: 'pending' | 'failed' | 'persisted';
+    drafts?: ConceptDraft[];
+  } | null;
   onRetrySaveAnalysis?: (material: Material) => void;
+  onExportRecoveryJson?: () => void;
   onPauseAnalysis?: (material: Material) => void;
   onResumeAnalysis?: (material: Material) => void;
   /** Server-backed approval (transactional RPC). When provided, the modal uses
@@ -73,6 +80,7 @@ export function ConceptReviewModal({
   analysisProgress = null,
   saveFailedInfo = null,
   onRetrySaveAnalysis,
+  onExportRecoveryJson,
   onPauseAnalysis,
   onResumeAnalysis,
   onApproveConceptDraft,
@@ -339,14 +347,25 @@ export function ConceptReviewModal({
             )}
 
             {saveFailedInfo && saveFailedInfo.canRetry && material && onRetrySaveAnalysis && (
-              <button
-                onClick={() => onRetrySaveAnalysis(material)}
-                disabled={isAnalyzing}
-                className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors shadow-xs animate-pulse disabled:opacity-50"
-                title="AI 재호출 없이 생성 완료된 초안만 DB에 다시 저장합니다."
-              >
-                <span>생성 완료, 저장 실패 - 저장 재시도</span>
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => onRetrySaveAnalysis(material)}
+                  disabled={isAnalyzing}
+                  className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors shadow-xs animate-pulse disabled:opacity-50"
+                  title="AI 재호출 없이 생성 완료된 초안만 DB에 다시 저장합니다."
+                >
+                  <span>생성 완료, 저장 실패 - 저장 재시도</span>
+                </button>
+                {onExportRecoveryJson && (
+                  <button
+                    onClick={onExportRecoveryJson}
+                    className="px-2 py-1.5 bg-[#33302b] hover:bg-[#44403a] text-[#ded6c8] hover:text-white text-xs font-academic-mono rounded-xs flex items-center gap-1 transition-colors border border-[#555047]"
+                    title="영구 저장 실패 대비: 브라우저에 보존된 AI 생성 초안을 JSON 파일로 백업합니다."
+                  >
+                    <span>JSON 내보내기</span>
+                  </button>
+                )}
+              </div>
             )}
 
             {material && (analysisProgress?.status === 'processing' || isAnalyzing) && onPauseAnalysis && (
@@ -418,6 +437,46 @@ export function ConceptReviewModal({
                 최신 내용으로 재분석
               </button>
             )}
+          </div>
+        )}
+
+        {/* Save Failed / Partial Completion Notice Banner */}
+        {saveFailedInfo && (
+          <div className="bg-amber-50 border-b border-amber-300 px-5 py-2.5 flex items-center justify-between text-xs text-amber-900">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+              <div>
+                <div className="font-bold">
+                  {saveFailedInfo.checkpointStatus === 'committed' && saveFailedInfo.draftsPersistStatus === 'failed'
+                    ? '체크포인트 완료 / 초안 테이블 저장 실패 (부분 완료)'
+                    : 'AI 생성 완료 / DB 저장 실패'}
+                </div>
+                <div className="text-[11px] text-amber-800">
+                  {saveFailedInfo.checkpointStatus === 'committed' && saveFailedInfo.draftsPersistStatus === 'failed'
+                    ? 'AI 청크 체크포인트는 DB에 확정되었으나 초안 테이블 영속 저장 단계에서 오류가 발생했습니다. AI 재호출 없이 초안 테이블 저장만 안전하게 재시도할 수 있습니다.'
+                    : (saveFailedInfo.message || '저장 단계에서 오류가 발생했습니다. AI 재호출 없이 저장만 재시도하거나 JSON으로 백업할 수 있습니다.')}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {onExportRecoveryJson && (
+                <button
+                  onClick={onExportRecoveryJson}
+                  className="px-2.5 py-1 bg-white hover:bg-amber-100 text-amber-900 border border-amber-300 rounded text-[11px] font-bold transition-colors"
+                >
+                  결과 JSON 백업
+                </button>
+              )}
+              {material && onRetrySaveAnalysis && saveFailedInfo.canRetry && (
+                <button
+                  onClick={() => onRetrySaveAnalysis(material)}
+                  disabled={isAnalyzing}
+                  className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-bold disabled:opacity-50 transition-colors"
+                >
+                  저장만 재시도
+                </button>
+              )}
+            </div>
           </div>
         )}
 
