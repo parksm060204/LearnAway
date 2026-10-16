@@ -57,6 +57,8 @@ interface ConceptReviewModalProps {
   } | null;
   onRetrySaveAnalysis?: (material: Material) => void;
   onExportRecoveryJson?: () => void;
+  unmigratedCount?: number;
+  onExportUnmigratedJson?: () => void;
   onPauseAnalysis?: (material: Material) => void;
   onResumeAnalysis?: (material: Material) => void;
   /** Server-backed approval (transactional RPC). When provided, the modal uses
@@ -82,6 +84,8 @@ export function ConceptReviewModal({
   saveFailedInfo = null,
   onRetrySaveAnalysis,
   onExportRecoveryJson,
+  unmigratedCount = 0,
+  onExportUnmigratedJson,
   onPauseAnalysis,
   onResumeAnalysis,
   onApproveConceptDraft,
@@ -490,6 +494,28 @@ export function ConceptReviewModal({
                 </button>
               )}
             </div>
+          </div>
+        )}
+
+        {/* Unmigrated legacy records preservation notice */}
+        {unmigratedCount > 0 && (
+          <div className="bg-[#24211d] border-b border-[#443e35] px-5 py-2 flex items-center justify-between text-xs text-[#d5cbbe]">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" />
+              <span>
+                이전 버전 미이관 복구 데이터가 {unmigratedCount}건 안전하게 보존되어 있습니다.{' '}
+                <span className="text-stone-400 text-[11px]">(참고: 과거에 이미 삭제되었던 데이터는 복구할 수 없습니다)</span>
+              </span>
+            </div>
+            {onExportUnmigratedJson && (
+              <button
+                onClick={onExportUnmigratedJson}
+                className="px-2.5 py-1 bg-[#332f29] hover:bg-[#443f37] text-stone-200 border border-[#554e43] rounded text-[11px] font-bold transition-colors"
+                title="보존된 미이관 레코드를 JSON 파일로 백업합니다."
+              >
+                미이관 데이터 백업 다운로드
+              </button>
+            )}
           </div>
         )}
 

@@ -321,16 +321,16 @@ exports.requireApiUser = async () => {
   // without replacing the service under test.
   function createFakeIndexedDB() {
     const databases = new Map();
-    const failure = { get: new Set(), getAll: false, put: new Set(), abortPut: new Set(), corruptPut: new Set() };
+    const failure = { get: new Set(), getAll: false, put: new Set(), abortPut: new Set(), corruptPut: new Set(), blocked: false };
 
     const recordFor = (name) => {
       if (!databases.has(name)) databases.set(name, new Map());
       return databases.get(name);
     };
 
-    const makeRequest = () => ({ onsuccess: null, onerror: null, onupgradeneeded: null, result: undefined, error: null });
+    const makeRequest = () => ({ onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null, result: undefined, error: null });
 
-    const makeTransaction = (stores, storeName) => {
+    const makeTransaction = (stores, storeName, notifyPending = null) => {
       if (!stores.has(storeName)) stores.set(storeName, new Map());
       const store = stores.get(storeName);
       const tx = { oncomplete: null, onerror: null, onabort: null, error: null, _settled: false };
@@ -349,75 +349,126 @@ exports.requireApiUser = async () => {
         indexNames: { contains: () => true },
         get: (id) => {
           const req = makeRequest();
+          if (notifyPending) notifyPending(1);
           setTimeout(() => {
-            if (failure.get.has(id)) { req.error = new Error('injected read failure'); if (req.onerror) req.onerror(); finish('error', req.error); return; }
-            req.result = store.has(id) ? structuredClone(store.get(id)) : undefined;
-            if (req.onsuccess) req.onsuccess();
+            try {
+              if (failure.get.has(id)) { req.error = new Error('injected read failure'); if (req.onerror) req.onerror(); finish('error', req.error); return; }
+              req.result = store.has(id) ? structuredClone(store.get(id)) : undefined;
+              if (req.onsuccess) req.onsuccess();
+            } finally {
+              if (notifyPending) notifyPending(-1);
+            }
           }, 0);
           return req;
         },
         getAll: () => {
           const req = makeRequest();
+          if (notifyPending) notifyPending(1);
           setTimeout(() => {
-            if (failure.getAll) { req.error = new Error('injected getAll failure'); if (req.onerror) req.onerror(); return; }
-            req.result = Array.from(store.values()).map((value) => structuredClone(value));
-            if (req.onsuccess) req.onsuccess();
+            try {
+              if (failure.getAll) { req.error = new Error('injected getAll failure'); if (req.onerror) req.onerror(); return; }
+              req.result = Array.from(store.values()).map((value) => structuredClone(value));
+              if (req.onsuccess) req.onsuccess();
+            } finally {
+              if (notifyPending) notifyPending(-1);
+            }
           }, 0);
           return req;
         },
         getAllKeys: () => {
           const req = makeRequest();
-          setTimeout(() => { req.result = Array.from(store.keys()); if (req.onsuccess) req.onsuccess(); }, 0);
+          if (notifyPending) notifyPending(1);
+          setTimeout(() => {
+            try {
+              req.result = Array.from(store.keys());
+              if (req.onsuccess) req.onsuccess();
+            } finally {
+              if (notifyPending) notifyPending(-1);
+            }
+          }, 0);
           return req;
         },
         put: (value) => {
           const req = makeRequest();
+          if (notifyPending) notifyPending(1);
           setTimeout(() => {
-            const key = value.id || value.materialId;
-            if (failure.abortPut.has(value.materialId)) { finish('abort', new Error('injected abort')); return; }
-            if (failure.put.has(value.materialId)) { req.error = new Error('injected write failure'); if (req.onerror) req.onerror(); finish('error', req.error); return; }
-            if (failure.corruptPut.has(value.materialId)) {
-              store.set(key, structuredClone({ ...value, markdown: String(value.markdown || '') + ' corrupted' }));
+            try {
+              const key = value.id || value.materialId;
+              if (failure.abortPut.has(value.materialId)) { finish('abort', new Error('injected abort')); return; }
+              if (failure.put.has(value.materialId)) { req.error = new Error('injected write failure'); if (req.onerror) req.onerror(); finish('error', req.error); return; }
+              if (failure.corruptPut.has(value.materialId)) {
+                store.set(key, structuredClone({ ...value, markdown: String(value.markdown || '') + ' corrupted' }));
+                req.result = key;
+                if (req.onsuccess) req.onsuccess();
+                finish('complete');
+                return;
+              }
+              store.set(key, structuredClone(value));
               req.result = key;
               if (req.onsuccess) req.onsuccess();
               finish('complete');
-              return;
+            } finally {
+              if (notifyPending) notifyPending(-1);
             }
-            store.set(key, structuredClone(value));
-            req.result = key;
-            if (req.onsuccess) req.onsuccess();
-            finish('complete');
           }, 0);
           return req;
         },
         index: (indexName) => ({
           get: (key) => {
             const req = makeRequest();
+            if (notifyPending) notifyPending(1);
             setTimeout(() => {
-              const item = Array.from(store.values()).find((v) => v && v[indexName] === key);
-              req.result = item ? structuredClone(item) : undefined;
-              if (req.onsuccess) req.onsuccess();
+              try {
+                const item = Array.from(store.values()).find((v) => v && v[indexName] === key);
+                req.result = item ? structuredClone(item) : undefined;
+                if (req.onsuccess) req.onsuccess();
+              } finally {
+                if (notifyPending) notifyPending(-1);
+              }
             }, 0);
             return req;
           },
           getAll: (key) => {
             const req = makeRequest();
+            if (notifyPending) notifyPending(1);
             setTimeout(() => {
-              const items = Array.from(store.values()).filter((v) => v && v[indexName] === key);
-              req.result = items.map((it) => structuredClone(it));
-              if (req.onsuccess) req.onsuccess();
+              try {
+                const items = Array.from(store.values()).filter((v) => v && v[indexName] === key);
+                req.result = items.map((it) => structuredClone(it));
+                if (req.onsuccess) req.onsuccess();
+              } finally {
+                if (notifyPending) notifyPending(-1);
+              }
             }, 0);
             return req;
           },
         }),
         delete: (id) => {
           const req = makeRequest();
-          setTimeout(() => { store.delete(id); if (req.onsuccess) req.onsuccess(); finish('complete'); }, 0);
+          if (notifyPending) notifyPending(1);
+          setTimeout(() => {
+            try {
+              store.delete(id);
+              if (req.onsuccess) req.onsuccess();
+              finish('complete');
+            } finally {
+              if (notifyPending) notifyPending(-1);
+            }
+          }, 0);
           return req;
         },
         clear: () => {
           const req = makeRequest();
-          setTimeout(() => { store.clear(); if (req.onsuccess) req.onsuccess(); finish('complete'); }, 0);
+          if (notifyPending) notifyPending(1);
+          setTimeout(() => {
+            try {
+              store.clear();
+              if (req.onsuccess) req.onsuccess();
+              finish('complete');
+            } finally {
+              if (notifyPending) notifyPending(-1);
+            }
+          }, 0);
           return req;
         },
       };
@@ -432,6 +483,13 @@ exports.requireApiUser = async () => {
       __dbVersions: dbVersions,
       open(name, version) {
         const request = makeRequest();
+        if (failure.blocked) {
+          setTimeout(() => {
+            if (request.onblocked) request.onblocked({ target: request });
+          }, 0);
+          return request;
+        }
+
         setTimeout(() => {
           const stores = recordFor(name);
           const oldVersion = dbVersions.get(name) || 0;
@@ -444,13 +502,33 @@ exports.requireApiUser = async () => {
             storesSnapshot.set(sName, new Map(Array.from(sMap.entries()).map(([k, v]) => [k, structuredClone(v)])));
           }
 
+          let pendingRequests = 0;
           let upgradeAborted = false;
+          let upgradeTxFinished = false;
+
+          const finishUpgradeIfReady = () => {
+            if (pendingRequests === 0 && !upgradeAborted && !upgradeTxFinished) {
+              upgradeTxFinished = true;
+              dbVersions.set(name, targetVersion);
+              db.version = targetVersion;
+              if (request.onsuccess) request.onsuccess({ target: request });
+            }
+          };
+
+          const notifyPending = (delta) => {
+            pendingRequests += delta;
+            if (pendingRequests <= 0) {
+              setTimeout(finishUpgradeIfReady, 0);
+            }
+          };
+
           const upgradeTx = {
             oncomplete: null,
             onerror: null,
             onabort: null,
             abort: () => {
               upgradeAborted = true;
+              upgradeTxFinished = true;
               // Rollback stores
               stores.clear();
               for (const [sName, sMap] of storesSnapshot.entries()) {
@@ -461,7 +539,7 @@ exports.requireApiUser = async () => {
                 request.onerror({ target: request });
               }
             },
-            objectStore: (storeName) => makeTransaction(stores, storeName, 'readwrite').objectStore(),
+            objectStore: (storeName) => makeTransaction(stores, storeName, notifyPending).objectStore(),
           };
 
           const db = {
@@ -470,7 +548,7 @@ exports.requireApiUser = async () => {
             objectStoreNames: { contains: (storeName) => stores.has(storeName) },
             createObjectStore: (storeName) => {
               if (!stores.has(storeName)) stores.set(storeName, new Map());
-              const storeApi = makeTransaction(stores, storeName, 'readwrite').objectStore();
+              const storeApi = makeTransaction(stores, storeName, notifyPending).objectStore();
               return {
                 createIndex: () => {},
                 put: (val) => storeApi.put(val),
@@ -479,7 +557,7 @@ exports.requireApiUser = async () => {
             deleteObjectStore: (storeName) => {
               stores.delete(storeName);
             },
-            transaction: (storeName, mode) => makeTransaction(stores, storeName, mode || 'readonly'),
+            transaction: (storeName) => makeTransaction(stores, storeName, null),
             close: () => {},
           };
           request.result = db;
@@ -495,10 +573,9 @@ exports.requireApiUser = async () => {
           }
 
           if (upgradeAborted) return;
-
-          dbVersions.set(name, targetVersion);
-          db.version = targetVersion;
-          if (request.onsuccess) request.onsuccess({ target: request });
+          if (pendingRequests === 0) {
+            finishUpgradeIfReady();
+          }
         }, 0);
         return request;
       },
@@ -526,7 +603,9 @@ exports.requireApiUser = async () => {
   function createFakeSupabase(options = {}) {
     const state = {
       user: options.user === undefined ? { id: 'user-a' } : options.user,
-      subjects: options.subjects ? [...options.subjects] : [],
+      subjects: options.subjects !== undefined
+        ? [...options.subjects]
+        : (options.materials || []).filter((m) => m && m.subject_id).map((m) => ({ id: m.subject_id, user_id: m.user_id || (options.user ? options.user.id : 'user-a'), name: 'Auto Subject' })),
       materials: options.materials ? [...options.materials] : [],
       objects: new Map(options.objects ? Object.entries(options.objects) : []),
       fail: options.fail || {},
@@ -538,7 +617,7 @@ exports.requireApiUser = async () => {
     // Seed any additional table arrays provided in options.
     for (const key of Object.keys(options)) {
       if (['user', 'subjects', 'materials', 'objects', 'fail', 'rpcResult'].includes(key)) continue;
-      if (Array.isArray(options[key])) state[key] = [...options[key]];
+      if (Array.isArray(options[key])) state[key] = options[key];
     }
     const clone = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
     const nowIso = () => new Date().toISOString();
@@ -722,13 +801,45 @@ exports.requireApiUser = async () => {
           return Promise.resolve({ data: null, error: null });
         }
         if (name === 'init_analysis_job_and_chunks') {
+          if (!params.p_user_id) {
+            return Promise.resolve({ data: { success: false, error: '사용자 식별자가 누락되었습니다.', error_code: 'UNAUTHORIZED' }, error: null });
+          }
+
+          // 1. Verify Subject Ownership in public.subjects
+          const subjects = (state.subjects = state.subjects || []);
+          const subject = subjects.find((s) => s.id === params.p_subject_id && s.user_id === params.p_user_id);
+          if (!subject) {
+            return Promise.resolve({
+              data: { success: false, error: '과목 또는 자료를 찾을 수 없거나 접근 권한이 없습니다.', error_code: 'NOT_FOUND_OR_FORBIDDEN' },
+              error: null,
+            });
+          }
+
+          // 2. Verify Material Ownership & Subject Linkage if present
+          const materials = (state.materials = state.materials || []);
+          const mat = materials.find((m) => m.id === params.p_material_id);
+          if (mat) {
+            if (mat.user_id && mat.user_id !== params.p_user_id) {
+              return Promise.resolve({
+                data: { success: false, error: '과목 또는 자료를 찾을 수 없거나 접근 권한이 없습니다.', error_code: 'NOT_FOUND_OR_FORBIDDEN' },
+                error: null,
+              });
+            }
+            if (mat.subject_id && mat.subject_id !== params.p_subject_id) {
+              return Promise.resolve({
+                data: { success: false, error: '과목 식별자가 자료의 과목과 일치하지 않습니다.', error_code: 'SUBJECT_MISMATCH' },
+                error: null,
+              });
+            }
+          }
+
+          // 3. Concurrency-safe job insertion with ON CONFLICT (id) DO NOTHING
           const jobs = (state.analysis_jobs = state.analysis_jobs || []);
           const chunks = (state.analysis_job_chunks = state.analysis_job_chunks || []);
-          const existingJobIdx = jobs.findIndex((j) => j.id === params.p_job_id);
-          if (existingJobIdx >= 0) {
-            jobs[existingJobIdx].updated_at = nowIso();
-          } else {
-            jobs.push({
+          let existingJob = jobs.find((j) => j.id === params.p_job_id);
+
+          if (!existingJob) {
+            existingJob = {
               id: params.p_job_id,
               user_id: params.p_user_id,
               subject_id: params.p_subject_id,
@@ -742,13 +853,50 @@ exports.requireApiUser = async () => {
               status: 'pending',
               created_at: nowIso(),
               updated_at: nowIso(),
-            });
+            };
+            jobs.push(existingJob);
+          } else {
+            // Check ownership
+            if (existingJob.user_id !== params.p_user_id) {
+              return Promise.resolve({
+                data: { success: false, error: '과목 또는 자료를 찾을 수 없거나 접근 권한이 없습니다.', error_code: 'NOT_FOUND_OR_FORBIDDEN' },
+                error: null,
+              });
+            }
+            // Strict identity verification
+            if (
+              existingJob.subject_id !== params.p_subject_id ||
+              existingJob.material_id !== params.p_material_id ||
+              existingJob.markdown_hash !== params.p_markdown_hash ||
+              existingJob.domain !== params.p_domain ||
+              existingJob.model_id !== params.p_model_id ||
+              existingJob.prompt_version !== (params.p_prompt_version || 'v2') ||
+              existingJob.chunking_version !== (params.p_chunking_version || 'v1') ||
+              existingJob.total_chunks !== params.p_total_chunks
+            ) {
+              return Promise.resolve({
+                data: { success: false, error: '동일한 작업 식별자에 다른 분석 정보가 전달되었습니다.', error_code: 'JOB_IDENTITY_MISMATCH' },
+                error: null,
+              });
+            }
+            existingJob.updated_at = nowIso();
           }
+
+          // Simulate chunk insertion failure leading to rollback if requested
+          if (state.fail.failChunkInit) {
+            const jobIdx = jobs.findIndex((j) => j.id === params.p_job_id);
+            if (jobIdx >= 0 && jobs[jobIdx].status === 'pending') {
+              jobs.splice(jobIdx, 1);
+            }
+            return Promise.resolve({ data: null, error: { message: 'injected chunk insert failure' } });
+          }
+
           if (Array.isArray(params.p_chunks)) {
             for (const ch of params.p_chunks) {
               const chIdx = chunks.findIndex((c) => c.job_id === params.p_job_id && c.chunk_index === ch.chunk_index);
               if (chIdx < 0) {
                 chunks.push({
+                  id: `chk_${params.p_job_id}_${ch.chunk_index}`,
                   job_id: params.p_job_id,
                   chunk_index: ch.chunk_index,
                   source_context: ch.source_context,
@@ -761,7 +909,7 @@ exports.requireApiUser = async () => {
               }
             }
           }
-          return Promise.resolve({ data: { success: true, job_id: params.p_job_id, total_chunks: params.p_total_chunks }, error: null });
+          return Promise.resolve({ data: { success: true, job_id: params.p_job_id, total_chunks: params.p_total_chunks, status: existingJob.status }, error: null });
         }
         return Promise.resolve({ data: state.rpcResult ?? 'created-id', error: null });
       },
@@ -9327,7 +9475,7 @@ exports.requireApiUser = async () => {
     });
   });
 
-  await checkAsync('P1 Problem 3: IndexedDB v1 -> v3 업그레이드 시 복구 데이터 안전 이관, 미이관 보존 및 충돌 방지', async () => {
+  await checkAsync('P1 Problem 2: IndexedDB v1 -> v4 업그레이드 시 복구 데이터 안전 이관, 읽기 실패/중단 시 원본 보존 및 차단 안내', async () => {
     const {
       saveAnalysisRecovery,
       loadAnalysisRecovery,
@@ -9337,7 +9485,7 @@ exports.requireApiUser = async () => {
     } = load(path.join(output, 'lib/analysisRecovery.js'));
 
     await withFakeIndexedDB(async (fakeIdb) => {
-      const scopeId = 'u_mig_test';
+      const scopeId = 'u_p2_idb_test';
       const dbName = `redcall_analysis_recovery_${scopeId}`;
 
       // 1. Manually setup a v1 IndexedDB schema with keyPath: 'materialId'
@@ -9348,112 +9496,336 @@ exports.requireApiUser = async () => {
       const v1RecoveryStore = new Map();
       v1Stores.set('recoveries', v1RecoveryStore);
 
-      // Seed 3 v1 records:
-      // Record 1: Complete valid record
       const v1Record1 = {
-        materialId: 'mat-v1-normal',
-        jobKey: 'job-v1-normal',
+        materialId: 'mat-v1-ok',
+        jobKey: 'job-v1-ok',
         subjectId: 'sub-math',
         domain: 'math_stats',
-        markdownHash: 'hash-v1-normal',
+        markdownHash: 'hash-v1',
         chunkIndex: 1,
-        workerId: 'worker-v1',
-        leaseToken: 'token-v1',
-        drafts: [
-          {
-            id: 'd-v1-1',
-            title: '테일러 급수',
-            domain: 'math_stats',
-            description: '함수를 다항식의 급수로 근사',
-            coreDefinitionFormulaOrAlgorithm: 'f(x) = \\sum \\frac{f^{(n)}(a)}{n!}(x-a)^n',
-          },
-        ],
-        signedRecoveryToken: 'token-signed-v1',
+        workerId: 'worker-1',
+        leaseToken: 'token-1',
+        drafts: [{ id: 'd-1', title: '코시-슈바르츠 부등식' }],
+        signedRecoveryToken: 'token-signed-1',
         checkpointStatus: 'committed',
         draftsPersistStatus: 'failed',
         savedAt: '2026-10-15T10:00:00.000Z',
-        errorMessage: 'v1 초안 저장 실패',
       };
-      v1RecoveryStore.set('mat-v1-normal', v1Record1);
+      v1RecoveryStore.set('mat-v1-ok', v1Record1);
 
-      // Record 2: Incomplete record (missing jobKey)
+      // Incomplete record (missing jobKey)
       const v1RecordIncomplete = {
-        materialId: 'mat-v1-incomplete',
-        drafts: [{ id: 'd-inc', title: '미완성 초안' }],
+        materialId: 'mat-v1-inc',
+        drafts: [{ id: 'd-inc', title: '미완성' }],
         savedAt: '2026-10-15T10:05:00.000Z',
       };
-      v1RecoveryStore.set('mat-v1-incomplete', v1RecordIncomplete);
+      v1RecoveryStore.set('mat-v1-inc', v1RecordIncomplete);
 
-      // 2. Open via lib/analysisRecovery.js (triggers v1 -> v3 upgrade)
-      const loadedNormal = await loadAnalysisRecovery(scopeId, 'job-v1-normal', 1);
+      // 2. READ FAILURE INJECTION: When getAll fails during upgrade, verify tx.abort() preserves v1 store and data
+      fakeIdb.__failure.getAll = true;
+      const readFailResult = await loadAnalysisRecovery(scopeId, 'mat-v1-ok');
+      assert.equal(readFailResult, null, '읽기 실패 시 null 반환');
+      // CRITICAL ASSERTION: The v1 store must NOT have been deleted! The records must be preserved!
+      assert.ok(v1Stores.has('recoveries'), '읽기 실패 시 기존 recoveries 저장소가 삭제되지 않고 보존됨');
+      assert.equal(v1RecoveryStore.has('mat-v1-ok'), true, '기존 v1 레코드가 그대로 유지됨');
+      assert.equal(fakeIdb.__dbVersions.get(dbName), 1, '업그레이드 트랜잭션이 롤백되어 DB 버전이 1로 유지됨');
+      fakeIdb.__failure.getAll = false;
 
-      assert.ok(loadedNormal, 'v1 정상 레코드가 v3 복구 저장소로 안전하게 이관됨');
-      assert.equal(loadedNormal.id, 'job-v1-normal_c1', '컴포지트 키(jobKey_c1)로 정상 변환');
-      assert.equal(loadedNormal.materialId, 'mat-v1-normal');
-      assert.equal(loadedNormal.jobKey, 'job-v1-normal');
-      assert.equal(loadedNormal.chunkIndex, 1);
-      assert.equal(loadedNormal.workerId, 'worker-v1');
-      assert.equal(loadedNormal.leaseToken, 'token-v1');
-      assert.equal(loadedNormal.drafts.length, 1);
-      assert.equal(loadedNormal.drafts[0].title, '테일러 급수');
-      assert.equal(loadedNormal.signedRecoveryToken, 'token-signed-v1');
-      assert.equal(loadedNormal.checkpointStatus, 'committed');
-      assert.equal(loadedNormal.draftsPersistStatus, 'failed');
+      // 3. Successful upgrade: opens and migrates v1 records into v4 structure
+      const loadedNormal = await loadAnalysisRecovery(scopeId, 'job-v1-ok', 1);
+      assert.ok(loadedNormal, 'v1 정상 레코드가 v4 복구 저장소로 안전하게 이관됨');
+      assert.equal(loadedNormal.id, 'job-v1-ok_c1');
+      assert.equal(loadedNormal.drafts[0].title, '코시-슈바르츠 부등식');
+      assert.equal(loadedNormal.signedRecoveryToken, 'token-signed-1');
 
-      // Backward compatibility lookup by materialId
-      const loadedByMat = await loadAnalysisRecovery(scopeId, 'mat-v1-normal');
-      assert.ok(loadedByMat, 'materialId로도 조회 성공');
-      assert.equal(loadedByMat.id, 'job-v1-normal_c1');
+      // Incomplete record is in unmigrated store
+      const unmigrated = await listUnmigratedAnalysisRecoveries(scopeId);
+      assert.equal(unmigrated.length, 1);
+      assert.equal(unmigrated[0].materialId, 'mat-v1-inc');
 
-      // 3. Verify incomplete legacy record is preserved in unmigrated store
-      const unmigratedList = await listUnmigratedAnalysisRecoveries(scopeId);
-      assert.equal(unmigratedList.length, 1, '필수 필드 누락 레거시 레코드가 unmigrated 저장소에 보존됨');
-      assert.equal(unmigratedList[0].materialId, 'mat-v1-incomplete');
-      assert.ok(unmigratedList[0].unmigratedReason.includes('필수 복구 필드'));
-
-      // 4. Duplicate key collision test: verify no silent overwrite
-      const recordCol1 = {
-        materialId: 'mat-col',
-        jobKey: 'job-col',
-        subjectId: 'sub-1',
+      // 4. Blocked upgrade handling
+      fakeIdb.__failure.blocked = true;
+      const blockedRes = await saveAnalysisRecovery(scopeId, {
+        materialId: 'mat-blocked',
+        jobKey: 'job-blocked',
+        subjectId: 'sub-math',
         domain: 'math_stats',
-        markdownHash: 'hash-c',
+        markdownHash: 'hash-b',
         chunkIndex: 1,
-        workerId: 'w1',
-        leaseToken: 'tok1',
-        drafts: [{ id: 'd1', title: '개념 1' }],
-        checkpointStatus: 'committed',
-        draftsPersistStatus: 'failed',
-        savedAt: '2026-10-15T11:00:00.000Z',
-      };
-      const recordCol2 = {
-        materialId: 'mat-col',
-        jobKey: 'job-col',
-        subjectId: 'sub-1',
-        domain: 'math_stats',
-        markdownHash: 'hash-c',
-        chunkIndex: 1,
-        workerId: 'w2',
-        leaseToken: 'tok2',
-        drafts: [{ id: 'd2', title: '개념 2' }],
-        checkpointStatus: 'committed',
-        draftsPersistStatus: 'failed',
-        savedAt: '2026-10-15T11:05:00.000Z',
-      };
-      await saveAnalysisRecovery(scopeId, recordCol1);
-      // Manually simulate a collision record
-      const col2WithId = { ...recordCol2, id: 'job-col_c1_alt_test' };
-      await saveAnalysisRecovery(scopeId, col2WithId);
+        workerId: 'w-b',
+        leaseToken: 'tok-b',
+        drafts: [{ id: 'd-b', title: '차단 테스트' }],
+        checkpointStatus: 'pending',
+        draftsPersistStatus: 'pending',
+        savedAt: new Date().toISOString(),
+      });
+      assert.equal(blockedRes.ok, false);
+      assert.ok(blockedRes.error.includes('다른 탭에서 데이터베이스를 사용 중이어서'));
+      fakeIdb.__failure.blocked = false;
 
-      const allRecoveries = await listAnalysisRecoveries(scopeId);
-      const colMatches = allRecoveries.filter((r) => r.jobKey === 'job-col');
-      assert.equal(colMatches.length, 2, '중복 청크 인덱스에 대해 서로 다른 복구 결과가 덮어써지지 않고 각각 보존됨');
-
-      // 5. Targeted delete: deleteAnalysisRecovery(scope, materialId, jobKey) deletes only that job\'s records
-      await deleteAnalysisRecovery(scopeId, 'mat-col', 'job-col');
+      // 5. Targeted delete: deleteAnalysisRecovery(scope, materialId, jobKey) deletes only that job's records
+      await deleteAnalysisRecovery(scopeId, 'mat-v1-ok', 'job-v1-ok');
       const afterDelete = await listAnalysisRecoveries(scopeId);
-      const remainingNormal = afterDelete.find((r) => r.jobKey === 'job-v1-normal');
-      assert.ok(remainingNormal, '특정 작업 삭제 시 다른 작업의 복구 레코드는 안전하게 유지됨');
+      assert.equal(afterDelete.filter((r) => r.jobKey === 'job-v1-ok').length, 0);
+    });
+  });
+
+  await checkAsync('P2 Problem 1: Migration 19/20 분석 작업 동시 초기화의 기본키 충돌 방지 및 작업 정체성 검증', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+
+    const testUser = { id: 'test-user' };
+    const testMaterialId = 'mat-p1-conc';
+    const testSubjectId = 'sub-p1-conc';
+    const testMarkdown = '# 선형대수\n## 행렬식\n행렬식은 부피의 팽창 비율을 나타내는 스칼라 함수이다. [PAGE 1]';
+
+    let jobsDb = [];
+    let chunksDb = [];
+    await withFakeSupabase({
+      user: testUser,
+      subjects: [{ id: testSubjectId, user_id: testUser.id, name: '선형대수' }],
+      materials: [{ id: testMaterialId, user_id: testUser.id, subject_id: testSubjectId }],
+      analysis_jobs: jobsDb,
+      analysis_job_chunks: chunksDb,
+    }, async (fakeClient) => {
+      // 1) Simulate two concurrent initialization requests with the EXACT SAME input
+      const req1 = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'init',
+          materialId: testMaterialId,
+          subjectId: testSubjectId,
+          domain: 'math_stats',
+          markdown: testMarkdown,
+        }),
+      });
+      const req2 = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'init',
+          materialId: testMaterialId,
+          subjectId: testSubjectId,
+          domain: 'math_stats',
+          markdown: testMarkdown,
+        }),
+      });
+
+      const [res1, res2] = await Promise.all([analyzePost(req1), analyzePost(req2)]);
+      const [data1, data2] = await Promise.all([res1.json(), res2.json()]);
+
+      assert.equal(res1.status, 200, '동시 요청 1 성공');
+      assert.equal(res2.status, 200, '동시 요청 2 성공 (기본키 충돌 없이 처리)');
+      assert.equal(data1.jobKey, data2.jobKey, '두 요청이 동일한 작업 식별자를 반환받음');
+      assert.equal(jobsDb.length, 1, 'DB에 정확히 1개의 작업만 생성됨 (중복 없음)');
+      assert.equal(chunksDb.length, 1, 'DB에 정확히 1개의 청크만 생성됨 (청크 중복 없음)');
+
+      // 2) Calling RPC with mismatched identity on the same jobKey -> JOB_IDENTITY_MISMATCH
+      const mismatchRpcRes = await fakeClient.rpc('init_analysis_job_and_chunks', {
+        p_user_id: testUser.id,
+        p_job_id: data1.jobKey,
+        p_subject_id: testSubjectId,
+        p_material_id: testMaterialId,
+        p_markdown_hash: 'completely_different_hash', // Mismatched hash!
+        p_domain: 'math_stats',
+        p_model_id: 'deepseek-v4.1-flash',
+        p_prompt_version: 'v2',
+        p_chunking_version: 'v1',
+        p_total_chunks: 1,
+        p_chunks: [{ chunk_index: 1, source_context: '청크 1' }],
+      });
+      assert.equal(mismatchRpcRes.data.success, false);
+      assert.equal(mismatchRpcRes.data.error_code, 'JOB_IDENTITY_MISMATCH', '동일 식별자에 다른 내용 전달 시 충돌 거부');
+
+      // 3) Re-initializing completed / paused job preserves status and results
+      chunksDb[0].status = 'completed';
+      chunksDb[0].drafts = [{ id: 'd-1', title: '행렬식' }];
+      chunksDb[0].attempt_count = 2;
+      jobsDb[0].status = 'completed';
+
+      const reInitReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'init',
+          materialId: testMaterialId,
+          subjectId: testSubjectId,
+          domain: 'math_stats',
+          markdown: testMarkdown,
+        }),
+      });
+      const reInitRes = await analyzePost(reInitReq);
+      assert.equal(reInitRes.status, 200);
+      assert.equal(chunksDb[0].status, 'completed', '기존 완료 청크 상태 유지');
+      assert.equal(chunksDb[0].drafts.length, 1, '기존 drafts 유지');
+      assert.equal(chunksDb[0].attempt_count, 2, '기존 attempt_count 유지');
+      assert.equal(jobsDb[0].status, 'completed', '기존 작업 status 유지');
+
+      // 4) Failure during chunk insertion rolls back new job creation atomically
+      fakeClient.__state.fail.failChunkInit = true;
+      const failJobKey = 'job-fail-atomic-rollback';
+      const failRpcRes = await fakeClient.rpc('init_analysis_job_and_chunks', {
+        p_user_id: testUser.id,
+        p_job_id: failJobKey,
+        p_subject_id: testSubjectId,
+        p_material_id: testMaterialId,
+        p_markdown_hash: 'hash-fail',
+        p_domain: 'math_stats',
+        p_model_id: 'deepseek-v4.1-flash',
+        p_prompt_version: 'v2',
+        p_chunking_version: 'v1',
+        p_total_chunks: 1,
+        p_chunks: [{ chunk_index: 1, source_context: '청크 1' }],
+      });
+      assert.ok(failRpcRes.error, '청크 생성 실패 에러 반환');
+      assert.ok(!jobsDb.some((j) => j.id === failJobKey), '청크 생성 실패 시 신규 작업도 함께 롤백됨');
+      delete fakeClient.__state.fail.failChunkInit;
+    });
+  });
+
+  await checkAsync('P1 Problem 3: 로컬 전용 자료 및 과목 소유권 엄격 검증, 타인 과목 차단 및 DB 오류 처리', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+
+    const testUser = { id: 'test-user' };
+    const otherUser = { id: 'other-user' };
+    const mySubjectId = 'sub-mine';
+    const otherSubjectId = 'sub-other-user';
+    const myMaterialId = 'mat-mine';
+    const localOnlyMaterialId = 'mat-local-only-123';
+    const testMarkdown = '# 추상대수학\n## 군의 정의\n군이란 닫힘성, 결합법칙, 항등원, 역원을 만족하는 대수 구조이다. [PAGE 1]';
+
+    let aiCalls = 0;
+    global.fetch = async () => {
+      aiCalls++;
+      return Response.json({ choices: [{ message: { content: '{}' } }] });
+    };
+
+    let jobsDb = [];
+    let chunksDb = [];
+    await withFakeSupabase({
+      user: testUser,
+      subjects: [
+        { id: mySubjectId, user_id: testUser.id, name: '내 과목' },
+        { id: otherSubjectId, user_id: otherUser.id, name: '남의 과목' },
+      ],
+      materials: [
+        { id: myMaterialId, user_id: testUser.id, subject_id: mySubjectId },
+      ],
+      analysis_jobs: jobsDb,
+      analysis_job_chunks: chunksDb,
+    }, async (fakeClient) => {
+      // 1) My subject + local-only material (no row in materials table) -> SUCCESS (no forced body upload)
+      const localOkReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'init',
+          materialId: localOnlyMaterialId,
+          subjectId: mySubjectId,
+          domain: 'math_stats',
+          markdown: testMarkdown,
+        }),
+      });
+      const localOkRes = await analyzePost(localOkReq);
+      const localOkData = await localOkRes.json();
+      assert.equal(localOkRes.status, 200, '내 과목 + 로컬 전용 자료 정상 초기화 성공');
+      assert.equal(localOkData.success, true);
+      assert.ok(localOkData.jobKey);
+      assert.equal(fakeClient.__state.materials.length, 1, '로컬 자료 초기화 시 본문/자료 강제 서버 업로드 없음');
+
+      // 2) Other user's subject + arbitrary material ID -> 404 NOT_FOUND_OR_FORBIDDEN (0 AI calls, no job created)
+      const aiBeforeOtherSub = aiCalls;
+      const jobsBeforeOtherSub = jobsDb.length;
+      const otherSubReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'init',
+          materialId: 'any-mat-id',
+          subjectId: otherSubjectId, // Other user's subject!
+          domain: 'math_stats',
+          markdown: testMarkdown,
+        }),
+      });
+      const otherSubRes = await analyzePost(otherSubReq);
+      const otherSubData = await otherSubRes.json();
+      assert.equal(otherSubRes.status, 404, '타인 과목 지정 시 404 거부');
+      assert.equal(otherSubData.errorCode, 'NOT_FOUND_OR_FORBIDDEN');
+      assert.equal(jobsDb.length, jobsBeforeOtherSub, '타인 과목 요청으로 작업 생성되지 않음');
+      assert.equal(aiCalls, aiBeforeOtherSub, '타인 과목 요청으로 AI 호출되지 않음');
+
+      // 3) Nonexistent subject -> 404 NOT_FOUND_OR_FORBIDDEN
+      const nonExistentSubReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'init',
+          materialId: localOnlyMaterialId,
+          subjectId: 'non-existent-sub-xyz',
+          domain: 'math_stats',
+          markdown: testMarkdown,
+        }),
+      });
+      const nonExistentSubRes = await analyzePost(nonExistentSubReq);
+      assert.equal(nonExistentSubRes.status, 404, '존재하지 않는 과목 지정 시 404 거부');
+
+      // 4) My material + different subject -> 400 SUBJECT_MISMATCH
+      const fakeSub2 = 'sub-my-second';
+      fakeClient.__state.subjects.push({ id: fakeSub2, user_id: testUser.id, name: '내 두번째 과목' });
+      const mismatchSubReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'init',
+          materialId: myMaterialId, // belongs to mySubjectId
+          subjectId: fakeSub2, // mismatched!
+          domain: 'math_stats',
+          markdown: testMarkdown,
+        }),
+      });
+      const mismatchSubRes = await analyzePost(mismatchSubReq);
+      const mismatchSubData = await mismatchSubRes.json();
+      assert.equal(mismatchSubRes.status, 400, '자료와 과목 불일치 시 400 거부');
+      assert.equal(mismatchSubData.errorCode, 'SUBJECT_MISMATCH');
+
+      // 5) Database query error on subjects or materials -> 500 DB_QUERY_ERROR, halts before save/AI
+      const aiBeforeDbErr = aiCalls;
+      const jobsBeforeDbErr = jobsDb.length;
+      const originalFrom = fakeClient.from;
+      fakeClient.from = (table) => {
+        if (table === 'subjects') {
+          return {
+            select: () => ({
+              eq: () => ({
+                eq: () => ({
+                  maybeSingle: () => Promise.resolve({ data: null, error: { message: 'Database query timeout' } }),
+                }),
+              }),
+            }),
+          };
+        }
+        return originalFrom(table);
+      };
+
+      const dbErrReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'init',
+          materialId: myMaterialId,
+          subjectId: mySubjectId,
+          domain: 'math_stats',
+          markdown: testMarkdown,
+        }),
+      });
+      const dbErrRes = await analyzePost(dbErrReq);
+      const dbErrData = await dbErrRes.json();
+      assert.equal(dbErrRes.status, 500, 'DB 조회 오류 시 500 반환');
+      assert.equal(dbErrData.errorCode, 'DB_QUERY_ERROR');
+      assert.equal(jobsDb.length, jobsBeforeDbErr, 'DB 오류 시 작업 생성 중단');
+      assert.equal(aiCalls, aiBeforeDbErr, 'DB 오류 시 AI 호출 중단');
     });
   });
 
@@ -9497,6 +9869,7 @@ exports.requireApiUser = async () => {
     let chunksDb = [];
     await withFakeSupabase({
       user: testUser,
+      subjects: [{ id: subjectId, user_id: testUser.id, name: '미적분학' }],
       materials: [{ id: materialId, user_id: testUser.id, subject_id: subjectId }],
       analysis_jobs: jobsDb,
       analysis_job_chunks: chunksDb,
@@ -9516,7 +9889,7 @@ exports.requireApiUser = async () => {
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           });
-          return { data: { success: true, job_id: args.p_job_id, total_chunks: args.p_total_chunks }, error: null };
+          return { data: { success: true, job_id: args.p_job_id, total_chunks: args.p_total_chunks, status: 'pending' }, error: null };
         }
         if (fn === 'claim_analysis_chunk_lease') {
           return { data: { acquired: true, lease_token: 'lease-p4', chunk_index: args.p_chunk_index }, error: null };
@@ -9551,7 +9924,6 @@ exports.requireApiUser = async () => {
       jobARow.status = 'completed';
 
       // 2) Step 2: User modifies text to Markdown B and clicks "새 분석" / "최신 내용으로 재분석"
-      // Request does NOT pass jobKey (it is a new analysis request for current markdown)
       const initBReq = new NextRequest('http://localhost/api/analyze-concepts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

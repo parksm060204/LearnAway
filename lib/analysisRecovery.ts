@@ -24,7 +24,7 @@ export interface AnalysisRecoveryRecord {
 const RECOVERY_DB_BASE = 'redcall_analysis_recovery';
 const RECOVERY_STORE = 'recoveries';
 const UNMIGRATED_STORE = 'recoveries_unmigrated';
-const RECOVERY_DB_VERSION = 3;
+const RECOVERY_DB_VERSION = 4;
 
 export interface UnmigratedRecoveryRecord {
   id: string;
@@ -78,58 +78,9 @@ function getIndexedDB(): IDBFactory | null {
   return null;
 }
 
-/**
- * Reads existing records from a v1 database before version upgrade.
- * Opening without a version number opens at the current version without triggering onupgradeneeded.
- */
-async function getLegacyV1RecordsIfAny(idb: IDBFactory, dbName: string): Promise<Record<string, unknown>[] | null> {
-  return new Promise((resolve) => {
-    try {
-      let settled = false;
-      const req = idb.open(dbName);
-      req.onupgradeneeded = (e) => {
-        // Database did not exist before: abort creation at v1 so upgrade handles fresh creation at v3
-        settled = true;
-        try {
-          const tx = (e.target as IDBOpenDBRequest)?.transaction;
-          if (tx && typeof tx.abort === 'function') tx.abort();
-        } catch {}
-        resolve(null);
-      };
-      req.onsuccess = () => {
-        if (settled) return;
-        const db = req.result;
-        if (db.version !== 1 || !db.objectStoreNames.contains(RECOVERY_STORE)) {
-          db.close();
-          resolve(null);
-          return;
-        }
-        try {
-          const tx = db.transaction(RECOVERY_STORE, 'readonly');
-          const store = tx.objectStore(RECOVERY_STORE);
-          const getReq = store.getAll();
-          getReq.onsuccess = () => {
-            const list = (getReq.result as Record<string, unknown>[]) || [];
-            db.close();
-            resolve(list);
-          };
-          getReq.onerror = () => {
-            db.close();
-            resolve(null);
-          };
-        } catch {
-          db.close();
-          resolve(null);
-        }
-      };
-      req.onerror = () => resolve(null);
-    } catch {
-      resolve(null);
-    }
-  });
-}
-
-async function openRecoveryDb(scopeId: string): Promise<{ db: IDBDatabase } | { error: string }> {
+async function openRecoveryDb(
+  scopeId: string
+): Promise<{ db: IDBDatabase } | { error: string; blocked?: boolean }> {
   if (!validScopeId(scopeId)) {
     return Promise.resolve({ error: '유효하지 않은 계정 스코프입니다.' });
   }
@@ -140,132 +91,193 @@ async function openRecoveryDb(scopeId: string): Promise<{ db: IDBDatabase } | { 
   }
 
   const dbName = recoveryDbNameForScope(scopeId);
-  const legacyRecords = await getLegacyV1RecordsIfAny(idb, dbName);
 
   return new Promise((resolve) => {
     try {
       const req = idb.open(dbName, RECOVERY_DB_VERSION);
+
+      req.onblocked = () => {
+        resolve({
+          error: '다른 탭에서 데이터베이스를 사용 중이어서 버전 업그레이드가 일시 차단되었습니다. 다른 탭을 닫고 다시 시도해 주세요.',
+          blocked: true,
+        });
+      };
+
       req.onupgradeneeded = (event) => {
         const db = req.result;
         const tx = req.transaction;
 
+        if (!tx) return;
+
         try {
-          // 1. If migrating from v1 (< 2) where keyPath was 'materialId', drop old store
-          if (event.oldVersion < 2 && db.objectStoreNames.contains(RECOVERY_STORE)) {
-            try {
-              db.deleteObjectStore(RECOVERY_STORE);
-            } catch {
-              // ignore
-            }
-          }
-
-          // 2. Create RECOVERY_STORE if not present (keyPath: 'id')
-          let store: IDBObjectStore;
-          if (!db.objectStoreNames.contains(RECOVERY_STORE)) {
-            store = db.createObjectStore(RECOVERY_STORE, { keyPath: 'id' });
-            store.createIndex('materialId', 'materialId', { unique: false });
-            store.createIndex('jobKey', 'jobKey', { unique: false });
-            store.createIndex('savedAt', 'savedAt', { unique: false });
-          } else {
-            store = tx!.objectStore(RECOVERY_STORE);
-          }
-
-          // 3. Create UNMIGRATED_STORE if not present
+          // Ensure UNMIGRATED_STORE exists in all versions
           let unmigratedStore: IDBObjectStore;
           if (!db.objectStoreNames.contains(UNMIGRATED_STORE)) {
             unmigratedStore = db.createObjectStore(UNMIGRATED_STORE, { keyPath: 'id' });
             unmigratedStore.createIndex('materialId', 'materialId', { unique: false });
             unmigratedStore.createIndex('savedAt', 'savedAt', { unique: false });
           } else {
-            unmigratedStore = tx!.objectStore(UNMIGRATED_STORE);
+            unmigratedStore = tx.objectStore(UNMIGRATED_STORE);
           }
 
-          // 4. Safely migrate legacy v1 records into v3 composite key structure
-          if (event.oldVersion < 2 && legacyRecords && legacyRecords.length > 0) {
-            const usedKeys = new Set<string>();
-
-            for (const rec of legacyRecords) {
-              const jobKey = typeof rec.jobKey === 'string' ? rec.jobKey.trim() : '';
-              const materialId = typeof rec.materialId === 'string' ? rec.materialId.trim() : '';
-              const chunkIndex = typeof rec.chunkIndex === 'number' && rec.chunkIndex > 0 ? rec.chunkIndex : 1;
-              const drafts = Array.isArray(rec.drafts) ? (rec.drafts as ConceptDraft[]) : [];
-
-              const isComplete = Boolean(jobKey && materialId && drafts.length > 0);
-              if (!isComplete) {
-                // Incomplete legacy record: preserve in unmigrated store without dropping or inventing fake jobKeys
-                const unmigratedId =
-                  (typeof rec.id === 'string' && rec.id) ||
-                  (materialId ? `unmigrated_${materialId}_${Date.now()}` : `unmigrated_${Math.random().toString(36).slice(2)}`);
-                unmigratedStore.put({
-                  ...rec,
-                  id: unmigratedId,
-                  materialId: materialId || undefined,
-                  unmigratedReason: '필수 복구 필드(jobKey, materialId, drafts)가 불완전하여 자동 이관되지 않고 보존되었습니다.',
-                  unmigratedAt: new Date().toISOString(),
-                });
-                continue;
-              }
-
-              let targetId = typeof rec.id === 'string' && rec.id ? rec.id : makeRecoveryRecordId(jobKey, chunkIndex);
-
-              // Prevent overwriting different recovery results if duplicate key occurs
-              if (usedKeys.has(targetId)) {
-                const collisionSuffix = `_alt_${Date.parse(String(rec.savedAt || '')) || Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-                targetId = `${targetId}${collisionSuffix}`;
-              }
-              usedKeys.add(targetId);
-
-              const contentHash =
-                typeof rec.contentHash === 'string' && rec.contentHash
-                  ? rec.contentHash
-                  : computeRecoveryContentHash({
-                      jobKey,
-                      chunkIndex,
-                      drafts,
-                      signedRecoveryToken: typeof rec.signedRecoveryToken === 'string' ? rec.signedRecoveryToken : undefined,
-                    });
-
-              const migratedRecord: AnalysisRecoveryRecord = {
-                id: targetId,
-                materialId,
-                jobKey,
-                subjectId: typeof rec.subjectId === 'string' ? rec.subjectId : '',
-                domain: typeof rec.domain === 'string' ? rec.domain : 'math_stats',
-                markdownHash: typeof rec.markdownHash === 'string' ? rec.markdownHash : '',
-                chunkIndex,
-                workerId: typeof rec.workerId === 'string' ? rec.workerId : '',
-                leaseToken: typeof rec.leaseToken === 'string' ? rec.leaseToken : '',
-                drafts,
-                signedRecoveryToken: typeof rec.signedRecoveryToken === 'string' ? rec.signedRecoveryToken : undefined,
-                checkpointStatus:
-                  rec.checkpointStatus === 'committed' || rec.checkpointStatus === 'already_completed'
-                    ? rec.checkpointStatus
-                    : 'pending',
-                draftsPersistStatus:
-                  rec.draftsPersistStatus === 'persisted' || rec.draftsPersistStatus === 'failed'
-                    ? rec.draftsPersistStatus
-                    : 'failed',
-                savedAt: typeof rec.savedAt === 'string' ? rec.savedAt : new Date().toISOString(),
-                contentHash,
-                errorMessage: typeof rec.errorMessage === 'string' ? rec.errorMessage : undefined,
-              };
-
-              store.put(migratedRecord);
+          // Scenario A: Fresh database creation (oldVersion === 0)
+          if (event.oldVersion === 0) {
+            if (!db.objectStoreNames.contains(RECOVERY_STORE)) {
+              const store = db.createObjectStore(RECOVERY_STORE, { keyPath: 'id' });
+              store.createIndex('materialId', 'materialId', { unique: false });
+              store.createIndex('jobKey', 'jobKey', { unique: false });
+              store.createIndex('savedAt', 'savedAt', { unique: false });
             }
+            return;
           }
-        } catch (err) {
-          if (tx && typeof tx.abort === 'function') {
-            try {
-              tx.abort();
-            } catch {}
+
+          // Scenario B: Upgrading from legacy v1 (oldVersion < 2) where keyPath was 'materialId'
+          // We read and migrate all records in the SAME versionchange transaction.
+          // We NEVER delete the old store until records have been read successfully!
+          if (event.oldVersion < 2 && db.objectStoreNames.contains(RECOVERY_STORE)) {
+            const oldStore = tx.objectStore(RECOVERY_STORE);
+            const readReq = oldStore.getAll();
+
+            readReq.onerror = () => {
+              // Read failed: DO NOT delete store. Abort transaction to preserve all existing data!
+              try {
+                tx.abort();
+              } catch {}
+            };
+
+            readReq.onsuccess = () => {
+              try {
+                const legacyRecords = (readReq.result as Record<string, unknown>[]) || [];
+
+                // Now that records are safely read in memory, delete old store
+                db.deleteObjectStore(RECOVERY_STORE);
+
+                // Create new store with keyPath: 'id'
+                const newStore = db.createObjectStore(RECOVERY_STORE, { keyPath: 'id' });
+                newStore.createIndex('materialId', 'materialId', { unique: false });
+                newStore.createIndex('jobKey', 'jobKey', { unique: false });
+                newStore.createIndex('savedAt', 'savedAt', { unique: false });
+
+                const usedKeys = new Set<string>();
+
+                for (const rec of legacyRecords) {
+                  const jobKey = typeof rec.jobKey === 'string' ? rec.jobKey.trim() : '';
+                  const materialId = typeof rec.materialId === 'string' ? rec.materialId.trim() : '';
+                  const chunkIndex = typeof rec.chunkIndex === 'number' && rec.chunkIndex > 0 ? rec.chunkIndex : 1;
+                  const drafts = Array.isArray(rec.drafts) ? (rec.drafts as ConceptDraft[]) : [];
+
+                  const isComplete = Boolean(jobKey && materialId && drafts.length > 0);
+                  if (!isComplete) {
+                    // Incomplete legacy record: preserve in unmigrated store without dropping or inventing fake jobKeys
+                    const unmigratedId =
+                      (typeof rec.id === 'string' && rec.id) ||
+                      (materialId ? `unmigrated_${materialId}_${Date.now()}` : `unmigrated_${Math.random().toString(36).slice(2)}`);
+                    unmigratedStore.put({
+                      ...rec,
+                      id: unmigratedId,
+                      materialId: materialId || undefined,
+                      unmigratedReason: '필수 복구 필드(jobKey, materialId, drafts)가 불완전하여 자동 이관되지 않고 보존되었습니다.',
+                      unmigratedAt: new Date().toISOString(),
+                    });
+                    continue;
+                  }
+
+                  let targetId = typeof rec.id === 'string' && rec.id ? rec.id : makeRecoveryRecordId(jobKey, chunkIndex);
+
+                  // Prevent overwriting different recovery results if duplicate key occurs
+                  if (usedKeys.has(targetId)) {
+                    const collisionSuffix = `_alt_${Date.parse(String(rec.savedAt || '')) || Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+                    targetId = `${targetId}${collisionSuffix}`;
+                  }
+                  usedKeys.add(targetId);
+
+                  const contentHash =
+                    typeof rec.contentHash === 'string' && rec.contentHash
+                      ? rec.contentHash
+                      : computeRecoveryContentHash({
+                          jobKey,
+                          chunkIndex,
+                          drafts,
+                          signedRecoveryToken: typeof rec.signedRecoveryToken === 'string' ? rec.signedRecoveryToken : undefined,
+                        });
+
+                  const migratedRecord: AnalysisRecoveryRecord = {
+                    id: targetId,
+                    materialId,
+                    jobKey,
+                    subjectId: typeof rec.subjectId === 'string' ? rec.subjectId : '',
+                    domain: typeof rec.domain === 'string' ? rec.domain : 'math_stats',
+                    markdownHash: typeof rec.markdownHash === 'string' ? rec.markdownHash : '',
+                    chunkIndex,
+                    workerId: typeof rec.workerId === 'string' ? rec.workerId : '',
+                    leaseToken: typeof rec.leaseToken === 'string' ? rec.leaseToken : '',
+                    drafts,
+                    signedRecoveryToken: typeof rec.signedRecoveryToken === 'string' ? rec.signedRecoveryToken : undefined,
+                    checkpointStatus:
+                      rec.checkpointStatus === 'committed' || rec.checkpointStatus === 'already_completed'
+                        ? rec.checkpointStatus
+                        : 'pending',
+                    draftsPersistStatus:
+                      rec.draftsPersistStatus === 'persisted' || rec.draftsPersistStatus === 'failed'
+                        ? rec.draftsPersistStatus
+                        : 'failed',
+                    savedAt: typeof rec.savedAt === 'string' ? rec.savedAt : new Date().toISOString(),
+                    contentHash,
+                    errorMessage: typeof rec.errorMessage === 'string' ? rec.errorMessage : undefined,
+                  };
+
+                  newStore.put(migratedRecord);
+                }
+              } catch {
+                try {
+                  tx.abort();
+                } catch {}
+              }
+            };
+            return;
           }
-          throw err;
+
+          // Scenario C: Upgrading from v2 or v3 where RECOVERY_STORE already has keyPath: 'id'
+          // Data is already safely keyed by id, so do NOT delete the store!
+          if (db.objectStoreNames.contains(RECOVERY_STORE)) {
+            const store = tx.objectStore(RECOVERY_STORE);
+            if (!store.indexNames.contains('materialId')) {
+              store.createIndex('materialId', 'materialId', { unique: false });
+            }
+            if (!store.indexNames.contains('jobKey')) {
+              store.createIndex('jobKey', 'jobKey', { unique: false });
+            }
+            if (!store.indexNames.contains('savedAt')) {
+              store.createIndex('savedAt', 'savedAt', { unique: false });
+            }
+          } else {
+            const store = db.createObjectStore(RECOVERY_STORE, { keyPath: 'id' });
+            store.createIndex('materialId', 'materialId', { unique: false });
+            store.createIndex('jobKey', 'jobKey', { unique: false });
+            store.createIndex('savedAt', 'savedAt', { unique: false });
+          }
+        } catch {
+          try {
+            tx.abort();
+          } catch {}
         }
       };
-      req.onsuccess = () => resolve({ db: req.result });
-      req.onerror = () => resolve({ error: '복구용 IndexedDB 저장소를 열지 못했습니다.' });
-    } catch (err) {
-      resolve({ error: err instanceof Error ? err.message : 'IndexedDB 열기 실패' });
+
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => {
+          try {
+            db.close();
+          } catch {}
+        };
+        resolve({ db });
+      };
+
+      req.onerror = () => {
+        resolve({ error: req.error?.message || 'IndexedDB 열기에 실패했습니다.' });
+      };
+    } catch (err: unknown) {
+      resolve({ error: err instanceof Error ? err.message : 'IndexedDB 열기 예외가 발생했습니다.' });
     }
   });
 }
@@ -593,3 +605,36 @@ export function exportAnalysisRecoveryAsJson(record: AnalysisRecoveryRecord, mat
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+/**
+ * Fallback preservation: exports unmigrated legacy recovery records as a downloadable JSON file.
+ * Enables the user to inspect and retain preserved legacy records without losing data.
+ */
+export function exportUnmigratedRecoveriesAsJson(
+  records: UnmigratedRecoveryRecord[],
+  scopeId: string
+): void {
+  if (typeof window === 'undefined' || !records.length) return;
+
+  const exportData = {
+    app: 'LearnAway',
+    version: '2.0',
+    notice: 'LearnAway 이전 버전 미이관 복구 데이터 목록입니다. (과거에 이미 삭제되었던 데이터는 복구할 수 없습니다)',
+    exportedAt: new Date().toISOString(),
+    scopeId,
+    recordCount: records.length,
+    records,
+  };
+
+  const jsonStr = JSON.stringify(exportData, null, 2);
+  const blob = new Blob([jsonStr], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `LearnAway_unmigrated_recoveries_${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+

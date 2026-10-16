@@ -176,7 +176,10 @@ import {
   loadAnalysisRecovery,
   deleteAnalysisRecovery,
   exportAnalysisRecoveryAsJson,
+  exportUnmigratedRecoveriesAsJson,
+  listUnmigratedAnalysisRecoveries,
   AnalysisRecoveryRecord,
+  UnmigratedRecoveryRecord,
 } from '../lib/analysisRecovery';
 import {
   recordMaterialBodyHash,
@@ -313,6 +316,15 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     canRetrySave: boolean;
     message: string;
   }) | null>(null);
+  const [unmigratedRecoveries, setUnmigratedRecoveries] = useState<UnmigratedRecoveryRecord[]>([]);
+
+  useEffect(() => {
+    if (isConceptReviewOpen) {
+      listUnmigratedAnalysisRecoveries(getStorageScopeId())
+        .then((records) => setUnmigratedRecoveries(records))
+        .catch(() => {});
+    }
+  }, [isConceptReviewOpen]);
 
   // Stage 3: AI Problem Generation & Review State
   const [problemDrafts, setProblemDrafts] = useState<ProblemDraft[]>([]);
@@ -4280,6 +4292,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           if (saveFailedState && conceptReviewMaterial) {
             exportAnalysisRecoveryAsJson(saveFailedState, conceptReviewMaterial.title);
             showToast('복구 데이터가 JSON 파일로 다운로드되었습니다.');
+          }
+        }}
+        unmigratedCount={unmigratedRecoveries.length}
+        onExportUnmigratedJson={() => {
+          if (unmigratedRecoveries.length) {
+            exportUnmigratedRecoveriesAsJson(unmigratedRecoveries, getStorageScopeId());
+            showToast('미이관 복구 데이터가 JSON 파일로 다운로드되었습니다.');
           }
         }}
         onRetrySaveAnalysis={handleRetrySaveAnalysis}

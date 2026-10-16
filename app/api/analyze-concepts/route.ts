@@ -430,26 +430,85 @@ export async function POST(req: NextRequest) {
 
     if (supabaseClient && typeof supabaseClient.from === 'function') {
       try {
+        // 1. Verify subject exists in public.subjects and belongs to auth.user.id
+        const { data: subRow, error: subErr } = await supabaseClient
+          .from('subjects')
+          .select('id, user_id')
+          .eq('id', subjectId)
+          .eq('user_id', auth.user.id)
+          .maybeSingle();
+
+        if (subErr) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: '과목 정보를 확인하는 중 데이터베이스 오류가 발생했습니다.',
+              errorCode: 'DB_QUERY_ERROR',
+            },
+            { status: 500 }
+          );
+        }
+
+        if (!subRow) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: '과목 또는 자료를 찾을 수 없거나 접근 권한이 없습니다.',
+              errorCode: 'NOT_FOUND_OR_FORBIDDEN',
+            },
+            { status: 404 }
+          );
+        }
+
+        // 2. Verify material if it exists on server
         const { data: matRow, error: matErr } = await supabaseClient
           .from('materials')
           .select('id, user_id, subject_id')
           .eq('id', materialId)
           .maybeSingle();
 
-        if (!matErr && matRow) {
-          if (matRow.user_id !== auth.user.id || (matRow.subject_id && matRow.subject_id !== subjectId)) {
+        if (matErr) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: '자료 정보를 확인하는 중 데이터베이스 오류가 발생했습니다.',
+              errorCode: 'DB_QUERY_ERROR',
+            },
+            { status: 500 }
+          );
+        }
+
+        if (matRow) {
+          if (matRow.user_id !== auth.user.id) {
             return NextResponse.json(
               {
                 success: false,
-                error: '작업을 찾을 수 없거나 접근 권한이 없습니다.',
+                error: '과목 또는 자료를 찾을 수 없거나 접근 권한이 없습니다.',
                 errorCode: 'NOT_FOUND_OR_FORBIDDEN',
               },
               { status: 404 }
             );
           }
+          if (matRow.subject_id && matRow.subject_id !== subjectId) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: '과목 식별자가 자료의 과목과 일치하지 않습니다.',
+                errorCode: 'SUBJECT_MISMATCH',
+              },
+              { status: 400 }
+            );
+          }
         }
       } catch {
-        // In-memory / mock operation
+        return NextResponse.json(
+          {
+            success: false,
+            error: '소유권 검증 중 오류가 발생했습니다.',
+            errorCode: 'DB_QUERY_ERROR',
+          },
+          { status: 500 }
+        );
       }
     }
 
