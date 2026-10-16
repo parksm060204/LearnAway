@@ -32,7 +32,7 @@ interface StudyPlanModalProps {
   isOpen: boolean;
   onClose: () => void;
   subjects: Subject[];
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   concepts: Concept[];
   studyPlanSummary: StudyPlanSummary;
   settings: StudyPlanSettings;
@@ -68,7 +68,7 @@ export function StudyPlanModal({
 
   // Settings edit state
   const [editingSettings, setEditingSettings] = useState<StudyPlanSettings>(() => structuredClone(settings));
-  const [selectedConfigSubjectId, setSelectedConfigSubjectId] = useState<string>(activeSubject.id);
+  const [selectedConfigSubjectId, setSelectedConfigSubjectId] = useState<string>(activeSubject?.id || subjects[0]?.id || '');
 
   if (!isOpen) return null;
 
@@ -91,14 +91,14 @@ export function StudyPlanModal({
     filterSubjectId === 'all' ? true : item.subjectId === filterSubjectId
   );
 
-  const activeConfigSubject = subjects.find((s) => s.id === selectedConfigSubjectId) || activeSubject;
-  const activeSubjectConcepts = concepts.filter((c) => c.subjectId === activeConfigSubject.id);
+  const activeConfigSubject = subjects.find((s) => s.id === selectedConfigSubjectId) || activeSubject || subjects[0];
+  const activeSubjectConcepts = activeConfigSubject ? concepts.filter((c) => c.subjectId === activeConfigSubject.id) : [];
 
-  const currentSubjectConfig = editingSettings.subjectConfigs[activeConfigSubject.id] || {
-    subjectId: activeConfigSubject.id,
+  const currentSubjectConfig = (activeConfigSubject && editingSettings.subjectConfigs[activeConfigSubject.id]) || {
+    subjectId: activeConfigSubject?.id || '',
     selectedConceptIds: activeSubjectConcepts.map((c) => c.id),
     selectedProblemTypes: [
-      activeConfigSubject.domain === 'math_stats' ? 'essay_descriptive' : 'impl_descriptive',
+      activeConfigSubject?.domain === 'math_stats' ? 'essay_descriptive' : 'impl_descriptive',
     ],
     includeMockExam: true,
     mockExamTargetMinutes: 45,
@@ -112,6 +112,7 @@ export function StudyPlanModal({
   };
 
   const handleToggleConceptScope = (conceptId: string) => {
+    if (!activeConfigSubject) return;
     const prevList = currentSubjectConfig.selectedConceptIds || [];
     const exists = prevList.includes(conceptId);
     const nextList = exists ? prevList.filter((id) => id !== conceptId) : [...prevList, conceptId];
@@ -129,6 +130,7 @@ export function StudyPlanModal({
   };
 
   const handleSelectAllConcepts = () => {
+    if (!activeConfigSubject) return;
     setEditingSettings({
       ...editingSettings,
       subjectConfigs: {
@@ -142,6 +144,7 @@ export function StudyPlanModal({
   };
 
   const handleToggleProblemType = (type: ProblemType) => {
+    if (!activeConfigSubject) return;
     const prevTypes = currentSubjectConfig.selectedProblemTypes || [];
     const exists = prevTypes.includes(type);
     let nextTypes = exists ? prevTypes.filter((t) => t !== type) : [...prevTypes, type];
@@ -175,7 +178,7 @@ export function StudyPlanModal({
     { type: 'debug_counterexample', label: '4. 디버깅 및 반례 분석' },
   ];
 
-  const domainProblemTypes = activeConfigSubject.domain === 'math_stats' ? mathTypes : csTypes;
+  const domainProblemTypes = activeConfigSubject?.domain === 'math_stats' ? mathTypes : csTypes;
 
   const koreanDayNames = ['일', '월', '화', '수', '목', '금', '토'];
 
@@ -844,7 +847,8 @@ export function StudyPlanModal({
                     <input
                       type="checkbox"
                       checked={currentSubjectConfig.includeMockExam}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        if (!activeConfigSubject) return;
                         setEditingSettings({
                           ...editingSettings,
                           subjectConfigs: {
@@ -854,8 +858,8 @@ export function StudyPlanModal({
                               includeMockExam: e.target.checked,
                             },
                           },
-                        })
-                      }
+                        });
+                      }}
                     />
                     <span>혼합 모의시험 일정 포함</span>
                   </label>
@@ -869,7 +873,8 @@ export function StudyPlanModal({
                         max={180}
                         step={5}
                         value={currentSubjectConfig.mockExamTargetMinutes}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          if (!activeConfigSubject) return;
                           setEditingSettings({
                             ...editingSettings,
                             subjectConfigs: {
@@ -879,8 +884,8 @@ export function StudyPlanModal({
                                 mockExamTargetMinutes: Number(e.target.value) || 45,
                               },
                             },
-                          })
-                        }
+                          });
+                        }}
                         className="w-24 p-1.5 border border-[#ded6c8] rounded-xs font-academic-mono text-xs font-bold"
                       />
                       <span className="text-xs text-[#57544e]">분 (하루 예산 내 포함)</span>

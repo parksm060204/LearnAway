@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback, useSyncExternalStore } from 'react';
 import {
   Subject,
   Material,
@@ -316,15 +316,43 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     canRetrySave: boolean;
     message: string;
   }) | null>(null);
-  const [unmigratedRecoveries, setUnmigratedRecoveries] = useState<UnmigratedRecoveryRecord[]>([]);
+  const [unmigratedRecoveries, setUnmigratedRecoveries] = useState<{
+    scopeId: string;
+    records: UnmigratedRecoveryRecord[];
+  }>({ scopeId: 'shared', records: [] });
+  const [recoveryDbStatus, setRecoveryDbStatus] = useState<{
+    blocked: boolean;
+    error: string;
+  } | null>(null);
+
+  const fetchUnmigrated = useCallback(async () => {
+    const scopeAtStart = getStorageScopeId();
+    try {
+      const res = await listUnmigratedAnalysisRecoveries(scopeAtStart);
+      if (getStorageScopeId() !== scopeAtStart) return;
+      if (res.status === 'success') {
+        setUnmigratedRecoveries({ scopeId: scopeAtStart, records: res.data });
+      } else if (res.status === 'blocked') {
+        setRecoveryDbStatus({
+          blocked: true,
+          error: res.error || '다른 탭에서 데이터베이스를 사용 중입니다. 다른 탭을 닫고 다시 시도해 주세요.',
+        });
+      } else {
+        setRecoveryDbStatus({
+          blocked: false,
+          error: res.error || '미이관 복구 데이터 조회 실패',
+        });
+      }
+    } catch {
+      // Preserve existing data on error
+    }
+  }, []);
 
   useEffect(() => {
     if (isConceptReviewOpen) {
-      listUnmigratedAnalysisRecoveries(getStorageScopeId())
-        .then((records) => setUnmigratedRecoveries(records))
-        .catch(() => {});
+      fetchUnmigrated();
     }
-  }, [isConceptReviewOpen]);
+  }, [isConceptReviewOpen, fetchUnmigrated]);
 
   // Stage 3: AI Problem Generation & Review State
   const [problemDrafts, setProblemDrafts] = useState<ProblemDraft[]>([]);
@@ -1215,8 +1243,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   // Pure affiliation: a session opened for another subject never becomes the
   // active subject's session; the UI shows its real owner and a return path.
   const sessionAffiliation = useMemo(
-    () => resolveSessionAffiliation(pinnedSessionProblem, activeSubject.id),
-    [pinnedSessionProblem, activeSubject.id]
+    () => resolveSessionAffiliation(pinnedSessionProblem, activeSubject?.id || ''),
+    [pinnedSessionProblem, activeSubject?.id]
   );
   const sessionSubjectMismatch =
     isProblemSessionOpen && sessionAffiliation.kind === 'other_subject';
@@ -2181,11 +2209,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     setIsAiAnalyzing(true);
     showToast(`[${targetMaterial.title}] AI 분석 결과 저장 재시도 중... (AI 재호출 없음)`);
     try {
-      let md = targetMaterial.parsedMarkdown;
-      if (!md || !md.trim()) {
-        const loaded = await loadMaterialContent(targetMaterial.id);
-        md = loaded?.markdown;
-      }
+      const currentMd = targetMaterial.parsedMarkdown;
+      const currentMarkdownHash =
+        currentMd && currentMd.trim() ? computeMarkdownHash(currentMd) : '';
 
       const res = await fetch('/api/analyze-concepts', {
         method: 'POST',
@@ -2201,8 +2227,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           subjectId: saveFailedState.subjectId || targetMaterial.subjectId,
           domain: saveFailedState.domain || activeSubject?.domain || 'mathematics',
           markdownHash: saveFailedState.markdownHash,
+          currentMarkdownHash,
           signedRecoveryToken: saveFailedState.signedRecoveryToken,
-          markdown: md || '',
         }),
       });
       const data = await res.json();
@@ -2241,8 +2267,24 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       );
 
       const newDrafts: ConceptDraft[] = data.drafts || saveFailedState.drafts;
-      const otherDrafts = conceptDrafts.filter((d) => d.materialId !== targetMaterial.id);
-      const updatedDrafts = [...newDrafts, ...otherDrafts];
+      // Merge by draft ID, preserving existing approval states and avoiding wiping other drafts
+      const existingDraftMap = new Map<string, ConceptDraft>();
+      for (const d of conceptDrafts) {
+        existingDraftMap.set(d.id, d);
+      }
+      const mergedIncoming = newDrafts.map((d) => {
+        const existing = existingDraftMap.get(d.id);
+        if (existing) {
+          return {
+            ...d,
+            isApproved: existing.isApproved,
+          };
+        }
+        return d;
+      });
+      const incomingIdSet = new Set(newDrafts.map((d) => d.id));
+      const untouchedDrafts = conceptDrafts.filter((d) => !incomingIdSet.has(d.id));
+      const updatedDrafts = [...untouchedDrafts, ...mergedIncoming];
       setConceptDrafts(updatedDrafts);
       saveStoredConceptDrafts(updatedDrafts);
       showToast(`[${targetMaterial.title}] 저장 완료! AI 재호출 없이 ${newDrafts.length}개 초안이 안전하게 저장되었습니다.`);
@@ -2357,8 +2399,29 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
     const restoreRecoveryItem = async () => {
       try {
-        const item = await loadAnalysisRecovery(scopeAtStart, conceptReviewMaterial.id);
-        if (!isCancelled && item && getStorageScopeId() === scopeAtStart) {
+        const res = await loadAnalysisRecovery(scopeAtStart, conceptReviewMaterial.id);
+        if (isCancelled || getStorageScopeId() !== scopeAtStart) return;
+
+        if (res.status === 'blocked') {
+          setRecoveryDbStatus({
+            blocked: true,
+            error: res.error || '다른 탭에서 데이터베이스를 사용 중입니다. 다른 탭을 닫고 다시 시도해 주세요.',
+          });
+          return;
+        }
+
+        if (res.status === 'error') {
+          setRecoveryDbStatus({
+            blocked: false,
+            error: res.error || '복구 데이터 읽기 오류가 발생했습니다.',
+          });
+          return;
+        }
+
+        // res.status === 'success' or 'not_found'
+        setRecoveryDbStatus(null);
+        if (res.status === 'success') {
+          const item = res.data;
           setSaveFailedState({
             ...item,
             canRetrySave: true,
@@ -3569,7 +3632,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
               <span>
                 진행 중인 문제 풀이가 있습니다: <strong>{(pinnedSessionProblem || activeSessionProblem)!.title}</strong>
-                {pinnedSessionSubject && pinnedSessionProblem && pinnedSessionSubject.id !== activeSubject.id && (
+                {pinnedSessionSubject && pinnedSessionProblem && Boolean(activeSubject && pinnedSessionSubject.id !== activeSubject.id) && (
                   <> · 소속 과목: <strong>{pinnedSessionSubject.name}</strong></>
                 )}
               </span>
@@ -3578,7 +3641,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               type="button"
               onClick={() => {
                 // Return path also restores the session's own subject.
-                if (pinnedSessionProblem && pinnedSessionProblem.subjectId !== activeSubject.id) {
+                if (pinnedSessionProblem && Boolean(activeSubject && pinnedSessionProblem.subjectId !== activeSubject.id)) {
                   handleSelectSubject(pinnedSessionProblem.subjectId);
                 }
                 handleSelectTab('session', { problemId: pinnedSessionProblem?.id });
@@ -3809,7 +3872,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 소속 과목: <strong>{pinnedSessionSubject.name}</strong> · 문제:{' '}
                 <strong>{pinnedSessionProblem.title}</strong>
                 <br />
-                현재 선택된 과목 [{activeSubject.name}]의 풀이로 표시하지 않습니다. 원래 과목으로 돌아가 이어서 풀 수 있습니다.
+                현재 선택된 과목 [{activeSubject?.name || ''}]의 풀이로 표시하지 않습니다. 원래 과목으로 돌아가 이어서 풀 수 있습니다.
               </p>
               <div className="flex items-center justify-center gap-2">
                 <button
@@ -3831,7 +3894,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 </button>
               </div>
             </div>
-          ) : isProblemSessionOpen && sessionConcept && activeSessionProblem ? (
+          ) : isProblemSessionOpen && sessionConcept && activeSessionProblem && activeSubject ? (
             <ProblemSessionModal
               variant="page"
               key={`${activeSubject.id}-${activeSessionProblem.id}-${activeSessionProblem.version ?? 1}`}
@@ -3864,7 +3927,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
         {/* Dedicated in-layout screen: Mock Exam */}
         <div className={activeTab === 'exam' ? 'block' : 'hidden'}>
-          {isMockExamModalOpen ? (
+          {isMockExamModalOpen && activeSubject ? (
             <MockExamModal
               variant="page"
               key={`${activeSubject.id}-${examIdFromUrl ?? 'active'}`}
@@ -3942,94 +4005,102 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       {/* Modals */}
 
       {/* 2. Exam Schedule Modal */}
-      <ExamScheduleModal
-        isOpen={isScheduleModalOpen}
-        onClose={() => setIsScheduleModalOpen(false)}
-        subject={activeSubject}
-        onUpdateSubject={handleUpdateSubject}
-      />
+      {isScheduleModalOpen && activeSubject && (
+        <ExamScheduleModal
+          isOpen={isScheduleModalOpen}
+          onClose={() => setIsScheduleModalOpen(false)}
+          subject={activeSubject}
+          onUpdateSubject={handleUpdateSubject}
+        />
+      )}
 
       {/* 3. Scope Management Modal */}
-      <ScopeManageModal
-        isOpen={isScopeModalOpen}
-        onClose={() => setIsScopeModalOpen(false)}
-        subject={activeSubject}
-        onUpdateSubject={handleUpdateSubject}
-      />
+      {isScopeModalOpen && activeSubject && (
+        <ScopeManageModal
+          isOpen={isScopeModalOpen}
+          onClose={() => setIsScopeModalOpen(false)}
+          subject={activeSubject}
+          onUpdateSubject={handleUpdateSubject}
+        />
+      )}
 
       {/* 4. Material Upload Modal */}
-      <MaterialUploadModal
-        isOpen={isUploadModalOpen}
-        onClose={() => setIsUploadModalOpen(false)}
-        subjects={subjects}
-        activeSubject={activeSubject}
-        existingMaterials={materials}
-        onAddMaterial={handleAddMaterial}
-        onOpenEditor={(newMat) => {
-          setEditingMaterial(newMat);
-          setIsMaterialEditorOpen(true);
-        }}
-      />
+      {isUploadModalOpen && (
+        <MaterialUploadModal
+          isOpen={isUploadModalOpen}
+          onClose={() => setIsUploadModalOpen(false)}
+          subjects={subjects}
+          activeSubject={activeSubject}
+          existingMaterials={materials}
+          onAddMaterial={handleAddMaterial}
+          onOpenEditor={(newMat) => {
+            setEditingMaterial(newMat);
+            setIsMaterialEditorOpen(true);
+          }}
+        />
+      )}
 
       {/* 4.1 Materials Repository List Modal */}
-      <MaterialsListModal
-        isOpen={isMaterialsListOpen}
-        onClose={() => setIsMaterialsListOpen(false)}
-        activeSubject={activeSubject}
-        materials={materials}
-        drafts={conceptDrafts}
-        onOpenUpload={() => {
-          setIsMaterialsListOpen(false);
-          setIsUploadModalOpen(true);
-        }}
-        onSelectMaterial={(mat) => {
-          setEditingMaterial(mat);
-          setIsMaterialEditorOpen(true);
-        }}
-        hasOriginal={(materialId) => Boolean(cloudOriginalPaths[materialId])}
-        onOpenOriginal={handleOpenOriginal}
-        onReconnectFile={async (material, kind, file) =>
-          kind === 'original'
-            ? handleReconnectOriginal(material, file)
-            : handleReconnectBody(material, file)
-        }
-        onDeleteMaterial={async (materialId) => {
-          const isLocalOnly = isLocalOnlyMaterial(materialId);
-          // Server-known materials must be deleted on the server first; never hide server delete failures.
-          // Local-only materials (e.g. restored from backup) do not require server success.
-          if (!isLocalOnly) {
-            const result = await deleteMaterial(materialId);
-            if (!result.ok) {
-              showToast(`자료 삭제 실패: ${result.error}`);
-              return;
-            }
+      {isMaterialsListOpen && (
+        <MaterialsListModal
+          isOpen={isMaterialsListOpen}
+          onClose={() => setIsMaterialsListOpen(false)}
+          activeSubject={activeSubject}
+          materials={materials}
+          drafts={conceptDrafts}
+          onOpenUpload={() => {
+            setIsMaterialsListOpen(false);
+            setIsUploadModalOpen(true);
+          }}
+          onSelectMaterial={(mat) => {
+            setEditingMaterial(mat);
+            setIsMaterialEditorOpen(true);
+          }}
+          hasOriginal={(materialId) => Boolean(cloudOriginalPaths[materialId])}
+          onOpenOriginal={handleOpenOriginal}
+          onReconnectFile={async (material, kind, file) =>
+            kind === 'original'
+              ? handleReconnectOriginal(material, file)
+              : handleReconnectBody(material, file)
           }
-          // Ledger the explicit deletion BEFORE any local save, so no later
-          // wholesale list save (or stale snapshot) can resurrect this material.
-          markMaterialDeleted(materialId);
-          clearLocalOnlyMaterialMarker(materialId);
-          const updated = materials.filter((m) => m.id !== materialId);
-          setMaterials(updated);
-          saveStoredMaterials(updated);
-          removeStoredMaterialBodyHash(materialId);
-          // Local body + original removal is separate from the metadata delete.
-          const bodyCleanup = await deleteMaterialContent(materialId);
-          const originalCleanup = await deleteMaterialOriginal(materialId);
-          const localCleanupOk = bodyCleanup.deleted && originalCleanup.deleted;
-          showToast(
-            localCleanupOk
-              ? '자료와 이 기기에 저장된 본문·원본이 삭제되었습니다.'
-              : `자료 메타데이터는 삭제되었으나 로컬 파일 정리에 일부 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '다시 시도 가능'})`
-          );
-        }}
-        onOpenConceptReview={(mat) => {
-          setIsMaterialsListOpen(false);
-          setConceptReviewMaterial(mat || null);
-          setIsConceptReviewOpen(true);
-        }}
-        onTriggerAnalysis={handleTriggerAiAnalysis}
-        isAnalyzing={isAiAnalyzing}
-      />
+          onDeleteMaterial={async (materialId) => {
+            const isLocalOnly = isLocalOnlyMaterial(materialId);
+            // Server-known materials must be deleted on the server first; never hide server delete failures.
+            // Local-only materials (e.g. restored from backup) do not require server success.
+            if (!isLocalOnly) {
+              const result = await deleteMaterial(materialId);
+              if (!result.ok) {
+                showToast(`자료 삭제 실패: ${result.error}`);
+                return;
+              }
+            }
+            // Ledger the explicit deletion BEFORE any local save, so no later
+            // wholesale list save (or stale snapshot) can resurrect this material.
+            markMaterialDeleted(materialId);
+            clearLocalOnlyMaterialMarker(materialId);
+            const updated = materials.filter((m) => m.id !== materialId);
+            setMaterials(updated);
+            saveStoredMaterials(updated);
+            removeStoredMaterialBodyHash(materialId);
+            // Local body + original removal is separate from the metadata delete.
+            const bodyCleanup = await deleteMaterialContent(materialId);
+            const originalCleanup = await deleteMaterialOriginal(materialId);
+            const localCleanupOk = bodyCleanup.deleted && originalCleanup.deleted;
+            showToast(
+              localCleanupOk
+                ? '자료와 이 기기에 저장된 본문·원본이 삭제되었습니다.'
+                : `자료 메타데이터는 삭제되었으나 로컬 파일 정리에 일부 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '다시 시도 가능'})`
+            );
+          }}
+          onOpenConceptReview={(mat) => {
+            setIsMaterialsListOpen(false);
+            setConceptReviewMaterial(mat || null);
+            setIsConceptReviewOpen(true);
+          }}
+          onTriggerAnalysis={handleTriggerAiAnalysis}
+          isAnalyzing={isAiAnalyzing}
+        />
+      )}
 
       {/* 4.2 Material Side-by-Side Comparison Editor Modal */}
       {isMaterialEditorOpen && editingMaterial && (
@@ -4253,11 +4324,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       )}
 
       {/* 4.3 AI Concept Extraction & Review Modal (Stage 2) */}
-      <ConceptReviewModal
-        isOpen={isConceptReviewOpen}
+      {isConceptReviewOpen && (
+        <ConceptReviewModal
+          isOpen={isConceptReviewOpen}
         onClose={() => {
           setIsConceptReviewOpen(false);
           setConceptReviewMaterial(null);
+          setRecoveryDbStatus(null);
         }}
         activeSubject={activeSubject}
         material={conceptReviewMaterial}
@@ -4288,16 +4361,48 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               }
             : null
         }
+        recoveryDbStatus={recoveryDbStatus}
+        onRetryRecoveryDb={() => {
+          setRecoveryDbStatus(null);
+          fetchUnmigrated();
+          if (conceptReviewMaterial) {
+            loadAnalysisRecovery(getStorageScopeId(), conceptReviewMaterial.id).then((res) => {
+              if (res.status === 'success') {
+                const item = res.data;
+                setSaveFailedState({
+                  ...item,
+                  canRetrySave: true,
+                  message:
+                    item.checkpointStatus === 'committed' && item.draftsPersistStatus === 'failed'
+                      ? '체크포인트 완료 / 초안 테이블 저장 실패 (부분 완료)'
+                      : 'AI 생성 완료 / DB 저장 실패',
+                });
+              } else if (res.status === 'blocked') {
+                setRecoveryDbStatus({ blocked: true, error: res.error });
+              } else if (res.status === 'error') {
+                setRecoveryDbStatus({ blocked: false, error: res.error });
+              }
+            });
+          }
+        }}
         onExportRecoveryJson={() => {
           if (saveFailedState && conceptReviewMaterial) {
             exportAnalysisRecoveryAsJson(saveFailedState, conceptReviewMaterial.title);
             showToast('복구 데이터가 JSON 파일로 다운로드되었습니다.');
           }
         }}
-        unmigratedCount={unmigratedRecoveries.length}
+        unmigratedCount={
+          unmigratedRecoveries.scopeId === getStorageScopeId()
+            ? unmigratedRecoveries.records.length
+            : 0
+        }
         onExportUnmigratedJson={() => {
-          if (unmigratedRecoveries.length) {
-            exportUnmigratedRecoveriesAsJson(unmigratedRecoveries, getStorageScopeId());
+          const currentScope = getStorageScopeId();
+          if (
+            unmigratedRecoveries.scopeId === currentScope &&
+            unmigratedRecoveries.records.length
+          ) {
+            exportUnmigratedRecoveriesAsJson(unmigratedRecoveries.records, currentScope);
             showToast('미이관 복구 데이터가 JSON 파일로 다운로드되었습니다.');
           }
         }}
@@ -4389,6 +4494,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           return true;
         }}
       />
+      )}
 
       {/* 5. PDF Reference Excerpt Reader Modal */}
       {pdfViewerSourceRef && (
@@ -4399,13 +4505,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         sourceRef={pdfViewerSourceRef}
         conceptTitle={selectedConcept?.title}
         material={
-          materials.find(
-            (m) =>
-              m.subjectId === activeSubject.id &&
-              (m.sourceRefs.includes(pdfViewerSourceRef || '') ||
-                m.title.includes(pdfViewerSourceRef || ''))
-          ) ||
-          materials.find((m) => m.subjectId === activeSubject.id) ||
+          (activeSubject &&
+            (materials.find(
+              (m) =>
+                m.subjectId === activeSubject.id &&
+                (m.sourceRefs.includes(pdfViewerSourceRef || '') ||
+                  m.title.includes(pdfViewerSourceRef || ''))
+            ) ||
+              materials.find((m) => m.subjectId === activeSubject.id))) ||
           null
         }
         onOpenEditor={(mat) => {
@@ -4427,7 +4534,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       />
 
       {/* 9. AI Problem Generator Modal (Stage 3) */}
-      {isProblemGeneratorOpen && <ProblemGeneratorModal
+      {isProblemGeneratorOpen && activeSubject && <ProblemGeneratorModal
         key={`${activeSubject.id}-${selectedConceptId}`}
         isOpen={isProblemGeneratorOpen}
         onClose={() => setIsProblemGeneratorOpen(false)}
@@ -4439,33 +4546,35 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       />}
 
       {/* 10. AI Problem Review & Approval Modal (Stage 3 & 6) */}
-      <ProblemReviewModal
-        isOpen={isProblemReviewOpen}
-        onClose={() => setIsProblemReviewOpen(false)}
-        activeSubject={activeSubject}
-        drafts={problemDrafts}
-        problems={allProblems}
-        materials={materials}
-        onUpdateDraft={handleUpdateProblemDraft}
-        onApproveDraft={handleApproveProblemDraft}
-        onBatchApproveDrafts={handleBatchApproveProblemDrafts}
-        onDeleteDraft={handleDeleteProblemDraft}
-        onStartPracticeSession={handleStartPracticeFromDraft}
-        onOpenGenerator={() => {
-          setIsProblemReviewOpen(false);
-          setIsProblemGeneratorOpen(true);
-        }}
-        onUpdateProblemQualityStatus={handleUpdateProblemQualityStatus}
-        onDismissReport={handleDismissProblemReport}
-        onReviseProblem={handleReviseProblem}
-        onReapproveProblem={handleReapproveProblem}
-        onSuspendProblem={handleSuspendProblem}
-      />
+      {isProblemReviewOpen && (
+        <ProblemReviewModal
+          isOpen={isProblemReviewOpen}
+          onClose={() => setIsProblemReviewOpen(false)}
+          activeSubject={activeSubject}
+          drafts={problemDrafts}
+          problems={allProblems}
+          materials={materials}
+          onUpdateDraft={handleUpdateProblemDraft}
+          onApproveDraft={handleApproveProblemDraft}
+          onBatchApproveDrafts={handleBatchApproveProblemDrafts}
+          onDeleteDraft={handleDeleteProblemDraft}
+          onStartPracticeSession={handleStartPracticeFromDraft}
+          onOpenGenerator={() => {
+            setIsProblemReviewOpen(false);
+            setIsProblemGeneratorOpen(true);
+          }}
+          onUpdateProblemQualityStatus={handleUpdateProblemQualityStatus}
+          onDismissReport={handleDismissProblemReport}
+          onReviseProblem={handleReviseProblem}
+          onReapproveProblem={handleReapproveProblem}
+          onSuspendProblem={handleSuspendProblem}
+        />
+      )}
 
       {/* 11. Study Plan Modal (Stage 9) */}
       {isStudyPlanOpen && (
       <StudyPlanModal
-        key={activeSubject.id}
+        key={activeSubject?.id || 'none'}
         isOpen
         onClose={() => setIsStudyPlanOpen(false)}
         subjects={subjects}
@@ -4497,22 +4606,24 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       )}
 
       {/* 12. Learning Analytics & Personalization Modal (Stage 10) */}
-      <LearningAnalyticsModal
-        isOpen={isLearningAnalyticsOpen}
-        onClose={() => setIsLearningAnalyticsOpen(false)}
-        subjects={subjects}
-        concepts={allConcepts}
-        problems={allProblems}
-        attempts={attempts}
-        mockExams={mockExams}
-        activeSubjectId={activeSubject.id}
-        personalizationSettings={personalizationSettings}
-        correctionState={effectiveCorrectionState}
-        onUpdatePersonalizationSettings={handleUpdatePersonalizationSettings}
-        onResetPersonalizationSettings={handleResetPersonalizationSettings}
-        onRecalculateCorrection={handleRecalculateCorrection}
-        onOpenRecord={handleOpenAnalyticsRecord}
-      />
+      {isLearningAnalyticsOpen && (
+        <LearningAnalyticsModal
+          isOpen={isLearningAnalyticsOpen}
+          onClose={() => setIsLearningAnalyticsOpen(false)}
+          subjects={subjects}
+          concepts={allConcepts}
+          problems={allProblems}
+          attempts={attempts}
+          mockExams={mockExams}
+          activeSubjectId={activeSubject?.id || ''}
+          personalizationSettings={personalizationSettings}
+          correctionState={effectiveCorrectionState}
+          onUpdatePersonalizationSettings={handleUpdatePersonalizationSettings}
+          onResetPersonalizationSettings={handleResetPersonalizationSettings}
+          onRecalculateCorrection={handleRecalculateCorrection}
+          onOpenRecord={handleOpenAnalyticsRecord}
+        />
+      )}
 
       {/* 13. Answer-Logic Strengthening Session (Stage 13) */}
       {logicTarget && (

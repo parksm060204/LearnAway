@@ -8,7 +8,7 @@ import { X, Calendar, Check } from 'lucide-react';
 interface ExamScheduleModalProps {
   isOpen: boolean;
   onClose: () => void;
-  subject: Subject;
+  subject?: Subject | null;
   onUpdateSubject: (updated: Subject) => void;
 }
 
@@ -19,15 +19,15 @@ export function ExamScheduleModal({
   onUpdateSubject,
 }: ExamScheduleModalProps) {
   // Extract initial date and time
-  const currentSeoulDate = subject.examAt ? toSeoulDateString(subject.examAt) : '';
-  const initialTime = subject.examAt ? new Date(subject.examAt).toTimeString().slice(0, 5) : '10:00';
+  const currentSeoulDate = subject?.examAt ? toSeoulDateString(subject.examAt) : '';
+  const initialTime = subject?.examAt ? new Date(subject.examAt).toTimeString().slice(0, 5) : '10:00';
 
   const [dateStr, setDateStr] = useState(currentSeoulDate);
   const [startTime, setStartTime] = useState(initialTime);
-  const [endTime, setEndTime] = useState(subject.examEndTime || '12:00');
-  const [location, setLocation] = useState(subject.location || '');
+  const [endTime, setEndTime] = useState(subject?.examEndTime || '12:00');
+  const [location, setLocation] = useState(subject?.location || '');
 
-  if (!isOpen) return null;
+  if (!isOpen || !subject) return null;
 
   // Real-time preview calculation
   const previewIso = dateStr ? `${dateStr}T${startTime || '10:00'}:00+09:00` : undefined;
@@ -35,6 +35,7 @@ export function ExamScheduleModal({
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!subject) return;
     const updatedSubject: Subject = {
       ...subject,
       examAt: previewIso,

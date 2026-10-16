@@ -22,7 +22,7 @@ interface MaterialUploadModalProps {
   isOpen: boolean;
   onClose: () => void;
   subjects: Subject[];
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   existingMaterials?: Material[];
   /** Resolves true only after the server confirmed the save. */
   onAddMaterial: (material: Material, originalFile?: File, jobId?: string) => Promise<boolean>;
@@ -50,7 +50,7 @@ export function MaterialUploadModal({
   onAddMaterial,
   onOpenEditor,
 }: MaterialUploadModalProps) {
-  const [selectedSubjectId, setSelectedSubjectId] = useState(activeSubject.id);
+  const [selectedSubjectId, setSelectedSubjectId] = useState(activeSubject?.id || subjects[0]?.id || '');
   const [kind, setKind] = useState<MaterialKind>('pdf');
   const [title, setTitle] = useState('');
   const [sourceRefs, setSourceRefs] = useState('');

@@ -31,7 +31,7 @@ import {
 interface ConceptReviewModalProps {
   isOpen: boolean;
   onClose: () => void;
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   material: Material | null;
   drafts: ConceptDraft[];
   onUpdateDrafts: (updatedDrafts: ConceptDraft[]) => void;
@@ -55,6 +55,11 @@ interface ConceptReviewModalProps {
     drafts?: ConceptDraft[];
     isMemoryOnly?: boolean;
   } | null;
+  recoveryDbStatus?: {
+    blocked: boolean;
+    error: string;
+  } | null;
+  onRetryRecoveryDb?: () => void;
   onRetrySaveAnalysis?: (material: Material) => void;
   onExportRecoveryJson?: () => void;
   unmigratedCount?: number;
@@ -82,6 +87,8 @@ export function ConceptReviewModal({
   isAnalyzing = false,
   analysisProgress = null,
   saveFailedInfo = null,
+  recoveryDbStatus = null,
+  onRetryRecoveryDb,
   onRetrySaveAnalysis,
   onExportRecoveryJson,
   unmigratedCount = 0,
@@ -110,11 +117,11 @@ export function ConceptReviewModal({
   // Filter drafts for current subject and (if selected) material
   const subjectDrafts = useMemo(() => {
     return drafts.filter((d) => {
-      if (d.subjectId !== activeSubject.id) return false;
+      if (activeSubject && d.subjectId !== activeSubject.id) return false;
       if (material && d.materialId !== material.id) return false;
       return true;
     });
-  }, [drafts, activeSubject.id, material]);
+  }, [drafts, activeSubject, material]);
 
   const filteredDrafts = useMemo(() => {
     return subjectDrafts.filter((d) => {
@@ -327,7 +334,7 @@ export function ConceptReviewModal({
             </div>
 
             <div className="text-[11px] font-academic-mono text-[#ded6c8] flex items-center gap-2">
-              <span>과목: {activeSubject.name}</span>
+              <span>과목: {activeSubject?.name || ''}</span>
               {material && (
                 <>
                   <span>•</span>
@@ -436,6 +443,49 @@ export function ConceptReviewModal({
             </button>
           </div>
         </div>
+
+        {/* IndexedDB Blocked or Read Error Banner */}
+        {recoveryDbStatus && (
+          <div
+            className={`border-b px-5 py-2.5 flex items-center justify-between text-xs ${
+              recoveryDbStatus.blocked
+                ? 'bg-amber-100/90 border-amber-400 text-amber-950'
+                : 'bg-red-50 border-red-300 text-red-900'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <AlertTriangle
+                className={`w-4 h-4 shrink-0 ${
+                  recoveryDbStatus.blocked ? 'text-amber-700' : 'text-red-600'
+                }`}
+              />
+              <div>
+                <div className="font-bold">
+                  {recoveryDbStatus.blocked
+                    ? '다른 탭에서 데이터베이스를 사용 중입니다'
+                    : '복구 데이터 조회 실패'}
+                </div>
+                <div className="text-[11px]">
+                  {recoveryDbStatus.blocked
+                    ? '다른 탭을 닫고 다시 시도해 주세요. 기존 복구 데이터는 안전하게 보존되어 있습니다.'
+                    : recoveryDbStatus.error}
+                </div>
+              </div>
+            </div>
+            {onRetryRecoveryDb && (
+              <button
+                onClick={onRetryRecoveryDb}
+                className={`px-3 py-1 rounded text-[11px] font-bold border transition-colors ${
+                  recoveryDbStatus.blocked
+                    ? 'bg-amber-700 hover:bg-amber-800 text-white border-amber-800'
+                    : 'bg-white hover:bg-red-50 text-red-900 border-red-300'
+                }`}
+              >
+                다시 시도
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Outdated Warning Banner */}
         {isOutdated && (

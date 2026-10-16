@@ -23,7 +23,7 @@ import { ConceptDraft } from '../lib/types';
 interface MaterialsListModalProps {
   isOpen: boolean;
   onClose: () => void;
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   materials: Material[];
   drafts?: ConceptDraft[];
   onOpenUpload: () => void;
@@ -103,7 +103,7 @@ export function MaterialsListModal({
   if (!isOpen) return null;
 
   // Filter materials for this subject only
-  const subjectMaterials = materials.filter((m) => m.subjectId === activeSubject.id);
+  const subjectMaterials = materials.filter((m) => Boolean(activeSubject && m.subjectId === activeSubject.id));
 
   const filteredMaterials = subjectMaterials.filter((m) => {
     if (filterKind === 'pdf') return m.kind === 'pdf';
@@ -127,10 +127,10 @@ export function MaterialsListModal({
             <FolderOpen className="w-4 h-4 text-[#c52828]" />
             <div>
               <h2 className="font-academic-serif font-bold text-sm">
-                {activeSubject.name} 학습 자료 보관함
+                {activeSubject?.name || ''} 학습 자료 보관함
               </h2>
               <div className="text-[10px] text-[#ded6c8] font-academic-mono">
-                {activeSubject.code} • 총 {subjectMaterials.length}건 등록 (사용자 {userCount}건 / 데모 {demoCount}건)
+                {activeSubject?.code || ''} • 총 {subjectMaterials.length}건 등록 (사용자 {userCount}건 / 데모 {demoCount}건)
               </div>
             </div>
           </div>
@@ -221,7 +221,7 @@ export function MaterialsListModal({
                 등록된 학습 자료가 없습니다.
               </h3>
               <p className="text-xs text-[#57544e] max-w-sm mb-4 leading-relaxed">
-                선택한 과목(<strong>{activeSubject.name}</strong>)에 강의 PDF나 녹음 전사본을 등록하여 PyMuPDF4LLM 변환 및 대조 편집을 시작하세요.
+                선택한 과목(<strong>{activeSubject?.name || ''}</strong>)에 강의 PDF나 녹음 전사본을 등록하여 PyMuPDF4LLM 변환 및 대조 편집을 시작하세요.
               </p>
               <button
                 onClick={onOpenUpload}

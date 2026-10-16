@@ -24,7 +24,7 @@ export interface AnalysisRecoveryRecord {
 const RECOVERY_DB_BASE = 'redcall_analysis_recovery';
 const RECOVERY_STORE = 'recoveries';
 const UNMIGRATED_STORE = 'recoveries_unmigrated';
-const RECOVERY_DB_VERSION = 4;
+const RECOVERY_DB_VERSION = 5;
 
 export interface UnmigratedRecoveryRecord {
   id: string;
@@ -34,6 +34,21 @@ export interface UnmigratedRecoveryRecord {
   rawRecord?: Record<string, unknown>;
   [key: string]: unknown;
 }
+
+export function isValidChunkIndex(val: unknown): val is number {
+  return typeof val === 'number' && Number.isFinite(val) && Number.isInteger(val) && val > 0;
+}
+
+export type LoadAnalysisRecoveryResult =
+  | { status: 'success'; data: AnalysisRecoveryRecord }
+  | { status: 'not_found'; data?: null }
+  | { status: 'blocked'; error: string }
+  | { status: 'error'; error: string };
+
+export type ListAnalysisRecoveryResult<T = AnalysisRecoveryRecord> =
+  | { status: 'success'; data: T[] }
+  | { status: 'blocked'; error: string }
+  | { status: 'error'; error: string };
 
 function validScopeId(scopeId: string): boolean {
   return scopeId === 'shared' || /^u_.+/.test(scopeId);
@@ -94,9 +109,11 @@ async function openRecoveryDb(
 
   return new Promise((resolve) => {
     try {
+      let wasBlocked = false;
       const req = idb.open(dbName, RECOVERY_DB_VERSION);
 
       req.onblocked = () => {
+        wasBlocked = true;
         resolve({
           error: '다른 탭에서 데이터베이스를 사용 중이어서 버전 업그레이드가 일시 차단되었습니다. 다른 탭을 닫고 다시 시도해 주세요.',
           blocked: true,
@@ -163,12 +180,20 @@ async function openRecoveryDb(
                 for (const rec of legacyRecords) {
                   const jobKey = typeof rec.jobKey === 'string' ? rec.jobKey.trim() : '';
                   const materialId = typeof rec.materialId === 'string' ? rec.materialId.trim() : '';
-                  const chunkIndex = typeof rec.chunkIndex === 'number' && rec.chunkIndex > 0 ? rec.chunkIndex : 1;
+                  const isValidChunk = isValidChunkIndex(rec.chunkIndex);
                   const drafts = Array.isArray(rec.drafts) ? (rec.drafts as ConceptDraft[]) : [];
 
-                  const isComplete = Boolean(jobKey && materialId && drafts.length > 0);
+                  const isComplete = Boolean(jobKey && materialId && drafts.length > 0 && isValidChunk);
                   if (!isComplete) {
-                    // Incomplete legacy record: preserve in unmigrated store without dropping or inventing fake jobKeys
+                    let unmigratedReason = '필수 복구 필드가 불완전하여 자동 이관되지 않고 원본이 보존되었습니다.';
+                    if (!isValidChunk) {
+                      unmigratedReason = `청크 번호(chunkIndex: ${JSON.stringify(rec.chunkIndex)})가 유효한 양의 정수가 아니어서 자동 이관에서 제외되었습니다.`;
+                    } else if (!jobKey || !materialId) {
+                      unmigratedReason = '필수 식별자(jobKey 또는 materialId)가 누락되어 자동 이관에서 제외되었습니다.';
+                    } else if (!drafts.length) {
+                      unmigratedReason = '초안 데이터(drafts)가 비어 있어 자동 이관에서 제외되었습니다.';
+                    }
+
                     const unmigratedId =
                       (typeof rec.id === 'string' && rec.id) ||
                       (materialId ? `unmigrated_${materialId}_${Date.now()}` : `unmigrated_${Math.random().toString(36).slice(2)}`);
@@ -176,12 +201,14 @@ async function openRecoveryDb(
                       ...rec,
                       id: unmigratedId,
                       materialId: materialId || undefined,
-                      unmigratedReason: '필수 복구 필드(jobKey, materialId, drafts)가 불완전하여 자동 이관되지 않고 보존되었습니다.',
+                      unmigratedReason,
                       unmigratedAt: new Date().toISOString(),
+                      rawRecord: rec,
                     });
                     continue;
                   }
 
+                  const chunkIndex = rec.chunkIndex as number;
                   let targetId = typeof rec.id === 'string' && rec.id ? rec.id : makeRecoveryRecordId(jobKey, chunkIndex);
 
                   // Prevent overwriting different recovery results if duplicate key occurs
@@ -237,8 +264,8 @@ async function openRecoveryDb(
             return;
           }
 
-          // Scenario C: Upgrading from v2 or v3 where RECOVERY_STORE already has keyPath: 'id'
-          // Data is already safely keyed by id, so do NOT delete the store!
+          // Scenario C: Upgrading from v2, v3, or v4 to v5
+          // Ensure all indices exist and quarantine incomplete/invalid chunkIndex records
           if (db.objectStoreNames.contains(RECOVERY_STORE)) {
             const store = tx.objectStore(RECOVERY_STORE);
             if (!store.indexNames.contains('materialId')) {
@@ -250,6 +277,57 @@ async function openRecoveryDb(
             if (!store.indexNames.contains('savedAt')) {
               store.createIndex('savedAt', 'savedAt', { unique: false });
             }
+
+            // Quarantine any existing invalid records
+            const readReq = store.getAll();
+            readReq.onerror = () => {
+              try {
+                tx.abort();
+              } catch {}
+            };
+            readReq.onsuccess = () => {
+              try {
+                const records = (readReq.result as Record<string, unknown>[]) || [];
+                for (const rec of records) {
+                  const isValidChunk = isValidChunkIndex(rec.chunkIndex);
+                  const hasJobKey = typeof rec.jobKey === 'string' && rec.jobKey.trim().length > 0;
+                  const hasMaterialId = typeof rec.materialId === 'string' && rec.materialId.trim().length > 0;
+                  const hasDrafts = Array.isArray(rec.drafts) && rec.drafts.length > 0;
+
+                  if (!isValidChunk || !hasJobKey || !hasMaterialId || !hasDrafts) {
+                    let unmigratedReason = '레코드 무결성 검증 실패(필수 필드 결함)로 격리되었습니다.';
+                    if (!isValidChunk) {
+                      unmigratedReason = `청크 번호(chunkIndex: ${JSON.stringify(rec.chunkIndex)})가 유효한 양의 정수가 아니어서 자동 복구에서 제외되고 원본이 보존되었습니다.`;
+                    } else if (!hasJobKey || !hasMaterialId) {
+                      unmigratedReason = '필수 식별자(jobKey 또는 materialId) 결함으로 격리되었습니다.';
+                    } else if (!hasDrafts) {
+                      unmigratedReason = '초안 데이터(drafts) 부재로 격리되었습니다.';
+                    }
+
+                    const recId =
+                      (typeof rec.id === 'string' && rec.id) ||
+                      `quarantine_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+                    unmigratedStore.put({
+                      ...rec,
+                      id: recId,
+                      materialId: (typeof rec.materialId === 'string' && rec.materialId) || undefined,
+                      unmigratedReason,
+                      unmigratedAt: new Date().toISOString(),
+                      rawRecord: rec,
+                    });
+
+                    if (typeof rec.id === 'string' && rec.id) {
+                      store.delete(rec.id);
+                    }
+                  }
+                }
+              } catch {
+                try {
+                  tx.abort();
+                } catch {}
+              }
+            };
           } else {
             const store = db.createObjectStore(RECOVERY_STORE, { keyPath: 'id' });
             store.createIndex('materialId', 'materialId', { unique: false });
@@ -265,6 +343,14 @@ async function openRecoveryDb(
 
       req.onsuccess = () => {
         const db = req.result;
+        if (wasBlocked) {
+          // If connection was opened after an earlier onblocked event,
+          // close it immediately to prevent connection leaks or unneeded locks.
+          try {
+            db.close();
+          } catch {}
+          return;
+        }
         db.onversionchange = () => {
           try {
             db.close();
@@ -290,13 +376,26 @@ export async function saveAnalysisRecovery(
   scopeId: string,
   record: AnalysisRecoveryRecord
 ): Promise<{ ok: boolean; error?: string }> {
+  if (!isValidChunkIndex(record.chunkIndex)) {
+    return { ok: false, error: '유효한 청크 번호(양의 정수)가 필요합니다.' };
+  }
+  if (!record.jobKey || typeof record.jobKey !== 'string' || !record.jobKey.trim()) {
+    return { ok: false, error: '유효한 jobKey가 필요합니다.' };
+  }
+  if (!record.materialId || typeof record.materialId !== 'string' || !record.materialId.trim()) {
+    return { ok: false, error: '유효한 materialId가 필요합니다.' };
+  }
+  if (!Array.isArray(record.drafts) || record.drafts.length === 0) {
+    return { ok: false, error: '복구할 초안(drafts)이 비어 있습니다.' };
+  }
+
   const dbRes = await openRecoveryDb(scopeId);
   if ('error' in dbRes) {
     return { ok: false, error: dbRes.error };
   }
 
   const db = dbRes.db;
-  const chunkIndex = typeof record.chunkIndex === 'number' ? record.chunkIndex : 1;
+  const chunkIndex = record.chunkIndex;
   const recordId = record.id || makeRecoveryRecordId(record.jobKey, chunkIndex);
   const contentHash = computeRecoveryContentHash({
     jobKey: record.jobKey,
@@ -359,9 +458,14 @@ export async function loadAnalysisRecovery(
   scopeId: string,
   keyOrMaterialId: string,
   chunkIndex?: number
-): Promise<AnalysisRecoveryRecord | null> {
+): Promise<LoadAnalysisRecoveryResult> {
   const dbRes = await openRecoveryDb(scopeId);
-  if ('error' in dbRes) return null;
+  if ('error' in dbRes) {
+    if (dbRes.blocked) {
+      return { status: 'blocked', error: dbRes.error };
+    }
+    return { status: 'error', error: dbRes.error };
+  }
 
   return new Promise((resolve) => {
     try {
@@ -371,14 +475,21 @@ export async function loadAnalysisRecovery(
       if (typeof chunkIndex === 'number') {
         const id = makeRecoveryRecordId(keyOrMaterialId, chunkIndex);
         const req = store.get(id);
-        req.onsuccess = () => resolve((req.result as AnalysisRecoveryRecord) || null);
-        req.onerror = () => resolve(null);
+        req.onsuccess = () => {
+          const rec = req.result as AnalysisRecoveryRecord | undefined;
+          if (rec) {
+            resolve({ status: 'success', data: rec });
+          } else {
+            resolve({ status: 'not_found' });
+          }
+        };
+        req.onerror = () => resolve({ status: 'error', error: req.error?.message || 'IndexedDB 읽기 실패' });
       } else {
         // Query by id directly first
         const directReq = store.get(keyOrMaterialId);
         directReq.onsuccess = () => {
           if (directReq.result) {
-            resolve(directReq.result as AnalysisRecoveryRecord);
+            resolve({ status: 'success', data: directReq.result as AnalysisRecoveryRecord });
             return;
           }
           // Query by materialId index if not found by direct id
@@ -390,20 +501,20 @@ export async function loadAnalysisRecovery(
               if (list.length > 0) {
                 // Return newest record
                 list.sort((a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime());
-                resolve(list[0]);
+                resolve({ status: 'success', data: list[0] });
               } else {
-                resolve(null);
+                resolve({ status: 'not_found' });
               }
             };
-            matReq.onerror = () => resolve(null);
+            matReq.onerror = () => resolve({ status: 'error', error: matReq.error?.message || 'IndexedDB 인덱스 읽기 실패' });
           } else {
-            resolve(null);
+            resolve({ status: 'not_found' });
           }
         };
-        directReq.onerror = () => resolve(null);
+        directReq.onerror = () => resolve({ status: 'error', error: directReq.error?.message || 'IndexedDB 읽기 실패' });
       }
-    } catch {
-      resolve(null);
+    } catch (err) {
+      resolve({ status: 'error', error: err instanceof Error ? err.message : 'IndexedDB 조회 예외' });
     }
   });
 }
@@ -414,9 +525,14 @@ export async function loadAnalysisRecovery(
 export async function loadAnalysisRecoveriesForMaterial(
   scopeId: string,
   materialId: string
-): Promise<AnalysisRecoveryRecord[]> {
+): Promise<ListAnalysisRecoveryResult<AnalysisRecoveryRecord>> {
   const dbRes = await openRecoveryDb(scopeId);
-  if ('error' in dbRes) return [];
+  if ('error' in dbRes) {
+    if (dbRes.blocked) {
+      return { status: 'blocked', error: dbRes.error };
+    }
+    return { status: 'error', error: dbRes.error };
+  }
 
   return new Promise((resolve) => {
     try {
@@ -425,18 +541,18 @@ export async function loadAnalysisRecoveriesForMaterial(
       if (store.indexNames && typeof store.indexNames.contains === 'function' && store.indexNames.contains('materialId')) {
         const matIndex = store.index('materialId');
         const req = matIndex.getAll(materialId);
-        req.onsuccess = () => resolve((req.result as AnalysisRecoveryRecord[]) || []);
-        req.onerror = () => resolve([]);
+        req.onsuccess = () => resolve({ status: 'success', data: (req.result as AnalysisRecoveryRecord[]) || [] });
+        req.onerror = () => resolve({ status: 'error', error: req.error?.message || '자료별 복구 목록 읽기 실패' });
       } else {
         const req = store.getAll();
         req.onsuccess = () => {
           const all = (req.result as AnalysisRecoveryRecord[]) || [];
-          resolve(all.filter((r) => r.materialId === materialId));
+          resolve({ status: 'success', data: all.filter((r) => r.materialId === materialId) });
         };
-        req.onerror = () => resolve([]);
+        req.onerror = () => resolve({ status: 'error', error: req.error?.message || '복구 목록 읽기 실패' });
       }
-    } catch {
-      resolve([]);
+    } catch (err) {
+      resolve({ status: 'error', error: err instanceof Error ? err.message : '조회 예외' });
     }
   });
 }
@@ -530,19 +646,24 @@ export async function deleteAnalysisRecovery(
  */
 export async function listAnalysisRecoveries(
   scopeId: string
-): Promise<AnalysisRecoveryRecord[]> {
+): Promise<ListAnalysisRecoveryResult<AnalysisRecoveryRecord>> {
   const dbRes = await openRecoveryDb(scopeId);
-  if ('error' in dbRes) return [];
+  if ('error' in dbRes) {
+    if (dbRes.blocked) {
+      return { status: 'blocked', error: dbRes.error };
+    }
+    return { status: 'error', error: dbRes.error };
+  }
 
   return new Promise((resolve) => {
     try {
       const tx = dbRes.db.transaction(RECOVERY_STORE, 'readonly');
       const store = tx.objectStore(RECOVERY_STORE);
       const req = store.getAll();
-      req.onsuccess = () => resolve((req.result as AnalysisRecoveryRecord[]) || []);
-      req.onerror = () => resolve([]);
-    } catch {
-      resolve([]);
+      req.onsuccess = () => resolve({ status: 'success', data: (req.result as AnalysisRecoveryRecord[]) || [] });
+      req.onerror = () => resolve({ status: 'error', error: req.error?.message || '목록 읽기 실패' });
+    } catch (err) {
+      resolve({ status: 'error', error: err instanceof Error ? err.message : '목록 조회 예외' });
     }
   });
 }
@@ -552,23 +673,28 @@ export async function listAnalysisRecoveries(
  */
 export async function listUnmigratedAnalysisRecoveries(
   scopeId: string
-): Promise<UnmigratedRecoveryRecord[]> {
+): Promise<ListAnalysisRecoveryResult<UnmigratedRecoveryRecord>> {
   const dbRes = await openRecoveryDb(scopeId);
-  if ('error' in dbRes) return [];
+  if ('error' in dbRes) {
+    if (dbRes.blocked) {
+      return { status: 'blocked', error: dbRes.error };
+    }
+    return { status: 'error', error: dbRes.error };
+  }
 
   return new Promise((resolve) => {
     try {
       if (!dbRes.db.objectStoreNames.contains(UNMIGRATED_STORE)) {
-        resolve([]);
+        resolve({ status: 'success', data: [] });
         return;
       }
       const tx = dbRes.db.transaction(UNMIGRATED_STORE, 'readonly');
       const store = tx.objectStore(UNMIGRATED_STORE);
       const req = store.getAll();
-      req.onsuccess = () => resolve((req.result as UnmigratedRecoveryRecord[]) || []);
-      req.onerror = () => resolve([]);
-    } catch {
-      resolve([]);
+      req.onsuccess = () => resolve({ status: 'success', data: (req.result as UnmigratedRecoveryRecord[]) || [] });
+      req.onerror = () => resolve({ status: 'error', error: req.error?.message || '미이관 목록 읽기 실패' });
+    } catch (err) {
+      resolve({ status: 'error', error: err instanceof Error ? err.message : '미이관 목록 조회 예외' });
     }
   });
 }
@@ -619,11 +745,17 @@ export function exportUnmigratedRecoveriesAsJson(
   const exportData = {
     app: 'LearnAway',
     version: '2.0',
-    notice: 'LearnAway 이전 버전 미이관 복구 데이터 목록입니다. (과거에 이미 삭제되었던 데이터는 복구할 수 없습니다)',
+    notice: 'LearnAway 이전 버전 미이관/격리 복구 데이터 목록입니다. (과거에 이미 삭제되었던 데이터는 복구할 수 없습니다)',
     exportedAt: new Date().toISOString(),
     scopeId,
     recordCount: records.length,
-    records,
+    records: records.map((r) => ({
+      id: r.id,
+      materialId: r.materialId,
+      unmigratedReason: r.unmigratedReason,
+      unmigratedAt: r.unmigratedAt,
+      rawRecord: r.rawRecord || r,
+    })),
   };
 
   const jsonStr = JSON.stringify(exportData, null, 2);
@@ -631,7 +763,8 @@ export function exportUnmigratedRecoveriesAsJson(
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `LearnAway_unmigrated_recoveries_${new Date().toISOString().slice(0, 10)}.json`;
+  const safeScope = scopeId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  a.download = `LearnAway_unmigrated_recoveries_${safeScope}_${new Date().toISOString().slice(0, 10)}.json`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

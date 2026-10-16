@@ -428,6 +428,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    let serverMaterialRow: { id: string; user_id: string; subject_id?: string; content_hash?: string } | null = null;
     if (supabaseClient && typeof supabaseClient.from === 'function') {
       try {
         // 1. Verify subject exists in public.subjects and belongs to auth.user.id
@@ -463,7 +464,7 @@ export async function POST(req: NextRequest) {
         // 2. Verify material if it exists on server
         const { data: matRow, error: matErr } = await supabaseClient
           .from('materials')
-          .select('id, user_id, subject_id')
+          .select('id, user_id, subject_id, content_hash')
           .eq('id', materialId)
           .maybeSingle();
 
@@ -479,6 +480,7 @@ export async function POST(req: NextRequest) {
         }
 
         if (matRow) {
+          serverMaterialRow = matRow;
           if (matRow.user_id !== auth.user.id) {
             return NextResponse.json(
               {
@@ -546,7 +548,12 @@ export async function POST(req: NextRequest) {
 
     const markdownHash =
       (dbJobForIdentity?.markdown_hash as string) || (markdown ? computeMarkdownHash(markdown) : '');
-    if (markdown.trim() && dbJobForIdentity?.markdown_hash && computeMarkdownHash(markdown) !== dbJobForIdentity.markdown_hash) {
+    if (
+      action !== 'retry_save' &&
+      markdown.trim() &&
+      dbJobForIdentity?.markdown_hash &&
+      computeMarkdownHash(markdown) !== dbJobForIdentity.markdown_hash
+    ) {
       return NextResponse.json(
         {
           success: false,
@@ -685,7 +692,10 @@ export async function POST(req: NextRequest) {
 
     // Handle retry save: persist already-generated AI chunk results without re-calling paid AI
     if (action === 'retry_save') {
-      const targetChunkIndex = typeof payload.chunkIndex === 'number' ? payload.chunkIndex : 1;
+      const targetChunkIndex =
+        typeof payload.chunkIndex === 'number' && Number.isInteger(payload.chunkIndex) && payload.chunkIndex > 0
+          ? payload.chunkIndex
+          : 0;
       const targetWorkerId = asString(payload.workerId);
       const targetLeaseToken = asString(payload.leaseToken);
       const targetDrafts = Array.isArray(payload.drafts) ? (payload.drafts as ConceptDraft[]) : [];
@@ -693,9 +703,26 @@ export async function POST(req: NextRequest) {
 
       if (!targetChunkIndex) {
         return NextResponse.json(
-          { success: false, error: '저장 재시도에 필요한 청크 식별자가 누락되었습니다.' },
+          { success: false, error: '저장 재시도에 필요한 청크 식별자(chunkIndex)가 누락되었거나 유효하지 않습니다.' },
           { status: 400 }
         );
+      }
+
+      // Check if source material body has changed since this job was run
+      const currentMarkdownHash =
+        asString(payload.currentMarkdownHash) || (markdown.trim() ? computeMarkdownHash(markdown) : '');
+      let isSourceOutdated = false;
+      if (currentMarkdownHash && currentMarkdownHash !== session.markdownHash) {
+        isSourceOutdated = true;
+      }
+      if (
+        !isSourceOutdated &&
+        serverMaterialRow &&
+        typeof serverMaterialRow.content_hash === 'string' &&
+        serverMaterialRow.content_hash &&
+        serverMaterialRow.content_hash !== session.markdownHash
+      ) {
+        isSourceOutdated = true;
       }
 
       let authoritativeDrafts: ConceptDraft[] = targetDrafts;
@@ -712,7 +739,10 @@ export async function POST(req: NextRequest) {
         if (chunkRow && chunkRow.status === 'completed') {
           // Chunk is already completed in DB! Use authoritative DB drafts ONLY.
           // Discard any client-supplied drafts to prevent forgery or state corruption.
-          authoritativeDrafts = Array.isArray(chunkRow.drafts) ? (chunkRow.drafts as ConceptDraft[]) : [];
+          const dbDrafts = Array.isArray(chunkRow.drafts) ? (chunkRow.drafts as ConceptDraft[]) : [];
+          authoritativeDrafts = isSourceOutdated
+            ? dbDrafts.map((d) => ({ ...d, needsSourceReview: true }))
+            : dbDrafts;
         } else {
           // Chunk not completed in DB: require cryptographic verification of drafts
           if (!signedRecoveryToken) {
@@ -762,6 +792,7 @@ export async function POST(req: NextRequest) {
               subjectId,
               domain,
               sourceMarkdownHash: session.markdownHash,
+              needsSourceReview: isSourceOutdated ? true : Boolean(d.needsSourceReview),
             })
           );
 
@@ -815,35 +846,64 @@ export async function POST(req: NextRequest) {
                 ? (recheckChunk.drafts as ConceptDraft[])
                 : [];
             }
+            if (isSourceOutdated) {
+              authoritativeDrafts = authoritativeDrafts.map((d) => ({ ...d, needsSourceReview: true }));
+            }
           } else {
-            authoritativeDrafts = targetDrafts;
+            authoritativeDrafts = sanitizedDrafts;
           }
         }
       } else {
         // In-memory mock
         const memChunk = session.chunks[targetChunkIndex];
         if (memChunk && memChunk.status === 'completed') {
-          authoritativeDrafts = memChunk.drafts;
+          authoritativeDrafts = isSourceOutdated
+            ? memChunk.drafts.map((d) => ({ ...d, needsSourceReview: true }))
+            : memChunk.drafts;
         } else {
-          if (signedRecoveryToken) {
-            const verifyRes = verifyRecoveryToken(signedRecoveryToken, {
-              userId: auth.user.id,
-              jobId: jobKey,
+          if (!signedRecoveryToken) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: '서버가 발급한 서명된 복구 데이터(signedRecoveryToken)가 누락되었습니다. 미검증 초안은 저장할 수 없습니다.',
+                canRetrySave: false,
+              },
+              { status: 403 }
+            );
+          }
+
+          const verifyRes = verifyRecoveryToken(signedRecoveryToken, {
+            userId: auth.user.id,
+            jobId: jobKey,
+            materialId,
+            subjectId,
+            domain,
+            chunkIndex: targetChunkIndex,
+            markdownHash: session.markdownHash,
+            drafts: targetDrafts,
+          });
+
+          if (!verifyRes.ok) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `복구 데이터 검증 실패: ${verifyRes.error}`,
+                errorCode: verifyRes.code,
+                canRetrySave: false,
+              },
+              { status: 403 }
+            );
+          }
+
+          authoritativeDrafts = targetDrafts.map((d) =>
+            sanitizeRecoveryDraft(d, {
               materialId,
               subjectId,
               domain,
-              chunkIndex: targetChunkIndex,
-              markdownHash: session.markdownHash,
-              drafts: targetDrafts,
-            });
-            if (!verifyRes.ok) {
-              return NextResponse.json(
-                { success: false, error: verifyRes.error, canRetrySave: false },
-                { status: 403 }
-              );
-            }
-          }
-          authoritativeDrafts = targetDrafts;
+              sourceMarkdownHash: session.markdownHash,
+              needsSourceReview: isSourceOutdated ? true : Boolean(d.needsSourceReview),
+            })
+          );
         }
       }
 
@@ -897,6 +957,10 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      const finalDrafts = isSourceOutdated
+        ? outcome.drafts.map((d) => ({ ...d, needsSourceReview: true }))
+        : outcome.drafts;
+
       return NextResponse.json({
         success: true,
         checkpointCommitted: true,
@@ -904,8 +968,8 @@ export async function POST(req: NextRequest) {
         draftsPersistStatus: 'persisted',
         persisted: true,
         retried: true,
-        drafts: outcome.drafts,
-        count: outcome.drafts.length,
+        drafts: finalDrafts,
+        count: finalDrafts.length,
         jobKey,
         chunkIndex: targetChunkIndex,
         materialId: session.materialId,

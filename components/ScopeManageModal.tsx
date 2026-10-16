@@ -7,7 +7,7 @@ import { X, Layers, Plus, Trash2, Check } from 'lucide-react';
 interface ScopeManageModalProps {
   isOpen: boolean;
   onClose: () => void;
-  subject: Subject;
+  subject?: Subject | null;
   onUpdateSubject: (updated: Subject) => void;
 }
 
@@ -17,11 +17,11 @@ export function ScopeManageModal({
   subject,
   onUpdateSubject,
 }: ScopeManageModalProps) {
-  const [scopeText, setScopeText] = useState(subject.scope);
-  const [chapters, setChapters] = useState<string[]>(subject.chapters || []);
+  const [scopeText, setScopeText] = useState(subject?.scope || '');
+  const [chapters, setChapters] = useState<string[]>(subject?.chapters || []);
   const [newChapter, setNewChapter] = useState('');
 
-  if (!isOpen) return null;
+  if (!isOpen || !subject) return null;
 
   const handleAddChapter = () => {
     if (!newChapter.trim()) return;
@@ -35,6 +35,7 @@ export function ScopeManageModal({
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!subject) return;
     const updated: Subject = {
       ...subject,
       scope: scopeText,

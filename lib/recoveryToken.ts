@@ -108,8 +108,15 @@ export function sanitizeRecoveryDraft(
     subjectId: string;
     domain: 'math_stats' | 'computer_science';
     sourceMarkdownHash?: string;
+    needsSourceReview?: boolean;
   }
 ): ConceptDraft {
+  const sourceMarkdownHash = draft.sourceMarkdownHash || context.sourceMarkdownHash || '';
+  const needsSourceReview =
+    context.needsSourceReview !== undefined
+      ? context.needsSourceReview
+      : Boolean(draft.needsSourceReview);
+
   return {
     id: draft.id,
     materialId: context.materialId,
@@ -122,7 +129,8 @@ export function sanitizeRecoveryDraft(
     relatedConcepts: Array.isArray(draft.relatedConcepts) ? draft.relatedConcepts.map((r) => String(r).trim()).filter(Boolean) : [],
     commonMisconceptions: Array.isArray(draft.commonMisconceptions) ? draft.commonMisconceptions.map((m) => String(m).trim()).filter(Boolean) : [],
     examples: Array.isArray(draft.examples) ? draft.examples.map((ex) => String(ex).trim()).filter(Boolean) : [],
-    sourceMarkdownHash: context.sourceMarkdownHash || draft.sourceMarkdownHash,
+    sourceMarkdownHash,
+    needsSourceReview,
     sourceEvidence: draft.sourceEvidence
       ? {
           type: draft.sourceEvidence.type,

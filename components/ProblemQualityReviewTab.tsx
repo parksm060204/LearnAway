@@ -39,7 +39,7 @@ import {
 } from 'lucide-react';
 
 interface ProblemQualityReviewTabProps {
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   problems: Problem[];
   materials?: Material[];
   onUpdateQualityStatus?: (problemId: string, newStatus: ProblemQualityStatus, note?: string) => void;
@@ -61,8 +61,8 @@ export function ProblemQualityReviewTab({
 }: ProblemQualityReviewTabProps) {
   // Filter problems for active subject
   const subjectProblems = useMemo(() => {
-    return problems.filter((p) => p.subjectId === activeSubject.id);
-  }, [problems, activeSubject.id]);
+    return problems.filter((p) => Boolean(activeSubject && p.subjectId === activeSubject.id));
+  }, [problems, activeSubject]);
 
   // Quality Filter Tab
   const [filterStatus, setFilterStatus] = useState<'all' | ProblemQualityStatus>('all');
@@ -187,7 +187,7 @@ export function ProblemQualityReviewTab({
 
     try {
       const subjectMaterial = materials.find(
-        (m) => m.subjectId === activeSubject.id && m.parsedMarkdown
+        (m) => Boolean(activeSubject && m.subjectId === activeSubject.id) && m.parsedMarkdown
       );
 
       const res = await fetch('/api/review-problem-quality', {

@@ -8353,8 +8353,25 @@ exports.requireApiUser = async () => {
       const data = await res.json();
       assert.equal(data.success, true);
 
-      // 2. Client passes altered markdown that mismatches the original job's hash
-      const mismatchReq = new NextRequest('http://localhost/api/analyze-concepts', {
+      // 2. Regular process / resume with altered markdown MUST be rejected with MARKDOWN_HASH_MISMATCH
+      const resumeMismatchReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'resume',
+          jobKey: 'job-cs-identity',
+          materialId: 'mat-os',
+          markdown: '# 완전히 다른 본문: 선형대수 행렬식',
+        }),
+      });
+      const resMismatch = await analyzePost(resumeMismatchReq);
+      assert.ok(resMismatch.status === 400 || resMismatch.status === 403, '일반 process/resume에 다른 본문 전달 시 불일치 거부');
+      const dataMismatch = await resMismatch.json();
+      assert.equal(dataMismatch.success, false);
+      assert.equal(dataMismatch.errorCode, 'MARKDOWN_HASH_MISMATCH');
+
+      // 3. retry_save with altered markdown succeeds, preserves original sourceMarkdownHash, and flags needsSourceReview: true
+      const retryAlteredReq = new NextRequest('http://localhost/api/analyze-concepts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -8369,11 +8386,12 @@ exports.requireApiUser = async () => {
           markdown: '# 완전히 다른 본문: 선형대수 행렬식',
         }),
       });
-      const resMismatch = await analyzePost(mismatchReq);
-      assert.ok(resMismatch.status === 400 || resMismatch.status === 403, '최초 작업과 다른 본문 전달 시 불일치 거부');
-      const dataMismatch = await resMismatch.json();
-      assert.equal(dataMismatch.success, false);
-      assert.equal(dataMismatch.errorCode, 'MARKDOWN_HASH_MISMATCH');
+      const resRetryAltered = await analyzePost(retryAlteredReq);
+      assert.equal(resRetryAltered.status, 200, '본문 변경 후에도 유효한 토큰과 기존 작업 기준 retry_save 성공');
+      const dataRetryAltered = await resRetryAltered.json();
+      assert.equal(dataRetryAltered.success, true);
+      assert.equal(dataRetryAltered.drafts[0].sourceMarkdownHash, csHash, '원래 출처 해시 보존');
+      assert.equal(dataRetryAltered.drafts[0].needsSourceReview, true, '본문 변경 감지 시 출처 재검토 필요 플래그 설정');
     });
   });
 
@@ -8577,14 +8595,14 @@ exports.requireApiUser = async () => {
 
       // 2. Account isolation: user B cannot read user A's recovery
       const loadedUserB = await loadAnalysisRecovery('u_userB', 'mat-persist-1');
-      assert.equal(loadedUserB, null, '계정별 IndexedDB 격리로 타 계정 복구 데이터 열람 불가');
+      assert.equal(loadedUserB.status, 'not_found', '계정별 IndexedDB 격리로 타 계정 복구 데이터 열람 불가');
 
       // 3. User A reloads and retrieves preserved recovery data
       const loadedUserA = await loadAnalysisRecovery('u_userA', 'mat-persist-1');
-      assert.ok(loadedUserA, '사용자 A는 새로고침 후에도 복구 데이터 로드 성공');
-      assert.equal(loadedUserA.jobKey, 'job-persist-1');
-      assert.equal(loadedUserA.drafts.length, 1);
-      assert.equal(loadedUserA.checkpointStatus, 'committed');
+      assert.equal(loadedUserA.status, 'success', '사용자 A는 새로고침 후에도 복구 데이터 로드 성공');
+      assert.equal(loadedUserA.data.jobKey, 'job-persist-1');
+      assert.equal(loadedUserA.data.drafts.length, 1);
+      assert.equal(loadedUserA.data.checkpointStatus, 'committed');
 
       // 4. JSON export fallback validation (simulating browser environment)
       let downloadedBlobContent = '';
@@ -8621,7 +8639,7 @@ exports.requireApiUser = async () => {
       // 5. Cleanup on successful recovery
       await deleteAnalysisRecovery('u_userA', 'mat-persist-1');
       const loadedAfterClean = await loadAnalysisRecovery('u_userA', 'mat-persist-1');
-      assert.equal(loadedAfterClean, null, '저장 완료 후 복구 데이터가 안전하게 정리됨');
+      assert.equal(loadedAfterClean.status, 'not_found', '저장 완료 후 복구 데이터가 안전하게 정리됨');
 
       delete global.window;
       delete global.document;
@@ -8963,24 +8981,27 @@ exports.requireApiUser = async () => {
 
       // 2) Verify both chunks exist simultaneously under the same material (no overwrite!)
       const allForMat = await listAnalysisRecoveries(scopeId, matId);
-      assert.equal(allForMat.length, 2, '같은 자료의 청크 1과 청크 2가 서로를 덮어쓰지 않고 공존함');
+      assert.equal(allForMat.status, 'success');
+      assert.equal(allForMat.data.length, 2, '같은 자료의 청크 1과 청크 2가 서로를 덮어쓰지 않고 공존함');
 
       const loadedC1 = await loadAnalysisRecovery(scopeId, job1, 1);
       const loadedC2 = await loadAnalysisRecovery(scopeId, job1, 2);
-      assert.ok(loadedC1 && loadedC1.drafts[0].title === '미적분학 기본정리 1');
-      assert.ok(loadedC2 && loadedC2.drafts[0].title === '미적분학 기본정리 2');
+      assert.equal(loadedC1.status, 'success');
+      assert.equal(loadedC2.status, 'success');
+      assert.ok(loadedC1.data && loadedC1.data.drafts[0].title === '미적분학 기본정리 1');
+      assert.ok(loadedC2.data && loadedC2.data.drafts[0].title === '미적분학 기본정리 2');
 
       // 3) Conditional deletion: older request completion cannot delete newer chunk record
       await deleteAnalysisRecovery(scopeId, job1, 2, 'outdated_stale_hash');
       const recheckC2 = await loadAnalysisRecovery(scopeId, job1, 2);
-      assert.ok(recheckC2, '해시가 일치하지 않는 구버전 요청의 삭제는 새 청크 복구 데이터를 삭제하지 못함');
+      assert.equal(recheckC2.status, 'success', '해시가 일치하지 않는 구버전 요청의 삭제는 새 청크 복구 데이터를 삭제하지 못함');
 
       // 4) Deleting exact chunk 1 leaves chunk 2 intact
       await deleteAnalysisRecovery(scopeId, job1, 1);
       const checkC1Deleted = await loadAnalysisRecovery(scopeId, job1, 1);
       const checkC2StillAlive = await loadAnalysisRecovery(scopeId, job1, 2);
-      assert.equal(checkC1Deleted, null, '청크 1만 정확하게 삭제됨');
-      assert.ok(checkC2StillAlive, '청크 2는 안전하게 유지됨');
+      assert.equal(checkC1Deleted.status, 'not_found', '청크 1만 정확하게 삭제됨');
+      assert.equal(checkC2StillAlive.status, 'success', '청크 2는 안전하게 유지됨');
     });
   });
 
@@ -9524,24 +9545,25 @@ exports.requireApiUser = async () => {
       // 2. READ FAILURE INJECTION: When getAll fails during upgrade, verify tx.abort() preserves v1 store and data
       fakeIdb.__failure.getAll = true;
       const readFailResult = await loadAnalysisRecovery(scopeId, 'mat-v1-ok');
-      assert.equal(readFailResult, null, '읽기 실패 시 null 반환');
+      assert.equal(readFailResult.status, 'error', '읽기 실패 시 error 반환');
       // CRITICAL ASSERTION: The v1 store must NOT have been deleted! The records must be preserved!
       assert.ok(v1Stores.has('recoveries'), '읽기 실패 시 기존 recoveries 저장소가 삭제되지 않고 보존됨');
       assert.equal(v1RecoveryStore.has('mat-v1-ok'), true, '기존 v1 레코드가 그대로 유지됨');
       assert.equal(fakeIdb.__dbVersions.get(dbName), 1, '업그레이드 트랜잭션이 롤백되어 DB 버전이 1로 유지됨');
       fakeIdb.__failure.getAll = false;
 
-      // 3. Successful upgrade: opens and migrates v1 records into v4 structure
+      // 3. Successful upgrade: opens and migrates v1 records into v5 structure
       const loadedNormal = await loadAnalysisRecovery(scopeId, 'job-v1-ok', 1);
-      assert.ok(loadedNormal, 'v1 정상 레코드가 v4 복구 저장소로 안전하게 이관됨');
-      assert.equal(loadedNormal.id, 'job-v1-ok_c1');
-      assert.equal(loadedNormal.drafts[0].title, '코시-슈바르츠 부등식');
-      assert.equal(loadedNormal.signedRecoveryToken, 'token-signed-1');
+      assert.equal(loadedNormal.status, 'success', 'v1 정상 레코드가 v5 복구 저장소로 안전하게 이관됨');
+      assert.equal(loadedNormal.data.id, 'job-v1-ok_c1');
+      assert.equal(loadedNormal.data.drafts[0].title, '코시-슈바르츠 부등식');
+      assert.equal(loadedNormal.data.signedRecoveryToken, 'token-signed-1');
 
       // Incomplete record is in unmigrated store
       const unmigrated = await listUnmigratedAnalysisRecoveries(scopeId);
-      assert.equal(unmigrated.length, 1);
-      assert.equal(unmigrated[0].materialId, 'mat-v1-inc');
+      assert.equal(unmigrated.status, 'success');
+      assert.equal(unmigrated.data.length, 1);
+      assert.equal(unmigrated.data[0].materialId, 'mat-v1-inc');
 
       // 4. Blocked upgrade handling
       fakeIdb.__failure.blocked = true;
@@ -9566,7 +9588,8 @@ exports.requireApiUser = async () => {
       // 5. Targeted delete: deleteAnalysisRecovery(scope, materialId, jobKey) deletes only that job's records
       await deleteAnalysisRecovery(scopeId, 'mat-v1-ok', 'job-v1-ok');
       const afterDelete = await listAnalysisRecoveries(scopeId);
-      assert.equal(afterDelete.filter((r) => r.jobKey === 'job-v1-ok').length, 0);
+      assert.equal(afterDelete.status, 'success');
+      assert.equal(afterDelete.data.filter((r) => r.jobKey === 'job-v1-ok').length, 0);
     });
   });
 
@@ -9998,6 +10021,520 @@ exports.requireApiUser = async () => {
       const statusRes = await analyzePost(statusReq);
       assert.equal(statusRes.status, 200, 'Status query succeeds');
       assert.equal(jobsDb.length, jobsBeforeStatus, 'Status query did not create any new DB jobs');
+    });
+  });
+
+  await checkAsync('결함 1 검증: 자료 본문 변경 후 이전 분석 결과 저장 재시도(retry_save) 성공, AI 0회 및 출처 재검토 상태 확인', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
+    const { signRecoveryToken } = load(path.join(output, 'lib/recoveryToken.js'));
+
+    const testUser = { id: 'test-user' };
+    const subjectId = 'sub_math_p1';
+    const materialId = 'mat_calculus_p1';
+
+    const bodyA = '# 미적분학 1강\n코시-슈바르츠 부등식: |<u, v>|^2 <= <u, u> <v, v>.';
+    const bodyB = '# 미적분학 1강 (수정본)\n선형대수학과 내적 공간의 성질.';
+    const hashA = computeMarkdownHash(bodyA);
+    const hashB = computeMarkdownHash(bodyB);
+
+    const draftA = {
+      id: 'draft-cs-p1',
+      subjectId,
+      materialId,
+      domain: 'math_stats',
+      title: '코시-슈바르츠 부등식',
+      description: '내적 공간의 기본 부등식',
+      coreDefinitionFormulaOrAlgorithm: '|<u, v>|^2 <= <u, u> <v, v>',
+      sourceMarkdownHash: hashA,
+      sourceEvidence: { type: 'quote', quote: '코시-슈바르츠', verified: true },
+      isApproved: false,
+    };
+
+    const jobKeyA = 'job_bodyA_persist';
+    const tokenA = signRecoveryToken({
+      userId: testUser.id,
+      jobId: jobKeyA,
+      materialId,
+      subjectId,
+      domain: 'math_stats',
+      chunkIndex: 1,
+      markdownHash: hashA,
+      modelId: 'deepseek-v4.1-flash',
+      drafts: [draftA],
+    });
+
+    let mockAiCalls = 0;
+    globalThis.__mockAiCallCounter = () => mockAiCalls++;
+
+    const dbJobs = [
+      {
+        id: jobKeyA,
+        user_id: testUser.id,
+        material_id: materialId,
+        subject_id: subjectId,
+        domain: 'math_stats',
+        markdown_hash: hashA,
+        status: 'processing',
+        total_chunks: 1,
+      },
+    ];
+    const dbChunks = [
+      {
+        job_id: jobKeyA,
+        chunk_index: 1,
+        status: 'pending',
+        drafts: [],
+        attempt_count: 1,
+      },
+    ];
+    const dbMaterials = [
+      {
+        id: materialId,
+        user_id: testUser.id,
+        subject_id: subjectId,
+        content_hash: hashB, // Material body was edited from A to B!
+      },
+    ];
+
+    await withFakeSupabase({
+      user: testUser,
+      subjects: [{ id: subjectId, user_id: testUser.id }],
+      materials: dbMaterials,
+      analysis_jobs: dbJobs,
+      analysis_job_chunks: dbChunks,
+      rpcImpl: (fn) => {
+        if (fn === 'commit_analysis_chunk_result') {
+          return { data: { committed: true, reason: 'committed' }, error: null };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      const aiBefore = mockAiCalls;
+
+      // 1) Flow: analyzed body A -> save failed -> body edited to B -> retry save A
+      const retryReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: jobKeyA,
+          chunkIndex: 1,
+          workerId: 'worker-p1',
+          leaseToken: 'lease-p1',
+          drafts: [draftA],
+          signedRecoveryToken: tokenA,
+          materialId,
+          subjectId,
+          currentMarkdownHash: hashB, // Notifying current material hash
+        }),
+      });
+
+      const retryRes = await analyzePost(retryReq);
+      assert.equal(retryRes.status, 200, '본문 수정(A->B) 후에도 이전 결과 저장 재시도 성공');
+      const retryData = await retryRes.json();
+      assert.equal(retryData.success, true);
+      assert.equal(retryData.persisted, true);
+      assert.equal(retryData.drafts.length, 1);
+      assert.equal(retryData.drafts[0].sourceMarkdownHash, hashA, '원래 출처 본문 A의 해시가 보존되어야 함');
+      assert.equal(retryData.drafts[0].needsSourceReview, true, '본문 수정 후 복구된 초안은 출처 재검토 필요 상태여야 함');
+      assert.equal(mockAiCalls, aiBefore, 'CRITICAL: 저장 재시도 중 AI 호출은 정확히 0회여야 함');
+
+      // 2) Flow: retry when local material body is completely missing / empty string
+      const retryNoLocalBodyReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: jobKeyA,
+          chunkIndex: 1,
+          workerId: 'worker-p1',
+          leaseToken: 'lease-p1',
+          drafts: [draftA],
+          signedRecoveryToken: tokenA,
+          materialId,
+          subjectId,
+          markdown: '', // No local markdown available
+        }),
+      });
+      const retryNoBodyRes = await analyzePost(retryNoLocalBodyReq);
+      assert.equal(retryNoBodyRes.status, 200, '로컬에 본문이 없어도 저장 복구 성공');
+
+      // 3) Tampered recovery token rejected with 403
+      const tamperedReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: jobKeyA,
+          chunkIndex: 1,
+          workerId: 'worker-p1',
+          leaseToken: 'lease-p1',
+          drafts: [draftA],
+          signedRecoveryToken: 'forged_tampered_token_xyz',
+          materialId,
+          subjectId,
+        }),
+      });
+      const tamperedRes = await analyzePost(tamperedReq);
+      assert.equal(tamperedRes.status, 403, '변조된 서명 토큰은 403으로 거부');
+
+      // 4) Wrong chunk token rejected
+      const wrongChunkToken = signRecoveryToken({
+        userId: testUser.id,
+        jobId: jobKeyA,
+        materialId,
+        subjectId,
+        domain: 'math_stats',
+        chunkIndex: 2, // Token for chunk 2
+        markdownHash: hashA,
+        modelId: 'deepseek-v4.1-flash',
+        drafts: [draftA],
+      });
+      const wrongChunkReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: jobKeyA,
+          chunkIndex: 1, // Target is chunk 1
+          workerId: 'worker-p1',
+          leaseToken: 'lease-p1',
+          drafts: [draftA],
+          signedRecoveryToken: wrongChunkToken,
+          materialId,
+          subjectId,
+        }),
+      });
+      const wrongChunkRes = await analyzePost(wrongChunkReq);
+      assert.equal(wrongChunkRes.status, 403, '다른 청크 번호의 서명 토큰은 403으로 거부');
+
+      // 5) Authoritative server draft protection: completed chunk in DB is never overwritten by client drafts
+      dbChunks[0].status = 'completed';
+      dbChunks[0].drafts = [{ id: 'draft-server-authoritative', title: '서버 확정 초안', sourceMarkdownHash: hashA }];
+      const clientSpoofedReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: jobKeyA,
+          chunkIndex: 1,
+          workerId: 'worker-p1',
+          leaseToken: 'lease-p1',
+          drafts: [{ id: 'draft-client-forged', title: '클라이언트 위조 초안' }],
+          signedRecoveryToken: tokenA,
+          materialId,
+          subjectId,
+        }),
+      });
+      const spoofedRes = await analyzePost(clientSpoofedReq);
+      assert.equal(spoofedRes.status, 200);
+      const spoofedData = await spoofedRes.json();
+      assert.equal(spoofedData.drafts[0].id, 'draft-server-authoritative', '서버 확정 결과가 클라이언트 초안으로 덮어써지지 않음');
+
+      // 6) Normal process/resume with different body is still rejected
+      const resumeMismatchReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          jobKey: jobKeyA,
+          materialId,
+          subjectId,
+          domain: 'math_stats',
+          markdown: bodyB, // altered body
+        }),
+      });
+      const resumeMismatchRes = await analyzePost(resumeMismatchReq);
+      assert.equal(resumeMismatchRes.status, 400, '일반 process/resume에 다른 본문을 전달하면 기존처럼 거부');
+      const resumeMismatchData = await resumeMismatchRes.json();
+      assert.equal(resumeMismatchData.errorCode, 'MARKDOWN_HASH_MISMATCH');
+    });
+  });
+
+  await checkAsync('결함 2 검증: 불완전한 복구 레코드 격리 (chunkIndex 보정 제거) 및 v5 이관 호환성', async () => {
+    const {
+      saveAnalysisRecovery,
+      listAnalysisRecoveries,
+      listUnmigratedAnalysisRecoveries,
+      exportUnmigratedRecoveriesAsJson,
+    } = load(path.join(output, 'lib/analysisRecovery.js'));
+
+    await withFakeIndexedDB(async (fakeIdb) => {
+      const scopeId = 'u_p2_chunk_quarantine';
+      const dbName = `redcall_analysis_recovery_${scopeId}`;
+
+      // 1. Setup a legacy v1 IndexedDB schema with a mix of valid and invalid chunkIndex records
+      const v1Stores = fakeIdb.__databases.get(dbName) || new Map();
+      fakeIdb.__databases.set(dbName, v1Stores);
+      fakeIdb.__dbVersions.set(dbName, 1);
+
+      const v1RecoveryStore = new Map();
+      v1Stores.set('recoveries', v1RecoveryStore);
+
+      // Normal chunk 1 record
+      v1RecoveryStore.set('mat-v1-chunk1', {
+        materialId: 'mat-v1-chunk1',
+        jobKey: 'job-chunk1',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-c1',
+        chunkIndex: 1,
+        workerId: 'w-1',
+        leaseToken: 't-1',
+        drafts: [{ id: 'd-c1', title: '정상 청크 1' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: '2026-10-15T12:00:00.000Z',
+      });
+
+      // Normal chunk 2 record
+      v1RecoveryStore.set('mat-v1-chunk2', {
+        materialId: 'mat-v1-chunk2',
+        jobKey: 'job-chunk2',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-c2',
+        chunkIndex: 2,
+        workerId: 'w-2',
+        leaseToken: 't-2',
+        drafts: [{ id: 'd-c2', title: '정상 청크 2' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: '2026-10-15T12:01:00.000Z',
+      });
+
+      // Invalid record A: missing chunkIndex (undefined)
+      v1RecoveryStore.set('mat-v1-nochunk', {
+        materialId: 'mat-v1-nochunk',
+        jobKey: 'job-nochunk',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-nc',
+        // chunkIndex missing
+        workerId: 'w-nc',
+        leaseToken: 't-nc',
+        drafts: [{ id: 'd-nc', title: '청크 누락' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: '2026-10-15T12:02:00.000Z',
+      });
+
+      // Invalid record B: chunkIndex = 0
+      v1RecoveryStore.set('mat-v1-zerochunk', {
+        materialId: 'mat-v1-zerochunk',
+        jobKey: 'job-zerochunk',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-zc',
+        chunkIndex: 0, // 0 is invalid
+        workerId: 'w-zc',
+        leaseToken: 't-zc',
+        drafts: [{ id: 'd-zc', title: '0번 청크' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: '2026-10-15T12:03:00.000Z',
+      });
+
+      // Invalid record C: chunkIndex = -1 (negative)
+      v1RecoveryStore.set('mat-v1-negchunk', {
+        materialId: 'mat-v1-negchunk',
+        jobKey: 'job-negchunk',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-neg',
+        chunkIndex: -1,
+        workerId: 'w-neg',
+        leaseToken: 't-neg',
+        drafts: [{ id: 'd-neg', title: '음수 청크' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: '2026-10-15T12:04:00.000Z',
+      });
+
+      // Invalid record D: chunkIndex = 1.5 (float)
+      v1RecoveryStore.set('mat-v1-floatchunk', {
+        materialId: 'mat-v1-floatchunk',
+        jobKey: 'job-floatchunk',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-flt',
+        chunkIndex: 1.5,
+        workerId: 'w-flt',
+        leaseToken: 't-flt',
+        drafts: [{ id: 'd-flt', title: '소수 청크' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: '2026-10-15T12:05:00.000Z',
+      });
+
+      // Invalid record E: chunkIndex = '1' (string)
+      v1RecoveryStore.set('mat-v1-strchunk', {
+        materialId: 'mat-v1-strchunk',
+        jobKey: 'job-strchunk',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-str',
+        chunkIndex: '1',
+        workerId: 'w-str',
+        leaseToken: 't-str',
+        drafts: [{ id: 'd-str', title: '문자열 청크' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: '2026-10-15T12:06:00.000Z',
+      });
+
+      // 2. Open DB and trigger upgrade to v5
+      const activeRecoveriesRes = await listAnalysisRecoveries(scopeId);
+      assert.equal(activeRecoveriesRes.status, 'success');
+      const activeRecoveries = activeRecoveriesRes.data;
+
+      // CRITICAL ASSERTION: ONLY the 2 valid chunk records remain in the active recoveries store!
+      assert.equal(activeRecoveries.length, 2, '정상 청크 1과 청크 2만 복구 목록에 유지됨 (임의 보정 레코드 제외)');
+      assert.ok(activeRecoveries.some((r) => r.jobKey === 'job-chunk1' && r.chunkIndex === 1));
+      assert.ok(activeRecoveries.some((r) => r.jobKey === 'job-chunk2' && r.chunkIndex === 2));
+
+      // 3. Unmigrated / Quarantined store inspection
+      const unmigratedRes = await listUnmigratedAnalysisRecoveries(scopeId);
+      assert.equal(unmigratedRes.status, 'success');
+      const unmigrated = unmigratedRes.data;
+      assert.equal(unmigrated.length, 5, '결함이 있는 5개 레코드가 모두 unmigrated에 격리 보존됨');
+
+      // Verify specific reasons and rawRecord preservation
+      const nochunk = unmigrated.find((r) => r.materialId === 'mat-v1-nochunk');
+      assert.ok(nochunk, '누락된 청크 레코드 격리 확인');
+      assert.ok(nochunk.unmigratedReason.includes('청크 번호'), '구체적 격리 사유 포함');
+      assert.ok(nochunk.rawRecord, '원본 rawRecord 필드 보존');
+
+      const zerochunk = unmigrated.find((r) => r.materialId === 'mat-v1-zerochunk');
+      assert.ok(zerochunk);
+      assert.ok(zerochunk.unmigratedReason.includes('0'));
+
+      // 4. Verify saveAnalysisRecovery strictly validates chunkIndex
+      const saveZeroRes = await saveAnalysisRecovery(scopeId, {
+        materialId: 'mat-invalid-save',
+        jobKey: 'job-save-test',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-x',
+        chunkIndex: 0, // invalid
+        workerId: 'w',
+        leaseToken: 't',
+        drafts: [{ id: 'd-1', title: '초안' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: new Date().toISOString(),
+      });
+      assert.equal(saveZeroRes.ok, false, 'chunkIndex=0 저장 거부');
+      assert.ok(saveZeroRes.error.includes('양의 정수'));
+
+      const saveStrRes = await saveAnalysisRecovery(scopeId, {
+        materialId: 'mat-invalid-save',
+        jobKey: 'job-save-test',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-x',
+        chunkIndex: '1', // string
+        workerId: 'w',
+        leaseToken: 't',
+        drafts: [{ id: 'd-1', title: '초안' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: new Date().toISOString(),
+      });
+      assert.equal(saveStrRes.ok, false, 'chunkIndex 문자열 저장 거부');
+
+      // 5. Verify JSON export includes reasons and raw values
+      let exportedBlob = '';
+      global.window = { indexedDB: globalThis.indexedDB };
+      global.document = {
+        body: { appendChild: () => {}, removeChild: () => {} },
+        createElement: () => ({ href: '', download: '', click: () => {} }),
+      };
+      global.URL = {
+        createObjectURL: (blob) => { exportedBlob = blob; return 'blob:test'; },
+        revokeObjectURL: () => {},
+      };
+
+      exportUnmigratedRecoveriesAsJson(unmigrated, scopeId);
+      assert.ok(exportedBlob, '미이관 데이터 JSON 파일 생성 성공');
+
+      delete global.window;
+      delete global.document;
+      global.URL = (await import('node:url')).URL;
+    });
+  });
+
+  await checkAsync('결함 3 검증: IndexedDB 차단·조회 오류와 명시적 반환 계약 (success, not_found, blocked, error)', async () => {
+    const {
+      loadAnalysisRecovery,
+      listAnalysisRecoveries,
+      listUnmigratedAnalysisRecoveries,
+      saveAnalysisRecovery,
+    } = load(path.join(output, 'lib/analysisRecovery.js'));
+
+    await withFakeIndexedDB(async (fakeIdb) => {
+      const scopeId = 'u_p3_explicit_contract';
+
+      // 1. Normal empty store -> returns explicit not_found / empty list
+      const emptyLoad = await loadAnalysisRecovery(scopeId, 'non-existent-material');
+      assert.equal(emptyLoad.status, 'not_found', '정상 빈 저장소 조회 시 status: not_found 반환');
+
+      const emptyList = await listAnalysisRecoveries(scopeId);
+      assert.equal(emptyList.status, 'success', '정상 빈 목록 조회 시 status: success 반환');
+      assert.equal(emptyList.data.length, 0);
+
+      const emptyUnmigrated = await listUnmigratedAnalysisRecoveries(scopeId);
+      assert.equal(emptyUnmigrated.status, 'success');
+      assert.equal(emptyUnmigrated.data.length, 0);
+
+      // Save a valid record
+      const saveRes = await saveAnalysisRecovery(scopeId, {
+        materialId: 'mat-p3-test',
+        jobKey: 'job-p3-1',
+        subjectId: 'sub-p3',
+        domain: 'math_stats',
+        markdownHash: 'hash-p3',
+        chunkIndex: 1,
+        workerId: 'w-p3',
+        leaseToken: 't-p3',
+        drafts: [{ id: 'd-p3', title: '복구 대상 초안' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: new Date().toISOString(),
+      });
+      assert.equal(saveRes.ok, true);
+
+      // 2. Blocked simulation: when IDB version upgrade is blocked by another tab
+      fakeIdb.__failure.blocked = true;
+
+      const blockedLoad = await loadAnalysisRecovery(scopeId, 'mat-p3-test');
+      assert.equal(blockedLoad.status, 'blocked', '차단 상태일 때 status: blocked 명시적 반환');
+      assert.ok(blockedLoad.error.includes('다른 탭'), '다른 탭 안내 문구 포함');
+
+      const blockedList = await listAnalysisRecoveries(scopeId);
+      assert.equal(blockedList.status, 'blocked', '차단 시 목록 조회도 status: blocked 반환 (빈 목록으로 오표시 방지)');
+
+      const blockedUnmigrated = await listUnmigratedAnalysisRecoveries(scopeId);
+      assert.equal(blockedUnmigrated.status, 'blocked');
+
+      // 3. Unblocked recovery: after blocking tab closes, retry succeeds and yields real records
+      fakeIdb.__failure.blocked = false;
+
+      const unblockedLoad = await loadAnalysisRecovery(scopeId, 'mat-p3-test');
+      assert.equal(unblockedLoad.status, 'success', '차단 해제 후 재시도 시 status: success 반환');
+      assert.equal(unblockedLoad.data.jobKey, 'job-p3-1');
+
+      const unblockedList = await listAnalysisRecoveries(scopeId);
+      assert.equal(unblockedList.status, 'success');
+      assert.equal(unblockedList.data.length, 1);
+
+      // 4. Read error simulation: transaction error returns status: error
+      fakeIdb.__failure.getAll = true;
+      const errorList = await listAnalysisRecoveries(scopeId);
+      assert.equal(errorList.status, 'error', '읽기 실패 시 status: error 반환');
+      fakeIdb.__failure.getAll = false;
     });
   });
 

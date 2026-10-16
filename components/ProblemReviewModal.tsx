@@ -37,7 +37,7 @@ import { ProblemQualityStatus } from '../lib/types';
 interface ProblemReviewModalProps {
   isOpen: boolean;
   onClose: () => void;
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   drafts: ProblemDraft[];
   problems?: Problem[];
   materials?: Material[];
@@ -81,19 +81,19 @@ export function ProblemReviewModal({
 
   // Filter drafts belonging to the active subject
   const subjectDrafts = useMemo(() => {
-    return drafts.filter((d) => d.subjectId === activeSubject.id);
-  }, [drafts, activeSubject.id]);
+    return drafts.filter((d) => Boolean(activeSubject && d.subjectId === activeSubject.id));
+  }, [drafts, activeSubject]);
 
   // Count problems with quality issues for badge
   const subjectQualityCount = useMemo(() => {
     return problems.filter(
       (p) =>
-        p.subjectId === activeSubject.id &&
+        Boolean(activeSubject && p.subjectId === activeSubject.id) &&
         (p.qualityStatus === 'reported' ||
           p.qualityStatus === 'under_review' ||
           p.qualityStatus === 'review_after_edit')
     ).length;
-  }, [problems, activeSubject.id]);
+  }, [problems, activeSubject]);
 
   const [filterTab, setFilterTab] = useState<'all' | 'pending' | 'needs_review' | 'approved'>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -161,10 +161,10 @@ export function ProblemReviewModal({
   // Check if active draft's source markdown hash differs from current subject material hash
   const isDraftOutdated = useMemo(() => {
     if (!materials || !activeDraft?.sourceMarkdownHash) return false;
-    const subjMats = materials.filter((m) => m.subjectId === activeSubject.id && m.parsedMarkdown);
+    const subjMats = materials.filter((m) => Boolean(activeSubject && m.subjectId === activeSubject.id) && m.parsedMarkdown);
     if (subjMats.length === 0) return false;
     return subjMats.some((m) => computeMarkdownHash(m.parsedMarkdown || '') !== activeDraft.sourceMarkdownHash);
-  }, [materials, activeDraft, activeSubject.id]);
+  }, [materials, activeDraft, activeSubject]);
 
   if (!isOpen) return null;
 
@@ -288,7 +288,7 @@ export function ProblemReviewModal({
             <span className="font-academic-mono text-xs text-[#ded6c8]">EXAM PROBLEM REVIEW & QA</span>
             <span className="text-[#827d73]">|</span>
             <span className="text-xs sm:text-sm font-bold text-white">
-              {activeSubject.name}
+              {activeSubject?.name || ''}
             </span>
 
             {/* Mode Switcher Tabs */}
@@ -329,7 +329,7 @@ export function ProblemReviewModal({
                   </span>
                 ) : (
                   <span className="px-1.5 py-0.2 bg-black/30 rounded-2xs text-[10px]">
-                    {(problems || []).filter((p) => p.subjectId === activeSubject.id).length}
+                    {(problems || []).filter((p) => Boolean(activeSubject && p.subjectId === activeSubject.id)).length}
                   </span>
                 )}
               </button>
