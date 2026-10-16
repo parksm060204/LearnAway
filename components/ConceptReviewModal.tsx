@@ -53,6 +53,7 @@ interface ConceptReviewModalProps {
     checkpointStatus?: 'pending' | 'committed' | 'already_completed';
     draftsPersistStatus?: 'pending' | 'failed' | 'persisted';
     drafts?: ConceptDraft[];
+    isMemoryOnly?: boolean;
   } | null;
   onRetrySaveAnalysis?: (material: Material) => void;
   onExportRecoveryJson?: () => void;
@@ -348,13 +349,25 @@ export function ConceptReviewModal({
 
             {saveFailedInfo && saveFailedInfo.canRetry && material && onRetrySaveAnalysis && (
               <div className="flex items-center gap-1.5">
+                {saveFailedInfo.isMemoryOnly && (
+                  <span
+                    className="px-2 py-1 bg-red-950/90 text-red-300 border border-red-500/50 text-[10px] font-academic-mono rounded-xs font-semibold animate-pulse"
+                    title="IndexedDB 저장 실패로 복구 데이터가 현재 메모리에만 보관 중입니다. 창을 닫기 전 JSON으로 내보내기를 권장합니다."
+                  >
+                    메모리에만 보관됨
+                  </span>
+                )}
                 <button
                   onClick={() => onRetrySaveAnalysis(material)}
                   disabled={isAnalyzing}
                   className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors shadow-xs animate-pulse disabled:opacity-50"
                   title="AI 재호출 없이 생성 완료된 초안만 DB에 다시 저장합니다."
                 >
-                  <span>생성 완료, 저장 실패 - 저장 재시도</span>
+                  <span>
+                    {saveFailedInfo.checkpointStatus === 'committed' && saveFailedInfo.draftsPersistStatus === 'failed'
+                      ? '초안 영속 저장 재시도'
+                      : '생성 완료, 저장 실패 - 저장 재시도'}
+                  </span>
                 </button>
                 {onExportRecoveryJson && (
                   <button

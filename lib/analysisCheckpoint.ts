@@ -186,6 +186,19 @@ export function findSessionLedger(userId: string, jobKey: string): AnalysisSessi
   return reg.get(jobKey) || null;
 }
 
+export function findLatestSessionForMaterial(userId: string, materialId: string): AnalysisSessionLedger | null {
+  const reg = getUserRegistry(userId);
+  let latest: AnalysisSessionLedger | null = null;
+  for (const session of reg.values()) {
+    if (session.materialId === materialId) {
+      if (!latest || new Date(session.updatedAt).getTime() > new Date(latest.updatedAt).getTime()) {
+        latest = session;
+      }
+    }
+  }
+  return latest;
+}
+
 export interface LeaseAcquireResult {
   acquired: boolean;
   reason: 'already_completed' | 'locked' | 'acquired' | 'not_found' | 'paused';

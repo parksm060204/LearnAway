@@ -3,6 +3,8 @@ import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { createClient } from '../../../lib/supabase/server';
+import { createAdminClient } from '../../../lib/supabase/admin';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { persistConceptDraftsForResponse } from '../../../lib/cloud/draftPersistence';
 import { ConceptDraft, ConceptEvidence } from '../../../lib/types';
 import {
@@ -16,6 +18,7 @@ import {
   makeConceptDraftId,
   getOrCreateSessionLedger,
   findSessionLedger,
+  findLatestSessionForMaterial,
   acquireChunkLease,
   commitChunkResult,
   syncDbLeaseToLedger,
@@ -24,7 +27,22 @@ import {
   AnalysisSessionLedger,
   ChunkProgressRecord,
 } from '../../../lib/analysisCheckpoint';
-import { signRecoveryToken, verifyRecoveryToken } from '../../../lib/recoveryToken';
+import {
+  signRecoveryToken,
+  verifyRecoveryToken,
+  hasRecoverySigningSecret,
+  sanitizeRecoveryDraft,
+} from '../../../lib/recoveryToken';
+
+// Helper to acquire a privileged service_role client for secure server-only RPCs (lease & commit)
+// after verifying user ownership in the route handler.
+function getPrivilegedClient(userClient: unknown): SupabaseClient {
+  try {
+    return createAdminClient();
+  } catch {
+    return userClient as SupabaseClient;
+  }
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -235,7 +253,7 @@ export async function POST(req: NextRequest) {
     let domain: 'math_stats' | 'computer_science' =
       payload.domain === 'computer_science' ? 'computer_science' : 'math_stats';
     const markdown = asString(payload.markdown);
-    const clientJobKey = asString(payload.jobKey);
+    let clientJobKey = asString(payload.jobKey);
     const action = asString(payload.action, 'process'); // 'process' | 'status' | 'pause' | 'resume' | 'init' | 'retry_save'
 
     let supabaseClient: Awaited<ReturnType<typeof createClient>> | null = null;
@@ -261,6 +279,43 @@ export async function POST(req: NextRequest) {
         if (dj) dbJobForIdentity = dj;
       } catch {
         // best effort lookup
+      }
+    }
+
+    if (!dbJobForIdentity && !clientJobKey && materialId && supabaseClient && typeof supabaseClient.from === 'function') {
+      try {
+        const { data: latestJobs } = await supabaseClient
+          .from('analysis_jobs')
+          .select('*')
+          .eq('user_id', auth.user.id)
+          .eq('material_id', materialId)
+          .order('updated_at', { ascending: false })
+          .limit(1);
+        if (latestJobs && latestJobs.length > 0) {
+          const matchedJob = latestJobs[0];
+          dbJobForIdentity = matchedJob;
+          if (matchedJob?.id) clientJobKey = matchedJob.id as string;
+        }
+      } catch {
+        // best effort lookup
+      }
+    }
+
+    if (!dbJobForIdentity && !clientJobKey && materialId) {
+      const memSession = findLatestSessionForMaterial(auth.user.id, materialId);
+      if (memSession) {
+        dbJobForIdentity = {
+          id: memSession.jobKey,
+          subject_id: memSession.subjectId,
+          material_id: memSession.materialId,
+          domain: memSession.domain,
+          markdown_hash: memSession.markdownHash,
+          model_id: memSession.modelId,
+          prompt_version: memSession.promptVersion,
+          chunking_version: memSession.chunkingVersion,
+          total_chunks: memSession.totalChunks,
+        };
+        clientJobKey = memSession.jobKey;
       }
     }
 
@@ -352,6 +407,21 @@ export async function POST(req: NextRequest) {
     const resolvedModelId =
       (dbJobForIdentity?.model_id as string) || (cred.ok ? cred.config.model : 'deepseek-v4.1-flash');
 
+    if (dbJobForIdentity?.model_id && cred.ok && cred.config.model !== dbJobForIdentity.model_id) {
+      if (payload.model && payload.model !== dbJobForIdentity.model_id) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `기존 분석 작업은 모델(${dbJobForIdentity.model_id})로 진행되었습니다. 새 모델(${cred.config.model})을 적용하려면 새 분석 작업을 시작해 주세요. 이전 작업 결과와 새 모델 결과를 하나의 작업에 혼합할 수 없습니다.`,
+            errorCode: 'JOB_MODEL_MISMATCH',
+            jobModel: dbJobForIdentity.model_id,
+            currentModel: cred.config.model,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
     const markdownHash =
       (dbJobForIdentity?.markdown_hash as string) || (markdown ? computeMarkdownHash(markdown) : '');
     if (markdown.trim() && dbJobForIdentity?.markdown_hash && computeMarkdownHash(markdown) !== dbJobForIdentity.markdown_hash) {
@@ -390,6 +460,20 @@ export async function POST(req: NextRequest) {
           success: false,
           error: '작업을 찾을 수 없거나 접근 권한이 없습니다.',
           errorCode: 'NOT_FOUND_OR_FORBIDDEN',
+        },
+        { status: 404 }
+      );
+    }
+
+    if (action === 'status' && !dbJobForIdentity && !findSessionLedger(auth.user.id, expectedJobKey)) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: '해당 자료에 대한 기존 분석 작업이 존재하지 않습니다.',
+          errorCode: 'JOB_NOT_FOUND',
+          notFound: true,
+          materialId,
+          subjectId,
         },
         { status: 404 }
       );
@@ -524,8 +608,18 @@ export async function POST(req: NextRequest) {
             );
           }
 
-          // Call hardened RPC
-          const { data: commitRes, error: commitErr } = await supabaseClient.rpc(
+          const sanitizedDrafts = targetDrafts.map((d) =>
+            sanitizeRecoveryDraft(d, {
+              materialId,
+              subjectId,
+              domain,
+              sourceMarkdownHash: session.markdownHash,
+            })
+          );
+
+          // Call hardened RPC using privileged client
+          const privilegedClient = getPrivilegedClient(supabaseClient);
+          const { data: commitRes, error: commitErr } = await privilegedClient.rpc(
             'commit_analysis_chunk_result',
             {
               p_job_id: jobKey,
@@ -533,7 +627,7 @@ export async function POST(req: NextRequest) {
               p_worker_id: targetWorkerId,
               p_lease_token: targetLeaseToken,
               p_status: 'completed',
-              p_drafts: targetDrafts,
+              p_drafts: sanitizedDrafts,
             }
           );
 
@@ -544,12 +638,16 @@ export async function POST(req: NextRequest) {
                 success: false,
                 checkpointCommitted: false,
                 persisted: false,
+                checkpointStatus: 'failed',
+                draftsPersistStatus: 'failed',
                 error: isMismatch
                   ? '선점 유효 시간이 만료되었거나 다른 작업자와 충돌하여 안전한 복구가 불가능합니다.'
                   : `DB 저장 재시도 실패: ${commitErr?.message || commitRes?.reason}`,
                 canRetrySave: !isMismatch,
                 jobKey,
                 chunkIndex: targetChunkIndex,
+                materialId: session.materialId,
+                subjectId: session.subjectId,
               },
               { status: 500 }
             );
@@ -633,6 +731,8 @@ export async function POST(req: NextRequest) {
           {
             success: false,
             checkpointCommitted: true,
+            checkpointStatus: 'completed',
+            draftsPersistStatus: 'failed',
             persisted: false,
             canRetrySave: true,
             error: `체크포인트는 완료되었으나 concept_drafts 테이블 저장에 실패했습니다. (${outcome.persistError || '초안 저장 오류'}). AI 재호출 없이 초안 저장만 다시 시도할 수 있습니다.`,
@@ -641,6 +741,8 @@ export async function POST(req: NextRequest) {
             count: outcome.drafts.length,
             jobKey,
             chunkIndex: targetChunkIndex,
+            materialId: session.materialId,
+            subjectId: session.subjectId,
             status: progress.status,
           },
           { status: 500 }
@@ -650,12 +752,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({
         success: true,
         checkpointCommitted: true,
+        checkpointStatus: 'completed',
+        draftsPersistStatus: 'persisted',
         persisted: true,
         retried: true,
         drafts: outcome.drafts,
         count: outcome.drafts.length,
         jobKey,
+        chunkIndex: targetChunkIndex,
+        materialId: session.materialId,
+        subjectId: session.subjectId,
         status: progress.status,
+        isAllComplete: progress.isAllComplete,
       });
     }
 
@@ -728,16 +836,52 @@ export async function POST(req: NextRequest) {
         }
       }
       const progress = getSessionProgress(session);
+
+      let draftsPersistStatus: 'pending' | 'persisted' | 'failed' = 'pending';
+      if (progress.status === 'completed') {
+        if (progress.allDrafts.length === 0) {
+          draftsPersistStatus = 'persisted';
+        } else if (supabaseClient) {
+          try {
+            const draftIds = progress.allDrafts.map((d) => d.id);
+            const { data: dbDrafts, error: draftsErr } = await supabaseClient
+              .from('concept_drafts')
+              .select('id')
+              .in('id', draftIds);
+            if (!draftsErr && dbDrafts && dbDrafts.length === draftIds.length) {
+              draftsPersistStatus = 'persisted';
+            } else {
+              draftsPersistStatus = 'failed';
+            }
+          } catch {
+            draftsPersistStatus = 'failed';
+          }
+        } else {
+          draftsPersistStatus = 'persisted';
+        }
+      }
+
+      const isAllComplete = progress.status === 'completed' && draftsPersistStatus === 'persisted';
+
       return NextResponse.json({
         success: true,
+        jobKey,
+        materialId: session.materialId,
+        subjectId: session.subjectId,
+        domain: session.domain,
+        markdownHash: session.markdownHash,
+        modelId: session.modelId,
+        promptVersion: session.promptVersion,
+        chunkingVersion: session.chunkingVersion,
+        checkpointStatus: progress.status,
+        draftsPersistStatus,
+        status: isAllComplete ? 'completed' : progress.status,
         totalChunks: progress.totalChunks,
         completedChunks: progress.completedChunks,
         runningChunks: progress.runningChunks,
         pendingChunks: progress.pendingChunks,
         failedChunks: progress.failedChunks,
-        isAllComplete: progress.isAllComplete,
-        status: progress.status,
-        jobKey,
+        isAllComplete,
         drafts: progress.allDrafts,
       });
     }
@@ -771,6 +915,17 @@ export async function POST(req: NextRequest) {
       targetChunks = targetChunks.slice(0, maxChunks);
     }
 
+    if (!hasRecoverySigningSecret()) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: '복구 서명 비밀값(ANALYSIS_RECOVERY_SIGNING_SECRET 또는 SUPABASE_SERVICE_ROLE_KEY)이 서버에 설정되지 않았습니다. 결과 생성 후 복구 불가 상태를 방지하기 위해 분석을 시작하지 않습니다.',
+          errorCode: 'SIGNING_SECRET_UNCONFIGURED',
+        },
+        { status: 500 }
+      );
+    }
+
     if (!cred.ok) {
       const needsAiConnection = cred.code === 'no_credentials';
       return NextResponse.json(
@@ -783,7 +938,10 @@ export async function POST(req: NextRequest) {
         { status: needsAiConnection ? 400 : 502 }
       );
     }
-    const aiConfig = cred.config;
+    const aiConfig = {
+      ...cred.config,
+      model: resolvedModelId,
+    };
 
     let responseModel = resolvedModelId;
     const workerId = `w_${Date.now()}_${Math.random().toString(36).substring(7)}`;
@@ -829,7 +987,8 @@ export async function POST(req: NextRequest) {
       // Attempt atomic lease reservation on DB if Supabase client is available
       if (supabaseClient) {
         try {
-          const { data: leaseData, error: leaseErr } = await supabaseClient.rpc(
+          const privilegedClient = getPrivilegedClient(supabaseClient);
+          const { data: leaseData, error: leaseErr } = await privilegedClient.rpc(
             'claim_analysis_chunk_lease',
             {
               p_job_id: jobKey,
@@ -929,7 +1088,8 @@ ${chunk.text}
         );
         if (supabaseClient && activeLeaseToken) {
           try {
-            await supabaseClient.rpc('commit_analysis_chunk_result', {
+            const privilegedClient = getPrivilegedClient(supabaseClient);
+            await privilegedClient.rpc('commit_analysis_chunk_result', {
               p_job_id: jobKey,
               p_chunk_index: chunk.chunkIndex,
               p_worker_id: workerId,
@@ -1046,7 +1206,8 @@ ${chunk.text}
       // Record successful chunk completion in DB using atomic lease token
       if (supabaseClient && activeLeaseToken) {
         try {
-          const { data: commitRes, error: commitErr } = await supabaseClient.rpc(
+          const privilegedClient = getPrivilegedClient(supabaseClient);
+          const { data: commitRes, error: commitErr } = await privilegedClient.rpc(
             'commit_analysis_chunk_result',
             {
               p_job_id: jobKey,
@@ -1185,6 +1346,8 @@ ${chunk.text}
         {
           success: false,
           checkpointCommitted: true,
+          checkpointStatus: 'completed',
+          draftsPersistStatus: 'failed',
           persisted: false,
           canRetrySave: true,
           error: `AI 개념 추출 및 체크포인트 커밋은 완료되었으나, concept_drafts 테이블 저장에 실패했습니다. (${outcome.persistError || '초안 저장 오류'}). AI 재호출 없이 초안 저장만 다시 시도할 수 있습니다.`,
@@ -1198,7 +1361,7 @@ ${chunk.text}
           completedChunks: progress.completedChunks,
           pendingChunks: progress.pendingChunks,
           failedChunks: progress.failedChunks,
-          isAllComplete: progress.isAllComplete,
+          isAllComplete: false,
           status: progress.status,
           jobKey,
           generationJobId,
@@ -1213,6 +1376,8 @@ ${chunk.text}
     return NextResponse.json({
       success: true,
       checkpointCommitted: true,
+      checkpointStatus: 'completed',
+      draftsPersistStatus: 'persisted',
       persisted: true,
       drafts: outcome.drafts,
       count: outcome.drafts.length,

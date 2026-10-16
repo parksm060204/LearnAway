@@ -2040,11 +2040,19 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             canRetrySave: true,
             message: data.error || '생성 완료, 저장 실패',
           };
+          const saveRes = await saveAnalysisRecovery(getStorageScopeId(), failedObj);
+          if (!saveRes.ok) {
+            failedObj.isMemoryOnly = true;
+            failedObj.message = (failedObj.message || '') + ' (로컬 저장 실패: 메모리에만 보관됨)';
+          }
           setSaveFailedState(failedObj);
-          await saveAnalysisRecovery(getStorageScopeId(), failedObj);
           setConceptReviewMaterial(targetMaterial);
           setIsConceptReviewOpen(true);
-          showToast('AI 개념 추출은 완료되었으나 DB 저장에 실패했습니다. AI 재호출 없이 저장만 다시 시도할 수 있습니다.');
+          showToast(
+            failedObj.isMemoryOnly
+              ? 'AI 개념 추출은 완료되었으나 로컬 저장소 저장에 실패하여 메모리에만 보관되었습니다. JSON 내보내기를 권장합니다.'
+              : 'AI 개념 추출은 완료되었으나 DB 저장에 실패했습니다. AI 재호출 없이 저장만 다시 시도할 수 있습니다.'
+          );
           return;
         }
         const errMsg = data.error || 'AI 개념 분석에 실패했습니다.';
@@ -2107,12 +2115,18 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             canRetrySave: true,
             message: '체크포인트는 완료되었으나 초안 테이블 저장에 실패했습니다. (부분 완료)',
           };
+          const saveRes = await saveAnalysisRecovery(getStorageScopeId(), failedObj);
+          if (!saveRes.ok) {
+            failedObj.isMemoryOnly = true;
+            failedObj.message = (failedObj.message || '') + ' (로컬 저장 실패: 메모리에만 보관됨)';
+          }
           setSaveFailedState(failedObj);
-          await saveAnalysisRecovery(getStorageScopeId(), failedObj);
           setConceptReviewMaterial(targetMaterial);
           setIsConceptReviewOpen(true);
           showToast(
-            '체크포인트는 저장되었으나 초안 테이블 영속 저장에 실패했습니다. AI 재호출 없이 초안 저장을 재시도할 수 있습니다.'
+            failedObj.isMemoryOnly
+              ? '체크포인트는 저장되었으나 초안 테이블 및 로컬 저장소 저장에 실패하여 메모리에만 보관되었습니다. JSON 내보내기를 권장합니다.'
+              : '체크포인트는 저장되었으나 초안 테이블 영속 저장에 실패했습니다. AI 재호출 없이 초안 저장을 재시도할 수 있습니다.'
           );
           return;
         }
@@ -2188,15 +2202,23 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             savedAt: new Date().toISOString(),
             signedRecoveryToken: data.signedRecoveryToken || saveFailedState.signedRecoveryToken,
           };
+          const saveRes = await saveAnalysisRecovery(getStorageScopeId(), updatedFail);
+          if (!saveRes.ok) {
+            updatedFail.isMemoryOnly = true;
+            updatedFail.message = (updatedFail.message || '') + ' (로컬 저장 실패: 메모리에만 보관됨)';
+          }
           setSaveFailedState(updatedFail);
-          await saveAnalysisRecovery(getStorageScopeId(), updatedFail);
         }
         return;
       }
 
       // ONLY cleared when both checkpoint AND drafts are confirmed persisted!
       setSaveFailedState(null);
-      await deleteAnalysisRecovery(getStorageScopeId(), targetMaterial.id);
+      await deleteAnalysisRecovery(
+        getStorageScopeId(),
+        saveFailedState.jobKey,
+        saveFailedState.chunkIndex
+      );
 
       const newDrafts: ConceptDraft[] = data.drafts || saveFailedState.drafts;
       const otherDrafts = conceptDrafts.filter((d) => d.materialId !== targetMaterial.id);
@@ -2307,6 +2329,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
   // Restore analysis progress and checkpointed drafts when opening concept review modal (e.g. after reload)
   useEffect(() => {
+    const scopeAtStart = getStorageScopeId();
     if (!conceptReviewMaterial || !isConceptReviewOpen) return;
     let isCancelled = false;
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2314,8 +2337,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
     const restoreRecoveryItem = async () => {
       try {
-        const item = await loadAnalysisRecovery(getStorageScopeId(), conceptReviewMaterial.id);
-        if (!isCancelled && item) {
+        const item = await loadAnalysisRecovery(scopeAtStart, conceptReviewMaterial.id);
+        if (!isCancelled && item && getStorageScopeId() === scopeAtStart) {
           setSaveFailedState({
             ...item,
             canRetrySave: true,
@@ -2339,13 +2362,21 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             action: 'status',
+            jobKey: analysisProgress?.jobKey || saveFailedState?.jobKey || undefined,
             materialId: conceptReviewMaterial.id,
             subjectId: conceptReviewMaterial.subjectId,
             domain: activeSubject?.domain || 'mathematics',
           }),
         });
         const data = await res.json();
-        if (isCancelled || currentSeq < latestSeq) return;
+        if (isCancelled || currentSeq < latestSeq || getStorageScopeId() !== scopeAtStart) return;
+
+        if (res.status === 404 || data.notFound) {
+          // Explicit NOT FOUND: clear any stale progress for this material
+          setAnalysisProgress((prev) => (prev?.materialId === conceptReviewMaterial.id ? null : prev));
+          return;
+        }
+
         if (res.ok && data.success && data.jobKey && data.materialId === conceptReviewMaterial.id) {
           setAnalysisProgress({
             jobKey: data.jobKey,
@@ -2357,7 +2388,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             status: data.status,
           });
 
-          if (data.status === 'completed') {
+          const isReallyAllComplete =
+            data.isAllComplete ||
+            (data.status === 'completed' && data.draftsPersistStatus === 'persisted');
+          const isPartialPersistFail =
+            data.checkpointStatus === 'completed' && data.draftsPersistStatus === 'failed';
+
+          if (isReallyAllComplete) {
             if (Array.isArray(data.drafts) && data.drafts.length > 0) {
               setConceptDrafts((prevDrafts) => {
                 const currentMaterialDrafts = prevDrafts.filter((d) => d.materialId === conceptReviewMaterial.id);
@@ -2370,8 +2407,20 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 return prevDrafts;
               });
             }
-            deleteAnalysisRecovery(getStorageScopeId(), conceptReviewMaterial.id);
+            await deleteAnalysisRecovery(scopeAtStart, conceptReviewMaterial.id, data.jobKey);
             setSaveFailedState((prev) => (prev?.materialId === conceptReviewMaterial.id ? null : prev));
+          } else if (isPartialPersistFail) {
+            setSaveFailedState((prev) => {
+              if (prev && prev.materialId === conceptReviewMaterial.id) {
+                return {
+                  ...prev,
+                  checkpointStatus: 'committed',
+                  draftsPersistStatus: 'failed',
+                  message: '체크포인트는 완료되었으나 초안 테이블 저장에 실패했습니다. (부분 완료)',
+                };
+              }
+              return prev;
+            });
           } else if (data.status === 'processing') {
             pollTimer = setTimeout(fetchStatus, 2500);
           }
@@ -2386,7 +2435,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       isCancelled = true;
       if (pollTimer) clearTimeout(pollTimer);
     };
-  }, [conceptReviewMaterial, isConceptReviewOpen, activeSubject?.domain]);
+  }, [
+    conceptReviewMaterial,
+    isConceptReviewOpen,
+    activeSubject?.domain,
+    analysisProgress?.jobKey,
+    saveFailedState?.jobKey,
+  ]);
 
   // Stage 3: AI Problem Generation & Review Handlers
   const handleProblemGenerateSuccess = (newDrafts: ProblemDraft[]) => {
@@ -4209,6 +4264,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 checkpointStatus: saveFailedState.checkpointStatus,
                 draftsPersistStatus: saveFailedState.draftsPersistStatus,
                 drafts: saveFailedState.drafts,
+                isMemoryOnly: saveFailedState.isMemoryOnly,
               }
             : null
         }

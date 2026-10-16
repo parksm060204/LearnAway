@@ -32,6 +32,8 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
 async function run() {
+  process.env.ANALYSIS_RECOVERY_SIGNING_SECRET =
+    process.env.ANALYSIS_RECOVERY_SIGNING_SECRET || 'test_secret_for_regressions_analysis_token_signing_123456';
   if (compile.status !== 0) throw new Error(compile.stdout + compile.stderr);
   // Windows cannot create directory symlinks without elevation; a junction works unprivileged.
   fs.symlinkSync(path.join(root, 'node_modules'), path.join(output, 'node_modules'), 'junction');
@@ -344,6 +346,7 @@ exports.requireApiUser = async () => {
         else if (tx.onerror) tx.onerror();
       };
       const api = {
+        indexNames: { contains: (name) => true },
         get: (id) => {
           const req = makeRequest();
           setTimeout(() => {
@@ -370,22 +373,43 @@ exports.requireApiUser = async () => {
         put: (value) => {
           const req = makeRequest();
           setTimeout(() => {
+            const key = value.id || value.materialId;
             if (failure.abortPut.has(value.materialId)) { finish('abort', new Error('injected abort')); return; }
             if (failure.put.has(value.materialId)) { req.error = new Error('injected write failure'); if (req.onerror) req.onerror(); finish('error', req.error); return; }
             if (failure.corruptPut.has(value.materialId)) {
-              store.set(value.materialId, structuredClone({ ...value, markdown: String(value.markdown || '') + ' corrupted' }));
-              req.result = value.materialId;
+              store.set(key, structuredClone({ ...value, markdown: String(value.markdown || '') + ' corrupted' }));
+              req.result = key;
               if (req.onsuccess) req.onsuccess();
               finish('complete');
               return;
             }
-            store.set(value.materialId, structuredClone(value));
-            req.result = value.materialId;
+            store.set(key, structuredClone(value));
+            req.result = key;
             if (req.onsuccess) req.onsuccess();
             finish('complete');
           }, 0);
           return req;
         },
+        index: (indexName) => ({
+          get: (key) => {
+            const req = makeRequest();
+            setTimeout(() => {
+              const item = Array.from(store.values()).find((v) => v && v[indexName] === key);
+              req.result = item ? structuredClone(item) : undefined;
+              if (req.onsuccess) req.onsuccess();
+            }, 0);
+            return req;
+          },
+          getAll: (key) => {
+            const req = makeRequest();
+            setTimeout(() => {
+              const items = Array.from(store.values()).filter((v) => v && v[indexName] === key);
+              req.result = items.map((it) => structuredClone(it));
+              if (req.onsuccess) req.onsuccess();
+            }, 0);
+            return req;
+          },
+        }),
         delete: (id) => {
           const req = makeRequest();
           setTimeout(() => { store.delete(id); if (req.onsuccess) req.onsuccess(); finish('complete'); }, 0);
@@ -411,7 +435,10 @@ exports.requireApiUser = async () => {
           const db = {
             name,
             objectStoreNames: { contains: (storeName) => stores.has(storeName) },
-            createObjectStore: (storeName) => { if (!stores.has(storeName)) stores.set(storeName, new Map()); return {}; },
+            createObjectStore: (storeName) => {
+              if (!stores.has(storeName)) stores.set(storeName, new Map());
+              return { createIndex: () => {} };
+            },
             transaction: (storeName, mode) => makeTransaction(stores, storeName, mode || 'readonly'),
             close: () => {},
           };
@@ -512,7 +539,10 @@ exports.requireApiUser = async () => {
             return { data: result.map(clone), error: null };
           }
           if (ctx.op === 'upsert') {
-            if (state.fail.upsert) return { data: null, error: { message: 'injected upsert failure' } };
+            const shouldFailUpsert = typeof state.fail.upsert === 'function'
+              ? state.fail.upsert(table)
+              : Boolean(state.fail.upsert === true || (Array.isArray(state.fail.upsert) && state.fail.upsert.includes(table)));
+            if (shouldFailUpsert) return { data: null, error: { message: 'injected upsert failure for ' + table } };
             const keys = (ctx.onConflict || 'id').split(',').map((s) => s.trim());
             const items = Array.isArray(ctx.payload) ? ctx.payload : [ctx.payload];
             const savedItems = [];
@@ -627,7 +657,7 @@ exports.requireApiUser = async () => {
           return Promise.resolve({ data: null, error: { message: state.fail.rpcMessage || 'injected rpc failure' } });
         }
         state.rpcCalls.push({ name, params });
-        if (state.rpcImpl) return Promise.resolve(state.rpcImpl(name, params));
+        if (state.rpcImpl) return Promise.resolve(state.rpcImpl(name, params, state));
         if (Object.prototype.hasOwnProperty.call(state.rpcResults, name)) {
           return Promise.resolve(state.rpcResults[name]);
         }
@@ -8351,7 +8381,643 @@ exports.requireApiUser = async () => {
 
       delete global.window;
       delete global.document;
-      delete global.URL;
+      global.URL = (await import('node:url')).URL;
+    });
+  });
+
+  // =========================================================================
+  // 6대 핵심 프로덕션 결함 검증 스위트
+  // =========================================================================
+
+  await checkAsync('6대 문제 1: 진행률 조회를 실제 분석 작업과 연결 및 부재/교차 계정 차단', async () => {
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const { NextRequest } = load(path.join(output, 'node_modules/next/server.js'));
+
+    const testUser = { id: 'test-user', email: 'test@example.com' };
+    const fakeSubjectId = 'sub_p1_math';
+    const fakeMaterialId = 'mat_p1_101';
+    const fakeJobKey = 'job_p1_real_101';
+
+    let aiCalls = 0;
+    const aiClientPath = path.join(output, 'lib', 'aiClient.js');
+    const aiModule = load(aiClientPath);
+    aiModule.callAiChat = async () => {
+      aiCalls++;
+      return { ok: true, content: '{"concepts":[]}', model: 'deepseek-v4.1-flash' };
+    };
+
+    await withFakeSupabase({
+      user: testUser,
+      materials: [{ id: fakeMaterialId, user_id: testUser.id, subject_id: fakeSubjectId }],
+      analysis_jobs: [
+        {
+          id: fakeJobKey,
+          user_id: testUser.id,
+          subject_id: fakeSubjectId,
+          material_id: fakeMaterialId,
+          markdown_hash: 'hash_p1',
+          domain: 'math_stats',
+          model_id: 'deepseek-v4.1-flash',
+          prompt_version: 'v2',
+          chunking_version: 'v1',
+          total_chunks: 2,
+          status: 'processing',
+          updated_at: new Date().toISOString(),
+        },
+      ],
+      analysis_job_chunks: [
+        {
+          job_id: fakeJobKey,
+          chunk_index: 1,
+          status: 'completed',
+          drafts: [],
+          updated_at: new Date().toISOString(),
+        },
+        {
+          job_id: fakeJobKey,
+          chunk_index: 2,
+          status: 'pending',
+          drafts: [],
+          updated_at: new Date().toISOString(),
+        },
+      ],
+      concept_drafts: [],
+      rpcImpl: (fn) => {
+        if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+        return { data: null, error: null };
+      },
+    }, async () => {
+      // 1) Actual UI query: passes materialId and subjectId without jobKey (reload simulation)
+      const reloadReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'status',
+          materialId: fakeMaterialId,
+          subjectId: fakeSubjectId,
+          domain: 'math_stats',
+        }),
+      });
+
+      const reloadRes = await analyzePost(reloadReq);
+      const reloadData = await reloadRes.json();
+
+      assert.equal(reloadRes.status, 200, '새로고침 후 jobKey 없이도 materialId로 기존 작업 복원 성공');
+      assert.equal(reloadData.jobKey, fakeJobKey, '정확한 기존 jobKey 반환');
+      assert.equal(reloadData.materialId, fakeMaterialId, '응답에 materialId 일치');
+      assert.equal(reloadData.subjectId, fakeSubjectId, '응답에 subjectId 일치');
+      assert.equal(reloadData.completedChunks, 1, '완료된 청크 수 복원');
+      assert.equal(reloadData.totalChunks, 2, '전체 청크 수 복원');
+      assert.equal(aiCalls, 0, '상태 조회 과정에서 AI 호출 0회 보장');
+
+      // 2) Explicit NOT FOUND for non-existing job/material
+      const notFoundReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'status',
+          materialId: 'mat_non_existing_999',
+          subjectId: fakeSubjectId,
+          domain: 'math_stats',
+        }),
+      });
+      const notFoundRes = await analyzePost(notFoundReq);
+      const notFoundData = await notFoundRes.json();
+
+      assert.equal(notFoundRes.status, 404, '존재하지 않는 작업 상태 조회 시 명시적 404');
+      assert.equal(notFoundData.notFound, true, 'notFound: true 명시 플래그 반환');
+      assert.equal(notFoundData.errorCode, 'JOB_NOT_FOUND', 'JOB_NOT_FOUND 에러 코드 반환');
+      assert.equal(aiCalls, 0, '존재하지 않는 작업 조회에서도 AI 호출 0회 보장');
+    });
+  });
+
+  await checkAsync('6대 문제 2: 복구 서명 전체 필드(출처검증·추가근거·승인상태) 변조 탐지 및 비밀값 미설정 즉각 실패', async () => {
+    const { signRecoveryToken, verifyRecoveryToken, hasRecoverySigningSecret } = load(path.join(output, 'lib/recoveryToken.js'));
+
+    const baseDraft = {
+      id: 'd_p2_1',
+      subjectId: 'sub_p2',
+      materialId: 'mat_p2',
+      title: '베이즈 정리',
+      domain: 'math_stats',
+      description: '사전확률과 사후확률의 관계를 나타낸다.',
+      coreDefinitionFormulaOrAlgorithm: 'P(A|B) = \\frac{P(B|A)P(A)}{P(B)}',
+      prerequisites: ['조건부확률'],
+      relatedConcepts: ['전확률 정리'],
+      commonMisconceptions: ['P(A|B)와 P(B|A)를 혼동한다.'],
+      examples: ['희귀 질병 진단 확률 계산'],
+      sourceEvidence: {
+        type: 'page',
+        pageNumber: 42,
+        quote: '베이즈 정리를 정의한다.',
+        verified: false,
+      },
+      additionalEvidences: [
+        { type: 'transcript_block', blockIndex: 3, quote: '교수님 강의 발화', verified: false },
+      ],
+      status: 'draft',
+      isApproved: false,
+      sourceMarkdownHash: 'hash_p2_base',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const tokenParams = {
+      userId: 'test-user',
+      jobId: 'job_p2_1',
+      materialId: 'mat_p2',
+      subjectId: 'sub_p2',
+      domain: 'math_stats',
+      chunkIndex: 1,
+      markdownHash: 'hash_p2_base',
+      modelId: 'deepseek-v4.1-flash',
+      drafts: [baseDraft],
+    };
+
+    const validToken = signRecoveryToken(tokenParams);
+    assert.ok(validToken, '정상 복구 토큰 발급');
+
+    // 1) Verify clean token passes
+    const validRes = verifyRecoveryToken(validToken, tokenParams);
+    assert.equal(validRes.ok, true, '변조 없는 원본 토큰 검증 성공');
+
+    // 2) Tamper: sourceEvidence.verified (false -> true)
+    const tamperedEvidence = structuredClone(tokenParams);
+    tamperedEvidence.drafts[0].sourceEvidence.verified = true;
+    const resEvidence = verifyRecoveryToken(validToken, tamperedEvidence);
+    assert.equal(resEvidence.ok, false, 'sourceEvidence.verified 변조 시 거부');
+    assert.equal(resEvidence.code, 'TAMPERED');
+
+    // 3) Tamper: additionalEvidences
+    const tamperedAddl = structuredClone(tokenParams);
+    tamperedAddl.drafts[0].additionalEvidences[0].verified = true;
+    const resAddl = verifyRecoveryToken(validToken, tamperedAddl);
+    assert.equal(resAddl.ok, false, 'additionalEvidences 변조 시 거부');
+    assert.equal(resAddl.code, 'TAMPERED');
+
+    // 4) Tamper: isApproved (false -> true)
+    const tamperedApproved = structuredClone(tokenParams);
+    tamperedApproved.drafts[0].isApproved = true;
+    const resApproved = verifyRecoveryToken(validToken, tamperedApproved);
+    assert.equal(resApproved.ok, false, 'isApproved 승인 상태 변조 시 거부');
+    assert.equal(resApproved.code, 'TAMPERED');
+
+    // 5) Tamper: materialId or subjectId in draft
+    const tamperedMat = structuredClone(tokenParams);
+    tamperedMat.drafts[0].materialId = 'mat_forged';
+    const resMat = verifyRecoveryToken(validToken, tamperedMat);
+    assert.equal(resMat.ok, false, '초안 내부 materialId 변조 시 거부');
+    assert.equal(resMat.code, 'TAMPERED');
+
+    // 6) Replay to another user or job
+    const replayUser = verifyRecoveryToken(validToken, { ...tokenParams, userId: 'u_attacker' });
+    assert.equal(replayUser.ok, false, '타 계정 토큰 재사용 거부');
+    assert.equal(replayUser.code, 'MISMATCH');
+
+    // 7) Secret unconfigured test: explicitly fails with no hardcoded fallback
+    const originalSecret = process.env.ANALYSIS_RECOVERY_SIGNING_SECRET;
+    const originalRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    try {
+      delete process.env.ANALYSIS_RECOVERY_SIGNING_SECRET;
+      delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+      assert.equal(hasRecoverySigningSecret(), false, '서명 키 미설정 감지');
+      assert.throws(() => {
+        signRecoveryToken(tokenParams);
+      }, /ANALYSIS_RECOVERY_SIGNING_SECRET 또는 SUPABASE_SERVICE_ROLE_KEY/, '서명 키 미설정 시 고정 문자열 폴백 없이 명시적 예외 발생');
+    } finally {
+      process.env.ANALYSIS_RECOVERY_SIGNING_SECRET = originalSecret;
+      if (originalRoleKey) process.env.SUPABASE_SERVICE_ROLE_KEY = originalRoleKey;
+    }
+  });
+
+  await checkAsync('6대 문제 3: 직접 RPC 우회 차단 및 서버 전용 결과 확정 권한 분리 (Migration 18 검증)', async () => {
+    // 1) Verify Migration 18 SQL exists and revokes execution from public/anon/authenticated
+    const migPath = path.join(root, 'supabase/migrations/20260101000018_restrict_analysis_commit_to_service_role.sql');
+    assert.ok(fs.existsSync(migPath), 'Migration 18 파일이 존재함');
+    const migSql = fs.readFileSync(migPath, 'utf8');
+
+    assert.ok(
+      /revoke (all|execute) on function public\.commit_analysis_chunk_result/i.test(migSql) &&
+      migSql.includes('public, anon, authenticated'),
+      'commit_analysis_chunk_result가 일반 사용자 및 공개 권한에서 취소됨'
+    );
+    assert.ok(
+      /revoke (all|execute) on function public\.claim_analysis_chunk_lease/i.test(migSql) &&
+      migSql.includes('public, anon, authenticated'),
+      'claim_analysis_chunk_lease가 일반 사용자 및 공개 권한에서 취소됨'
+    );
+    assert.ok(
+      /grant execute on function public\.commit_analysis_chunk_result/i.test(migSql) &&
+      migSql.includes('service_role'),
+      '결과 확정 권한은 오직 service_role에만 부여됨'
+    );
+    assert.ok(
+      /drop policy if exists .* on public\.analysis_job_chunks/i.test(migSql),
+      '청크 직접 쓰기 RLS 우회 차단됨'
+    );
+
+    // 2) Unprivileged caller RPC rejection simulation
+    const unprivilegedClient = {
+      rpc: (fn) => {
+        if (fn === 'commit_analysis_chunk_result' || fn === 'claim_analysis_chunk_lease') {
+          return { data: null, error: { message: 'permission denied for function ' + fn, code: '42501' } };
+        }
+        return { data: null, error: null };
+      },
+    };
+
+    const directCall = unprivilegedClient.rpc('commit_analysis_chunk_result', {
+      p_job_id: 'job_attack',
+      p_chunk_index: 1,
+      p_worker_id: 'w_hack',
+      p_lease_token: 'fake',
+      p_status: 'completed',
+      p_drafts: [],
+    });
+    assert.equal(directCall.error.code, '42501', '일반 사용자의 직접 결과 확정 RPC 호출은 DB 권한 오류로 거부됨');
+  });
+
+  await checkAsync('6대 문제 4: 복구 데이터 작업·청크별 독립 보존, durable 트랜잭션, 조건부 삭제 및 메모리 폴백', async () => {
+    const {
+      saveAnalysisRecovery,
+      loadAnalysisRecovery,
+      deleteAnalysisRecovery,
+      listAnalysisRecoveries,
+    } = load(path.join(output, 'lib/analysisRecovery.js'));
+
+    await withFakeIndexedDB(async () => {
+      const scopeId = 'u_p4_user';
+      const matId = 'mat_p4_same';
+      const job1 = 'job_p4_1';
+
+      const draftA = {
+        id: 'd_chunk1',
+        materialId: matId,
+        subjectId: 'sub_p4',
+        title: '미적분학 기본정리 1',
+        domain: 'math_stats',
+        description: '도함수의 정적분',
+        coreDefinitionFormulaOrAlgorithm: '\\frac{d}{dx}\\int_a^x f(t)dt = f(x)',
+        prerequisites: [],
+        relatedConcepts: [],
+        commonMisconceptions: [],
+        examples: [],
+        sourceEvidence: { type: 'page', quote: '기본정리', verified: false },
+        status: 'draft',
+        isApproved: false,
+      };
+
+      const draftB = {
+        id: 'd_chunk2',
+        materialId: matId,
+        subjectId: 'sub_p4',
+        title: '미적분학 기본정리 2',
+        domain: 'math_stats',
+        description: '정적분의 계산',
+        coreDefinitionFormulaOrAlgorithm: '\\int_a^b f(x)dx = F(b)-F(a)',
+        prerequisites: [],
+        relatedConcepts: [],
+        commonMisconceptions: [],
+        examples: [],
+        sourceEvidence: { type: 'page', quote: '계산 공식', verified: false },
+        status: 'draft',
+        isApproved: false,
+      };
+
+      // 1) Save chunk 1 and chunk 2 for the same material
+      const res1 = await saveAnalysisRecovery(scopeId, {
+        jobKey: job1,
+        chunkIndex: 1,
+        workerId: 'w1',
+        leaseToken: 'lt1',
+        drafts: [draftA],
+        materialId: matId,
+        subjectId: 'sub_p4',
+        domain: 'math_stats',
+        markdownHash: 'hash_p4',
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: new Date(Date.now() - 5000).toISOString(),
+      });
+      assert.equal(res1.ok, true, '청크 1 저장 성공');
+
+      const res2 = await saveAnalysisRecovery(scopeId, {
+        jobKey: job1,
+        chunkIndex: 2,
+        workerId: 'w1',
+        leaseToken: 'lt2',
+        drafts: [draftB],
+        materialId: matId,
+        subjectId: 'sub_p4',
+        domain: 'math_stats',
+        markdownHash: 'hash_p4',
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: new Date().toISOString(),
+      });
+      assert.equal(res2.ok, true, '청크 2 저장 성공');
+
+      // 2) Verify both chunks exist simultaneously under the same material (no overwrite!)
+      const allForMat = await listAnalysisRecoveries(scopeId, matId);
+      assert.equal(allForMat.length, 2, '같은 자료의 청크 1과 청크 2가 서로를 덮어쓰지 않고 공존함');
+
+      const loadedC1 = await loadAnalysisRecovery(scopeId, job1, 1);
+      const loadedC2 = await loadAnalysisRecovery(scopeId, job1, 2);
+      assert.ok(loadedC1 && loadedC1.drafts[0].title === '미적분학 기본정리 1');
+      assert.ok(loadedC2 && loadedC2.drafts[0].title === '미적분학 기본정리 2');
+
+      // 3) Conditional deletion: older request completion cannot delete newer chunk record
+      await deleteAnalysisRecovery(scopeId, job1, 2, 'outdated_stale_hash');
+      const recheckC2 = await loadAnalysisRecovery(scopeId, job1, 2);
+      assert.ok(recheckC2, '해시가 일치하지 않는 구버전 요청의 삭제는 새 청크 복구 데이터를 삭제하지 못함');
+
+      // 4) Deleting exact chunk 1 leaves chunk 2 intact
+      await deleteAnalysisRecovery(scopeId, job1, 1);
+      const checkC1Deleted = await loadAnalysisRecovery(scopeId, job1, 1);
+      const checkC2StillAlive = await loadAnalysisRecovery(scopeId, job1, 2);
+      assert.equal(checkC1Deleted, null, '청크 1만 정확하게 삭제됨');
+      assert.ok(checkC2StillAlive, '청크 2는 안전하게 유지됨');
+    });
+  });
+
+  await checkAsync('6대 문제 5: 체크포인트 완료와 초안 저장 완료 분리 및 상태 조회 일관성', async () => {
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const { NextRequest } = load(path.join(output, 'node_modules/next/server.js'));
+
+    const testUser = { id: 'test-user', email: 'test@example.com' };
+    const fakeSubjectId = 'sub_p5_cs';
+    const fakeMaterialId = 'mat_p5_algo';
+    const fakeDraft = {
+      id: 'd_p5_dijkstra',
+      materialId: fakeMaterialId,
+      subjectId: fakeSubjectId,
+      title: '다익스트라 알고리즘',
+      domain: 'computer_science',
+      description: '단일 출발점 최단 경로 알고리즘',
+      coreDefinitionFormulaOrAlgorithm: 'O((V+E)log V)',
+      prerequisites: ['그래프'],
+      relatedConcepts: ['벨만-포드'],
+      commonMisconceptions: ['음수 가중치 간선이 있어도 동작한다.'],
+      examples: ['GPS 경로 탐색'],
+      sourceEvidence: { type: 'page', quote: '최단경로', verified: false },
+      status: 'draft',
+      isApproved: false,
+    };
+
+    let aiCalls = 0;
+    const aiClientPath = path.join(output, 'lib', 'aiClient.js');
+    const aiModule = load(aiClientPath);
+    aiModule.callAiChat = async () => {
+      aiCalls++;
+      return {
+        ok: true,
+        content: JSON.stringify({ concepts: [fakeDraft] }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    // State: Checkpoint succeeds, but concept_drafts DB insert fails
+    let simulateDraftsPersistFailure = true;
+
+    const fakeJobChunks = [];
+
+    await withFakeSupabase({
+      user: testUser,
+      materials: [{ id: fakeMaterialId, user_id: testUser.id, subject_id: fakeSubjectId }],
+      analysis_jobs: [],
+      analysis_job_chunks: fakeJobChunks,
+      concept_drafts: [],
+      rpcImpl: (fn, args, state) => {
+        if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+        if (fn === 'claim_analysis_chunk_lease') {
+          return { data: { acquired: true, lease_token: 'lease_p5_tok' }, error: null };
+        }
+        if (fn === 'commit_analysis_chunk_result') {
+          const targetIndex = args?.p_chunk_index || 1;
+          const chunks = state.analysis_job_chunks || [];
+          const existing = chunks.find((c) => c.chunk_index === targetIndex);
+          if (existing) {
+            existing.status = args?.p_status || 'completed';
+            existing.drafts = args?.p_drafts || [];
+          } else {
+            chunks.push({
+              job_id: args?.p_job_id,
+              chunk_index: targetIndex,
+              status: args?.p_status || 'completed',
+              drafts: args?.p_drafts || [],
+            });
+          }
+          const jobs = state.analysis_jobs || [];
+          const job = jobs.find((j) => j.id === args?.p_job_id);
+          if (job) job.status = 'completed';
+          return { data: { committed: true, reason: 'committed' }, error: null };
+        }
+        return { data: null, error: null };
+      },
+      fail: {
+        upsert: (table) => simulateDraftsPersistFailure && table === 'concept_drafts',
+      },
+    }, async () => {
+      // 1) First process run: Checkpoint succeeds, drafts persist fails -> partial completion
+      const runReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          materialId: fakeMaterialId,
+          subjectId: fakeSubjectId,
+          domain: 'computer_science',
+          markdown: '# Dijkstra\n\nShortest path algorithm',
+        }),
+      });
+
+      const runRes = await analyzePost(runReq);
+      const runData = await runRes.json();
+
+      assert.equal(runRes.status, 500, '초안 영속 저장 실패 시 500 반환');
+      assert.equal(runData.checkpointCommitted, true, '체크포인트는 커밋 성공');
+      assert.equal(runData.checkpointStatus, 'completed', '체크포인트 상태는 completed');
+      assert.equal(runData.draftsPersistStatus, 'failed', '초안 영속 저장 상태는 failed (부분 완료 명시)');
+      assert.equal(runData.persisted, false, 'persisted는 false');
+      assert.equal(runData.canRetrySave, true, 'AI 재호출 없는 저장 재시도 가능 플래그 제공');
+      assert.ok(runData.signedRecoveryToken, '재시도용 서명된 복구 토큰 발급');
+      assert.equal(aiCalls, 1, '첫 실행에서 AI 1회 호출');
+
+      // 2) Status query during this partial completion state
+      const statusReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'status',
+          jobKey: runData.jobKey,
+          materialId: fakeMaterialId,
+          subjectId: fakeSubjectId,
+          domain: 'computer_science',
+        }),
+      });
+
+      const statusRes = await analyzePost(statusReq);
+      const statusData = await statusRes.json();
+
+      assert.equal(statusData.checkpointStatus, 'completed');
+      assert.equal(statusData.draftsPersistStatus, 'failed');
+      assert.equal(statusData.isAllComplete, false, '초안 미저장 상태이므로 isAllComplete는 false여야 함');
+      assert.equal(aiCalls, 1, '상태 조회에서 AI 호출 0회');
+
+      // 3) Retry save with signedRecoveryToken: DB recovers, drafts persist succeeds!
+      simulateDraftsPersistFailure = false;
+
+      const retryReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey: runData.jobKey,
+          chunkIndex: 1,
+          workerId: runData.workerId || 'w_p5',
+          leaseToken: runData.leaseToken || 'lease_p5_tok',
+          drafts: runData.drafts,
+          materialId: fakeMaterialId,
+          subjectId: fakeSubjectId,
+          domain: 'computer_science',
+          markdownHash: runData.markdownHash,
+          signedRecoveryToken: runData.signedRecoveryToken,
+        }),
+      });
+
+      const retryRes = await analyzePost(retryReq);
+      const retryData = await retryRes.json();
+
+      assert.equal(retryRes.status, 200, '저장 재시도 성공');
+      assert.equal(retryData.persisted, true, '초안 영속 저장 성공');
+      assert.equal(retryData.draftsPersistStatus, 'persisted');
+      assert.equal(aiCalls, 1, '저장 재시도 과정에서 AI 재호출 0회 보장');
+    });
+  });
+
+  await checkAsync('6대 문제 6: 재개 작업의 기록 모델과 실제 호출 모델 일치 및 충돌 거부', async () => {
+    const { POST: analyzePost } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const { NextRequest } = load(path.join(output, 'node_modules/next/server.js'));
+
+    const testUser = { id: 'test-user', email: 'test@example.com' };
+    const fakeSubjectId = 'sub_p6';
+    const fakeMaterialId = 'mat_p6';
+    const fakeJobKey = 'job_p6_model_a';
+
+    let actualConfigModelReceivedByAi = '';
+    const aiClientPath = path.join(output, 'lib', 'aiClient.js');
+    const aiModule = load(aiClientPath);
+    aiModule.callAiChat = async (_opts, config) => {
+      actualConfigModelReceivedByAi = config.model;
+      return { ok: true, content: '{"concepts":[]}', model: config.model };
+    };
+
+    // User settings returned from resolveAiConfigForUser is Model B ('gpt-4o')
+    const aiCredPath = path.join(output, 'lib', 'aiCredentials.js');
+    const credModule = load(aiCredPath);
+    credModule.resolveAiConfigForUser = async () => ({
+      ok: true,
+      config: {
+        provider: 'openai',
+        apiKey: 'sk-test',
+        model: 'gpt-4o', // Model B
+      },
+    });
+
+    const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
+    const p6Markdown = '# Section 1\n\n' + 'A'.repeat(5000) + '\n\n# Section 2\n\n' + 'B'.repeat(5000);
+    const p6MarkdownHash = computeMarkdownHash(p6Markdown);
+
+    await withFakeSupabase({
+      user: testUser,
+      materials: [{ id: fakeMaterialId, user_id: testUser.id, subject_id: fakeSubjectId }],
+      analysis_jobs: [
+        {
+          id: fakeJobKey,
+          user_id: testUser.id,
+          subject_id: fakeSubjectId,
+          material_id: fakeMaterialId,
+          markdown_hash: p6MarkdownHash,
+          domain: 'math_stats',
+          model_id: 'deepseek-v4.1-flash', // Originally created with Model A
+          prompt_version: 'v2',
+          chunking_version: 'v1',
+          total_chunks: 2,
+          status: 'paused',
+          updated_at: new Date().toISOString(),
+        },
+      ],
+      analysis_job_chunks: [
+        {
+          job_id: fakeJobKey,
+          chunk_index: 1,
+          status: 'completed',
+          drafts: [],
+        },
+        {
+          job_id: fakeJobKey,
+          chunk_index: 2,
+          status: 'pending',
+          drafts: [],
+        },
+      ],
+      concept_drafts: [],
+      rpcImpl: (fn) => {
+        if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+        if (fn === 'resume_analysis_job') return { data: { success: true }, error: null };
+        if (fn === 'claim_analysis_chunk_lease') return { data: { acquired: true, lease_token: 'lease_p6' }, error: null };
+        if (fn === 'commit_analysis_chunk_result') return { data: { committed: true }, error: null };
+        return { data: null, error: null };
+      },
+    }, async () => {
+      // 1) Explicit model mismatch attempt: user sends payload requesting Model B into Job A
+      const mismatchReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          jobKey: fakeJobKey,
+          materialId: fakeMaterialId,
+          subjectId: fakeSubjectId,
+          domain: 'math_stats',
+          markdown: p6Markdown,
+          model: 'gpt-4o', // User tries to mix Model B into Job A!
+        }),
+      });
+
+      const mismatchRes = await analyzePost(mismatchReq);
+      const mismatchData = await mismatchRes.json();
+
+      assert.equal(mismatchRes.status, 400, '기존 작업의 모델과 다른 모델로 요청 시 400 반환');
+      assert.equal(mismatchData.errorCode, 'JOB_MODEL_MISMATCH', 'JOB_MODEL_MISMATCH 에러 코드 반환');
+      assert.ok(mismatchData.error.includes('하나의 작업에 혼합할 수 없습니다'));
+
+      // 2) Normal resume: user calls process without forcing new model
+      // The server MUST enforce Model A (deepseek-v4.1-flash) for actual AI call
+      const resumeReq = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          jobKey: fakeJobKey,
+          materialId: fakeMaterialId,
+          subjectId: fakeSubjectId,
+          domain: 'math_stats',
+          markdown: p6Markdown,
+          chunkIndex: 2,
+        }),
+      });
+
+      const resumeRes = await analyzePost(resumeReq);
+      const resumeData = await resumeRes.json();
+
+      assert.equal(resumeRes.status, 200, '재개 작업 정상 완료');
+      assert.equal(
+        actualConfigModelReceivedByAi,
+        'deepseek-v4.1-flash',
+        '실제 AI 호출에 전달된 모델이 기존 작업 모델(Model A)과 엄격히 일치함'
+      );
+      assert.equal(resumeData.model, 'deepseek-v4.1-flash', '응답 메타데이터의 모델 일치');
     });
   });
 
