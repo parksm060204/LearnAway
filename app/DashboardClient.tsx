@@ -320,10 +320,21 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     scopeId: string;
     records: UnmigratedRecoveryRecord[];
   }>({ scopeId: 'shared', records: [] });
-  const [recoveryDbStatus, setRecoveryDbStatus] = useState<{
+  const [itemRecoveryError, setItemRecoveryError] = useState<{
     blocked: boolean;
     error: string;
   } | null>(null);
+  const [unmigratedRecoveryError, setUnmigratedRecoveryError] = useState<{
+    blocked: boolean;
+    error: string;
+  } | null>(null);
+  const recoveryRequestSeqRef = useRef<number>(0);
+
+  const recoveryDbStatus = useMemo(() => {
+    if (itemRecoveryError) return itemRecoveryError;
+    if (unmigratedRecoveryError) return unmigratedRecoveryError;
+    return null;
+  }, [itemRecoveryError, unmigratedRecoveryError]);
 
   const fetchUnmigrated = useCallback(async () => {
     const scopeAtStart = getStorageScopeId();
@@ -332,13 +343,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       if (getStorageScopeId() !== scopeAtStart) return;
       if (res.status === 'success') {
         setUnmigratedRecoveries({ scopeId: scopeAtStart, records: res.data });
+        setUnmigratedRecoveryError(null);
       } else if (res.status === 'blocked') {
-        setRecoveryDbStatus({
+        setUnmigratedRecoveryError({
           blocked: true,
           error: res.error || '다른 탭에서 데이터베이스를 사용 중입니다. 다른 탭을 닫고 다시 시도해 주세요.',
         });
       } else {
-        setRecoveryDbStatus({
+        setUnmigratedRecoveryError({
           blocked: false,
           error: res.error || '미이관 복구 데이터 조회 실패',
         });
@@ -2403,7 +2415,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         if (isCancelled || getStorageScopeId() !== scopeAtStart) return;
 
         if (res.status === 'blocked') {
-          setRecoveryDbStatus({
+          setItemRecoveryError({
             blocked: true,
             error: res.error || '다른 탭에서 데이터베이스를 사용 중입니다. 다른 탭을 닫고 다시 시도해 주세요.',
           });
@@ -2411,7 +2423,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }
 
         if (res.status === 'error') {
-          setRecoveryDbStatus({
+          setItemRecoveryError({
             blocked: false,
             error: res.error || '복구 데이터 읽기 오류가 발생했습니다.',
           });
@@ -2419,7 +2431,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }
 
         // res.status === 'success' or 'not_found'
-        setRecoveryDbStatus(null);
+        setItemRecoveryError(null);
         if (res.status === 'success') {
           const item = res.data;
           setSaveFailedState({
@@ -3564,7 +3576,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         <div className="w-full bg-[#fbf9f5] border-b border-[#e2ded6]">
           <div className="max-w-[1440px] mx-auto px-4 sm:px-6 py-2.5 flex flex-col sm:flex-row sm:items-center gap-2 justify-between">
             <div className="text-xs text-[#57544e]">
-              <span className="font-bold text-[#191817]">AI 기능을 사용하려면 내 API 연결이 필요합니다.</span>{' '}
+              <span className="font-bold text-[#c52828]">AI 기능을 사용하려면 내 API 연결이 필요합니다.</span>{' '}
               학교 BAZE API 키를 등록하면 AI 호출 크레딧이 키를 발급한 계정에서 차감됩니다.
             </div>
             <button
@@ -4315,6 +4327,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           };
         }}
         onOpenConceptReview={(mat) => {
+          recoveryRequestSeqRef.current++;
+          setItemRecoveryError(null);
+          setUnmigratedRecoveryError(null);
           setConceptReviewMaterial(mat || null);
           setIsConceptReviewOpen(true);
         }}
@@ -4328,9 +4343,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         <ConceptReviewModal
           isOpen={isConceptReviewOpen}
         onClose={() => {
+          recoveryRequestSeqRef.current++;
           setIsConceptReviewOpen(false);
           setConceptReviewMaterial(null);
-          setRecoveryDbStatus(null);
+          setItemRecoveryError(null);
+          setUnmigratedRecoveryError(null);
         }}
         activeSubject={activeSubject}
         material={conceptReviewMaterial}
@@ -4363,12 +4380,25 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }
         recoveryDbStatus={recoveryDbStatus}
         onRetryRecoveryDb={() => {
-          setRecoveryDbStatus(null);
+          const currentSeq = ++recoveryRequestSeqRef.current;
+          const currentScope = getStorageScopeId();
+          const targetMaterialId = conceptReviewMaterial?.id;
+          setItemRecoveryError(null);
+          setUnmigratedRecoveryError(null);
           fetchUnmigrated();
           if (conceptReviewMaterial) {
-            loadAnalysisRecovery(getStorageScopeId(), conceptReviewMaterial.id).then((res) => {
+            loadAnalysisRecovery(currentScope, conceptReviewMaterial.id).then((res) => {
+              if (
+                recoveryRequestSeqRef.current !== currentSeq ||
+                !isConceptReviewOpen ||
+                conceptReviewMaterial?.id !== targetMaterialId ||
+                getStorageScopeId() !== currentScope
+              ) {
+                return;
+              }
               if (res.status === 'success') {
                 const item = res.data;
+                setItemRecoveryError(null);
                 setSaveFailedState({
                   ...item,
                   canRetrySave: true,
@@ -4378,15 +4408,24 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                       : 'AI 생성 완료 / DB 저장 실패',
                 });
               } else if (res.status === 'blocked') {
-                setRecoveryDbStatus({ blocked: true, error: res.error });
+                setItemRecoveryError({ blocked: true, error: res.error });
               } else if (res.status === 'error') {
-                setRecoveryDbStatus({ blocked: false, error: res.error });
+                setItemRecoveryError({ blocked: false, error: res.error });
               }
             });
           }
         }}
         onExportRecoveryJson={() => {
           if (saveFailedState && conceptReviewMaterial) {
+            const currentScope = getStorageScopeId();
+            if (saveFailedState.materialId !== conceptReviewMaterial.id) {
+              showToast('현재 선택된 자료와 복구 데이터의 식별자가 일치하지 않습니다.');
+              return;
+            }
+            if (saveFailedState.scopeId && saveFailedState.scopeId !== currentScope) {
+              showToast('현재 로그인 계정과 복구 데이터의 소유 범위가 일치하지 않습니다.');
+              return;
+            }
             exportAnalysisRecoveryAsJson(saveFailedState, conceptReviewMaterial.title);
             showToast('복구 데이터가 JSON 파일로 다운로드되었습니다.');
           }

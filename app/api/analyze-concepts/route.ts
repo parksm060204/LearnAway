@@ -9,6 +9,7 @@ import { persistConceptDraftsForResponse } from '../../../lib/cloud/draftPersist
 import { ConceptDraft, ConceptEvidence } from '../../../lib/types';
 import {
   computeMarkdownHash,
+  compareSourceMarkdown,
   chunkMarkdownForAnalysis,
   verifySourceCitation,
   MarkdownChunk,
@@ -428,7 +429,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    let serverMaterialRow: { id: string; user_id: string; subject_id?: string; content_hash?: string } | null = null;
     if (supabaseClient && typeof supabaseClient.from === 'function') {
       try {
         // 1. Verify subject exists in public.subjects and belongs to auth.user.id
@@ -480,7 +480,6 @@ export async function POST(req: NextRequest) {
         }
 
         if (matRow) {
-          serverMaterialRow = matRow;
           if (matRow.user_id !== auth.user.id) {
             return NextResponse.json(
               {
@@ -708,22 +707,14 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      // Check if source material body has changed since this job was run
-      const currentMarkdownHash =
-        asString(payload.currentMarkdownHash) || (markdown.trim() ? computeMarkdownHash(markdown) : '');
-      let isSourceOutdated = false;
-      if (currentMarkdownHash && currentMarkdownHash !== session.markdownHash) {
-        isSourceOutdated = true;
-      }
-      if (
-        !isSourceOutdated &&
-        serverMaterialRow &&
-        typeof serverMaterialRow.content_hash === 'string' &&
-        serverMaterialRow.content_hash &&
-        serverMaterialRow.content_hash !== session.markdownHash
-      ) {
-        isSourceOutdated = true;
-      }
+      // Check if source material body has changed using canonical compareSourceMarkdown
+      // Strict rule: Never compare differing hash formats (e.g. mh_ vs h_).
+      const sourceComparison = compareSourceMarkdown({
+        sourceMarkdownHash: session.markdownHash,
+        currentMarkdown: markdown.trim() ? markdown : null,
+        clientMarkdownHash: asString(payload.currentMarkdownHash) || null,
+      });
+      const isSourceOutdated = sourceComparison.isOutdated;
 
       let authoritativeDrafts: ConceptDraft[] = targetDrafts;
 
@@ -952,6 +943,7 @@ export async function POST(req: NextRequest) {
             materialId: session.materialId,
             subjectId: session.subjectId,
             status: progress.status,
+            sourceStatus: sourceComparison.status,
           },
           { status: 500 }
         );
@@ -968,6 +960,7 @@ export async function POST(req: NextRequest) {
         draftsPersistStatus: 'persisted',
         persisted: true,
         retried: true,
+        sourceStatus: sourceComparison.status,
         drafts: finalDrafts,
         count: finalDrafts.length,
         jobKey,

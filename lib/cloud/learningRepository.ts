@@ -143,6 +143,45 @@ export async function upsertConceptDrafts(
           existing.status === 'approved' ||
           existing.status === 'rejected';
 
+        // Persist needs_source_review to server concept_drafts if requested,
+        // while strictly preserving user edits, approved state, content_version,
+        // and protecting drafts already generated or re-verified against a newer source.
+        if (draft.needsSourceReview === true) {
+          const existingSourceHash = (payload.sourceMarkdownHash as string) || '';
+          const isSameOrUnsetVersion =
+            !draft.sourceMarkdownHash ||
+            !existingSourceHash ||
+            existingSourceHash === draft.sourceMarkdownHash;
+
+          if (isSameOrUnsetVersion && !existing.needs_source_review) {
+            const updatedPayload = {
+              ...payload,
+              needsSourceReview: true,
+              ...(payload.sourceEvidence
+                ? {
+                    sourceEvidence: {
+                      ...(payload.sourceEvidence as Record<string, unknown>),
+                      verified: false,
+                      verificationNote: '근거 자료 본문이 수정되어 재검토가 필요합니다.',
+                    },
+                  }
+                : {}),
+            };
+
+            const { error: updateErr } = await supabase
+              .from('concept_drafts')
+              .update({
+                needs_source_review: true,
+                payload: updatedPayload,
+              })
+              .eq('id', draft.id);
+
+            if (updateErr) return repoError(updateErr.message);
+            existing.needs_source_review = true;
+            existing.payload = updatedPayload;
+          }
+        }
+
         if (isUserEdited || isApprovedOrRejected) {
           // Strictly preserve user edits and approved state!
           const preserved = rowToConceptDraft(existing);

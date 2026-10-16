@@ -87,7 +87,20 @@ export function TopUtilityBar({
         {/* Left: Brand + Subject Selector */}
         <div className="flex items-center gap-3">
           {/* Logo */}
-          <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              closeMenus();
+              if (onSelectTab) {
+                onSelectTab('today');
+              } else {
+                onScrollToTodayReview();
+              }
+            }}
+            className="flex items-center gap-2 cursor-pointer text-left hover:opacity-80 transition-opacity focus:outline-none"
+            title="홈(오늘 학습)으로 이동"
+            aria-label="홈으로 이동"
+          >
             <span className="w-3 h-3 bg-[#c52828] inline-block shrink-0" aria-hidden="true" />
             <span className="font-extrabold tracking-wider text-base font-academic-mono text-[#191817]">
               Learn my way
@@ -95,7 +108,7 @@ export function TopUtilityBar({
             <span className="text-[11px] font-academic-mono tracking-wider px-1.5 py-0.5 border border-[#c8c2b5] bg-[#faf8f4] text-[#57544e] rounded-xs font-medium">
               ACADEMIC V2.4
             </span>
-          </div>
+          </button>
 
           <span className="hidden sm:inline text-[#c8c2b5]">|</span>
 
@@ -107,7 +120,6 @@ export function TopUtilityBar({
               aria-expanded={isDropdownOpen}
               aria-label="과목 선택 드롭다운"
             >
-              <span className="text-[#827d73] font-academic-mono text-xs">REF:{activeSubject.code.replace('§', '')}</span>
               <span className="truncate max-w-[140px] sm:max-w-[220px]">{activeSubject.name}</span>
               {activeSubject.isDemo && (
                 <span className="text-[10px] font-academic-mono bg-[#f4f1ea] text-[#827d73] px-1.5 py-0.5 rounded-xs border border-[#ded6c8]">
@@ -146,7 +158,7 @@ export function TopUtilityBar({
                           )}
                         </div>
                         <div className="text-[11px] text-[#827d73] font-academic-mono">
-                          {sub.code} · {sub.domain === 'math_stats' ? '수학/수리통계' : '컴퓨터공학/코딩'}
+                          {sub.domain === 'math_stats' ? '수학/수리통계' : '컴퓨터공학/코딩'}
                         </div>
                       </div>
                       {sub.id === activeSubject.id && (

@@ -57,8 +57,13 @@ export function conceptToUpsert(concept: Concept): ConceptUpsert {
  * stale payload can never make an approved draft look unapproved.
  */
 export function rowToConceptDraft(row: ConceptDraftRow): ConceptDraft {
+  const base = doc<ConceptDraft>(row.payload);
+  const needsSourceReview =
+    typeof row.needs_source_review === 'boolean'
+      ? row.needs_source_review
+      : Boolean(base.needsSourceReview);
   return {
-    ...doc<ConceptDraft>(row.payload),
+    ...base,
     id: row.id,
     subjectId: row.subject_id,
     materialId: row.material_id ?? undefined,
@@ -69,6 +74,7 @@ export function rowToConceptDraft(row: ConceptDraftRow): ConceptDraft {
     contentVersion: row.content_version,
     approvalState: row.approval_state as ConceptDraft['approvalState'],
     approvedConceptId: row.approved_concept_id ?? undefined,
+    needsSourceReview,
   } as ConceptDraft;
 }
 
@@ -101,6 +107,7 @@ export function conceptDraftContentUpsert(
     material_id: draft.materialId ?? null,
     title: draft.title,
     generation_job_id: jobId ?? null,
+    needs_source_review: draft.needsSourceReview ?? false,
     payload: draft as unknown as Record<string, unknown>,
   };
 }

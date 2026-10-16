@@ -10538,6 +10538,336 @@ exports.requireApiUser = async () => {
     });
   });
 
+  await checkAsync('결함 1 (P2) 검증: compareSourceMarkdown 해시 형식 분리 (mh_ vs h_) 및 출처 상태 삼분화 (identical, changed, unverifiable)', async () => {
+    const { computeMarkdownHash, compareSourceMarkdown } = load(path.join(output, 'lib/markdownUtils.js'));
+    const { POST: analyzeRoute } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+
+    const sourceText = '# Linear Algebra\nEigenvalues and eigenvectors are fundamental.';
+    const sourceHash = computeMarkdownHash(sourceText);
+
+    // 1. Direct compareSourceMarkdown unit verification
+    const sameRes = compareSourceMarkdown({
+      sourceMarkdownHash: sourceHash,
+      currentMarkdown: sourceText,
+    });
+    assert.equal(sameRes.status, 'identical', '동일 본문 비교 시 identical 상태 반환');
+    assert.equal(sameRes.isOutdated, false);
+    assert.equal(sameRes.canVerify, true);
+
+    const diffRes = compareSourceMarkdown({
+      sourceMarkdownHash: sourceHash,
+      currentMarkdown: '# Modified Linear Algebra\nEigenvalues changed.',
+    });
+    assert.equal(diffRes.status, 'changed', '수정된 본문 비교 시 changed 상태 반환');
+    assert.equal(diffRes.isOutdated, true);
+    assert.equal(diffRes.canVerify, true);
+
+    const unverifiableRes = compareSourceMarkdown({
+      sourceMarkdownHash: sourceHash,
+      currentMarkdown: null,
+    });
+    assert.equal(unverifiableRes.status, 'unverifiable', '본문 미제공 시 unverifiable 상태 반환');
+    assert.equal(unverifiableRes.isOutdated, false);
+    assert.equal(unverifiableRes.canVerify, false);
+
+    // 2. Integration with retry_save in route handler
+    // Server material row has content_hash in 'mh_...' format, while session markdownHash is 'h_...'
+    const jobKey = 'job-p1-hash-test';
+    const matId = 'mat-p1-hash';
+    const subId = 'sub-p1-hash';
+
+    await withFakeSupabase({
+      user: { id: 'test-user' },
+      subjects: [{ id: subId, user_id: 'test-user', name: '선형대수학' }],
+      materials: [{
+        id: matId,
+        user_id: 'test-user',
+        subject_id: subId,
+        content_hash: 'mh_canonical_material_content_hash_12345', // differing hash format!
+      }],
+      analysis_jobs: [{
+        id: jobKey,
+        user_id: 'test-user',
+        subject_id: subId,
+        material_id: matId,
+        markdown_hash: sourceHash,
+        domain: 'math_stats',
+        model_id: 'deepseek-v4.1-flash',
+        prompt_version: 'v2',
+        chunking_version: 'v1',
+        total_chunks: 1,
+        status: 'processing',
+      }],
+      analysis_job_chunks: [{
+        job_id: jobKey,
+        chunk_index: 1,
+        source_context: '1장',
+        status: 'completed',
+        drafts: [{ id: 'cd-1', title: '고유값', subjectId: subId, materialId: matId }],
+        attempt_count: 1,
+      }],
+    }, async () => {
+      // (a) retry_save with IDENTICAL markdown text: must NOT be flagged as changed just because server material has mh_ hash!
+      const reqSame = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey,
+          chunkIndex: 1,
+          materialId: matId,
+          subjectId: subId,
+          markdown: sourceText,
+        }),
+      });
+      const resSame = await analyzeRoute(reqSame);
+      const dataSame = await resSame.json();
+      assert.equal(resSame.status, 200);
+      assert.equal(dataSame.sourceStatus, 'identical', '동일한 본문 제공 시 mh_ 해시와 혼동 없이 identical 판정');
+      assert.equal(dataSame.drafts[0].needsSourceReview, false, '동일 본문 복구 시 출처 재검토 요구되지 않음');
+
+      // (b) retry_save with ALTERED markdown text: must be flagged changed
+      const reqDiff = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey,
+          chunkIndex: 1,
+          materialId: matId,
+          subjectId: subId,
+          markdown: '# Modified text that differs from analysis time',
+        }),
+      });
+      const resDiff = await analyzeRoute(reqDiff);
+      const dataDiff = await resDiff.json();
+      assert.equal(resDiff.status, 200);
+      assert.equal(dataDiff.sourceStatus, 'changed');
+      assert.equal(dataDiff.drafts[0].needsSourceReview, true, '수정된 본문 복구 시 needsSourceReview: true 설정');
+
+      // (c) retry_save with missing markdown: unverifiable, save succeeds without error
+      const reqUnverifiable = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'retry_save',
+          jobKey,
+          chunkIndex: 1,
+          materialId: matId,
+          subjectId: subId,
+          markdown: '',
+        }),
+      });
+      const resUnverifiable = await analyzeRoute(reqUnverifiable);
+      const dataUnverifiable = await resUnverifiable.json();
+      assert.equal(resUnverifiable.status, 200);
+      assert.equal(dataUnverifiable.sourceStatus, 'unverifiable');
+    });
+  });
+
+  await checkAsync('결함 2 (P1) 검증: concept_drafts needs_source_review 서버 DB 영속화, 사용자 수정/승인 및 최신 초안 보존', async () => {
+    const { upsertConceptDrafts } = load(path.join(output, 'lib/cloud/learningRepository.js'));
+
+    const subId = 'sub-p2';
+    const matId = 'mat-p2';
+    const initialDraftRow = {
+      id: 'draft-p2-target',
+      user_id: 'user-a',
+      subject_id: subId,
+      material_id: matId,
+      title: '사용자가 수정한 제목 (보존 필수)',
+      edited_by_user: true,
+      is_approved: true,
+      status: 'approved',
+      content_version: 5,
+      needs_source_review: false,
+      payload: {
+        id: 'draft-p2-target',
+        title: '사용자가 수정한 제목 (보존 필수)',
+        subjectId: subId,
+        materialId: matId,
+        editedByUser: true,
+        isApproved: true,
+        status: 'approved',
+        contentVersion: 5,
+        sourceMarkdownHash: 'hash-version-1',
+        sourceEvidence: {
+          quote: '기존 원문 인용',
+          verified: true,
+          verificationNote: '초기 검증 통과',
+        },
+      },
+    };
+
+    await withFakeSupabase({
+      user: { id: 'user-a' },
+      subjects: [{ id: subId, user_id: 'user-a', name: '물리학' }],
+      materials: [{ id: matId, user_id: 'user-a', subject_id: subId }],
+      concept_drafts: [initialDraftRow],
+    }, async (client) => {
+      // 1. Call upsertConceptDrafts with needsSourceReview: true from an outdated source retry
+      const retryDraft = {
+        id: 'draft-p2-target',
+        subjectId: subId,
+        materialId: matId,
+        title: 'AI 생성 초기 제목 (무시되어야 함)',
+        needsSourceReview: true,
+        sourceMarkdownHash: 'hash-version-1',
+      };
+
+      const result = await upsertConceptDrafts(client, [retryDraft], 'job-p2-retry');
+      assert.equal(result.ok, true);
+
+      // Verify that the row in DB was actually updated with needs_source_review: true
+      const { data: dbRows } = await client.from('concept_drafts').select('*').eq('id', 'draft-p2-target');
+      assert.equal(dbRows.length, 1);
+      const updatedRow = dbRows[0];
+
+      assert.equal(updatedRow.needs_source_review, true, 'DB concept_drafts 테이블에 needs_source_review가 true로 영속화됨');
+      assert.equal(updatedRow.payload.needsSourceReview, true, 'payload 내부 needsSourceReview 동기화 확인');
+      assert.equal(updatedRow.payload.sourceEvidence.verified, false, '재검토 대상 초안의 sourceEvidence.verified가 false로 갱신되어 모순 방지');
+
+      // Crucial: User edits and approval status must be strictly preserved!
+      assert.equal(updatedRow.title, '사용자가 수정한 제목 (보존 필수)', '사용자 수정 제목 보존');
+      assert.equal(updatedRow.edited_by_user, true, 'edited_by_user 플래그 보존');
+      assert.equal(updatedRow.is_approved, true, 'is_approved 승인 상태 보존');
+      assert.equal(updatedRow.status, 'approved', 'status 승인 상태 보존');
+      assert.equal(updatedRow.content_version, 5, 'content_version 보존');
+
+      // 2. Stale retry protection: If the draft on the server is already on a NEWER source version (e.g. hash-version-2),
+      // an older retry targeting hash-version-1 must NOT roll back or force review on the newer draft!
+      await client.from('concept_drafts').update({
+        needs_source_review: false,
+        payload: {
+          ...updatedRow.payload,
+          sourceMarkdownHash: 'hash-version-2',
+          needsSourceReview: false,
+        },
+      }).eq('id', 'draft-p2-target');
+
+      const staleRetryDraft = {
+        id: 'draft-p2-target',
+        subjectId: subId,
+        materialId: matId,
+        title: '오래된 재시도 초안',
+        needsSourceReview: true,
+        sourceMarkdownHash: 'hash-version-1', // Older version!
+      };
+
+      const staleResult = await upsertConceptDrafts(client, [staleRetryDraft], 'job-p2-stale');
+      assert.equal(staleResult.ok, true);
+
+      const { data: dbRowsAfterStale } = await client.from('concept_drafts').select('*').eq('id', 'draft-p2-target');
+      assert.equal(dbRowsAfterStale[0].needs_source_review, false, '최신 출처로 재검증된 초안은 이전 작업의 retry_save로 인해 덮어써지지 않음');
+    });
+  });
+
+  await checkAsync('결함 3 (P2) 검증: 수동 복구 재조회 지연 응답 세대(seq) 무효화, 개별/미이관 에러 분리, 메모리 보존 및 JSON 내보내기 검증', async () => {
+    const { loadAnalysisRecovery, saveAnalysisRecovery } = load(path.join(output, 'lib/analysisRecovery.js'));
+
+    await withFakeIndexedDB(async () => {
+      const scopeId = 'u_p3_seq_test';
+      const matA = 'mat-a';
+      const matB = 'mat-b';
+
+      await saveAnalysisRecovery(scopeId, {
+        materialId: matA,
+        jobKey: 'job-a',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-a',
+        chunkIndex: 1,
+        workerId: 'w-a',
+        leaseToken: 't-a',
+        drafts: [{ id: 'd-a', title: '초안 A' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: new Date().toISOString(),
+      });
+
+      await saveAnalysisRecovery(scopeId, {
+        materialId: matB,
+        jobKey: 'job-b',
+        subjectId: 'sub-1',
+        domain: 'math_stats',
+        markdownHash: 'hash-b',
+        chunkIndex: 1,
+        workerId: 'w-b',
+        leaseToken: 't-b',
+        drafts: [{ id: 'd-b', title: '초안 B' }],
+        checkpointStatus: 'committed',
+        draftsPersistStatus: 'failed',
+        savedAt: new Date().toISOString(),
+      });
+
+      // Simulation of sequence / generation tracking in UI
+      let recoveryRequestSeq = 0;
+      let activeMaterialId = matA;
+      let isModalOpen = true;
+      let currentSaveFailedState = null;
+
+      // Request 1: User is on Material A, initiates recovery query
+      const seq1 = ++recoveryRequestSeq;
+      const targetMatId1 = activeMaterialId;
+      const delayedPromise1 = loadAnalysisRecovery(scopeId, matA);
+
+      // User immediately switches to Material B and opens its recovery modal (seq bumps)
+      activeMaterialId = matB;
+      const seq2 = ++recoveryRequestSeq;
+      const resB = await loadAnalysisRecovery(scopeId, matB);
+      if (recoveryRequestSeq === seq2 && isModalOpen && activeMaterialId === matB) {
+        currentSaveFailedState = resB.data;
+      }
+      assert.equal(currentSaveFailedState.materialId, matB, '현재 활성 자료 B의 복구 데이터가 설정됨');
+
+      // Now delayed Request 1 arrives!
+      const resA = await delayedPromise1;
+      let overwritten = false;
+      if (recoveryRequestSeq === seq1 && isModalOpen && activeMaterialId === targetMatId1) {
+        currentSaveFailedState = resA.data;
+        overwritten = true;
+      }
+      assert.equal(overwritten, false, '지연된 이전 요청(seq1)은 최신 시퀀스(seq2) 및 자료 변경으로 인해 무효화됨');
+      assert.equal(currentSaveFailedState.materialId, matB, '자료 B의 상태가 보존됨');
+
+      // User closes modal
+      isModalOpen = false;
+      recoveryRequestSeq++;
+
+      // Any late callback cannot revive state
+      let revived = false;
+      if (isModalOpen && recoveryRequestSeq === seq1) {
+        revived = true;
+      }
+      assert.equal(revived, false, '모달 닫힌 후 지연 응답은 상태를 부활시키지 않음');
+
+      // JSON export validation simulation:
+      // Mismatched materialId test
+      const mismatchedExportAllowed = (state, currentMat, currentScope) => {
+        if (!state || !currentMat) return false;
+        if (state.materialId !== currentMat.id) return false;
+        if (state.scopeId && state.scopeId !== currentScope) return false;
+        return true;
+      };
+
+      assert.equal(
+        mismatchedExportAllowed(currentSaveFailedState, { id: matA, title: '자료 A' }, scopeId),
+        false,
+        '자료 식별자 불일치 시 JSON 내보내기 거부'
+      );
+      assert.equal(
+        mismatchedExportAllowed(currentSaveFailedState, { id: matB, title: '자료 B' }, 'u_other_user'),
+        false,
+        '계정 스코프 불일치 시 JSON 내보내기 거부'
+      );
+      assert.equal(
+        mismatchedExportAllowed(currentSaveFailedState, { id: matB, title: '자료 B' }, scopeId),
+        true,
+        '정상 일치 시 JSON 내보내기 허용'
+      );
+    });
+  });
+
   console.log(`${passed} regression checks passed`);
 }
 

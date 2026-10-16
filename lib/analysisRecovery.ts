@@ -4,6 +4,7 @@ import type { ConceptDraft } from './types';
 export interface AnalysisRecoveryRecord {
   id?: string; // Composite key: `${jobKey}_c${chunkIndex}`
   materialId: string;
+  scopeId?: string;
   jobKey: string;
   subjectId: string;
   domain: string;
@@ -407,6 +408,7 @@ export async function saveAnalysisRecovery(
   const recordToSave: AnalysisRecoveryRecord = {
     ...record,
     id: recordId,
+    scopeId: record.scopeId || scopeId,
     chunkIndex,
     contentHash,
     savedAt: record.savedAt || new Date().toISOString(),
@@ -478,7 +480,7 @@ export async function loadAnalysisRecovery(
         req.onsuccess = () => {
           const rec = req.result as AnalysisRecoveryRecord | undefined;
           if (rec) {
-            resolve({ status: 'success', data: rec });
+            resolve({ status: 'success', data: { scopeId, ...rec } });
           } else {
             resolve({ status: 'not_found' });
           }
@@ -489,7 +491,7 @@ export async function loadAnalysisRecovery(
         const directReq = store.get(keyOrMaterialId);
         directReq.onsuccess = () => {
           if (directReq.result) {
-            resolve({ status: 'success', data: directReq.result as AnalysisRecoveryRecord });
+            resolve({ status: 'success', data: { scopeId, ...(directReq.result as AnalysisRecoveryRecord) } });
             return;
           }
           // Query by materialId index if not found by direct id
@@ -501,7 +503,7 @@ export async function loadAnalysisRecovery(
               if (list.length > 0) {
                 // Return newest record
                 list.sort((a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime());
-                resolve({ status: 'success', data: list[0] });
+                resolve({ status: 'success', data: { scopeId, ...list[0] } });
               } else {
                 resolve({ status: 'not_found' });
               }

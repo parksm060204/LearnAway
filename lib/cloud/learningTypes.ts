@@ -32,6 +32,7 @@ export interface ConceptDraftRow {
   approval_state: string;
   approval_error: string | null;
   edited_by_user?: boolean;
+  needs_source_review?: boolean;
   payload: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
@@ -45,6 +46,7 @@ export interface ConceptDraftContentUpsert {
   material_id: string | null;
   title: string;
   generation_job_id: string | null;
+  needs_source_review?: boolean;
   payload: Record<string, unknown>;
 }
 

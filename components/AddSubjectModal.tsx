@@ -25,7 +25,6 @@ function createSubjectId(): string {
 
 export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectModalProps) {
   const [name, setName] = useState('');
-  const [code, setCode] = useState('');
   const [semester] = useState('2026-2');
   const [examDate, setExamDate] = useState('');
   const [startTime, setStartTime] = useState('10:00');
@@ -47,13 +46,13 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
       return;
     }
 
-    const cleanCode = code.trim() || `§${new Date().getFullYear()}-${domain === 'math_stats' ? 'MATH' : 'CS'}-${Math.floor(Math.random() * 90 + 10)}`;
+    const autoCode = `§${new Date().getFullYear()}-${domain === 'math_stats' ? 'MATH' : 'CS'}-${Math.floor(Math.random() * 90 + 10)}`;
 
     const newSubject: Subject = {
       id: createSubjectId(),
       ownerId: 'local-user',
       name: name.trim(),
-      code: cleanCode.startsWith('§') ? cleanCode : `§${cleanCode}`,
+      code: autoCode,
       semester: semester.trim() || '2026-2',
       examAt: previewIso,
       examEndTime: endTime || undefined,
@@ -72,7 +71,6 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
 
     // Reset form
     setName('');
-    setCode('');
     setExamDate('');
     setLocation('');
     setScope('');
@@ -128,34 +126,19 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
             </div>
           </div>
 
-          {/* Subject Name and Code */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div className="sm:col-span-2">
-              <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-                과목명 <span className="text-[#c52828]">*</span>:
-              </label>
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="예: 수치해석학 및 프로그래밍"
-                required
-                className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817] font-medium"
-              />
-            </div>
-
-            <div>
-              <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-                과목 코드:
-              </label>
-              <input
-                type="text"
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                placeholder="예: §2026-MATH-03"
-                className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817] font-academic-mono"
-              />
-            </div>
+          {/* Subject Name */}
+          <div>
+            <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
+              과목명 <span className="text-[#c52828]">*</span>:
+            </label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="예: 수치해석학 및 프로그래밍"
+              required
+              className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817] font-medium"
+            />
           </div>
 
           {/* Domain Category */}

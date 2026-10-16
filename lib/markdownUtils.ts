@@ -23,6 +23,67 @@ export function computeMarkdownHash(content: string): string {
   return `h_${hex}_l${content.length}`;
 }
 
+export type SourceMaterialStatus = 'identical' | 'changed' | 'unverifiable';
+
+export interface SourceComparisonOutcome {
+  status: SourceMaterialStatus;
+  isOutdated: boolean;
+  canVerify: boolean;
+  sourceMarkdownHash: string;
+  currentMarkdownHash?: string;
+}
+
+/**
+ * Compares an analysis session's source markdown hash with the current markdown.
+ * 
+ * Strict invariants:
+ * 1. Hashes compared MUST come from the same algorithm (computeMarkdownHash) and same input (markdown text).
+ * 2. If the current markdown body is not present, status is 'unverifiable' (or 'changed' if client explicitly flags a differing hash).
+ * 3. Never assume latest or clear review on unverifiable comparison alone.
+ */
+export function compareSourceMarkdown({
+  sourceMarkdownHash,
+  currentMarkdown,
+  clientMarkdownHash,
+}: {
+  sourceMarkdownHash: string;
+  currentMarkdown?: string | null;
+  clientMarkdownHash?: string | null;
+}): SourceComparisonOutcome {
+  if (typeof currentMarkdown === 'string' && currentMarkdown.trim().length > 0) {
+    const computed = computeMarkdownHash(currentMarkdown);
+    const identical = computed === sourceMarkdownHash;
+    return {
+      status: identical ? 'identical' : 'changed',
+      isOutdated: !identical,
+      canVerify: true,
+      sourceMarkdownHash,
+      currentMarkdownHash: computed,
+    };
+  }
+
+  // Current markdown body is not directly available to verify
+  if (clientMarkdownHash && clientMarkdownHash !== sourceMarkdownHash) {
+    // Client explicitly reported a changed markdown hash
+    return {
+      status: 'changed',
+      isOutdated: true,
+      canVerify: false,
+      sourceMarkdownHash,
+      currentMarkdownHash: clientMarkdownHash,
+    };
+  }
+
+  // Neither verified body nor explicit changed hash: state is unverifiable
+  return {
+    status: 'unverifiable',
+    isOutdated: false,
+    canVerify: false,
+    sourceMarkdownHash,
+    currentMarkdownHash: clientMarkdownHash || undefined,
+  };
+}
+
 export interface MarkdownChunk {
   chunkIndex: number;
   text: string;
