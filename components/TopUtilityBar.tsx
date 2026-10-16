@@ -144,8 +144,8 @@ export function TopUtilityBar({
                         setIsDropdownOpen(false);
                       }}
                       className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between hover:bg-[#faf8f4] transition-colors ${sub.id === activeSubject.id
-                          ? 'font-bold text-[#c52828] bg-[#fef2f2]'
-                          : 'text-[#191817]'
+                        ? 'font-bold text-[#c52828] bg-[#fef2f2]'
+                        : 'text-[#191817]'
                         }`}
                     >
                       <div>
@@ -196,8 +196,8 @@ export function TopUtilityBar({
               else onScrollToTodayReview();
             }}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xs transition-colors font-bold ${activeTab === 'today'
-                ? 'bg-[#191817] text-white shadow-xs'
-                : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
+              ? 'bg-[#191817] text-white shadow-xs'
+              : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
               }`}
             title="오늘의 학습 요약으로 이동"
           >
@@ -213,8 +213,8 @@ export function TopUtilityBar({
                 if (onSelectTab) onSelectTab('materials');
               }}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xs transition-colors font-bold ${activeTab === 'materials'
-                  ? 'bg-[#191817] text-white shadow-xs'
-                  : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
+                ? 'bg-[#191817] text-white shadow-xs'
+                : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
                 }`}
               title="과목별 학습 자료 관리"
             >
@@ -293,8 +293,8 @@ export function TopUtilityBar({
                 if (onSelectTab) onSelectTab('problems');
               }}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xs transition-colors font-bold ${activeTab === 'problems'
-                  ? 'bg-[#191817] text-white shadow-xs'
-                  : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
+                ? 'bg-[#191817] text-white shadow-xs'
+                : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
                 }`}
               title="문제은행 작업 공간"
             >
@@ -398,8 +398,8 @@ export function TopUtilityBar({
               else onOpenLearningAnalytics?.();
             }}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xs transition-colors font-bold ${activeTab === 'history'
-                ? 'bg-[#191817] text-white shadow-xs'
-                : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
+              ? 'bg-[#191817] text-white shadow-xs'
+              : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
               }`}
             title="과거 답안·평가와 오답·취약 개념 분석"
           >
@@ -414,8 +414,8 @@ export function TopUtilityBar({
               else onOpenSettings();
             }}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xs transition-colors font-bold ml-1 ${activeTab === 'settings'
-                ? 'bg-[#191817] text-white shadow-xs'
-                : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
+              ? 'bg-[#191817] text-white shadow-xs'
+              : 'text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] border border-transparent'
               }`}
             title="설정 (API 연결 · 저장 정책 · 데이터 관리)"
             aria-label="설정"
