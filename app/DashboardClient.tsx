@@ -23,6 +23,7 @@ import {
   DEFAULT_PERSONALIZATION_SETTINGS,
   RechallengeReservation,
 } from '../lib/types';
+import { notifyTrialCreditsUpdated } from '../lib/trialCreditsClient';
 import { INITIAL_MATERIALS } from '../lib/initialData';
 import {
   loadStoredSubjects,
@@ -2207,6 +2208,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
       setConceptReviewMaterial(targetMaterial);
       setIsConceptReviewOpen(true);
+      notifyTrialCreditsUpdated();
       showToast(`[${targetMaterial.title}] 분석 완료! ${newDrafts.length}개 개념 초안이 생성되었습니다.`);
     } catch (err) {
       showToast(`네트워크 또는 서버 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
@@ -2219,7 +2221,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     if (!saveFailedState || saveFailedState.materialId !== targetMaterial.id) return;
     const scopeAtStart = getStorageScopeId();
     setIsAiAnalyzing(true);
-    showToast(`[${targetMaterial.title}] AI 분석 결과 저장 재시도 중... (AI 재호출 없음)`);
+    showToast(`[${targetMaterial.title}] AI 분석 결과 저장 재시도 중... (추가 크레딧 없이 저장 재시도)`);
     try {
       const currentMd = targetMaterial.parsedMarkdown;
       const currentMarkdownHash =
@@ -3921,6 +3923,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               planItemId={activePlanItemIdForSession || undefined}
               onOpenSourceModal={(sourceRef) => setPdfViewerSourceRef(sourceRef)}
               onReportProblem={handleReportProblem}
+              onOpenSettings={() => setActiveTab('settings')}
             />
           ) : activeTab === 'session' ? (
             <div className="bg-white border border-[#c8c2b5] rounded-xs p-8 text-center max-w-xl mx-auto my-8">
@@ -4582,6 +4585,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         materials={materials.filter((m) => m.subjectId === activeSubject.id)}
         selectedConceptId={selectedConceptId}
         onGenerateSuccess={handleProblemGenerateSuccess}
+        onOpenSettings={() => setActiveTab('settings')}
       />}
 
       {/* 10. AI Problem Review & Approval Modal (Stage 3 & 6) */}

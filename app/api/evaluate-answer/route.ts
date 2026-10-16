@@ -2,7 +2,15 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { createClient } from '../../../lib/supabase/server';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
-import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { resolveAiConfigForUser, lookupConnectionSecret, operatorFallbackAllowed, type TrialContext } from '../../../lib/aiCredentials';
+import { computeMarkdownHash } from '../../../lib/markdownUtils';
+import {
+  validateTrialEvaluateAnswerInput,
+  settleTrialCredit,
+  releaseTrialCredit,
+  MAX_TRIAL_EXECUTION_TIMEOUT_MS,
+  MAX_TRIAL_OUTPUT_TOKENS,
+} from '../../../lib/trialCredits';
 import { validateEvaluationOutput, validateEvaluationRubric } from '../../../lib/evaluationValidation';
 import {
   RubricCriterion,
@@ -435,12 +443,50 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3. Resolve AI credentials (user's registered key first, then operator).
-    const cred = await resolveAiConfigForUser(auth.user.id);
+    const isMockExam = Boolean(body.mockExamSessionId);
+    let trialContext: TrialContext | undefined = undefined;
+    let taskId: string | null = null;
+
+    if (!isMockExam) {
+      const inputIdentifier = computeMarkdownHash(`${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`);
+      taskId = (typeof body === 'object' && body && 'taskId' in body && typeof (body as Record<string, unknown>).taskId === 'string' && (body as Record<string, unknown>).taskId ? (body as Record<string, unknown>).taskId : null) as string || (`eval_${inputIdentifier}`);
+      trialContext = {
+        taskId,
+        taskType: 'evaluate_answer',
+        inputIdentifier,
+      };
+
+      const userLookup = await lookupConnectionSecret(auth.user.id);
+      if (userLookup.status === 'unregistered') {
+        const trialVal = validateTrialEvaluateAnswerInput(userAnswer, false);
+        if (!trialVal.ok) {
+          return NextResponse.json(
+            { success: false, error: trialVal.error, errorCode: trialVal.errorCode, needsAiConnection: true },
+            { status: 400 }
+          );
+        }
+      }
+    } else {
+      const userLookup = await lookupConnectionSecret(auth.user.id);
+      if (userLookup.status === 'unregistered' && !operatorFallbackAllowed()) {
+        return NextResponse.json(
+          {
+            success: false,
+            errorCode: 'MOCK_EXAM_TRIAL_PROHIBITED',
+            error: '모의시험은 여러 문항이 일괄 평가되므로 AI 체험 크레딧으로 이용할 수 없습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+            needsAiConnection: true,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    // 3. Resolve AI credentials (user's registered key first, then operator trial credit).
+    const cred = await resolveAiConfigForUser(auth.user.id, trialContext);
     if (!cred.ok) {
-      const needsAiConnection = cred.code === 'no_credentials';
+      const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
       return NextResponse.json(
-        { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
+        { success: false, error: cred.message, errorCode: cred.code === 'no_credentials' ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
         { status: needsAiConnection ? 400 : 502 }
       );
     }
@@ -630,11 +676,14 @@ ${
       user: userPrompt,
       temperature: 0.15, // Low temperature for consistent academic grading
       json: true,
-      outputTokenCeiling: 16_000,
-      timeoutMs: 45000,
+      outputTokenCeiling: cred.isTrial ? MAX_TRIAL_OUTPUT_TOKENS : 16_000,
+      timeoutMs: cred.isTrial ? MAX_TRIAL_EXECUTION_TIMEOUT_MS : 45000,
       label: 'evaluate-answer',
     }, cred.config);
     if (!aiCall.ok) {
+      if (cred.isTrial && taskId) {
+        await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed');
+      }
       return NextResponse.json(
         { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
         { status: httpStatusForAiError(aiCall.error.code) }
@@ -651,6 +700,9 @@ ${
       parsed = JSON.parse(cleanJson);
       evaluationResult = validateEvaluationOutput(parsed, checkedRubric);
     } catch (cause) {
+      if (cred.isTrial && taskId) {
+        await releaseTrialCredit(auth.user.id, taskId, 'validation_failed');
+      }
       return NextResponse.json({ success: false,
         error: cause instanceof Error ? cause.message : 'AI 평가 결과 검증에 실패했습니다.' }, { status: 502 });
     }
@@ -772,6 +824,10 @@ ${
       } catch (cacheErr) {
         console.warn('Failed to persist mock exam evaluation cache into mock_exam_sessions:', cacheErr);
       }
+    }
+
+    if (cred.isTrial && taskId) {
+      await settleTrialCredit(auth.user.id, taskId);
     }
 
     return NextResponse.json({

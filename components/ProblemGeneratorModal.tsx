@@ -5,6 +5,7 @@ import { Subject, Concept, Material, ProblemType, ProblemDifficulty, ProblemDraf
 import { collectProblemSources } from '../lib/problemSources';
 import { getStorageScopeId } from '../lib/storageScope';
 import { X, Sparkles, AlertCircle, BrainCircuit, Loader2 } from 'lucide-react';
+import { useTrialCredits, notifyTrialCreditsUpdated } from '../lib/trialCreditsClient';
 
 interface ProblemGeneratorModalProps {
   isOpen: boolean;
@@ -14,6 +15,7 @@ interface ProblemGeneratorModalProps {
   materials: Material[];
   selectedConceptId?: string;
   onGenerateSuccess: (newDrafts: ProblemDraft[]) => void;
+  onOpenSettings?: () => void;
 }
 
 const MATH_PROBLEM_TYPES: { type: ProblemType; label: string; desc: string; estMin: number }[] = [
@@ -78,7 +80,9 @@ export function ProblemGeneratorModal({
   materials,
   selectedConceptId,
   onGenerateSuccess,
+  onOpenSettings,
 }: ProblemGeneratorModalProps) {
+  const trialCredits = useTrialCredits();
   const isMath = activeSubject.domain === 'math_stats';
   const availableTypes = isMath ? MATH_PROBLEM_TYPES : CS_PROBLEM_TYPES;
 
@@ -211,6 +215,7 @@ export function ProblemGeneratorModal({
 
       if (getStorageScopeId() !== scopeAtStart) return;
 
+      notifyTrialCreditsUpdated();
       onGenerateSuccess(generatedDrafts);
       onClose();
     } catch (err) {
@@ -260,6 +265,49 @@ export function ProblemGeneratorModal({
               치환이 아닌 심화 제약, 경계 조건, 개념 간 복합 연계를 설계하며, 총점 100점의 세부
               루브릭과 단계별 힌트를 함께 제공합니다.
             </p>
+          </div>
+
+          {/* AI Trial Credit / Connection Status Banner */}
+          <div
+            className={`p-3 rounded-xs border text-xs flex items-center justify-between ${
+              trialCredits.hasPersonalKey
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                : trialCredits.balance > 0
+                ? 'bg-amber-50 border-amber-200 text-amber-950'
+                : 'bg-red-50 border-red-200 text-red-950'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <Sparkles className={`w-4 h-4 shrink-0 ${trialCredits.hasPersonalKey ? 'text-emerald-600' : trialCredits.balance > 0 ? 'text-amber-600' : 'text-red-500'}`} />
+              <div>
+                <div className="font-bold">
+                  {trialCredits.hasPersonalKey
+                    ? '내 API 사용 중 · 체험 크레딧 차감 없음'
+                    : trialCredits.balance > 0
+                    ? `이번 작업은 체험 크레딧 1회를 사용합니다. (남은 체험: ${trialCredits.balance}회)`
+                    : '체험 크레딧이 모두 소진되었습니다.'}
+                </div>
+                <div className="text-[11px] text-[#57544e]">
+                  {trialCredits.hasPersonalKey
+                    ? '개인 API 키가 등록되어 있어 운영자 체험 크레딧을 소모하지 않습니다.'
+                    : trialCredits.balance > 0
+                    ? '체험 크레딧 사용 시 1회 최대 2문항까지 고난도 문제 생성이 가능합니다.'
+                    : 'AI 문제 생성을 계속 이용하시려면 본인의 BAZE API 키를 연결해 주세요.'}
+                </div>
+              </div>
+            </div>
+            {!trialCredits.hasPersonalKey && trialCredits.balance <= 0 && onOpenSettings && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onOpenSettings();
+                }}
+                className="px-2.5 py-1.5 bg-[#c52828] text-white font-bold rounded-xs text-[11px] hover:bg-[#a82020] transition-colors shrink-0 ml-2"
+              >
+                내 API 연결
+              </button>
+            )}
           </div>
 
           {/* Error Message Alert */}
@@ -466,20 +514,29 @@ export function ProblemGeneratorModal({
                 <span className="text-[#827d73] text-[11px]">최대 3문항</span>
               </label>
               <div className="grid grid-cols-3 gap-2">
-                {[1, 2, 3].map((num) => (
-                  <button
-                    key={num}
-                    type="button"
-                    onClick={() => setProblemCount(num)}
-                    className={`py-2 text-xs font-academic-mono font-bold rounded-xs border transition-all ${
-                      problemCount === num
-                        ? 'bg-[#c52828] text-white border-[#c52828] shadow-xs'
-                        : 'bg-white text-[#57544e] border-[#ded6c8] hover:bg-[#faf8f4]'
-                    }`}
-                  >
-                    {num}문항
-                  </button>
-                ))}
+                {[1, 2, 3].map((num) => {
+                  const isTrialLimited = !trialCredits.hasPersonalKey && num > 2;
+                  return (
+                    <button
+                      key={num}
+                      type="button"
+                      onClick={() => {
+                        if (!isTrialLimited) setProblemCount(num);
+                      }}
+                      disabled={isTrialLimited}
+                      title={isTrialLimited ? '체험 모드에서는 최대 2문항까지 출제 가능합니다.' : undefined}
+                      className={`py-2 text-xs font-academic-mono font-bold rounded-xs border transition-all ${
+                        isTrialLimited
+                          ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
+                          : problemCount === num
+                          ? 'bg-[#c52828] text-white border-[#c52828] shadow-xs'
+                          : 'bg-white text-[#57544e] border-[#ded6c8] hover:bg-[#faf8f4]'
+                      }`}
+                    >
+                      {num}문항{isTrialLimited ? ' (체험 한도)' : ''}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -504,7 +561,12 @@ export function ProblemGeneratorModal({
             <button
               type="button"
               onClick={handleGenerate}
-              disabled={isGenerating || eligibleConcepts.length === 0 || selectedSourceMaterials.length === 0}
+              disabled={
+                isGenerating ||
+                eligibleConcepts.length === 0 ||
+                selectedSourceMaterials.length === 0 ||
+                (!trialCredits.hasPersonalKey && trialCredits.balance <= 0)
+              }
               className="flex items-center gap-2 px-5 py-2 bg-[#c52828] hover:bg-[#a82020] text-white text-xs font-bold rounded-xs shadow-xs transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isGenerating ? (

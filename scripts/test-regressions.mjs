@@ -28,6 +28,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/historyMigration.ts',
   'lib/cloud/mockExamSync.ts', 'lib/cloud/pendingExamAnswers.ts', 'lib/cloud/draftPersistence.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts', 'app/api/analyze-concepts/route.ts', 'lib/supabase/admin.ts', 'app/api/reminders/cron/route.ts',
+  'lib/trialCredits.ts', 'lib/drive/googleDrive.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -59,6 +60,7 @@ async function run() {
     get length() { return sessionData.size; },
   };
   window.sessionStorage = sessionStorage;
+  const nowIso = () => new Date().toISOString();
 
   // --- Auth gate mock ------------------------------------------------------
   // Production route handlers verify the user on the server with no bypass.
@@ -153,6 +155,7 @@ exports.requireApiUser = async () => {
   const dashboardUrl = load(path.join(output, 'lib/dashboardUrl.js'));
   const practiceAnswerDraft = load(path.join(output, 'lib/practiceAnswerDraft.js'));
   const sessionAffiliation = load(path.join(output, 'lib/sessionAffiliation.js'));
+  const googleDrive = load(path.join(output, 'lib/drive/googleDrive.js'));
   const { INITIAL_SUBJECTS, INITIAL_CONCEPTS, INITIAL_PROBLEMS } = load(path.join(output, 'lib/initialData.js'));
   let passed = 0;
   const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -238,12 +241,24 @@ exports.requireApiUser = async () => {
   const aiClient = load(path.join(output, 'lib/aiClient.js'));
   const aiCredentials = load(path.join(output, 'lib/aiCredentials.js'));
   globalThis.__fakeSupabaseClient = {
-    rpc: async (name) => ({
-      data: name === 'consume_ai_call_budget'
-        ? { allowed: true, remaining: 9, retryAfterSeconds: 60 }
-        : null,
-      error: null,
-    }),
+    rpc: async (name) => {
+      if (name === 'consume_ai_call_budget') {
+        return { data: { allowed: true, remaining: 9, retryAfterSeconds: 60 }, error: null };
+      }
+      if (name === 'get_or_create_trial_credits') {
+        return { data: { success: true, granted_credits: 3, remaining_credits: 3, is_first_grant: false }, error: null };
+      }
+      if (name === 'reserve_trial_credit') {
+        return { data: { allowed: true, status: 'reserved', remaining: 2 }, error: null };
+      }
+      if (name === 'settle_trial_credit') {
+        return { data: { success: true, status: 'settled', is_existing: false }, error: null };
+      }
+      if (name === 'release_trial_credit') {
+        return { data: { success: true, refunded: true, remaining_credits: 3 }, error: null };
+      }
+      return { data: null, error: null };
+    },
   };
   const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
   const { POST } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
@@ -650,8 +665,20 @@ exports.requireApiUser = async () => {
       async function exec(maybe) {
         const rows = (state[table] = state[table] || []);
         try {
+          if (!state.isAdmin && (table === 'ai_trial_credits' || table === 'ai_trial_reservations')) {
+            if (ctx.op === 'upsert' || ctx.op === 'update' || ctx.op === 'delete') {
+              return { data: null, error: { message: 'permission denied for table ' + table, code: '42501' } };
+            }
+          }
           if (ctx.op === 'select') {
             let result = matchFilters(rows, ctx.filters);
+            if (!state.isAdmin && (table === 'ai_trial_credits' || table === 'ai_trial_reservations')) {
+              if (state.user) {
+                result = result.filter((r) => r.user_id === state.user.id);
+              } else {
+                result = [];
+              }
+            }
             if (ctx.order.length > 0) {
               result = [...result].sort((a, b) => {
                 for (const { col, opts } of ctx.order) {
@@ -790,7 +817,12 @@ exports.requireApiUser = async () => {
           return Promise.resolve({ data: null, error: { message: state.fail.rpcMessage || 'injected rpc failure' } });
         }
         state.rpcCalls.push({ name, params });
-        if (state.rpcImpl) return Promise.resolve(state.rpcImpl(name, params, state));
+        if (state.rpcImpl) {
+          const custom = state.rpcImpl(name, params, state);
+          if (custom && (custom.data !== null || custom.error !== null || name === 'get_ai_connection_secret')) {
+            return Promise.resolve(custom);
+          }
+        }
         if (Object.prototype.hasOwnProperty.call(state.rpcResults, name)) {
           return Promise.resolve(state.rpcResults[name]);
         }
@@ -799,6 +831,173 @@ exports.requireApiUser = async () => {
         }
         if (name === 'get_ai_connection_secret') {
           return Promise.resolve({ data: null, error: null });
+        }
+        if (name === 'get_or_create_trial_credits') {
+          const userId = (params && params.p_user_id) || (state.user ? state.user.id : 'test-user');
+          const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
+          let entry = creditsList.find((c) => c.user_id === userId);
+          if (!entry) {
+            entry = {
+              user_id: userId,
+              granted_credits: 3,
+              balance: 3,
+              granted_at: nowIso(),
+              updated_at: nowIso(),
+            };
+            creditsList.push(entry);
+            return Promise.resolve({
+              data: {
+                granted: 3,
+                balance: 3,
+                hasPersonalKey: false,
+              },
+              error: null,
+            });
+          }
+          return Promise.resolve({
+            data: {
+              granted: entry.granted_credits,
+              balance: entry.balance,
+              hasPersonalKey: false,
+            },
+            error: null,
+          });
+        }
+        if (name === 'reserve_trial_credit') {
+          const userId = (params && params.p_user_id) || (state.user ? state.user.id : 'test-user');
+          const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
+          const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
+          let userCredits = creditsList.find((c) => c.user_id === userId);
+          if (!userCredits) {
+            userCredits = {
+              user_id: userId,
+              granted_credits: 3,
+              balance: 3,
+              granted_at: nowIso(),
+              updated_at: nowIso(),
+            };
+            creditsList.push(userCredits);
+          }
+
+          const taskId = params && params.p_task_id;
+          const taskType = params && params.p_task_type;
+          const inputIdentifier = params && params.p_input_identifier;
+
+          const existing = resList.find((r) => r.task_id === taskId);
+          if (existing) {
+            if (existing.user_id !== userId) {
+              return Promise.resolve({
+                data: { allowed: false, error_code: 'TASK_OWNERSHIP_MISMATCH', message: '다른 사용자의 작업 식별자입니다.' },
+                error: null,
+              });
+            }
+            if (existing.task_type !== taskType) {
+              return Promise.resolve({
+                data: { allowed: false, error_code: 'TASK_TYPE_MISMATCH', message: '작업 종류가 일치하지 않습니다.' },
+                error: null,
+              });
+            }
+            if (existing.input_identifier !== inputIdentifier) {
+              return Promise.resolve({
+                data: { allowed: false, error_code: 'TASK_INPUT_MISMATCH', message: '동일한 작업 식별자에 다른 입력이 전달되었습니다.' },
+                error: null,
+              });
+            }
+            return Promise.resolve({
+              data: {
+                allowed: true,
+                status: existing.status === 'settled' ? 'already_settled' : 'already_reserved',
+                remaining: userCredits.balance,
+              },
+              error: null,
+            });
+          }
+
+          if (userCredits.balance <= 0) {
+            return Promise.resolve({
+              data: {
+                allowed: false,
+                error_code: 'INSUFFICIENT_CREDITS',
+                remaining: 0,
+                message: 'AI 체험 크레딧(3회)이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+              },
+              error: null,
+            });
+          }
+
+          userCredits.balance -= 1;
+          userCredits.updated_at = nowIso();
+          const newRes = {
+            id: `res_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+            user_id: userId,
+            task_id: taskId,
+            task_type: taskType,
+            input_identifier: inputIdentifier,
+            status: 'reserved',
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          };
+          resList.push(newRes);
+
+          return Promise.resolve({
+            data: {
+              allowed: true,
+              status: 'reserved',
+              remaining: userCredits.balance,
+            },
+            error: null,
+          });
+        }
+        if (name === 'settle_trial_credit') {
+          const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
+          const taskId = params && params.p_task_id;
+          const res = resList.find((r) => r.task_id === taskId);
+          if (res) {
+            res.status = 'settled';
+            res.settled_at = nowIso();
+            res.updated_at = nowIso();
+          }
+          return Promise.resolve({
+            data: {
+              success: true,
+              status: 'settled',
+            },
+            error: null,
+          });
+        }
+        if (name === 'release_trial_credit') {
+          const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
+          const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
+          const taskId = params && params.p_task_id;
+          const res = resList.find((r) => r.task_id === taskId);
+          if (res && res.status === 'reserved') {
+            res.status = 'released';
+            res.released_at = nowIso();
+            res.release_reason = (params && params.p_reason) || 'failure';
+            res.updated_at = nowIso();
+
+            const userCredits = creditsList.find((c) => c.user_id === res.user_id);
+            if (userCredits) {
+              userCredits.balance += 1;
+              userCredits.updated_at = nowIso();
+            }
+            return Promise.resolve({
+              data: {
+                success: true,
+                refunded: true,
+                balance: userCredits ? userCredits.balance : 0,
+              },
+              error: null,
+            });
+          }
+          return Promise.resolve({
+            data: {
+              success: false,
+              refunded: false,
+              balance: 0,
+            },
+            error: null,
+          });
         }
         if (name === 'init_analysis_job_and_chunks') {
           if (!params.p_user_id) {
@@ -9172,6 +9371,7 @@ exports.requireApiUser = async () => {
     let actualConfigModelReceivedByAi = '';
     const aiClientPath = path.join(output, 'lib', 'aiClient.js');
     const aiModule = load(aiClientPath);
+    const originalCallAiChat = aiModule.callAiChat;
     aiModule.callAiChat = async (_opts, config) => {
       actualConfigModelReceivedByAi = config.model;
       return { ok: true, content: '{"concepts":[]}', model: config.model };
@@ -9180,6 +9380,7 @@ exports.requireApiUser = async () => {
     // User settings returned from resolveAiConfigForUser is Model B ('gpt-4o')
     const aiCredPath = path.join(output, 'lib', 'aiCredentials.js');
     const credModule = load(aiCredPath);
+    const originalResolveAiConfigForUser = credModule.resolveAiConfigForUser;
     credModule.resolveAiConfigForUser = async () => ({
       ok: true,
       config: {
@@ -9189,101 +9390,106 @@ exports.requireApiUser = async () => {
       },
     });
 
-    const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
-    const p6Markdown = '# Section 1\n\n' + 'A'.repeat(5000) + '\n\n# Section 2\n\n' + 'B'.repeat(5000);
-    const p6MarkdownHash = computeMarkdownHash(p6Markdown);
+    try {
+      const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
+      const p6Markdown = '# Section 1\n\n' + 'A'.repeat(5000) + '\n\n# Section 2\n\n' + 'B'.repeat(5000);
+      const p6MarkdownHash = computeMarkdownHash(p6Markdown);
 
-    await withFakeSupabase({
-      user: testUser,
-      materials: [{ id: fakeMaterialId, user_id: testUser.id, subject_id: fakeSubjectId }],
-      analysis_jobs: [
-        {
-          id: fakeJobKey,
-          user_id: testUser.id,
-          subject_id: fakeSubjectId,
-          material_id: fakeMaterialId,
-          markdown_hash: p6MarkdownHash,
-          domain: 'math_stats',
-          model_id: 'deepseek-v4.1-flash', // Originally created with Model A
-          prompt_version: 'v2',
-          chunking_version: 'v1',
-          total_chunks: 2,
-          status: 'paused',
-          updated_at: new Date().toISOString(),
+      await withFakeSupabase({
+        user: testUser,
+        materials: [{ id: fakeMaterialId, user_id: testUser.id, subject_id: fakeSubjectId }],
+        analysis_jobs: [
+          {
+            id: fakeJobKey,
+            user_id: testUser.id,
+            subject_id: fakeSubjectId,
+            material_id: fakeMaterialId,
+            markdown_hash: p6MarkdownHash,
+            domain: 'math_stats',
+            model_id: 'deepseek-v4.1-flash', // Originally created with Model A
+            prompt_version: 'v2',
+            chunking_version: 'v1',
+            total_chunks: 2,
+            status: 'paused',
+            updated_at: new Date().toISOString(),
+          },
+        ],
+        analysis_job_chunks: [
+          {
+            job_id: fakeJobKey,
+            chunk_index: 1,
+            status: 'completed',
+            drafts: [],
+          },
+          {
+            job_id: fakeJobKey,
+            chunk_index: 2,
+            status: 'pending',
+            drafts: [],
+          },
+        ],
+        concept_drafts: [],
+        rpcImpl: (fn) => {
+          if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+          if (fn === 'resume_analysis_job') return { data: { success: true }, error: null };
+          if (fn === 'claim_analysis_chunk_lease') return { data: { acquired: true, lease_token: 'lease_p6' }, error: null };
+          if (fn === 'commit_analysis_chunk_result') return { data: { committed: true }, error: null };
+          return { data: null, error: null };
         },
-      ],
-      analysis_job_chunks: [
-        {
-          job_id: fakeJobKey,
-          chunk_index: 1,
-          status: 'completed',
-          drafts: [],
-        },
-        {
-          job_id: fakeJobKey,
-          chunk_index: 2,
-          status: 'pending',
-          drafts: [],
-        },
-      ],
-      concept_drafts: [],
-      rpcImpl: (fn) => {
-        if (fn === 'get_ai_connection_secret') return { data: null, error: null };
-        if (fn === 'resume_analysis_job') return { data: { success: true }, error: null };
-        if (fn === 'claim_analysis_chunk_lease') return { data: { acquired: true, lease_token: 'lease_p6' }, error: null };
-        if (fn === 'commit_analysis_chunk_result') return { data: { committed: true }, error: null };
-        return { data: null, error: null };
-      },
-    }, async () => {
-      // 1) Explicit model mismatch attempt: user sends payload requesting Model B into Job A
-      const mismatchReq = new NextRequest('http://localhost/api/analyze-concepts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'process',
-          jobKey: fakeJobKey,
-          materialId: fakeMaterialId,
-          subjectId: fakeSubjectId,
-          domain: 'math_stats',
-          markdown: p6Markdown,
-          model: 'gpt-4o', // User tries to mix Model B into Job A!
-        }),
+      }, async () => {
+        // 1) Explicit model mismatch attempt: user sends payload requesting Model B into Job A
+        const mismatchReq = new NextRequest('http://localhost/api/analyze-concepts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'process',
+            jobKey: fakeJobKey,
+            materialId: fakeMaterialId,
+            subjectId: fakeSubjectId,
+            domain: 'math_stats',
+            markdown: p6Markdown,
+            model: 'gpt-4o', // User tries to mix Model B into Job A!
+          }),
+        });
+
+        const mismatchRes = await analyzePost(mismatchReq);
+        const mismatchData = await mismatchRes.json();
+
+        assert.equal(mismatchRes.status, 400, '기존 작업의 모델과 다른 모델로 요청 시 400 반환');
+        assert.equal(mismatchData.errorCode, 'JOB_MODEL_MISMATCH', 'JOB_MODEL_MISMATCH 에러 코드 반환');
+        assert.ok(mismatchData.error.includes('하나의 작업에 혼합할 수 없습니다'));
+
+        // 2) Normal resume: user calls process without forcing new model
+        // The server MUST enforce Model A (deepseek-v4.1-flash) for actual AI call
+        const resumeReq = new NextRequest('http://localhost/api/analyze-concepts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'process',
+            jobKey: fakeJobKey,
+            materialId: fakeMaterialId,
+            subjectId: fakeSubjectId,
+            domain: 'math_stats',
+            markdown: p6Markdown,
+            chunkIndex: 2,
+          }),
+        });
+
+        const resumeRes = await analyzePost(resumeReq);
+        const resumeData = await resumeRes.json();
+
+        assert.equal(resumeRes.status, 200, '재개 작업 정상 완료');
+        assert.equal(
+          actualConfigModelReceivedByAi,
+          'deepseek-v4.1-flash',
+          '실제 AI 호출에 전달된 모델이 기존 작업 모델(Model A)과 엄격히 일치함'
+        );
+        assert.equal(resumeData.model, 'deepseek-v4.1-flash', '응답 메타데이터의 모델 일치');
       });
-
-      const mismatchRes = await analyzePost(mismatchReq);
-      const mismatchData = await mismatchRes.json();
-
-      assert.equal(mismatchRes.status, 400, '기존 작업의 모델과 다른 모델로 요청 시 400 반환');
-      assert.equal(mismatchData.errorCode, 'JOB_MODEL_MISMATCH', 'JOB_MODEL_MISMATCH 에러 코드 반환');
-      assert.ok(mismatchData.error.includes('하나의 작업에 혼합할 수 없습니다'));
-
-      // 2) Normal resume: user calls process without forcing new model
-      // The server MUST enforce Model A (deepseek-v4.1-flash) for actual AI call
-      const resumeReq = new NextRequest('http://localhost/api/analyze-concepts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'process',
-          jobKey: fakeJobKey,
-          materialId: fakeMaterialId,
-          subjectId: fakeSubjectId,
-          domain: 'math_stats',
-          markdown: p6Markdown,
-          chunkIndex: 2,
-        }),
-      });
-
-      const resumeRes = await analyzePost(resumeReq);
-      const resumeData = await resumeRes.json();
-
-      assert.equal(resumeRes.status, 200, '재개 작업 정상 완료');
-      assert.equal(
-        actualConfigModelReceivedByAi,
-        'deepseek-v4.1-flash',
-        '실제 AI 호출에 전달된 모델이 기존 작업 모델(Model A)과 엄격히 일치함'
-      );
-      assert.equal(resumeData.model, 'deepseek-v4.1-flash', '응답 메타데이터의 모델 일치');
-    });
+    } finally {
+      aiModule.callAiChat = originalCallAiChat;
+      credModule.resolveAiConfigForUser = originalResolveAiConfigForUser;
+    }
   });
 
   // =========================================================================
@@ -10868,8 +11074,672 @@ exports.requireApiUser = async () => {
     });
   });
 
+  // =========================================================================
+  // AI Trial Credits (3 Credits per Account) Tests (Section 7)
+  // =========================================================================
+
+  await checkAsync('AI 체험 크레딧 1: 최초 지급 3회, 재로그인·동시 최초 요청에도 중복 지급 없음', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-trial-1' },
+      ai_trial_credits: [],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      // 1. First grant gives 3 credits
+      const r1 = await client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' });
+      assert.equal(r1.data.granted, 3);
+      assert.equal(r1.data.balance, 3);
+
+      // 2. Re-login / page refresh / multiple calls: returns existing balance without duplicate grant
+      const r2 = await client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' });
+      assert.equal(r2.data.granted, 3);
+      assert.equal(r2.data.balance, 3);
+
+      // 3. Concurrent requests with Promise.all
+      const [c1, c2, c3] = await Promise.all([
+        client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' }),
+        client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' }),
+        client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' }),
+      ]);
+      assert.equal(c1.data.balance, 3);
+      assert.equal(c2.data.balance, 3);
+      assert.equal(c3.data.balance, 3);
+
+      // Table has exactly one row
+      assert.equal(client.__state.ai_trial_credits.length, 1);
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 2: 잔액 1에서 동시 요청 2개 -> 최대 1개만 예약', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-trial-2' },
+      ai_trial_credits: [{ user_id: 'user-trial-2', granted_credits: 3, balance: 1, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      // Two concurrent calls attempting to reserve a credit for distinct tasks
+      const [res1, res2] = await Promise.all([
+        client.rpc('reserve_trial_credit', {
+          p_task_id: 'task-concurrent-A',
+          p_task_type: 'generate_problems',
+          p_input_identifier: 'hash-A',
+          p_user_id: 'user-trial-2',
+        }),
+        client.rpc('reserve_trial_credit', {
+          p_task_id: 'task-concurrent-B',
+          p_task_type: 'evaluate_answer',
+          p_input_identifier: 'hash-B',
+          p_user_id: 'user-trial-2',
+        }),
+      ]);
+
+      const successCount = [res1, res2].filter((r) => r.data && r.data.allowed === true).length;
+      const failCount = [res1, res2].filter((r) => r.data && r.data.allowed === false).length;
+
+      assert.equal(successCount, 1, '잔액 1에서 동시 요청 중 정확히 1개만 예약 성공');
+      assert.equal(failCount, 1, '나머지 1개는 잔액 부족으로 거부');
+
+      const failed = res1.data.allowed ? res2.data : res1.data;
+      assert.equal(failed.error_code, 'INSUFFICIENT_CREDITS');
+
+      // Final balance is exactly 0
+      const credRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-trial-2');
+      assert.equal(credRow.balance, 0);
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 3: 같은 작업 재시도 -> 중복 차감·중복 호출 없음 (멱등성)', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-trial-3' },
+      ai_trial_credits: [{ user_id: 'user-trial-3', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      // First attempt
+      const first = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-idempotent-1',
+        p_task_type: 'analyze_concepts',
+        p_input_identifier: 'hash-same-input',
+        p_user_id: 'user-trial-3',
+      });
+      assert.equal(first.data.allowed, true);
+      assert.equal(first.data.status, 'reserved');
+      assert.equal(first.data.remaining, 2);
+
+      // Duplicate network send or retry with identical task_id and input
+      const retry = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-idempotent-1',
+        p_task_type: 'analyze_concepts',
+        p_input_identifier: 'hash-same-input',
+        p_user_id: 'user-trial-3',
+      });
+      assert.equal(retry.data.allowed, true);
+      assert.equal(retry.data.status, 'already_reserved');
+      assert.equal(retry.data.remaining, 2, '중복 호출 시 잔액 재차감 없음');
+
+      // Now settle it
+      await client.rpc('settle_trial_credit', { p_task_id: 'task-idempotent-1' });
+
+      // Call reserve after settled (e.g. repeated submission)
+      const postSettle = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-idempotent-1',
+        p_task_type: 'analyze_concepts',
+        p_input_identifier: 'hash-same-input',
+        p_user_id: 'user-trial-3',
+      });
+      assert.equal(postSettle.data.allowed, true);
+      assert.equal(postSettle.data.status, 'already_settled');
+      assert.equal(postSettle.data.remaining, 2);
+
+      // Remaining credits remain 2 (only 1 deducted)
+      const credRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-trial-3');
+      assert.equal(credRow.balance, 2);
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 4: 다른 입력으로 작업 ID 재사용 -> 거부 (TASK_INPUT_MISMATCH)', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-trial-4' },
+      ai_trial_credits: [{ user_id: 'user-trial-4', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      // 1. Initial reservation
+      await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-fixed-id',
+        p_task_type: 'generate_problems',
+        p_input_identifier: 'hash-input-A',
+        p_user_id: 'user-trial-4',
+      });
+
+      // 2. Reusing same task_id with DIFFERENT input
+      const tampered = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-fixed-id',
+        p_task_type: 'generate_problems',
+        p_input_identifier: 'hash-input-B-different',
+        p_user_id: 'user-trial-4',
+      });
+
+      assert.equal(tampered.data.allowed, false);
+      assert.equal(tampered.data.error_code, 'TASK_INPUT_MISMATCH');
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 5: 개인 API 사용 -> 체험 차감 없음', async () => {
+    const encKey = Buffer.alloc(32, 7);
+    process.env.AI_CREDENTIAL_ENCRYPTION_KEY = encKey.toString('base64');
+    const { encryptSecret } = load(path.join(output, 'lib/aiCredentials.js'));
+    const secretEnc = encryptSecret('baze-user-personal-api-key', encKey);
+
+    await withFakeSupabase({
+      user: { id: 'user-with-key' },
+      ai_trial_credits: [{ user_id: 'user-with-key', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+      rpcImpl: (fn) => {
+        if (fn === 'get_ai_connection_secret') {
+          return {
+            data: {
+              provider: 'school_gateway',
+              ciphertext: secretEnc.ciphertext,
+              iv: secretEnc.iv,
+              tag: secretEnc.tag,
+              model: 'deepseek-v4.1-flash',
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      },
+    }, async (client) => {
+      const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+      const res = await resolveAiConfigForUser('user-with-key', {
+        taskId: 'task-personal-key-1',
+        taskType: 'evaluate_answer',
+        inputIdentifier: 'hash-eval',
+      });
+
+      assert.equal(res.ok, true);
+      assert.equal(res.source, 'user', '개인 등록 키가 우선 사용됨');
+      assert.equal(res.isTrial, undefined, '체험 모드가 아님');
+      assert.equal(res.config.apiKey, 'baze-user-personal-api-key');
+
+      // Balance was NOT deducted
+      const credRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-with-key');
+      assert.equal(credRow.balance, 3, '개인 API 사용 시 체험 크레딧 차감 없음');
+      assert.equal(client.__state.ai_trial_reservations.length, 0);
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 6: 키 조회 실패 -> 운영자 키 전환 없음', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-lookup-fail' },
+      ai_trial_credits: [{ user_id: 'user-lookup-fail', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+      rpcImpl: (fn) => {
+        if (fn === 'get_ai_connection_secret') {
+          return { data: null, error: { message: 'DB connection error' } };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+      const res = await resolveAiConfigForUser('user-lookup-fail', {
+        taskId: 'task-lookup-fail-1',
+        taskType: 'evaluate_answer',
+        inputIdentifier: 'hash-eval',
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'lookup_failed');
+      assert.equal(res.source, undefined, '조회 실패 시 운영자 키로 전환 금지');
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 7: 결과 생성 후 저장 실패 -> 추가 차감 없이 복구', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-save-retry' },
+      ai_trial_credits: [{ user_id: 'user-save-retry', granted_credits: 3, balance: 2, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [{
+        id: 'res-saved-prior',
+        user_id: 'user-save-retry',
+        task_id: 'task-concept-1',
+        task_type: 'analyze_concepts',
+        input_identifier: 'hash-concept-input',
+        status: 'settled',
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }],
+    }, async (client) => {
+      const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+      // Save retry with isSaveRetry: true
+      const res = await resolveAiConfigForUser('user-save-retry', {
+        taskId: 'task-concept-1',
+        taskType: 'analyze_concepts',
+        inputIdentifier: 'hash-concept-input',
+        isSaveRetry: true,
+      });
+
+      assert.equal(res.ok, true);
+      assert.equal(res.source, 'operator');
+      assert.equal(res.isTrial, true);
+
+      // Balance remains 2 (no additional deduction)
+      const credRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-save-retry');
+      assert.equal(credRow.balance, 2, '저장 재시도에는 추가 크레딧 차감 없음');
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 8: 호출 전 실패 -> 예약 해제 및 잔액 환급', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-abort' },
+      ai_trial_credits: [{ user_id: 'user-abort', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      // 1. Reserve
+      const reserved = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-aborted-call',
+        p_task_type: 'generate_problems',
+        p_input_identifier: 'hash-gen',
+        p_user_id: 'user-abort',
+      });
+      assert.equal(reserved.data.allowed, true);
+      assert.equal(reserved.data.remaining, 2);
+
+      // 2. Pre-call abort/failure triggers release
+      const released = await client.rpc('release_trial_credit', {
+        p_task_id: 'task-aborted-call',
+        p_reason: 'aborted_before_call',
+      });
+      assert.equal(released.data.success, true);
+      assert.equal(released.data.refunded, true);
+      assert.equal(released.data.balance, 3);
+
+      const credRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-abort');
+      assert.equal(credRow.balance, 3, '예약 취소 시 크레딧 환급 완료');
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 9: 응답 유실·작업 중단 -> 사용 상태 복구', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-restore' },
+      ai_trial_credits: [{ user_id: 'user-restore', granted_credits: 3, balance: 2, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [{
+        id: 'res-lost',
+        user_id: 'user-restore',
+        task_id: 'task-lost-resp',
+        task_type: 'evaluate_answer',
+        input_identifier: 'hash-lost',
+        status: 'reserved',
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }],
+    }, async (client) => {
+      // Client re-requests the same task after lost response:
+      const checkRes = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-lost-resp',
+        p_task_type: 'evaluate_answer',
+        p_input_identifier: 'hash-lost',
+        p_user_id: 'user-restore',
+      });
+
+      assert.equal(checkRes.data.allowed, true);
+      assert.equal(checkRes.data.status, 'already_reserved');
+      assert.equal(checkRes.data.remaining, 2, '진행 중 예약 상태로 복구되어 중복 차감 없음');
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 10: 잔액 0 또는 운영자 긴급 중지 -> 운영자 호출 차단', async () => {
+    // A) Balance 0
+    await withFakeSupabase({
+      user: { id: 'user-zero-balance' },
+      ai_trial_credits: [{ user_id: 'user-zero-balance', granted_credits: 3, balance: 0, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async () => {
+      const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+      const res = await resolveAiConfigForUser('user-zero-balance', {
+        taskId: 'task-exhausted',
+        taskType: 'analyze_concepts',
+        inputIdentifier: 'hash-md',
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'insufficient_credits');
+      assert.equal(res.needsAiConnection, true);
+    });
+
+    // B) Emergency stop active
+    process.env.OPERATOR_EMERGENCY_STOP = 'true';
+    try {
+      await withFakeSupabase({
+        user: { id: 'user-stopped' },
+        ai_trial_credits: [{ user_id: 'user-stopped', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+        ai_trial_reservations: [],
+      }, async () => {
+        const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+        const res = await resolveAiConfigForUser('user-stopped', {
+          taskId: 'task-stopped',
+          taskType: 'analyze_concepts',
+          inputIdentifier: 'hash-md',
+        });
+
+        assert.equal(res.ok, false);
+        assert.equal(res.code, 'operator_disabled');
+        assert.equal(res.needsAiConnection, true);
+      });
+    } finally {
+      delete process.env.OPERATOR_EMERGENCY_STOP;
+    }
+  });
+
+  await checkAsync('AI 체험 크레딧 11: 사용자 직접 크레딧 변경 및 타 사용자 내역 접근 거부', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-hacker' },
+      ai_trial_credits: [
+        { user_id: 'user-hacker', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() },
+        { user_id: 'user-victim', granted_credits: 3, balance: 1, granted_at: nowIso(), updated_at: nowIso() },
+      ],
+      ai_trial_reservations: [
+        { id: 'res-victim', user_id: 'user-victim', task_id: 'victim-task', task_type: 'evaluate_answer', input_identifier: 'h', status: 'reserved' },
+      ],
+    }, async (client) => {
+      // 1. Direct update attempt: permission denied (42501)
+      const updateRes = await client.from('ai_trial_credits').update({ balance: 999 }).eq('user_id', 'user-hacker');
+      assert.ok(updateRes.error);
+      assert.equal(updateRes.error.code, '42501', '직접 UPDATE 차단');
+
+      // 2. Direct upsert attempt: permission denied
+      const upsertRes = await client.from('ai_trial_credits').upsert({ user_id: 'user-hacker', balance: 999 });
+      assert.ok(upsertRes.error);
+      assert.equal(upsertRes.error.code, '42501', '직접 UPSERT 차단');
+
+      // 3. Direct delete attempt: permission denied
+      const deleteRes = await client.from('ai_trial_credits').delete().eq('user_id', 'user-hacker');
+      assert.ok(deleteRes.error);
+      assert.equal(deleteRes.error.code, '42501', '직접 DELETE 차단');
+
+      // 4. Querying another user's rows: RLS isolates rows to only the authenticated user
+      const selectOtherCredits = await client.from('ai_trial_credits').select('*').eq('user_id', 'user-victim');
+      assert.equal(selectOtherCredits.data.length, 0, '타인 크레딧 조회 불가');
+
+      const selectOtherRes = await client.from('ai_trial_reservations').select('*').eq('user_id', 'user-victim');
+      assert.equal(selectOtherRes.data.length, 0, '타인 예약 내역 조회 불가');
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 12: 입력·출력·청크·재시도 한도 준수', async () => {
+    const {
+      validateTrialAnalyzeConceptsInput,
+      validateTrialGenerateProblemsInput,
+      validateTrialEvaluateAnswerInput,
+    } = load(path.join(output, 'lib/trialCredits.js'));
+
+    // A) Concept analysis: max 2 chunks, max 12,000 chars
+    assert.equal(validateTrialAnalyzeConceptsInput(2, 10000).ok, true);
+    assert.equal(validateTrialAnalyzeConceptsInput(3, 5000).ok, false, '3청크 초과 거부');
+    assert.equal(validateTrialAnalyzeConceptsInput(3, 5000).errorCode, 'TRIAL_LIMIT_EXCEEDED');
+    assert.equal(validateTrialAnalyzeConceptsInput(1, 15000).ok, false, '12,000자 초과 거부');
+
+    // B) Problem generation: max 2 problems, max 15,000 chars source
+    assert.equal(validateTrialGenerateProblemsInput(2, 10000).ok, true);
+    assert.equal(validateTrialGenerateProblemsInput(3, 5000).ok, false, '3문항 생성 거부');
+    assert.equal(validateTrialGenerateProblemsInput(1, 18000).ok, false, '15,000자 초과 거부');
+
+    // C) Answer evaluation: single problem max 6,000 chars, mock exam prohibited
+    assert.equal(validateTrialEvaluateAnswerInput('a'.repeat(2000), false).ok, true);
+    assert.equal(validateTrialEvaluateAnswerInput('a'.repeat(7000), false).ok, false, '6,000자 답안 초과 거부');
+    assert.equal(validateTrialEvaluateAnswerInput('답안', true).ok, false, '모의시험 체험 금지');
+    assert.equal(validateTrialEvaluateAnswerInput('답안', true).errorCode, 'MOCK_EXAM_TRIAL_PROHIBITED');
+  });
+
+  await checkAsync('AI 체험 크레딧 13: 불특정 사용자/체험 크레딧은 Gemini API로만 엄격 제한', async () => {
+    const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+    const savedEnv = {
+      AI_PROVIDER: process.env.AI_PROVIDER,
+      BAZE_API_KEY: process.env.BAZE_API_KEY,
+      GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+      AI_API_KEY: process.env.AI_API_KEY,
+    };
+
+    try {
+      // 1) Server has BAZE Gateway key, but Gemini key is also set
+      process.env.AI_PROVIDER = 'school_gateway';
+      process.env.BAZE_API_KEY = 'baze-secret-key-1234';
+      process.env.GEMINI_API_KEY = 'gemini-secret-key-5678';
+      delete process.env.AI_API_KEY;
+
+      await withFakeSupabase({
+        user: { id: 'unregistered-trial-user' },
+        ai_trial_credits: [{ user_id: 'unregistered-trial-user', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+        ai_trial_reservations: [],
+      }, async () => {
+        const res = await resolveAiConfigForUser('unregistered-trial-user', {
+          taskId: 'task-trial-gemini-only',
+          taskType: 'analyze_concepts',
+          inputIdentifier: 'hash-gemini',
+        });
+
+        assert.equal(res.ok, true);
+        assert.equal(res.source, 'operator');
+        assert.equal(res.isTrial, true);
+        assert.equal(res.config.provider, 'gemini', '불특정 사용자 체험은 반드시 gemini provider여야 함');
+        assert.equal(res.config.apiKey, 'gemini-secret-key-5678', 'Gemini 키가 사용됨');
+        assert.notEqual(res.config.apiKey, 'baze-secret-key-1234', '학교 BAZE 키는 절대 불특정 사용자에게 사용되지 않음');
+      });
+
+      // 2) Server has ONLY BAZE Gateway key, NO Gemini key set
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.AI_API_KEY;
+
+      await withFakeSupabase({
+        user: { id: 'unregistered-trial-user-2' },
+        ai_trial_credits: [{ user_id: 'unregistered-trial-user-2', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+        ai_trial_reservations: [],
+      }, async () => {
+        const res = await resolveAiConfigForUser('unregistered-trial-user-2', {
+          taskId: 'task-trial-no-gemini',
+          taskType: 'analyze_concepts',
+          inputIdentifier: 'hash-no-gemini',
+        });
+
+        assert.equal(res.ok, false, 'Gemini 키가 없으면 체험 호출 차단');
+        assert.equal(res.code, 'no_credentials');
+        assert.ok(res.message.includes('Gemini'), 'Gemini API 안내 메시지 포함');
+      });
+    } finally {
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  // ==========================================
+  // Google Drive & Local Backup Regression Suite
+  // ==========================================
+
+  check('Google Drive 백업 1: 최소 권한 범위(drive.file) 검증 및 과도한 권한 차단', () => {
+    assert.ok(
+      googleDrive.REQUIRED_DRIVE_SCOPES.includes('https://www.googleapis.com/auth/drive.file'),
+      '최소 권한인 drive.file 스코프가 포함되어야 함'
+    );
+    const scopeTokens = googleDrive.REQUIRED_DRIVE_SCOPES.split(' ');
+    assert.equal(
+      scopeTokens.includes('https://www.googleapis.com/auth/drive'),
+      false,
+      '전체 Drive 접근 권한(https://www.googleapis.com/auth/drive)을 요청하지 않아야 함'
+    );
+    assert.ok(
+      googleDrive.REQUIRED_DRIVE_SCOPES.includes('https://www.googleapis.com/auth/userinfo.email'),
+      '연결된 Google 계정 표시를 위한 userinfo.email 스코프가 포함되어야 함'
+    );
+  });
+
+  check('Google Drive 백업 2: 환경변수 미설정 시 안전한 안내 및 로컬 백업 유지', () => {
+    const unconfigured = googleDrive.getGoogleDriveConfig({});
+    assert.equal(unconfigured.configured, false);
+    assert.equal(unconfigured.clientId, '');
+    assert.equal(unconfigured.clientSecret, '');
+
+    const configured = googleDrive.getGoogleDriveConfig({
+      GOOGLE_DRIVE_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+      GOOGLE_DRIVE_CLIENT_SECRET: 'test-client-secret',
+      GOOGLE_DRIVE_REDIRECT_URI: 'http://localhost:3000/api/drive/callback',
+    });
+    assert.equal(configured.configured, true);
+    assert.equal(configured.clientId, 'test-client-id.apps.googleusercontent.com');
+  });
+
+  check('Google Drive 백업 3: OAuth state 생성, 사용자 ID 바인딩 및 CSRF 위변조 거부', () => {
+    const userId = 'learnaway-user-uuid-1234';
+    const state = googleDrive.createOAuthState(userId);
+
+    // 1) Correct user ID succeeds
+    const verified = googleDrive.verifyOAuthState(state, userId);
+    assert.equal(verified.valid, true);
+    assert.equal(verified.userId, userId);
+
+    // 2) Mismatched user ID fails (cross-account attack prevented)
+    const mismatched = googleDrive.verifyOAuthState(state, 'another-user-uuid-9999');
+    assert.equal(mismatched.valid, false);
+
+    // 3) Tampered state string fails
+    const tampered = state.slice(0, -6) + 'abcdef';
+    const tamperedResult = googleDrive.verifyOAuthState(tampered, userId);
+    assert.equal(tamperedResult.valid, false);
+  });
+
+  check('Google Drive 백업 4: 세션 토큰 AES-256-GCM 암호화 및 무결성 검증', () => {
+    const sessionPayload = JSON.stringify({
+      userId: 'test-user-id',
+      googleEmail: 'student@example.com',
+      accessToken: 'ya29.test-access-token',
+      expiresAt: Date.now() + 3600 * 1000,
+    });
+
+    const encrypted = googleDrive.encryptPayload(sessionPayload);
+    assert.notEqual(encrypted, sessionPayload, '평문이 그대로 노출되지 않음');
+
+    const decrypted = googleDrive.decryptPayload(encrypted);
+    assert.equal(decrypted, sessionPayload, '정상 복호화 성공');
+
+    // Tampered ciphertext fails
+    const corrupted = encrypted.slice(0, -5) + (encrypted.endsWith('A') ? 'B' : 'A') + 'corrupt';
+    const corruptedDecrypted = googleDrive.decryptPayload(corrupted);
+    assert.equal(corruptedDecrypted, null, '변조된 세션 암호문은 복호화 거부');
+  });
+
+  check('Google Drive 백업 5: Google Drive 에러 유형 세분화 및 사용자 안내 매핑', () => {
+    // 401 -> AUTH_EXPIRED
+    const e401 = googleDrive.categorizeDriveError(401, 'Unauthorized');
+    assert.equal(e401.code, 'AUTH_EXPIRED');
+
+    // 403 storageQuotaExceeded -> STORAGE_FULL
+    const eStorage = googleDrive.categorizeDriveError(403, '{"error":{"errors":[{"reason":"storageQuotaExceeded"}]}}');
+    assert.equal(eStorage.code, 'STORAGE_FULL');
+
+    // 403 userRateLimitExceeded -> RATE_LIMIT
+    const eRate = googleDrive.categorizeDriveError(403, '{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}');
+    assert.equal(eRate.code, 'RATE_LIMIT');
+
+    // 403 insufficientPermissions -> PERMISSION_DENIED
+    const ePerm = googleDrive.categorizeDriveError(403, '{"error":{"errors":[{"reason":"insufficientPermissions"}]}}');
+    assert.equal(ePerm.code, 'PERMISSION_DENIED');
+
+    // 429 -> RATE_LIMIT
+    const e429 = googleDrive.categorizeDriveError(429, 'Too Many Requests');
+    assert.equal(e429.code, 'RATE_LIMIT');
+  });
+
+  await checkAsync('Google Drive 백업 6: 로컬 백업과 Drive 백업의 스키마 완전 호환 및 복원 검증', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'gdrive-backup-user' });
+
+      const testSubject = { id: 'subj-math', name: '선형대수학' };
+      const testMaterial = {
+        id: 'mat-eig',
+        subjectId: 'subj-math',
+        title: '고유값과 고유벡터',
+        kind: 'pdf',
+        sourceRefs: '',
+        status: 'ready',
+        isConverted: true,
+        uploadedAt: new Date().toISOString(),
+        storagePolicy: materialPolicy.DEFAULT_MATERIAL_POLICY,
+      };
+
+      const originalBytes = new TextEncoder().encode('PDF binary content dummy');
+      const hash = await matStorage.hashBlob(new Blob([originalBytes], { type: 'application/pdf' }));
+
+      // Build backup using standard buildMaterialBackup
+      const backup = await materialPolicy.buildMaterialBackup([testMaterial], {
+        loadBody: async () => ({
+          status: 'found',
+          body: { markdown: '# 고유값 정의\n$Ax = \\lambda x$', rawText: '고유값 정의', pages: [] },
+        }),
+        loadOriginal: async () => ({
+          status: 'found',
+          original: { contentType: 'application/pdf', hash, data: originalBytes },
+        }),
+      });
+
+      assert.ok([1, 2].includes(backup.version), '지원하는 백업 버전(v1 또는 v2)이어야 함');
+      assert.equal(backup.materials.length, 1);
+
+      // Serialize into JSON (what gets uploaded to Google Drive or downloaded locally)
+      const serialized = JSON.stringify(backup);
+
+      // Parse with parseMaterialBackup (what happens when user restores from Drive download or local file)
+      const parsed = materialPolicy.parseMaterialBackup(serialized);
+      assert.equal(parsed.ok, true);
+
+      // Verify hashes
+      const hashVerify = await materialPolicy.verifyBackupOriginalHashes(parsed.backup);
+      assert.equal(hashVerify.ok, true, '원본 파일 해시가 정확히 일치');
+
+      // Execute restore using standard makeRestoreIo
+      const { io, writtenMetadata } = makeRestoreIo({ knownSubjectIds: [testSubject.id] });
+
+      const outcome = await materialRestore.executeMaterialRestore(parsed.backup.materials, io);
+      assert.equal(outcome.restored.length, 1);
+      assert.equal(outcome.restored[0], 'mat-eig');
+      assert.equal(writtenMetadata.length, 1);
+      assert.equal(writtenMetadata[0].title, '고유값과 고유벡터');
+    });
+  });
+
+  check('Google Drive 백업 7: 비밀정보(API 키, 토큰) 포함 시 업로드 및 내보내기 즉시 차단', () => {
+    const leakBackup = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      materials: [
+        {
+          material: { id: 'm1', subjectId: 's1', title: '자료 1', createdAt: nowIso(), updatedAt: nowIso() },
+          body: { markdown: '강의 본문' },
+          apiKey: 'injected-secret-api-key',
+        },
+      ],
+    };
+
+    assert.equal(materialPolicy.backupContainsSecrets(leakBackup), true, '비밀정보 포함 감지');
+  });
+
+  check('Google Drive 백업 8: 부분 백업 구분 및 완전 백업으로 오표기 금지', () => {
+    const incompleteBackup = {
+      version: 2,
+      createdAt: new Date().toISOString(),
+      materials: [
+        {
+          material: { id: 'm1', subjectId: 's1', title: '자료 1', kind: 'pdf', status: 'ready', isConverted: true, uploadedAt: nowIso() },
+          fileState: { body: 'error', original: 'present' },
+          fileError: { body: 'IndexedDB 읽기 실패' },
+        },
+      ],
+    };
+
+    const summary = materialPolicy.summarizeBackupCompleteness(incompleteBackup);
+    assert.equal(summary.complete, false, '본문이 누락된 백업은 완전 백업이 아님');
+    assert.equal(summary.materialsWithIssues, 1);
+  });
+
   console.log(`${passed} regression checks passed`);
 }
+
 
 run().catch((error) => { console.error(error); process.exitCode = 1; })
   .finally(() => fs.rmSync(output, { recursive: true, force: true }));

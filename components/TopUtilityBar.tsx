@@ -19,6 +19,7 @@ import {
   BarChart3,
   LogOut,
 } from 'lucide-react';
+import { useTrialCredits } from '../lib/trialCreditsClient';
 
 export type DashboardTab = 'today' | 'materials' | 'problems' | 'history' | 'settings' | 'session' | 'exam';
 
@@ -75,6 +76,7 @@ export function TopUtilityBar({
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<'materials' | 'problems' | null>(null);
+  const trialCredits = useTrialCredits();
 
   const closeMenus = () => {
     setOpenMenu(null);
@@ -407,6 +409,42 @@ export function TopUtilityBar({
             <span>학습 기록</span>
           </button>
 
+          {/* AI Trial Credits / Connection Status Badge */}
+          <button
+            type="button"
+            onClick={() => {
+              closeMenus();
+              if (onSelectTab) onSelectTab('settings');
+              else onOpenSettings();
+            }}
+            className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-xs border text-[11px] font-academic-mono transition-colors ml-1 ${
+              trialCredits.hasPersonalKey
+                ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                : trialCredits.balance > 0
+                ? 'bg-amber-50 text-amber-900 border-amber-200 hover:bg-amber-100'
+                : 'bg-red-50 text-red-900 border-red-200 hover:bg-red-100'
+            }`}
+            title={
+              trialCredits.hasPersonalKey
+                ? '내 API 키 사용 중 · 체험 크레딧 차감 없음 (설정 열기)'
+                : trialCredits.balance > 0
+                ? `AI 체험 3회 제공 · 남은 체험: ${trialCredits.balance}회 (설정 열기)`
+                : 'AI 체험 크레딧 소진 · 내 API 연결 필요 (설정 열기)'
+            }
+            aria-label="AI 연결 및 체험 크레딧 상태"
+          >
+            <Sparkles className={`w-3.5 h-3.5 ${trialCredits.hasPersonalKey ? 'text-emerald-600' : trialCredits.balance > 0 ? 'text-amber-600' : 'text-red-500'}`} />
+            <span>
+              {trialCredits.loading
+                ? 'AI...'
+                : trialCredits.hasPersonalKey
+                ? '내 API 사용 중 · 체험 크레딧 차감 없음'
+                : trialCredits.balance > 0
+                ? `남은 체험: ${trialCredits.balance}회`
+                : '체험 소진 · 내 API 연결'}
+            </span>
+          </button>
+
           <button
             onClick={() => {
               closeMenus();
@@ -526,6 +564,35 @@ export function TopUtilityBar({
       {/* Mobile Drawer: same five main menus */}
       {isMobileMenuOpen && (
         <div className="lg:hidden border-t border-[#e2ded6] bg-white px-4 py-3 space-y-2">
+          {/* Mobile AI status */}
+          <div
+            onClick={() => {
+              if (onSelectTab) onSelectTab('settings');
+              else onOpenSettings();
+              setIsMobileMenuOpen(false);
+            }}
+            className={`p-2.5 rounded-xs border text-xs flex items-center justify-between cursor-pointer ${
+              trialCredits.hasPersonalKey
+                ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                : trialCredits.balance > 0
+                ? 'bg-amber-50 text-amber-900 border-amber-200'
+                : 'bg-red-50 text-red-900 border-red-200'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <Sparkles className={`w-4 h-4 shrink-0 ${trialCredits.hasPersonalKey ? 'text-emerald-600' : trialCredits.balance > 0 ? 'text-amber-600' : 'text-red-500'}`} />
+              <span className="font-semibold">
+                {trialCredits.loading
+                  ? 'AI 크레딧 확인 중…'
+                  : trialCredits.hasPersonalKey
+                  ? '내 API 사용 중 · 체험 크레딧 차감 없음'
+                  : trialCredits.balance > 0
+                  ? `AI 체험 3회 제공 (남은 체험: ${trialCredits.balance}회)`
+                  : '체험 크레딧 소진 (내 API 연결 필요)'}
+              </span>
+            </div>
+            <span className="text-[10px] underline font-academic-mono">설정</span>
+          </div>
           <button
             onClick={() => {
               if (onSelectTab) onSelectTab('today');

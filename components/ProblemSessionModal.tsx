@@ -46,6 +46,7 @@ import {
   Lock,
   Compass,
 } from 'lucide-react';
+import { useTrialCredits, notifyTrialCreditsUpdated } from '../lib/trialCreditsClient';
 
 // Snapshot of every input that the AI evaluation depends on. Recording is only
 // allowed while the current inputs still match this snapshot.
@@ -82,6 +83,7 @@ interface ProblemSessionModalProps {
     problemId: string,
     reportData: { type: ProblemReportType; details: string; attemptId?: string }
   ) => { success: boolean; error?: string };
+  onOpenSettings?: () => void;
 }
 
 export function ProblemSessionModal({
@@ -97,7 +99,9 @@ export function ProblemSessionModal({
   planItemId,
   onOpenSourceModal,
   onReportProblem,
+  onOpenSettings,
 }: ProblemSessionModalProps) {
+  const trialCredits = useTrialCredits();
   // Stable per-tab identifier (sessionStorage): a refresh restores THIS tab's
   // own draft; a duplicated tab forks a new id instead of colliding.
   const [tabId] = useState(() => resolvePracticeTabId());
@@ -390,6 +394,7 @@ export function ProblemSessionModal({
       }
 
       const evalData: EvaluationResult = data.evaluation;
+      notifyTrialCreditsUpdated();
       setEvaluationResult(evalData);
       setEvaluatedSnapshot({
         answer: trimmed,
@@ -1021,21 +1026,68 @@ export function ProblemSessionModal({
             </div>
           </div>
 
+          {/* AI Trial Credit / Connection Status Banner */}
+          <div
+            className={`p-2.5 rounded-xs border text-xs flex items-center justify-between ${
+              trialCredits.hasPersonalKey
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                : trialCredits.balance > 0
+                ? 'bg-amber-50 border-amber-200 text-amber-950'
+                : 'bg-red-50 border-red-200 text-red-950'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <Sparkles className={`w-4 h-4 shrink-0 ${trialCredits.hasPersonalKey ? 'text-emerald-600' : trialCredits.balance > 0 ? 'text-amber-600' : 'text-red-500'}`} />
+              <div>
+                <span className="font-bold">
+                  {trialCredits.hasPersonalKey
+                    ? '내 API 사용 중 · 체험 크레딧 차감 없음'
+                    : trialCredits.balance > 0
+                    ? `이번 작업은 체험 크레딧 1회를 사용합니다. (남은 체험: ${trialCredits.balance}회)`
+                    : '체험 크레딧이 모두 소진되었습니다.'}
+                </span>
+                <span className="block text-[11px] text-[#57544e]">
+                  {trialCredits.hasPersonalKey
+                    ? '개인 API 키가 연결되어 있어 운영자 크레딧이 차감되지 않습니다.'
+                    : trialCredits.balance > 0
+                    ? '신규 가입자 체험 크레딧으로 1회당 1건의 답안 AI 정밀 평가를 이용할 수 있습니다.'
+                    : 'AI 정밀 평가를 이용하시려면 내 AI API 연결에서 개인 API 키를 등록해 주세요.'}
+                </span>
+              </div>
+            </div>
+            {!trialCredits.hasPersonalKey && trialCredits.balance <= 0 && onOpenSettings && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onOpenSettings();
+                }}
+                className="px-2.5 py-1.5 bg-[#c52828] text-white font-bold rounded-xs text-[11px] hover:bg-[#a82020] transition-colors shrink-0 ml-2"
+              >
+                내 API 연결
+              </button>
+            )}
+          </div>
+
           {/* Evaluation Trigger Button or Loading / Error / Results */}
           {!evaluationResult && !isEvaluating && !evaluationError && (
             <div className="pt-2">
               <button
                 type="button"
                 onClick={handleRequestEvaluation}
-                disabled={!answerText.trim()}
+                disabled={!answerText.trim() || (!trialCredits.hasPersonalKey && trialCredits.balance <= 0)}
                 className={`w-full flex items-center justify-center gap-2 py-3 px-4 text-xs sm:text-sm font-bold rounded-xs shadow-xs transition-all ${
-                  answerText.trim()
-                    ? 'bg-[#c52828] hover:bg-[#a82020] text-white cursor-pointer'
-                    : 'bg-[#ded6c8] text-[#827d73] cursor-not-allowed'
+                  !answerText.trim() || (!trialCredits.hasPersonalKey && trialCredits.balance <= 0)
+                    ? 'bg-[#ded6c8] text-[#827d73] cursor-not-allowed'
+                    : 'bg-[#c52828] hover:bg-[#a82020] text-white cursor-pointer'
                 }`}
               >
                 <Send className="w-4 h-4" />
-                <span>답안 제출 및 AI 정밀 평가 요청 (EVALUATE SUBMISSION)</span>
+                <span>
+                  {!trialCredits.hasPersonalKey && trialCredits.balance <= 0
+                    ? '체험 크레딧 소진 · 내 API 연결 후 평가 가능'
+                    : '답안 제출 및 AI 정밀 평가 요청 (EVALUATE SUBMISSION)'}
+                </span>
               </button>
             </div>
           )}

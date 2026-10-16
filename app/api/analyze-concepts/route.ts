@@ -2,6 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import {
+  validateTrialAnalysisInput,
+  settleTrialCredit,
+  releaseTrialCredit,
+  MAX_TRIAL_EXECUTION_TIMEOUT_MS,
+  MAX_TRIAL_OUTPUT_TOKENS,
+} from '../../../lib/trialCredits';
 import { createClient } from '../../../lib/supabase/server';
 import { createAdminClient, hasAdminClientConfig } from '../../../lib/supabase/admin';
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -513,38 +520,6 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 2. Resolve AI credentials early to bind actual model ID into job identity
-    const cred = await resolveAiConfigForUser(auth.user.id);
-    if (!cred.ok && action !== 'status' && action !== 'retry_save' && action !== 'pause') {
-      const needsAiConnection = cred.code === 'no_credentials';
-      return NextResponse.json(
-        {
-          success: false,
-          error: cred.message,
-          errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code,
-          needsAiConnection,
-        },
-        { status: needsAiConnection ? 400 : 502 }
-      );
-    }
-    const resolvedModelId =
-      (dbJobForIdentity?.model_id as string) || (cred.ok ? cred.config.model : 'deepseek-v4.1-flash');
-
-    if (dbJobForIdentity?.model_id && cred.ok && cred.config.model !== dbJobForIdentity.model_id) {
-      if (payload.model && payload.model !== dbJobForIdentity.model_id) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: `기존 분석 작업은 모델(${dbJobForIdentity.model_id})로 진행되었습니다. 새 모델(${cred.config.model})을 적용하려면 새 분석 작업을 시작해 주세요. 이전 작업 결과와 새 모델 결과를 하나의 작업에 혼합할 수 없습니다.`,
-            errorCode: 'JOB_MODEL_MISMATCH',
-            jobModel: dbJobForIdentity.model_id,
-            currentModel: cred.config.model,
-          },
-          { status: 400 }
-        );
-      }
-    }
-
     const markdownHash =
       (dbJobForIdentity?.markdown_hash as string) || (markdown ? computeMarkdownHash(markdown) : '');
     if (
@@ -569,6 +544,26 @@ export async function POST(req: NextRequest) {
     const chunks: MarkdownChunk[] = markdown.trim() ? chunkMarkdownForAnalysis(markdown, 4500) : [];
     const totalChunksCount = (dbJobForIdentity?.total_chunks as number) || chunks.length || 1;
 
+    // Validate trial limits before reserving credit if user has no personal API key
+    if (action !== 'status' && action !== 'retry_save' && action !== 'pause') {
+      const trialVal = validateTrialAnalysisInput(markdown, totalChunksCount);
+      if (!trialVal.ok) {
+        const { lookupConnectionSecret } = await import('../../../lib/aiCredentials');
+        const userLookup = await lookupConnectionSecret(auth.user.id);
+        if (userLookup.status === 'unregistered') {
+          return NextResponse.json(
+            {
+              success: false,
+              error: trialVal.error,
+              errorCode: trialVal.errorCode,
+              needsAiConnection: true,
+            },
+            { status: 400 }
+          );
+        }
+      }
+    }
+
     const expectedJobKey = clientJobKey && dbJobForIdentity
       ? (clientJobKey as string)
       : makeAnalysisJobKey(
@@ -578,9 +573,47 @@ export async function POST(req: NextRequest) {
           domain,
           promptVersion,
           chunkingVersion,
-          resolvedModelId,
+          (dbJobForIdentity?.model_id as string) || 'deepseek-v4.1-flash',
           subjectId
         );
+
+    // 2. Resolve AI credentials with trialContext
+    const cred = await resolveAiConfigForUser(auth.user.id, {
+      taskId: expectedJobKey,
+      taskType: 'analyze_concepts',
+      inputIdentifier: markdownHash,
+      isSaveRetry: action === 'retry_save',
+    });
+
+    if (!cred.ok && action !== 'status' && action !== 'retry_save' && action !== 'pause') {
+      const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
+      return NextResponse.json(
+        {
+          success: false,
+          error: cred.message,
+          errorCode: cred.code === 'no_credentials' ? 'AI_CONNECTION_REQUIRED' : cred.code,
+          needsAiConnection,
+        },
+        { status: needsAiConnection ? 400 : 502 }
+      );
+    }
+    const resolvedModelId =
+      (dbJobForIdentity?.model_id as string) || (cred.ok ? cred.config.model : 'deepseek-v4.1-flash');
+
+    if (dbJobForIdentity?.model_id && cred.ok && cred.config.model !== dbJobForIdentity.model_id) {
+      if (payload.model && payload.model !== dbJobForIdentity.model_id) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `기존 분석 작업은 모델(${dbJobForIdentity.model_id})로 진행되었습니다. 새 모델(${cred.config.model})을 적용하려면 새 분석 작업을 시작해 주세요. 이전 작업 결과와 새 모델 결과를 하나의 작업에 혼합할 수 없습니다.`,
+            errorCode: 'JOB_MODEL_MISMATCH',
+            jobModel: dbJobForIdentity.model_id,
+            currentModel: cred.config.model,
+          },
+          { status: 400 }
+        );
+      }
+    }
 
     // Idempotency lookup for new analysis: check if this exact expectedJobKey was already initialized
     if (!dbJobForIdentity && expectedJobKey) {
@@ -1275,13 +1308,17 @@ ${chunk.text}
           user: userPrompt,
           temperature: 0.15,
           json: true,
-          timeoutMs: 50000,
+          timeoutMs: cred.ok && cred.isTrial ? MAX_TRIAL_EXECUTION_TIMEOUT_MS : 50000,
+          outputTokenCeiling: cred.ok && cred.isTrial ? MAX_TRIAL_OUTPUT_TOKENS : undefined,
           label: `analyze-concepts-c${chunk.chunkIndex}`,
         },
         aiConfig
       );
 
       if (!aiCall.ok) {
+        if (cred.ok && cred.isTrial) {
+          await releaseTrialCredit(auth.user.id, jobKey, 'ai_call_failed');
+        }
         commitChunkResult(
           session,
           chunk.chunkIndex,
@@ -1508,6 +1545,9 @@ ${chunk.text}
 
     // 8. Aggregate progress across the session ledger
     const progress = getSessionProgress(session);
+    if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial) {
+      await settleTrialCredit(auth.user.id, jobKey);
+    }
 
     // 9. Persist drafts server-side
     let outcome: { persisted: boolean; drafts: ConceptDraft[]; persistError?: string } = {

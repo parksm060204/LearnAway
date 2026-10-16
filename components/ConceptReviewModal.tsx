@@ -376,8 +376,8 @@ export function ConceptReviewModal({
                 >
                   <span>
                     {saveFailedInfo.checkpointStatus === 'committed' && saveFailedInfo.draftsPersistStatus === 'failed'
-                      ? '초안 영속 저장 재시도'
-                      : '생성 완료, 저장 실패 - 저장 재시도'}
+                      ? '추가 크레딧 없이 초안 영속 저장 재시도'
+                      : '생성 완료, 저장 실패 - 추가 크레딧 없이 저장 재시도'}
                   </span>
                 </button>
                 {onExportRecoveryJson && (
@@ -540,7 +540,7 @@ export function ConceptReviewModal({
                   disabled={isAnalyzing}
                   className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-bold disabled:opacity-50 transition-colors"
                 >
-                  저장만 재시도
+                  추가 크레딧 없이 저장 재시도
                 </button>
               )}
             </div>

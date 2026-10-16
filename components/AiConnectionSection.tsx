@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
-import { KeyRound, Eye, EyeOff, Check, Trash2, RefreshCw, ShieldCheck, AlertTriangle } from 'lucide-react';
+import { KeyRound, Eye, EyeOff, Check, Trash2, RefreshCw, ShieldCheck, AlertTriangle, Sparkles } from 'lucide-react';
+import { useTrialCredits, notifyTrialCreditsUpdated } from '../lib/trialCreditsClient';
 
 type ConnectionStatus = 'unregistered' | 'checking' | 'checked' | 'connected' | 'failed';
 
@@ -40,6 +41,7 @@ export function AiConnectionSection() {
   const [replacing, setReplacing] = useState(false);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const trialCredits = useTrialCredits();
 
   const resetInput = () => {
     setApiKey('');
@@ -137,6 +139,7 @@ export function AiConnectionSection() {
       setStatus('connected');
       setReplacing(false);
       resetInput();
+      notifyTrialCreditsUpdated();
       setMessage('API 연결이 저장되었습니다. 키는 브라우저에 저장되지 않습니다.');
     } catch {
       setStatus('failed');
@@ -188,6 +191,7 @@ export function AiConnectionSection() {
       setConnection({ connected: false, operatorFallback: connection?.operatorFallback });
       setStatus('unregistered');
       resetInput();
+      notifyTrialCreditsUpdated();
       setMessage('API 연결이 삭제되었습니다.');
     } catch {
       setMessage('네트워크 오류로 연결을 삭제하지 못했습니다.');
@@ -222,6 +226,40 @@ export function AiConnectionSection() {
       </div>
 
       <div className="p-4 space-y-3 text-xs">
+        {/* Trial Credits Overview Card */}
+        <div
+          className={`p-3 rounded-xs border space-y-1.5 ${
+            trialCredits.hasPersonalKey
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+              : trialCredits.balance > 0
+              ? 'bg-amber-50/70 border-amber-200 text-amber-950'
+              : 'bg-red-50/70 border-red-200 text-red-950'
+          }`}
+        >
+          <div className="flex items-center justify-between font-bold">
+            <div className="flex items-center gap-1.5">
+              <Sparkles className={`w-4 h-4 ${trialCredits.hasPersonalKey ? 'text-emerald-600' : trialCredits.balance > 0 ? 'text-amber-600' : 'text-red-500'}`} />
+              <span>
+                {trialCredits.hasPersonalKey
+                  ? '내 API 사용 중 · 체험 크레딧 차감 없음'
+                  : `AI 체험 ${trialCredits.granted}회 제공 (남은 체험: ${trialCredits.balance}회)`}
+              </span>
+            </div>
+            {!trialCredits.hasPersonalKey && (
+              <span className="font-academic-mono text-[11px] px-1.5 py-0.5 rounded-2xs bg-white/80 border border-current">
+                잔여 {trialCredits.balance} / {trialCredits.granted}
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] leading-relaxed text-[#57544e]">
+            {trialCredits.hasPersonalKey
+              ? '개인 API 키가 정상 등록되어 있어 모든 AI 작업은 내 계정의 BAZE 크레딧을 사용하며, 제공된 체험 크레딧은 차감되지 않고 보존됩니다.'
+              : trialCredits.balance > 0
+              ? '신규 가입자 혜택으로 개인 API 키 없이 운영자 Gemini API를 통해 핵심 AI 기능(개념 분석 1건, 고난도 문제 생성 1건, 답안 AI 정밀 평가 1건)을 3회까지 무료로 체험할 수 있습니다. (자료당 최대 2청크, 생성 2문항 한도)'
+              : '체험 크레딧 3회가 모두 소진되었습니다. AI 개념 분석, 문제 출제, 답안 정밀 평가를 계속 이용하시려면 본인의 BAZE API 키를 등록해 주세요.'}
+          </p>
+        </div>
+
         <p className="text-[11px] text-[#57544e] leading-relaxed">
           내 학교 API 키를 등록하면 AI 호출 크레딧이 <strong>키를 발급한 계정</strong>에서 차감됩니다. 키는 서버에서
           암호화되어 저장되며 브라우저로 다시 전송되지 않고 <code>localStorage</code>에도 저장되지 않습니다.

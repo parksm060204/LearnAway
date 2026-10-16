@@ -85,6 +85,8 @@ async function loadStoredKey(supabase: Awaited<ReturnType<typeof createClient>>)
   }
 }
 
+import { getTrialCreditStatus } from '@/lib/trialCredits';
+
 /** Connection status + operator fallback, without any secret material. */
 export async function GET() {
   const auth = await requireApiUser();
@@ -100,9 +102,11 @@ export async function GET() {
       );
     }
     const connection = read.state === 'registered' ? read.connection : { connected: false };
+    const trialCredits = await getTrialCreditStatus(auth.user.id);
     return NextResponse.json({
       success: true,
       ...connection,
+      trialCredits,
       operatorFallback: operatorFallbackAllowed() && isAiConfigured(),
       encryptionConfigured: Boolean(getEncryptionKey()),
       defaultModel: DEFAULT_SCHOOL_MODEL,

@@ -1,7 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '@/lib/aiClient';
-import { resolveAiConfigForUser } from '@/lib/aiCredentials';
+import { resolveAiConfigForUser, lookupConnectionSecret } from '@/lib/aiCredentials';
+import {
+  validateTrialProblemGenInput,
+  settleTrialCredit,
+  releaseTrialCredit,
+  MAX_TRIAL_EXECUTION_TIMEOUT_MS,
+  MAX_TRIAL_OUTPUT_TOKENS,
+} from '@/lib/trialCredits';
 import { createClient } from '@/lib/supabase/server';
 import { persistProblemDraftsForResponse } from '@/lib/cloud/draftPersistence';
 import {
@@ -147,16 +154,6 @@ export async function POST(req: NextRequest) {
         ? [{ materialId: 'legacy', title: '학습 자료', markdown: legacyMarkdown, sourceRefs: '' }]
         : [];
 
-    // 1. Resolve AI credentials (user's registered key first, then operator).
-    const cred = await resolveAiConfigForUser(auth.user.id);
-    if (!cred.ok) {
-      const needsAiConnection = cred.code === 'no_credentials';
-      return NextResponse.json(
-        { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
-        { status: needsAiConnection ? 400 : 502 }
-      );
-    }
-
     // 2. Validation: Subject & Concepts
     if (!subjectId || !subjectDomain) {
       return NextResponse.json(
@@ -226,6 +223,35 @@ export async function POST(req: NextRequest) {
       .map((s, idx) => `[자료 ${idx + 1}] ID: ${s.materialId} / 제목: ${s.title}\n${s.markdown}`)
       .join('\n\n===== 다음 자료 =====\n\n');
     const markdownHash = computeMarkdownHash(combinedSource);
+    const conceptKey = concepts.map((c) => c.id).sort().join(',');
+    const inputIdentifier = computeMarkdownHash(`${subjectId}:${conceptKey}:${problemType}:${difficulty}:${markdownHash}`);
+    const taskId = asString(payload.taskId) || (`gen_${inputIdentifier}`);
+
+    // Check trial limits if user has no personal API key
+    const userLookup = await lookupConnectionSecret(auth.user.id);
+    if (userLookup.status === 'unregistered') {
+      const trialVal = validateTrialProblemGenInput(count, combinedSource.length);
+      if (!trialVal.ok) {
+        return NextResponse.json(
+          { success: false, error: trialVal.error, errorCode: trialVal.errorCode, needsAiConnection: true },
+          { status: 400 }
+        );
+      }
+    }
+
+    // 1. Resolve AI credentials with trialContext
+    const cred = await resolveAiConfigForUser(auth.user.id, {
+      taskId,
+      taskType: 'generate_problems',
+      inputIdentifier,
+    });
+    if (!cred.ok) {
+      const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
+      return NextResponse.json(
+        { success: false, error: cred.message, errorCode: cred.code === 'no_credentials' ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
+        { status: needsAiConnection ? 400 : 502 }
+      );
+    }
 
     const verifyQuoteInSources = (quote: string): boolean => {
       const trimmed = quote.trim();
@@ -361,10 +387,14 @@ ${combinedSource}
       user: userPrompt,
       temperature: 0.25,
       json: true,
-      timeoutMs: 60000,
+      timeoutMs: cred.isTrial ? MAX_TRIAL_EXECUTION_TIMEOUT_MS : 60000,
+      outputTokenCeiling: cred.isTrial ? MAX_TRIAL_OUTPUT_TOKENS : undefined,
       label: 'generate-problems',
     }, cred.config);
     if (!aiCall.ok) {
+      if (cred.isTrial) {
+        await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed');
+      }
       return NextResponse.json(
         { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
         { status: httpStatusForAiError(aiCall.error.code) }
@@ -377,6 +407,9 @@ ${combinedSource}
       try {
         parsedResult = JSON.parse(cleanedJson);
       } catch {
+        if (cred.isTrial) {
+          await releaseTrialCredit(auth.user.id, taskId, 'invalid_json');
+        }
         return NextResponse.json(
           { success: false, error: 'AI 문제 생성 응답을 JSON으로 해석하지 못했습니다.' },
           { status: 502 }
@@ -391,6 +424,9 @@ ${combinedSource}
           : [];
 
       if (rawProblems.length === 0) {
+        if (cred.isTrial) {
+          await releaseTrialCredit(auth.user.id, taskId, 'empty_problems');
+        }
         return NextResponse.json(
           {
             success: false,
@@ -544,6 +580,10 @@ ${combinedSource}
           drafts: draftsWithIds,
           persistError: e instanceof Error ? e.message : '초안 저장에 실패했습니다.',
         };
+      }
+
+      if (cred.isTrial && draftsWithIds.length > 0) {
+        await settleTrialCredit(auth.user.id, taskId);
       }
 
       return NextResponse.json({

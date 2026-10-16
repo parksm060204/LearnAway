@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { AI_CONFIG, isAiConfigured, type AiConfig } from './aiConfig';
+import { resolveOperatorGeminiConfig, type AiConfig } from './aiConfig';
+export { resolveOperatorGeminiConfig };
 
 /**
  * Server-only storage/encryption for per-user AI credentials.
@@ -157,6 +158,19 @@ export function operatorFallbackAllowed(env: Record<string, string | undefined> 
   return value === 'true' || value === '1' || value === 'yes';
 }
 
+import {
+  reserveTrialCredit,
+  isOperatorEmergencyStopped,
+  type TrialTaskType,
+} from './trialCredits';
+
+export interface TrialContext {
+  taskId: string;
+  taskType: TrialTaskType;
+  inputIdentifier: string;
+  isSaveRetry?: boolean;
+}
+
 /** Tri-state result of looking up the caller's stored connection. */
 export type ConnectionLookup =
   | { status: 'registered'; secret: ConnectionSecretData }
@@ -164,11 +178,25 @@ export type ConnectionLookup =
   | { status: 'lookup_failed' };
 
 export type AiConfigResolution =
-  | { ok: true; config: AiConfig; source: 'user' | 'operator' }
+  | {
+      ok: true;
+      config: AiConfig;
+      source: 'user' | 'operator';
+      isTrial?: boolean;
+      trialRemaining?: number;
+    }
   | {
       ok: false;
-      code: 'no_credentials' | 'lookup_failed' | 'credential_error' | 'encryption_not_configured';
+      code:
+        | 'no_credentials'
+        | 'lookup_failed'
+        | 'credential_error'
+        | 'encryption_not_configured'
+        | 'insufficient_credits'
+        | 'operator_disabled'
+        | 'trial_limit_exceeded';
       message: string;
+      needsAiConnection?: boolean;
     };
 
 /** Reads the caller's stored secret and distinguishes the three states. */
@@ -194,14 +222,18 @@ export async function lookupConnectionSecret(userId?: string): Promise<Connectio
  * Resolves the AI config for a request.
  *
  * Order:
- *  1. the user's registered connection (decrypted server-side);
- *  2. the operator's global key, ONLY when the user is confirmed unregistered
- *     AND the explicit policy (AI_ALLOW_OPERATOR_FALLBACK) permits it.
+ *  1. the user's registered connection (decrypted server-side); trial credit is NOT deducted.
+ *  2. the operator's key via trial credit, ONLY when the user is confirmed unregistered
+ *     AND a trial credit is successfully reserved for this bounded task (or save retry).
+ *  3. legacy explicit operator fallback (AI_ALLOW_OPERATOR_FALLBACK), used only when enabled.
  *
  * A lookup failure, malformed response or decryption failure aborts the call:
  * we never silently switch to the operator key (or any other paid provider).
  */
-export async function resolveAiConfigForUser(userId?: string): Promise<AiConfigResolution> {
+export async function resolveAiConfigForUser(
+  userId?: string,
+  trialContext?: TrialContext
+): Promise<AiConfigResolution> {
   const lookup = await lookupConnectionSecret(userId);
 
   if (lookup.status === 'lookup_failed') {
@@ -236,13 +268,86 @@ export async function resolveAiConfigForUser(userId?: string): Promise<AiConfigR
     }
   }
 
+  // Confirmed unregistered: check trial credit reservation or explicit fallback.
+  // POLICY: Unspecified/unregistered users are strictly restricted to the Gemini API only.
+  if (trialContext && userId) {
+    if (isOperatorEmergencyStopped()) {
+      return {
+        ok: false,
+        code: 'operator_disabled',
+        needsAiConnection: true,
+        message: '운영자 AI 체험 서비스가 일시 점검 중입니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+      };
+    }
+
+    const operatorConfig = resolveOperatorGeminiConfig();
+    if (!operatorConfig) {
+      return {
+        ok: false,
+        code: 'no_credentials',
+        needsAiConnection: true,
+        message: '운영자 Gemini AI 체험 API가 설정되지 않았습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+      };
+    }
+
+    if (trialContext.isSaveRetry) {
+      return { ok: true, source: 'operator', isTrial: true, config: operatorConfig };
+    }
+
+    const reservation = await reserveTrialCredit(
+      userId,
+      trialContext.taskId,
+      trialContext.taskType,
+      trialContext.inputIdentifier
+    );
+
+    if (reservation.allowed) {
+      return {
+        ok: true,
+        source: 'operator',
+        isTrial: true,
+        trialRemaining: reservation.remaining,
+        config: operatorConfig,
+      };
+    }
+
+    if (reservation.errorCode === 'INSUFFICIENT_CREDITS') {
+      return {
+        ok: false,
+        code: 'insufficient_credits',
+        needsAiConnection: true,
+        message: reservation.message || 'AI 체험 크레딧(3회)이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+      };
+    }
+
+    if (reservation.errorCode === 'OPERATOR_DISABLED' || reservation.errorCode === 'OPERATOR_DAILY_CAP_EXCEEDED') {
+      return {
+        ok: false,
+        code: 'operator_disabled',
+        needsAiConnection: true,
+        message: reservation.message || '운영자 AI 체험 제공 한도가 초과되었거나 점검 중입니다.',
+      };
+    }
+
+    return {
+      ok: false,
+      code: 'trial_limit_exceeded',
+      message: reservation.message || '체험 크레딧 예약에 실패했습니다.',
+    };
+  }
+
   // Confirmed unregistered: operator key only under an explicit policy.
-  if (isAiConfigured() && operatorFallbackAllowed()) {
-    return { ok: true, source: 'operator', config: AI_CONFIG };
+  // Unspecified users are strictly restricted to the Gemini API only.
+  if (operatorFallbackAllowed()) {
+    const operatorConfig = resolveOperatorGeminiConfig();
+    if (operatorConfig) {
+      return { ok: true, source: 'operator', config: operatorConfig };
+    }
   }
   return {
     ok: false,
     code: 'no_credentials',
+    needsAiConnection: true,
     message: 'AI API 연결이 필요합니다. 설정 > 내 AI API 연결에서 학교 BAZE API 키를 등록해 주세요.',
   };
 }
