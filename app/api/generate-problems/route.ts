@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
-import { callAiChat, httpStatusForAiError } from '@/lib/aiClient';
-import { resolveAiConfigForUser, lookupConnectionSecret } from '@/lib/aiCredentials';
+import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
+import { resolveAiConfigForUser, lookupConnectionSecret } from '../../../lib/aiCredentials';
 import {
   validateTrialProblemGenInput,
   settleTrialCredit,
@@ -10,9 +10,9 @@ import {
   recordTrialResultReady,
   MAX_TRIAL_EXECUTION_TIMEOUT_MS,
   MAX_TRIAL_OUTPUT_TOKENS,
-} from '@/lib/trialCredits';
-import { createClient } from '@/lib/supabase/server';
-import { persistProblemDraftsForResponse } from '@/lib/cloud/draftPersistence';
+} from '../../../lib/trialCredits';
+import { createClient } from '../../../lib/supabase/server';
+import { persistProblemDraftsForResponse } from '../../../lib/cloud/draftPersistence';
 import {
   ProblemDraft,
   ProblemType,
@@ -20,8 +20,8 @@ import {
   PROBLEM_DIFFICULTY_LABELS,
   Concept,
   RubricCriterion,
-} from '@/lib/types';
-import { computeMarkdownHash } from '@/lib/markdownUtils';
+} from '../../../lib/types';
+import { computeMarkdownHash } from '../../../lib/markdownUtils';
 
 interface SourceInput {
   materialId: string;
@@ -250,12 +250,30 @@ export async function POST(req: NextRequest) {
     if (!cred.ok) {
       if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
         const cached = cred.cachedResult as { drafts?: ProblemDraft[]; count?: number; generationJobId?: string };
+        const generationJobId = cached.generationJobId || taskId || randomUUID();
+        const drafts = Array.isArray(cached.drafts) ? cached.drafts : [];
+        let outcome: { persisted: boolean; drafts: ProblemDraft[]; persistError?: string } = {
+          persisted: false,
+          drafts,
+          persistError: undefined,
+        };
+        try {
+          const supabase = await createClient();
+          outcome = await persistProblemDraftsForResponse(supabase, drafts, generationJobId);
+        } catch (e) {
+          outcome = {
+            persisted: false,
+            drafts,
+            persistError: e instanceof Error ? e.message : '초안 저장에 실패했습니다.',
+          };
+        }
         return NextResponse.json({
           success: true,
-          drafts: cached.drafts || [],
-          count: cached.count || (cached.drafts ? cached.drafts.length : 0),
-          generationJobId: cached.generationJobId || taskId || randomUUID(),
-          persisted: true,
+          drafts: outcome.drafts,
+          count: outcome.drafts.length,
+          generationJobId,
+          persisted: outcome.persisted,
+          persistError: outcome.persistError,
           fromCache: true,
         });
       }
@@ -412,7 +430,7 @@ ${combinedSource}
     }, cred.config);
     if (!aiCall.ok) {
       if (cred.isTrial) {
-        await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed');
+        await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
       }
       return NextResponse.json(
         { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
@@ -427,7 +445,7 @@ ${combinedSource}
         parsedResult = JSON.parse(cleanedJson);
       } catch {
         if (cred.isTrial) {
-          await releaseTrialCredit(auth.user.id, taskId, 'invalid_json');
+          await releaseTrialCredit(auth.user.id, taskId, 'invalid_json', cred.leaseToken);
         }
         return NextResponse.json(
           { success: false, error: 'AI 문제 생성 응답을 JSON으로 해석하지 못했습니다.' },
@@ -444,7 +462,7 @@ ${combinedSource}
 
       if (rawProblems.length === 0) {
         if (cred.isTrial) {
-          await releaseTrialCredit(auth.user.id, taskId, 'empty_problems');
+          await releaseTrialCredit(auth.user.id, taskId, 'empty_problems', cred.leaseToken);
         }
         return NextResponse.json(
           {
@@ -583,11 +601,19 @@ ${combinedSource}
       }));
 
       if (cred.isTrial && draftsWithIds.length > 0) {
-        await recordTrialResultReady(auth.user.id, taskId, {
-          drafts: draftsWithIds,
-          count: draftsWithIds.length,
-          generationJobId,
-        });
+        const cacheRes = await recordTrialResultReady(
+          auth.user.id,
+          taskId,
+          {
+            drafts: draftsWithIds,
+            count: draftsWithIds.length,
+            generationJobId,
+          },
+          cred.leaseToken
+        );
+        if (!cacheRes.success) {
+          console.warn('Record trial result warning:', cacheRes.error);
+        }
       }
 
       // Return the SERVER drafts on success (DB updatedAt / contentVersion /
@@ -609,9 +635,11 @@ ${combinedSource}
         };
       }
 
+      let settlementError: string | undefined;
       if (cred.isTrial && draftsWithIds.length > 0) {
-        const settleResult = await settleTrialCredit(auth.user.id, taskId);
+        const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
         if (!settleResult.success) {
+          settlementError = settleResult.error;
           console.warn('Trial credit settlement warning:', settleResult.error);
         }
       }
@@ -623,6 +651,7 @@ ${combinedSource}
         generationJobId,
         persisted: outcome.persisted,
         persistError: outcome.persistError,
+        settlementError,
       });
   } catch (err) {
     console.error('Error generating problems:', err);

@@ -709,7 +709,7 @@ ${
     }, cred.config);
     if (!aiCall.ok) {
       if (cred.isTrial && taskId) {
-        await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed');
+        await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
       }
       return NextResponse.json(
         { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
@@ -728,7 +728,7 @@ ${
       evaluationResult = validateEvaluationOutput(parsed, checkedRubric);
     } catch (cause) {
       if (cred.isTrial && taskId) {
-        await releaseTrialCredit(auth.user.id, taskId, 'validation_failed');
+        await releaseTrialCredit(auth.user.id, taskId, 'validation_failed', cred.leaseToken);
       }
       return NextResponse.json({ success: false,
         error: cause instanceof Error ? cause.message : 'AI 평가 결과 검증에 실패했습니다.' }, { status: 502 });
@@ -854,15 +854,23 @@ ${
     }
 
     if (cred.isTrial && taskId) {
-      await recordTrialResultReady(auth.user.id, taskId, {
-        evaluation: evaluationResult,
-        problemId,
-        conceptId,
-        conceptIds,
-        subjectId,
-        isProvisionalLocal: isProvisional,
-      });
-      const settleResult = await settleTrialCredit(auth.user.id, taskId);
+      const cacheRes = await recordTrialResultReady(
+        auth.user.id,
+        taskId,
+        {
+          evaluation: evaluationResult,
+          problemId,
+          conceptId,
+          conceptIds,
+          subjectId,
+          isProvisionalLocal: isProvisional,
+        },
+        cred.leaseToken
+      );
+      if (!cacheRes.success) {
+        console.warn('Record trial result warning:', cacheRes.error);
+      }
+      const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
       if (!settleResult.success) {
         console.warn('Trial credit settlement warning:', settleResult.error);
       }

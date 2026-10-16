@@ -23,6 +23,7 @@ export interface TrialReservationResult {
   allowed: boolean;
   status?: 'reserved' | 'processing' | 'already_completed' | 'concurrent_in_progress';
   remaining?: number;
+  leaseToken?: string;
   cachedResult?: unknown;
   errorCode?: string;
   message?: string;
@@ -170,6 +171,7 @@ export async function reserveTrialCredit(
       allowed?: boolean;
       status?: 'reserved' | 'processing' | 'already_completed' | 'concurrent_in_progress';
       remaining?: number;
+      lease_token?: string;
       cached_result?: unknown;
       error_code?: string;
       message?: string;
@@ -207,6 +209,7 @@ export async function reserveTrialCredit(
       allowed: true,
       status: res.status || 'processing',
       remaining: res.remaining,
+      leaseToken: res.lease_token,
     };
   } catch (err) {
     return {
@@ -219,11 +222,13 @@ export async function reserveTrialCredit(
 
 /**
  * Records AI output as result_ready before attempting DB persistence.
+ * Validates leaseToken to prevent stale executions from overwriting state.
  */
 export async function recordTrialResultReady(
   userId: string,
   taskId: string,
-  result: unknown
+  result: unknown,
+  leaseToken?: string
 ): Promise<{ success: boolean; status?: string; error?: string }> {
   try {
     const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
@@ -231,12 +236,13 @@ export async function recordTrialResultReady(
       p_task_id: taskId,
       p_result: result,
       p_user_id: userId,
+      p_lease_token: leaseToken ?? null,
     });
     if (error || !data || typeof data !== 'object') {
       return { success: false, error: '결과 보존 처리 중 오류가 발생했습니다.' };
     }
-    const res = data as { success?: boolean; status?: string };
-    return { success: Boolean(res.success), status: res.status };
+    const res = data as { success?: boolean; status?: string; error?: string };
+    return { success: Boolean(res.success), status: res.status, error: res.error };
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : '결과 보존 통신 오류' };
   }
@@ -244,17 +250,20 @@ export async function recordTrialResultReady(
 
 /**
  * Settles a previously reserved trial credit after successful generation and persistence.
+ * Validates leaseToken to prevent stale executions from settling refunded/retried tasks.
  * Service-role only execution.
  */
 export async function settleTrialCredit(
   userId: string,
-  taskId: string
+  taskId: string,
+  leaseToken?: string
 ): Promise<{ success: boolean; status?: string; error?: string }> {
   try {
     const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
     const { data, error } = await client.rpc('settle_trial_credit', {
       p_task_id: taskId,
       p_user_id: userId,
+      p_lease_token: leaseToken ?? null,
     });
     if (error || !data || typeof data !== 'object') {
       return { success: false, error: '체험 크레딧 확정 중 오류가 발생했습니다.' };
@@ -268,12 +277,14 @@ export async function settleTrialCredit(
 
 /**
  * Releases/refunds a reserved trial credit back to the user balance on pre-generation failure.
+ * Validates leaseToken to prevent stale executions from double-refunding or mutating retried state.
  * Service-role only execution.
  */
 export async function releaseTrialCredit(
   userId: string,
   taskId: string,
-  reason?: string
+  reason?: string,
+  leaseToken?: string
 ): Promise<{ success: boolean; status?: string; remaining?: number; error?: string }> {
   try {
     const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
@@ -281,6 +292,7 @@ export async function releaseTrialCredit(
       p_task_id: taskId,
       p_reason: reason || 'cancelled_or_failed',
       p_user_id: userId,
+      p_lease_token: leaseToken ?? null,
     });
     if (error || !data || typeof data !== 'object') {
       return { success: false, error: '체험 크레딧 환급 중 오류가 발생했습니다.' };

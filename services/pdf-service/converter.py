@@ -205,3 +205,27 @@ def convert_pdf_stream(pdf_bytes: bytes, max_pages: int = MAX_PAGES_DEFAULT) -> 
                 doc.close()
             except Exception:
                 pass
+
+
+def run_worker_conversion(pdf_path: str, max_pages: int, res_queue: Any) -> None:
+    """
+    Subprocess entry point for converting PDF from a local file path.
+    Runs in an isolated process so it can be terminated on timeout.
+    Writes result dictionary to multiprocessing Queue.
+    """
+    try:
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+        res = convert_pdf_stream(pdf_bytes, max_pages)
+        res_queue.put(res)
+    except Exception as e:
+        res_queue.put({
+            "success": False,
+            "engine": "pymupdf4llm",
+            "code": "WORKER_EXCEPTION",
+            "errorCode": "WORKER_EXCEPTION",
+            "error": f"작업자 프로세스 실행 오류: {str(e)}",
+            "pages": [],
+            "fullMarkdown": "",
+            "markdown": "",
+        })

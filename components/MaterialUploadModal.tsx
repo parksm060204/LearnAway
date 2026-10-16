@@ -298,63 +298,93 @@ export function MaterialUploadModal({
           error?: string | null;
         };
 
-        // For large PDFs (> 4.5MB), use direct Supabase Storage ticket path to bypass Vercel limits
-        if (file.size > 4.5 * 1024 * 1024) {
-          setPdfConvertMessage('대용량 PDF (4.5MB 초과): 임시 스토리지 전송 후 정밀 변환 중...');
-          const ticketRes = await fetch('/api/convert', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: 'create_storage_ticket',
-              fileName: file.name,
-              fileSize: file.size,
-            }),
-            signal: controller.signal,
-          });
-          const ticket = await ticketRes.json();
-          if (!ticketRes.ok || !ticket.success) {
-            throw new Error(ticket.error || '스토리지 변환 티켓 발급 실패');
+        let currentTicket: { jobId: string; storagePath: string } | null = null;
+        try {
+          // For large PDFs (> 4.5MB), use direct Supabase Storage ticket path to bypass Vercel limits
+          if (file.size > 4.5 * 1024 * 1024) {
+            setPdfConvertMessage('대용량 PDF (4.5MB 초과): 임시 스토리지 전송 후 정밀 변환 중...');
+            const ticketRes = await fetch('/api/convert', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'create_storage_ticket',
+                fileName: file.name,
+                fileSize: file.size,
+              }),
+              signal: controller.signal,
+            });
+            const ticket = await ticketRes.json();
+            if (!ticketRes.ok || !ticket.success) {
+              throw new Error(ticket.error || '스토리지 변환 티켓 발급 실패');
+            }
+            currentTicket = { jobId: ticket.jobId, storagePath: ticket.storagePath };
+
+            let supabaseClient;
+            try {
+              supabaseClient = createBrowserSupabaseClient();
+            } catch {
+              throw new Error('스토리지 클라이언트를 생성할 수 없습니다. "이 기기에서 변환"을 이용해 주세요.');
+            }
+
+            const { error: uploadErr } = await supabaseClient.storage
+              .from(ticket.bucket || 'materials')
+              .upload(ticket.storagePath, file, { upsert: true });
+
+            if (uploadErr) {
+              throw new Error(`임시 스토리지 업로드 실패: ${uploadErr.message}`);
+            }
+
+            const convertRes = await fetch('/api/convert', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'convert_storage',
+                jobId: ticket.jobId,
+                storagePath: ticket.storagePath,
+              }),
+              signal: controller.signal,
+            });
+            data = await convertRes.json();
+          } else {
+            // Standard size direct form proxy
+            const formData = new FormData();
+            formData.append('file', file);
+            const res = await fetch('/api/convert', {
+              method: 'POST',
+              body: formData,
+              signal: controller.signal,
+            });
+            data = await res.json();
           }
-
-          let supabaseClient;
-          try {
-            supabaseClient = createBrowserSupabaseClient();
-          } catch {
-            throw new Error('스토리지 클라이언트를 생성할 수 없습니다. "이 기기에서 변환"을 이용해 주세요.');
+        } catch (convertErr) {
+          if (currentTicket) {
+            fetch('/api/convert', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'cancel_storage_ticket',
+                jobId: currentTicket.jobId,
+                storagePath: currentTicket.storagePath,
+              }),
+            }).catch(() => {});
           }
-
-          const { error: uploadErr } = await supabaseClient.storage
-            .from(ticket.bucket || 'materials')
-            .upload(ticket.storagePath, file, { upsert: true });
-
-          if (uploadErr) {
-            throw new Error(`임시 스토리지 업로드 실패: ${uploadErr.message}`);
-          }
-
-          const convertRes = await fetch('/api/convert', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: 'convert_storage',
-              jobId: ticket.jobId,
-              storagePath: ticket.storagePath,
-            }),
-            signal: controller.signal,
-          });
-          data = await convertRes.json();
-        } else {
-          // Standard size direct form proxy
-          const formData = new FormData();
-          formData.append('file', file);
-          const res = await fetch('/api/convert', {
-            method: 'POST',
-            body: formData,
-            signal: controller.signal,
-          });
-          data = await res.json();
+          throw convertErr;
         }
 
-        if (conversionId !== pdfConversionIdRef.current) return;
+        if (conversionId !== pdfConversionIdRef.current) {
+          if (currentTicket) {
+            fetch('/api/convert', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'cancel_storage_ticket',
+                jobId: currentTicket.jobId,
+                storagePath: currentTicket.storagePath,
+              }),
+            }).catch(() => {});
+          }
+          return;
+        }
 
         if (!data.success) {
           const errCode = data.code || data.errorCode;

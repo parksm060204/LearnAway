@@ -27,8 +27,9 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/historyMappers.ts', 'lib/cloud/historyMerge.ts', 'lib/cloud/historyRepository.ts',
   'lib/cloud/historyMigration.ts',
   'lib/cloud/mockExamSync.ts', 'lib/cloud/pendingExamAnswers.ts', 'lib/cloud/draftPersistence.ts',
-  'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts', 'app/api/analyze-concepts/route.ts', 'lib/supabase/admin.ts', 'app/api/reminders/cron/route.ts',
+  'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts', 'app/api/analyze-concepts/route.ts', 'app/api/generate-problems/route.ts', 'lib/supabase/admin.ts', 'app/api/reminders/cron/route.ts',
   'lib/trialCredits.ts', 'lib/drive/googleDrive.ts', 'app/api/auth/username/route.ts', 'app/api/guest-login/route.ts', 'lib/auth/session.ts', 'lib/auth/apiAuth.ts',
+  'lib/auth/username.ts',
   'lib/pdf/token.ts', 'lib/pdf/browserPdfConverter.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
@@ -1008,14 +1009,33 @@ exports.requireApiUser = async () => {
                 error: null,
               });
             }
+            if (existing.status === 'released') {
+              if (userCredits.balance <= 0) {
+                return Promise.resolve({
+                  data: {
+                    allowed: false,
+                    error_code: 'INSUFFICIENT_CREDITS',
+                    remaining: 0,
+                    message: 'AI 체험 크레딧이 모두 소진되었습니다.',
+                  },
+                  error: null,
+                });
+              }
+              userCredits.balance -= 1;
+              userCredits.updated_at = nowIso();
+            }
+
+            const leaseToken = 'lease_' + Math.random().toString(36).slice(2);
             existing.status = 'processing';
             existing.attempt_count = (existing.attempt_count || 1) + 1;
+            existing.lease_token = leaseToken;
             existing.lease_expires_at = new Date(Date.now() + 60000).toISOString();
             return Promise.resolve({
               data: {
                 allowed: true,
                 status: 'processing',
                 remaining: userCredits.balance,
+                lease_token: leaseToken,
               },
               error: null,
             });
@@ -1035,6 +1055,7 @@ exports.requireApiUser = async () => {
 
           userCredits.balance -= 1;
           userCredits.updated_at = nowIso();
+          const leaseToken = 'lease_' + Math.random().toString(36).slice(2);
           const newRes = {
             id: `res_${Date.now()}_${Math.random().toString(36).slice(2)}`,
             user_id: userId,
@@ -1043,6 +1064,7 @@ exports.requireApiUser = async () => {
             input_identifier: inputIdentifier,
             status: 'processing',
             attempt_count: 1,
+            lease_token: leaseToken,
             lease_expires_at: new Date(Date.now() + 60000).toISOString(),
             created_at: nowIso(),
             updated_at: nowIso(),
@@ -1054,6 +1076,7 @@ exports.requireApiUser = async () => {
               allowed: true,
               status: 'processing',
               remaining: userCredits.balance,
+              lease_token: leaseToken,
             },
             error: null,
           });
@@ -1065,6 +1088,9 @@ exports.requireApiUser = async () => {
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           const taskId = params && params.p_task_id;
           const res = resList.find((r) => r.task_id === taskId);
+          if (res && params && params.p_lease_token && res.lease_token && res.lease_token !== params.p_lease_token) {
+            return Promise.resolve({ data: { success: false, error: '만료되었거나 유효하지 않은 실행 토큰(fencing token)입니다.', error_code: 'STALE_LEASE_TOKEN' }, error: null });
+          }
           if (res) {
             res.status = 'result_ready';
             res.cached_result = params.p_result;
@@ -1080,6 +1106,9 @@ exports.requireApiUser = async () => {
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           const taskId = params && params.p_task_id;
           const res = resList.find((r) => r.task_id === taskId);
+          if (res && params && params.p_lease_token && res.lease_token && res.lease_token !== params.p_lease_token) {
+            return Promise.resolve({ data: { success: false, message: '만료되었거나 유효하지 않은 실행 토큰입니다.', error_code: 'STALE_LEASE_TOKEN' }, error: null });
+          }
           if (res) {
             res.status = 'settled';
             res.settled_at = nowIso();
@@ -1102,6 +1131,9 @@ exports.requireApiUser = async () => {
           const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
           const taskId = params && params.p_task_id;
           const res = resList.find((r) => r.task_id === taskId);
+          if (res && params && params.p_lease_token && res.lease_token && res.lease_token !== params.p_lease_token) {
+            return Promise.resolve({ data: { success: false, message: '만료되었거나 유효하지 않은 실행 토큰입니다.', error_code: 'STALE_LEASE_TOKEN' }, error: null });
+          }
           if (res && (res.status === 'processing' || res.status === 'reserved')) {
             res.status = 'released';
             res.released_at = nowIso();
@@ -11921,7 +11953,7 @@ exports.requireApiUser = async () => {
 
   // --- Requirement 1: Username Signup / Login & Legacy Guest Removal ---
   await checkAsync('간편 가입/로그인 1: 아이디 정규화, 허용 문자, 길이 검증', async () => {
-    const { normalizeUsername, validateUsername } = load(path.join(output, 'app/api/auth/username/route.js'));
+    const { normalizeUsername, validateUsername } = load(path.join(output, 'lib/auth/username.js'));
     assert.equal(normalizeUsername('  User_123  '), 'user_123');
     assert.equal(validateUsername('abc').ok, true);
     assert.equal(validateUsername('user-name_99').ok, true);
@@ -12307,13 +12339,18 @@ exports.requireApiUser = async () => {
   await checkAsync('PDF 변환 5: GET /api/convert 정밀 변환 상태 확인 (외부 서비스 상태 조회 성공)', async () => {
     const { GET: getConvertHealth } = load(path.join(output, 'app/api/convert/route.js'));
     const savedServiceUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    const savedServiceToken = process.env.PDF_CONVERT_SERVICE_TOKEN;
     process.env.PDF_CONVERT_SERVICE_URL = 'http://127.0.0.1:8001';
+    process.env.PDF_CONVERT_SERVICE_TOKEN = 'secret-test-token-123';
 
     const originalFetch = global.fetch;
     global.fetch = async (url) => {
       if (String(url).startsWith('http://127.0.0.1:8001/health')) {
         return new Response(JSON.stringify({
-          status: 'ok',
+          status: 'ready',
+          ready: true,
+          available: true,
+          configured: true,
           service: 'learnaway-pdf-converter',
           engine: 'pymupdf4llm',
           version: '1.1.0',
@@ -12336,6 +12373,8 @@ exports.requireApiUser = async () => {
       global.fetch = originalFetch;
       if (savedServiceUrl) process.env.PDF_CONVERT_SERVICE_URL = savedServiceUrl;
       else delete process.env.PDF_CONVERT_SERVICE_URL;
+      if (savedServiceToken) process.env.PDF_CONVERT_SERVICE_TOKEN = savedServiceToken;
+      else delete process.env.PDF_CONVERT_SERVICE_TOKEN;
     }
   });
 
@@ -12412,6 +12451,272 @@ exports.requireApiUser = async () => {
     const validPdfBuf = new TextEncoder().encode('%PDF-1.7 sample data').buffer;
     const validRes = validatePdfBuffer(validPdfBuf);
     assert.equal(validRes.ok, true);
+  });
+
+  // ==========================================================================
+  // 8대 리뷰 수정 검증 (Problems 1 ~ 8)
+  // ==========================================================================
+
+  await checkAsync('8대 리뷰 1: app/api/auth/username Route export 정리 및 lib/auth/username 모듈 분리 검증', async () => {
+    const usernameModule = load(path.join(output, 'lib/auth/username.js'));
+    assert.equal(typeof usernameModule.normalizeUsername, 'function');
+    assert.equal(typeof usernameModule.validateUsername, 'function');
+    assert.equal(typeof usernameModule.usernameToEmail, 'function');
+
+    // Route file should only export POST and dynamic (no helper exports)
+    const routeModule = load(path.join(output, 'app/api/auth/username/route.js'));
+    assert.equal(typeof routeModule.POST, 'function');
+    assert.equal(routeModule.normalizeUsername, undefined, 'normalizeUsername must NOT be exported from route.ts');
+    assert.equal(routeModule.validateUsername, undefined, 'validateUsername must NOT be exported from route.ts');
+    assert.equal(routeModule.usernameToEmail, undefined, 'usernameToEmail must NOT be exported from route.ts');
+  });
+
+  await checkAsync('8대 리뷰 2: Migration 25 구형 4인자 reserve_trial_credit 제거 및 권한 정리 검증', async () => {
+    const migrationSql = fs.readFileSync(
+      path.join(process.cwd(), 'supabase/migrations/20260101000025_trial_credits_v3_and_temp_pdf_cleanup.sql'),
+      'utf-8'
+    );
+    assert.ok(migrationSql.includes('drop function if exists public.reserve_trial_credit(text, text, text, uuid);'), '구형 4인자 함수 DROP 명시');
+    assert.ok(migrationSql.includes('revoke execute on function public.reserve_trial_credit(text, text, text, uuid) from public, anon, authenticated;'), '구형 4인자 권한 회수');
+    assert.ok(migrationSql.includes('grant execute on function public.reserve_trial_credit(text, text, text, uuid, integer) to service_role;'), '5인자 함수 service_role 전용 허용');
+    assert.ok(migrationSql.includes('revoke all on function public.reserve_trial_credit(text, text, text, uuid, integer) from public, anon, authenticated;'), '일반 사용자 실행 거부');
+  });
+
+  await checkAsync('8대 리뷰 3: 체험 크레딧 재시도 잔액 재확인, 재차감 및 leaseToken(fencing token) 검증', async () => {
+    const { recordTrialResultReady, settleTrialCredit } = load(path.join(output, 'lib/trialCredits.js'));
+
+    await withFakeSupabase({
+      user: { id: 'user-1' },
+      isAdmin: true,
+      ai_trial_credits: [{ user_id: 'user-1', granted_credits: 1, balance: 1, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [
+        {
+          id: 'res-1',
+          user_id: 'user-1',
+          task_id: 'task-1',
+          task_type: 'generate_problems',
+          input_identifier: 'hash-1',
+          status: 'processing',
+          lease_token: 'valid-lease-token',
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        },
+      ],
+    }, async () => {
+      // 1. Stale lease token is rejected
+      const staleRes = await recordTrialResultReady('user-1', 'task-1', { data: 'test' }, 'stale-lease-token');
+      assert.equal(staleRes.success, false);
+      assert.ok(staleRes.error);
+
+      // 2. Valid lease token is accepted
+      const validRes = await recordTrialResultReady('user-1', 'task-1', { data: 'test' }, 'valid-lease-token');
+      assert.equal(validRes.success, true);
+      assert.equal(validRes.status, 'result_ready');
+
+      // 3. Stale settle is rejected
+      const staleSettle = await settleTrialCredit('user-1', 'task-1', 'wrong-lease');
+      assert.equal(staleSettle.success, false);
+
+      // 4. Valid settle succeeds
+      const validSettle = await settleTrialCredit('user-1', 'task-1', 'valid-lease-token');
+      assert.equal(validSettle.success, true);
+      assert.equal(validSettle.status, 'settled');
+    });
+  });
+
+  await checkAsync('8대 리뷰 4: AI 결과 캐시와 초안 DB 저장 분리 검증 (DB 저장 실패 시 persisted:false 유지 및 재시도 성공)', async () => {
+    const { POST: generateProblems } = load(path.join(output, 'app/api/generate-problems/route.js'));
+
+    const cachedDrafts = [
+      {
+        id: 'draft-cached-1',
+        title: '수리통계학 가설검정',
+        type: 'essay_descriptive',
+        difficulty: 'advanced_college',
+        promptText: '검정력 함수를 유도하고 일치성을 증명하시오.',
+        modelAnswer: '모범 답안 수식 전개',
+        rubric: [{ id: 'r1', label: '유도', maxScore: 50 }, { id: 'r2', label: '증명', maxScore: 50 }],
+        status: 'draft',
+        isApproved: false,
+      },
+    ];
+
+    // Scenario 1: DB persistence fails
+    await withFakeSupabase({
+      user: { id: 'user-problem-gen' },
+      fail: { upsert: true },
+      rpcImpl: (fn) => {
+        if (fn === 'reserve_trial_credit') {
+          return {
+            data: {
+              allowed: false,
+              status: 'already_completed',
+              remaining: 0,
+              cached_result: { drafts: cachedDrafts, generationJobId: 'gen-job-cached' },
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      const req1 = new NextRequest('http://localhost/api/generate-problems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'sub-math',
+          subjectDomain: 'math_stats',
+          problemType: 'essay_descriptive',
+          concepts: [{ id: 'c1', subjectId: 'sub-math', title: '가설검정' }],
+          sources: [{ materialId: 'm1', title: '교재', markdown: '내용' }],
+        }),
+      });
+
+      const res1 = await generateProblems(req1);
+      const data1 = await res1.json();
+      assert.equal(data1.success, true);
+      assert.equal(data1.fromCache, true);
+      assert.equal(data1.persisted, false, 'DB 실패 시 persisted는 false여야 함');
+      assert.ok(data1.persistError, 'persistError 메시지 제공');
+    });
+
+    // Scenario 2: DB persistence succeeds on retry without re-calling AI
+    await withFakeSupabase({
+      user: { id: 'user-problem-gen' },
+      problem_drafts: [],
+      rpcImpl: (fn) => {
+        if (fn === 'reserve_trial_credit') {
+          return {
+            data: {
+              allowed: false,
+              status: 'already_completed',
+              remaining: 0,
+              cached_result: { drafts: cachedDrafts, generationJobId: 'gen-job-cached' },
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      const req2 = new NextRequest('http://localhost/api/generate-problems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'sub-math',
+          subjectDomain: 'math_stats',
+          problemType: 'essay_descriptive',
+          concepts: [{ id: 'c1', subjectId: 'sub-math', title: '가설검정' }],
+          sources: [{ materialId: 'm1', title: '교재', markdown: '내용' }],
+        }),
+      });
+
+      const res2 = await generateProblems(req2);
+      const data2 = await res2.json();
+      assert.equal(data2.success, true);
+      assert.equal(data2.fromCache, true);
+      assert.equal(data2.persisted, true, 'DB 성공 시 persisted는 true여야 함');
+    });
+  });
+
+  await checkAsync('8대 리뷰 5: Python 변환 서비스 기본 거부(default-deny) 및 환경변수 누락 시 available:false 검증', async () => {
+    const { GET: getConvertHealth } = load(path.join(output, 'app/api/convert/route.js'));
+    const savedUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    const savedToken = process.env.PDF_CONVERT_SERVICE_TOKEN;
+
+    // Case 1: URL is configured but TOKEN is missing -> available: false, configured: false
+    process.env.PDF_CONVERT_SERVICE_URL = 'http://127.0.0.1:8001';
+    delete process.env.PDF_CONVERT_SERVICE_TOKEN;
+
+    const res1 = await getConvertHealth();
+    const data1 = await res1.json();
+    assert.equal(data1.available, false);
+    assert.equal(data1.configured, false);
+    assert.ok(data1.message.includes('PDF_CONVERT_SERVICE_TOKEN'));
+
+    // Restore
+    if (savedUrl) process.env.PDF_CONVERT_SERVICE_URL = savedUrl;
+    else delete process.env.PDF_CONVERT_SERVICE_URL;
+    if (savedToken) process.env.PDF_CONVERT_SERVICE_TOKEN = savedToken;
+    else delete process.env.PDF_CONVERT_SERVICE_TOKEN;
+  });
+
+  await checkAsync('8대 리뷰 6: TypeScript 작업 토큰 생성 및 검증(verifyPdfJobToken)과 claims 바인딩 검증', async () => {
+    const { createPdfJobToken, verifyPdfJobToken } = load(path.join(output, 'lib/pdf/token.js'));
+    const savedToken = process.env.PDF_CONVERT_SERVICE_TOKEN;
+    process.env.PDF_CONVERT_SERVICE_TOKEN = 'secret-token-key-32-chars-length!!';
+
+    try {
+      const storagePath = 'user-uuid-1/temp-convert/job-xyz/lecture.pdf';
+      const token = createPdfJobToken('user-uuid-1', 'job-xyz', 250, 120, storagePath);
+      assert.ok(token);
+
+      // Verify valid token with matching context
+      const validPayload = verifyPdfJobToken(token, {
+        userId: 'user-uuid-1',
+        jobId: 'job-xyz',
+        storagePath,
+      });
+      assert.ok(validPayload);
+      assert.equal(validPayload.userId, 'user-uuid-1');
+      assert.equal(validPayload.jobId, 'job-xyz');
+      assert.equal(validPayload.storagePath, storagePath);
+
+      // Reject tampered token
+      const tampered = token.slice(0, -2) + 'aa';
+      assert.equal(verifyPdfJobToken(tampered), null);
+
+      // Reject different user
+      assert.equal(verifyPdfJobToken(token, { userId: 'attacker-uuid' }), null);
+
+      // Reject different job
+      assert.equal(verifyPdfJobToken(token, { jobId: 'different-job' }), null);
+
+      // Reject different storage path
+      assert.equal(verifyPdfJobToken(token, { storagePath: 'other/path.pdf' }), null);
+    } finally {
+      if (savedToken) process.env.PDF_CONVERT_SERVICE_TOKEN = savedToken;
+      else delete process.env.PDF_CONVERT_SERVICE_TOKEN;
+    }
+  });
+
+  await checkAsync('8대 리뷰 7: 임시 PDF 취소(cancel_storage_ticket) 및 만료 파일 정리(cleanup_expired_temp_files) 검증', async () => {
+    const { POST: convertRoute } = load(path.join(output, 'app/api/convert/route.js'));
+
+    await withFakeSupabase({
+      user: { id: 'test-user' },
+      isAdmin: true,
+      temp_pdf_conversion_jobs: [],
+    }, async () => {
+      // 1. Cancel storage ticket
+      const cancelReq = new NextRequest('http://localhost/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'cancel_storage_ticket',
+          jobId: 'job-cancel-test',
+          storagePath: 'test-user/temp-convert/job-cancel-test/test.pdf',
+        }),
+      });
+
+      const cancelRes = await convertRoute(cancelReq);
+      const cancelData = await cancelRes.json();
+      assert.equal(cancelData.success, true);
+      assert.equal(cancelData.cancelled, true);
+
+      // 2. Cleanup expired files query test
+      const cleanupReq = new NextRequest('http://localhost/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'cleanup_expired_temp_files',
+        }),
+      });
+      const cleanupRes = await convertRoute(cleanupReq);
+      const cleanupData = await cleanupRes.json();
+      assert.equal(cleanupData.success, true);
+      assert.equal(typeof cleanupData.cleanedCount, 'number');
+    });
   });
 
   console.log(`${passed} regression checks passed`);

@@ -184,6 +184,7 @@ export type AiConfigResolution =
       source: 'user' | 'operator';
       isTrial?: boolean;
       trialRemaining?: number;
+      leaseToken?: string;
     }
   | {
       ok: false;
@@ -326,6 +327,7 @@ export async function resolveAiConfigForUser(
         source: 'operator',
         isTrial: true,
         trialRemaining: reservation.remaining,
+        leaseToken: reservation.leaseToken,
         config: operatorConfig,
       };
     }

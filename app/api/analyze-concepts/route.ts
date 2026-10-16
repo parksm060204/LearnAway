@@ -1359,7 +1359,7 @@ ${chunk.text}
 
       if (!aiCall.ok) {
         if (cred.ok && cred.isTrial) {
-          await releaseTrialCredit(auth.user.id, jobKey, 'ai_call_failed');
+          await releaseTrialCredit(auth.user.id, jobKey, 'ai_call_failed', cred.leaseToken);
         }
         commitChunkResult(
           session,
@@ -1588,7 +1588,10 @@ ${chunk.text}
     // 8. Aggregate progress across the session ledger
     const progress = getSessionProgress(session);
     if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial) {
-      await recordTrialResultReady(auth.user.id, jobKey, { drafts: progress.allDrafts });
+      const recRes = await recordTrialResultReady(auth.user.id, jobKey, { drafts: progress.allDrafts }, cred.leaseToken);
+      if (!recRes.success) {
+        console.warn('Record trial result warning in analyze-concepts:', recRes.error);
+      }
     }
 
     // 9. Persist drafts server-side
@@ -1617,7 +1620,7 @@ ${chunk.text}
     }
 
     if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial && outcome.persisted) {
-      const settleResult = await settleTrialCredit(auth.user.id, jobKey);
+      const settleResult = await settleTrialCredit(auth.user.id, jobKey, cred.leaseToken);
       if (!settleResult.success) {
         console.warn('Trial credit settlement warning in analyze-concepts:', settleResult.error);
       }
