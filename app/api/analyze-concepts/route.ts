@@ -3,7 +3,7 @@ import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { createClient } from '../../../lib/supabase/server';
-import { createAdminClient } from '../../../lib/supabase/admin';
+import { createAdminClient, hasAdminClientConfig } from '../../../lib/supabase/admin';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { persistConceptDraftsForResponse } from '../../../lib/cloud/draftPersistence';
 import { ConceptDraft, ConceptEvidence } from '../../../lib/types';
@@ -34,14 +34,10 @@ import {
   sanitizeRecoveryDraft,
 } from '../../../lib/recoveryToken';
 
-// Helper to acquire a privileged service_role client for secure server-only RPCs (lease & commit)
-// after verifying user ownership in the route handler.
-function getPrivilegedClient(userClient: unknown): SupabaseClient {
-  try {
-    return createAdminClient();
-  } catch {
-    return userClient as SupabaseClient;
-  }
+// Acquires authoritative privileged service_role client for secure server RPCs.
+// CRITICAL: NEVER falls back silently to userClient.
+function getPrivilegedClient(): SupabaseClient {
+  return createAdminClient();
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -174,54 +170,79 @@ async function syncJobToSupabase(
   supabase: Awaited<ReturnType<typeof createClient>>,
   userId: string,
   session: AnalysisSessionLedger
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; errorCode?: string }> {
   try {
-    const { error: jobErr } = await supabase.from('analysis_jobs').upsert(
-      {
-        id: session.jobKey,
-        user_id: userId,
-        subject_id: session.subjectId,
-        material_id: session.materialId,
-        markdown_hash: session.markdownHash,
-        domain: session.domain,
-        model_id: session.modelId,
-        prompt_version: session.promptVersion,
-        chunking_version: session.chunkingVersion,
-        total_chunks: session.totalChunks,
-        status: session.status,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'id' }
-    );
-
-    if (jobErr) {
-      return { ok: false, error: `분석 작업 저장 실패: ${jobErr.message}` };
+    // 1. Verify User Ownership & Relations
+    if (!userId) {
+      return { ok: false, error: '사용자 식별자가 누락되었습니다.', errorCode: 'UNAUTHORIZED' };
     }
 
+    // 2. Pre-verify material ownership on server if material row exists
+    if (supabase && typeof supabase.from === 'function') {
+      const { data: matRow, error: matErr } = await supabase
+        .from('materials')
+        .select('id, user_id, subject_id')
+        .eq('id', session.materialId)
+        .maybeSingle();
+
+      if (!matErr && matRow) {
+        if (matRow.user_id !== userId) {
+          return { ok: false, error: '자료에 대한 접근 권한이 없습니다.', errorCode: 'FORBIDDEN' };
+        }
+        if (matRow.subject_id && matRow.subject_id !== session.subjectId) {
+          return { ok: false, error: '과목 식별자가 자료의 과목과 일치하지 않습니다.', errorCode: 'SUBJECT_MISMATCH' };
+        }
+      }
+      // Note: If matRow is null, it is preserved as local-only material.
+    }
+
+    // 3. Acquire privileged service_role client (never userClient)
+    let adminClient: SupabaseClient;
+    try {
+      adminClient = getPrivilegedClient();
+    } catch (err) {
+      return {
+        ok: false,
+        error: `관리자 클라이언트 설정 오류: ${err instanceof Error ? err.message : '서비스 역할 키 필요'}`,
+        errorCode: 'SERVER_CONFIG_ERROR',
+      };
+    }
+
+    // 4. Call atomic server RPC init_analysis_job_and_chunks
     const chunkInserts = Object.values(session.chunks).map((c: ChunkProgressRecord) => ({
-      job_id: session.jobKey,
       chunk_index: c.chunkIndex,
-      source_context: c.sourceContext,
-      status: c.status,
-      drafts: c.drafts,
-      attempt_count: c.attemptCount || 1,
-      last_error: c.error || null,
-      completed_at: c.completedAt || null,
-      updated_at: new Date().toISOString(),
+      source_context: c.sourceContext || `청크 ${c.chunkIndex}`,
     }));
 
-    if (chunkInserts.length > 0) {
-      const { error: chunkErr } = await supabase
-        .from('analysis_job_chunks')
-        .upsert(chunkInserts, { onConflict: 'job_id,chunk_index', ignoreDuplicates: true });
-      if (chunkErr) {
-        return { ok: false, error: `분석 청크 초기화 실패: ${chunkErr.message}` };
-      }
+    const { data: rpcRes, error: rpcErr } = await adminClient.rpc('init_analysis_job_and_chunks', {
+      p_user_id: userId,
+      p_job_id: session.jobKey,
+      p_subject_id: session.subjectId,
+      p_material_id: session.materialId,
+      p_markdown_hash: session.markdownHash,
+      p_domain: session.domain,
+      p_model_id: session.modelId,
+      p_prompt_version: session.promptVersion || 'v2',
+      p_chunking_version: session.chunkingVersion || 'v1',
+      p_total_chunks: session.totalChunks,
+      p_chunks: chunkInserts,
+    });
+
+    if (rpcErr) {
+      return { ok: false, error: `분석 작업 초기화 RPC 오류: ${rpcErr.message}`, errorCode: 'RPC_ERROR' };
+    }
+
+    if (rpcRes && !rpcRes.success) {
+      return {
+        ok: false,
+        error: rpcRes.error || '분석 작업 초기화 실패',
+        errorCode: rpcRes.error_code || 'RPC_FAILED',
+      };
     }
 
     return { ok: true };
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : '작업 저장 중 오류' };
+    return { ok: false, error: err instanceof Error ? err.message : '작업 초기화 중 오류', errorCode: 'INTERNAL_ERROR' };
   }
 }
 
@@ -263,76 +284,118 @@ export async function POST(req: NextRequest) {
       // In-memory / mock operation
     }
 
+    // Early check: if Supabase client exists on server, verify admin client credentials upfront
+    if (supabaseClient && !hasAdminClientConfig()) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: '서버 설정 오류: 관리자 서비스 키(SUPABASE_SERVICE_ROLE_KEY)가 설정되지 않았습니다.',
+          errorCode: 'SERVER_CONFIG_ERROR',
+        },
+        { status: 500 }
+      );
+    }
+
     // 1. Authoritative Job Identity Recovery
-    // For status, retry_save, pause, or resume with an existing clientJobKey:
-    // We recover the original job identity (domain, subjectId, materialId, markdownHash) directly from DB or memory ledger.
-    // This ensures computer_science jobs never regress to math_stats, and avoids re-uploading entire raw markdown.
+    // Differentiate:
+    // - Resume/Status/Retry with explicit clientJobKey: strictly lookup specified job (no quiet substitution)
+    // - Status without clientJobKey: look up latest job for this material (read-only query)
+    // - New analysis (init/process without clientJobKey): separate job identified by current markdown hash & model
     let dbJobForIdentity: Record<string, unknown> | null = null;
-    if (clientJobKey && supabaseClient && typeof supabaseClient.from === 'function') {
-      try {
-        const { data: dj } = await supabaseClient
-          .from('analysis_jobs')
-          .select('*')
-          .eq('id', clientJobKey)
-          .eq('user_id', auth.user.id)
-          .maybeSingle();
-        if (dj) dbJobForIdentity = dj;
-      } catch {
-        // best effort lookup
-      }
-    }
-
-    if (!dbJobForIdentity && !clientJobKey && materialId && supabaseClient && typeof supabaseClient.from === 'function') {
-      try {
-        const { data: latestJobs } = await supabaseClient
-          .from('analysis_jobs')
-          .select('*')
-          .eq('user_id', auth.user.id)
-          .eq('material_id', materialId)
-          .order('updated_at', { ascending: false })
-          .limit(1);
-        if (latestJobs && latestJobs.length > 0) {
-          const matchedJob = latestJobs[0];
-          dbJobForIdentity = matchedJob;
-          if (matchedJob?.id) clientJobKey = matchedJob.id as string;
+    if (clientJobKey) {
+      if (supabaseClient && typeof supabaseClient.from === 'function') {
+        try {
+          const { data: dj } = await supabaseClient
+            .from('analysis_jobs')
+            .select('*')
+            .eq('id', clientJobKey)
+            .eq('user_id', auth.user.id)
+            .maybeSingle();
+          if (dj) dbJobForIdentity = dj;
+        } catch {
+          // best effort lookup
         }
-      } catch {
-        // best effort lookup
       }
-    }
 
-    if (!dbJobForIdentity && !clientJobKey && materialId) {
-      const memSession = findLatestSessionForMaterial(auth.user.id, materialId);
-      if (memSession) {
-        dbJobForIdentity = {
-          id: memSession.jobKey,
-          subject_id: memSession.subjectId,
-          material_id: memSession.materialId,
-          domain: memSession.domain,
-          markdown_hash: memSession.markdownHash,
-          model_id: memSession.modelId,
-          prompt_version: memSession.promptVersion,
-          chunking_version: memSession.chunkingVersion,
-          total_chunks: memSession.totalChunks,
-        };
-        clientJobKey = memSession.jobKey;
+      if (!dbJobForIdentity) {
+        const memSession = findSessionLedger(auth.user.id, clientJobKey);
+        if (memSession) {
+          dbJobForIdentity = {
+            id: memSession.jobKey,
+            subject_id: memSession.subjectId,
+            material_id: memSession.materialId,
+            domain: memSession.domain,
+            markdown_hash: memSession.markdownHash,
+            model_id: memSession.modelId,
+            prompt_version: memSession.promptVersion,
+            chunking_version: memSession.chunkingVersion,
+            total_chunks: memSession.totalChunks,
+          };
+        }
       }
-    }
 
-    if (!dbJobForIdentity && clientJobKey) {
-      const memSession = findSessionLedger(auth.user.id, clientJobKey);
-      if (memSession) {
-        dbJobForIdentity = {
-          id: memSession.jobKey,
-          subject_id: memSession.subjectId,
-          material_id: memSession.materialId,
-          domain: memSession.domain,
-          markdown_hash: memSession.markdownHash,
-          model_id: memSession.modelId,
-          prompt_version: memSession.promptVersion,
-          chunking_version: memSession.chunkingVersion,
-          total_chunks: memSession.totalChunks,
-        };
+      // If explicit clientJobKey was passed but not found anywhere, reject with 404 (do not quietly substitute with another job)
+      if (!dbJobForIdentity) {
+        return NextResponse.json(
+          {
+            success: false,
+            notFound: true,
+            error: '지정한 분석 작업을 찾을 수 없습니다.',
+            errorCode: 'JOB_NOT_FOUND',
+          },
+          { status: 404 }
+        );
+      }
+    } else if (action === 'status') {
+      // ONLY status query without clientJobKey looks up the latest job for this material
+      if (materialId && supabaseClient && typeof supabaseClient.from === 'function') {
+        try {
+          const { data: latestJobs } = await supabaseClient
+            .from('analysis_jobs')
+            .select('*')
+            .eq('user_id', auth.user.id)
+            .eq('material_id', materialId)
+            .order('updated_at', { ascending: false })
+            .limit(1);
+          if (latestJobs && latestJobs.length > 0) {
+            dbJobForIdentity = latestJobs[0];
+            if (latestJobs[0]?.id) clientJobKey = latestJobs[0].id as string;
+          }
+        } catch {
+          // best effort lookup
+        }
+      }
+
+      if (!dbJobForIdentity && materialId) {
+        const memSession = findLatestSessionForMaterial(auth.user.id, materialId);
+        if (memSession) {
+          dbJobForIdentity = {
+            id: memSession.jobKey,
+            subject_id: memSession.subjectId,
+            material_id: memSession.materialId,
+            domain: memSession.domain,
+            markdown_hash: memSession.markdownHash,
+            model_id: memSession.modelId,
+            prompt_version: memSession.promptVersion,
+            chunking_version: memSession.chunkingVersion,
+            total_chunks: memSession.totalChunks,
+          };
+          clientJobKey = memSession.jobKey;
+        }
+      }
+
+      if (!dbJobForIdentity) {
+        return NextResponse.json(
+          {
+            success: false,
+            notFound: true,
+            error: '해당 자료에 대한 기존 분석 작업이 존재하지 않습니다.',
+            errorCode: 'JOB_NOT_FOUND',
+            materialId,
+            subjectId,
+          },
+          { status: 404 }
+        );
       }
     }
 
@@ -442,7 +505,7 @@ export async function POST(req: NextRequest) {
     const totalChunksCount = (dbJobForIdentity?.total_chunks as number) || chunks.length || 1;
 
     const expectedJobKey = clientJobKey && dbJobForIdentity
-      ? clientJobKey
+      ? (clientJobKey as string)
       : makeAnalysisJobKey(
           auth.user.id,
           materialId,
@@ -454,15 +517,41 @@ export async function POST(req: NextRequest) {
           subjectId
         );
 
-    if (clientJobKey && !dbJobForIdentity && clientJobKey !== expectedJobKey) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: '작업을 찾을 수 없거나 접근 권한이 없습니다.',
-          errorCode: 'NOT_FOUND_OR_FORBIDDEN',
-        },
-        { status: 404 }
-      );
+    // Idempotency lookup for new analysis: check if this exact expectedJobKey was already initialized
+    if (!dbJobForIdentity && expectedJobKey) {
+      if (supabaseClient && typeof supabaseClient.from === 'function') {
+        try {
+          const { data: ej } = await supabaseClient
+            .from('analysis_jobs')
+            .select('*')
+            .eq('id', expectedJobKey)
+            .eq('user_id', auth.user.id)
+            .maybeSingle();
+          if (ej) {
+            dbJobForIdentity = ej;
+            clientJobKey = expectedJobKey;
+          }
+        } catch {
+          // best effort
+        }
+      }
+      if (!dbJobForIdentity) {
+        const memSession = findSessionLedger(auth.user.id, expectedJobKey);
+        if (memSession) {
+          dbJobForIdentity = {
+            id: memSession.jobKey,
+            subject_id: memSession.subjectId,
+            material_id: memSession.materialId,
+            domain: memSession.domain,
+            markdown_hash: memSession.markdownHash,
+            model_id: memSession.modelId,
+            prompt_version: memSession.promptVersion,
+            chunking_version: memSession.chunkingVersion,
+            total_chunks: memSession.totalChunks,
+          };
+          clientJobKey = expectedJobKey;
+        }
+      }
     }
 
     if (action === 'status' && !dbJobForIdentity && !findSessionLedger(auth.user.id, expectedJobKey)) {
@@ -618,7 +707,7 @@ export async function POST(req: NextRequest) {
           );
 
           // Call hardened RPC using privileged client
-          const privilegedClient = getPrivilegedClient(supabaseClient);
+          const privilegedClient = getPrivilegedClient();
           const { data: commitRes, error: commitErr } = await privilegedClient.rpc(
             'commit_analysis_chunk_result',
             {
@@ -987,7 +1076,7 @@ export async function POST(req: NextRequest) {
       // Attempt atomic lease reservation on DB if Supabase client is available
       if (supabaseClient) {
         try {
-          const privilegedClient = getPrivilegedClient(supabaseClient);
+          const privilegedClient = getPrivilegedClient();
           const { data: leaseData, error: leaseErr } = await privilegedClient.rpc(
             'claim_analysis_chunk_lease',
             {
@@ -1088,7 +1177,7 @@ ${chunk.text}
         );
         if (supabaseClient && activeLeaseToken) {
           try {
-            const privilegedClient = getPrivilegedClient(supabaseClient);
+            const privilegedClient = getPrivilegedClient();
             await privilegedClient.rpc('commit_analysis_chunk_result', {
               p_job_id: jobKey,
               p_chunk_index: chunk.chunkIndex,
@@ -1206,7 +1295,7 @@ ${chunk.text}
       // Record successful chunk completion in DB using atomic lease token
       if (supabaseClient && activeLeaseToken) {
         try {
-          const privilegedClient = getPrivilegedClient(supabaseClient);
+          const privilegedClient = getPrivilegedClient();
           const { data: commitRes, error: commitErr } = await privilegedClient.rpc(
             'commit_analysis_chunk_result',
             {

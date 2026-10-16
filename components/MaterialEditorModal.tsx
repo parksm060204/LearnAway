@@ -597,7 +597,7 @@ export function MaterialEditorModal({
 
             {onTriggerAnalysis && (
               <button
-                onClick={() => onTriggerAnalysis(material)}
+                onClick={() => onTriggerAnalysis({ ...material, parsedMarkdown: markdown })}
                 disabled={isAnalyzing || !markdown.trim()}
                 className="px-3 py-1.5 bg-[#33302b] hover:bg-[#44403a] text-white text-xs font-academic-mono rounded-xs flex items-center gap-1.5 transition-colors disabled:opacity-40"
                 title="현재 저장된 Markdown으로 AI 개념 분석 실행"

@@ -1968,6 +1968,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     const scopeAtStart = getStorageScopeId();
     setIsAiAnalyzing(true);
     setSaveFailedState(null);
+    setAnalysisProgress(null);
     showToast(`[${targetMaterial.title}] AI 개념 분석 시작...`);
 
     try {
@@ -1986,21 +1987,28 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           }),
         });
         const initData = await initRes.json();
-        if (initRes.ok && initData.success) {
-          if (getStorageScopeId() !== scopeAtStart) return;
-          initialJobKey = initData.jobKey;
-          setAnalysisProgress({
-            jobKey: initData.jobKey,
-            materialId: targetMaterial.id,
-            totalChunks: initData.totalChunks || 1,
-            completedChunks: initData.completedChunks || 0,
-            pendingChunks: initData.pendingChunks || 0,
-            failedChunks: 0,
-            status: 'processing',
-          });
+        if (!initRes.ok || !initData.success) {
+          setIsAiAnalyzing(false);
+          const errMsg = initData.error || 'AI 개념 분석 초기화에 실패했습니다.';
+          showToast(`분석 초기화 실패: ${errMsg}`);
+          return;
         }
-      } catch {
-        // Fall back to standard processing if init fails
+
+        if (getStorageScopeId() !== scopeAtStart) return;
+        initialJobKey = initData.jobKey;
+        setAnalysisProgress({
+          jobKey: initData.jobKey,
+          materialId: targetMaterial.id,
+          totalChunks: initData.totalChunks || 1,
+          completedChunks: initData.completedChunks || 0,
+          pendingChunks: initData.pendingChunks || 0,
+          failedChunks: 0,
+          status: 'processing',
+        });
+      } catch (initErr) {
+        setIsAiAnalyzing(false);
+        showToast(`분석 초기화 네트워크 오류: ${initErr instanceof Error ? initErr.message : '서버에 연결할 수 없습니다.'}`);
+        return;
       }
 
       const res = await fetch('/api/analyze-concepts', {

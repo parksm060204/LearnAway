@@ -17,9 +17,16 @@ export function createAdminClient(): SupabaseClient {
   }
 
   // Explicit test injection: allows isolated unit/regression tests to supply a controllable fake
-  const testClient = (globalThis as unknown as { __fakeSupabaseAdminClient?: SupabaseClient }).__fakeSupabaseAdminClient;
-  if (testClient) {
-    return testClient;
+  const testAdminClient = (globalThis as unknown as { __fakeSupabaseAdminClient?: SupabaseClient }).__fakeSupabaseAdminClient;
+  if (testAdminClient) {
+    return testAdminClient;
+  }
+
+  if ((globalThis as unknown as { __disableFakeAdminClient?: boolean }).__disableFakeAdminClient !== true) {
+    const testClient = (globalThis as unknown as { __fakeSupabaseClient?: SupabaseClient }).__fakeSupabaseClient;
+    if (testClient) {
+      return testClient;
+    }
   }
 
   const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -35,4 +42,28 @@ export function createAdminClient(): SupabaseClient {
   return createSupabaseClient(env.url, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+}
+
+/**
+ * Returns whether authoritative admin client credentials (SUPABASE_SERVICE_ROLE_KEY and URL)
+ * are configured in the current server environment.
+ */
+export function hasAdminClientConfig(): boolean {
+  if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
+    return false;
+  }
+  if ((globalThis as unknown as { __disableFakeAdminClient?: boolean }).__disableFakeAdminClient === true) {
+    return false;
+  }
+  const testAdminClient = (globalThis as unknown as { __fakeSupabaseAdminClient?: SupabaseClient }).__fakeSupabaseAdminClient;
+  if (testAdminClient) {
+    return true;
+  }
+  const testClient = (globalThis as unknown as { __fakeSupabaseClient?: SupabaseClient }).__fakeSupabaseClient;
+  if (testClient) {
+    return true;
+  }
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const env = readSupabaseEnv();
+  return Boolean(serviceRoleKey && env && env.url);
 }
