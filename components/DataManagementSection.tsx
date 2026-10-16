@@ -367,65 +367,150 @@ export function DataManagementSection({
       setBackupProgressMessage('Google Drive 백업 폴더로 안전하게 업로드 중...');
 
       const completeness = cached.summary.complete ? 'complete' : 'partial';
+      const backupBlob = new Blob(cached.parts, { type: 'application/json' });
+      const totalBytes = backupBlob.size;
+      const totalMaterials = cached.backup.materials.length;
+      const withFiles = totalMaterials - cached.summary.materialsWithIssues;
 
-      const res = await fetch('/api/drive/upload', {
+      // 1. Initialize resumable session
+      const initRes = await fetch('/api/drive/upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          backup: cached.backup,
+          action: 'init',
           jobId: cached.jobId,
           completeness,
+          totalBytes,
+          totalMaterials,
+          withFiles,
         }),
       });
 
-      const data = (await res.json()) as {
+      const initData = (await initRes.json()) as {
         ok: boolean;
+        existing?: boolean;
+        complete?: boolean;
         fileId?: string;
         fileName?: string;
         timestamp?: string;
+        sessionToken?: string;
+        chunkSize?: number;
         error?: { code: string; message: string };
       };
 
-      if (!res.ok || !data.ok) {
+      if (!initRes.ok || !initData.ok) {
         setBackupStage('failed');
         setBackupResult({
-          total: cached.backup.materials.length,
-          withFiles: cached.backup.materials.length - cached.summary.materialsWithIssues,
+          total: totalMaterials,
+          withFiles,
           issues: cached.summary.issues,
           complete: false,
           target: 'drive',
-          errorCode: data.error?.code || 'UNKNOWN_ERROR',
-          error: data.error?.message || 'Google Drive 업로드에 실패했습니다.',
+          errorCode: initData.error?.code || 'UNKNOWN_ERROR',
+          error: initData.error?.message || 'Google Drive 업로드 세션 생성에 실패했습니다.',
           targetEmail: driveState.email || undefined,
         });
         return;
       }
 
-      // Success or Partial
+      // If existing completed backup was found (idempotency guard)
+      if (initData.existing && initData.fileId) {
+        const isComplete = cached.summary.complete;
+        setBackupStage(isComplete ? 'success' : 'partial');
+        setBackupResult({
+          total: totalMaterials,
+          withFiles,
+          issues: cached.summary.issues,
+          complete: isComplete,
+          target: 'drive',
+          driveFileId: initData.fileId,
+          driveFileName: initData.fileName,
+          timestamp: initData.timestamp || new Date().toISOString(),
+          targetEmail: driveState.email || undefined,
+        });
+        return;
+      }
+
+      const sessionToken = initData.sessionToken;
+      const chunkSize = initData.chunkSize || 2 * 1024 * 1024;
+      if (!sessionToken) {
+        throw new Error('업로드 세션 토큰을 발급받지 못했습니다.');
+      }
+
+      // 2. Stream chunks under serverless size limit
+      let offset = 0;
+      let finalFileId = '';
+      let finalFileName = '';
+      let finalTimestamp = '';
+
+      while (offset < totalBytes) {
+        const end = Math.min(offset + chunkSize, totalBytes) - 1;
+        const chunkBlob = backupBlob.slice(offset, end + 1);
+        const chunkBuffer = await chunkBlob.arrayBuffer();
+        const pct = Math.round(((end + 1) / totalBytes) * 100);
+        setBackupProgressMessage(`Google Drive 백업 업로드 중... (${pct}%)`);
+
+        const chunkRes = await fetch('/api/drive/upload', {
+          method: 'POST',
+          headers: {
+            'x-upload-session': sessionToken,
+            'Content-Range': `bytes ${offset}-${end}/${totalBytes}`,
+            'Content-Type': 'application/octet-stream',
+          },
+          body: chunkBuffer,
+        });
+
+        const chunkData = (await chunkRes.json()) as {
+          ok: boolean;
+          complete?: boolean;
+          fileId?: string;
+          fileName?: string;
+          timestamp?: string;
+          error?: { code: string; message: string };
+        };
+
+        if (!chunkRes.ok || !chunkData.ok) {
+          throw new Error(chunkData.error?.message || '청크 업로드 처리 중 오류가 발생했습니다.');
+        }
+
+        if (chunkData.complete && chunkData.fileId) {
+          finalFileId = chunkData.fileId;
+          finalFileName = chunkData.fileName || '';
+          finalTimestamp = chunkData.timestamp || new Date().toISOString();
+          break;
+        }
+
+        offset = end + 1;
+      }
+
+      if (!finalFileId) {
+        throw new Error('Google Drive 업로드 완료 확인을 받지 못했습니다.');
+      }
+
+      // 3. Mark success ONLY after server confirmed completion
       const isComplete = cached.summary.complete;
       setBackupStage(isComplete ? 'success' : 'partial');
       setBackupResult({
-        total: cached.backup.materials.length,
-        withFiles: cached.backup.materials.length - cached.summary.materialsWithIssues,
+        total: totalMaterials,
+        withFiles,
         issues: cached.summary.issues,
         complete: isComplete,
         target: 'drive',
-        driveFileId: data.fileId,
-        driveFileName: data.fileName,
-        timestamp: data.timestamp,
+        driveFileId: finalFileId,
+        driveFileName: finalFileName,
+        timestamp: finalTimestamp,
         targetEmail: driveState.email || undefined,
       });
 
-      // Update Drive state with last backup
       setDriveState((prev) => ({
         ...prev,
         lastBackup: {
-          timestamp: data.timestamp || new Date().toISOString(),
-          fileId: data.fileId || '',
-          fileName: data.fileName || '',
+          timestamp: finalTimestamp,
+          fileId: finalFileId,
+          fileName: finalFileName,
           completeness,
-          totalMaterials: cached.backup.materials.length,
-          withFiles: cached.backup.materials.length - cached.summary.materialsWithIssues,
+          totalMaterials,
+          withFiles,
         },
       }));
     } catch (error) {

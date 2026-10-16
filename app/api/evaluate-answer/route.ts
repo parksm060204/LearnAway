@@ -8,6 +8,7 @@ import {
   validateTrialEvaluateAnswerInput,
   settleTrialCredit,
   releaseTrialCredit,
+  recordTrialResultReady,
   MAX_TRIAL_EXECUTION_TIMEOUT_MS,
   MAX_TRIAL_OUTPUT_TOKENS,
 } from '../../../lib/trialCredits';
@@ -484,6 +485,32 @@ export async function POST(req: NextRequest) {
     // 3. Resolve AI credentials (user's registered key first, then operator trial credit).
     const cred = await resolveAiConfigForUser(auth.user.id, trialContext);
     if (!cred.ok) {
+      if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
+        const cached = cred.cachedResult as {
+          evaluation: EvaluationResult;
+          problemId?: string;
+          conceptId?: string;
+          conceptIds?: string[];
+          subjectId?: string;
+          isProvisionalLocal?: boolean;
+        };
+        return NextResponse.json({
+          success: true,
+          evaluation: cached.evaluation,
+          problemId: cached.problemId || problemId,
+          conceptId: cached.conceptId || conceptId,
+          conceptIds: cached.conceptIds || conceptIds,
+          subjectId: cached.subjectId || subjectId,
+          isProvisionalLocal: cached.isProvisionalLocal || isProvisional,
+          fromCache: true,
+        });
+      }
+      if (cred.code === 'concurrent_in_progress') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'CONCURRENT_EXECUTION_BLOCKED' },
+          { status: 409 }
+        );
+      }
       const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
       return NextResponse.json(
         { success: false, error: cred.message, errorCode: cred.code === 'no_credentials' ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
@@ -827,7 +854,18 @@ ${
     }
 
     if (cred.isTrial && taskId) {
-      await settleTrialCredit(auth.user.id, taskId);
+      await recordTrialResultReady(auth.user.id, taskId, {
+        evaluation: evaluationResult,
+        problemId,
+        conceptId,
+        conceptIds,
+        subjectId,
+        isProvisionalLocal: isProvisional,
+      });
+      const settleResult = await settleTrialCredit(auth.user.id, taskId);
+      if (!settleResult.success) {
+        console.warn('Trial credit settlement warning:', settleResult.error);
+      }
     }
 
     return NextResponse.json({

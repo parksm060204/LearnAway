@@ -31,12 +31,24 @@ export function authFailureResponse(state: Exclude<AuthState, { status: 'authent
     );
   }
 
+  if (state.status === 'forbidden') {
+    return NextResponse.json(
+      {
+        success: false,
+        authError: true,
+        code: 'FORBIDDEN_SHARED_ACCOUNT',
+        error: state.message || '공용 게스트 계정은 보안 및 데이터 격리를 위해 이용이 중단되었습니다. 간편 회원가입 또는 Google 로그인을 이용해 주세요.',
+      },
+      { status: 403 }
+    );
+  }
+
   return NextResponse.json(
     {
       success: false,
       authError: true,
       code: 'UNAUTHENTICATED',
-      error: '로그인이 필요합니다. Google 로그인 후 다시 시도하세요.',
+      error: '로그인이 필요합니다. 간편 로그인 또는 Google 로그인 후 다시 시도하세요.',
     },
     { status: 401 }
   );

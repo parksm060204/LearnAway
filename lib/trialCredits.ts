@@ -1,8 +1,9 @@
 import { createClient } from './supabase/server';
+import { createAdminClient, hasAdminClientConfig } from './supabase/admin';
 
 export type TrialTaskType = 'analyze_concepts' | 'generate_problems' | 'evaluate_answer';
 
-export const DEFAULT_TRIAL_GRANTED_CREDITS = 3;
+export const DEFAULT_TRIAL_GRANTED_CREDITS = 1;
 export const MAX_TRIAL_ANALYZE_CHARS = 12000;
 export const MAX_TRIAL_ANALYZE_CHUNKS = 2;
 export const MAX_TRIAL_PROBLEMS_COUNT = 2;
@@ -20,8 +21,9 @@ export interface TrialCreditStatus {
 
 export interface TrialReservationResult {
   allowed: boolean;
-  status?: 'reserved' | 'already_reserved' | 'already_settled';
+  status?: 'reserved' | 'processing' | 'already_completed' | 'concurrent_in_progress';
   remaining?: number;
+  cachedResult?: unknown;
   errorCode?: string;
   message?: string;
 }
@@ -104,7 +106,7 @@ export function validateTrialEvaluateAnswerInput(
 }
 
 /**
- * Retrieves the user's trial credits status or initializes 3 credits atomically if new.
+ * Retrieves the user's trial credits status or initializes 1 credit atomically if new.
  */
 export async function getTrialCreditStatus(userId?: string): Promise<TrialCreditStatus> {
   if (!userId) {
@@ -129,12 +131,14 @@ export async function getTrialCreditStatus(userId?: string): Promise<TrialCredit
 
 /**
  * Atomically reserves 1 trial credit for a bounded task.
+ * Executed via server admin client (service_role) to protect reservation RPC from client tampering.
  */
 export async function reserveTrialCredit(
   userId: string,
   taskId: string,
   taskType: TrialTaskType,
-  inputIdentifier: string
+  inputIdentifier: string,
+  dailyCap = getOperatorDailyCap()
 ): Promise<TrialReservationResult> {
   if (isOperatorEmergencyStopped()) {
     return {
@@ -145,12 +149,13 @@ export async function reserveTrialCredit(
   }
 
   try {
-    const supabase = await createClient();
-    const { data, error } = await supabase.rpc('reserve_trial_credit', {
+    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const { data, error } = await client.rpc('reserve_trial_credit', {
       p_task_id: taskId,
       p_task_type: taskType,
       p_input_identifier: inputIdentifier,
       p_user_id: userId,
+      p_daily_cap: dailyCap,
     });
 
     if (error || !data || typeof data !== 'object') {
@@ -163,11 +168,31 @@ export async function reserveTrialCredit(
 
     const res = data as {
       allowed?: boolean;
-      status?: 'reserved' | 'already_reserved' | 'already_settled';
+      status?: 'reserved' | 'processing' | 'already_completed' | 'concurrent_in_progress';
       remaining?: number;
+      cached_result?: unknown;
       error_code?: string;
       message?: string;
     };
+
+    if (res.status === 'already_completed') {
+      return {
+        allowed: false,
+        status: 'already_completed',
+        remaining: res.remaining ?? 0,
+        cachedResult: res.cached_result,
+        message: '이미 완료된 작업의 결과가 보존되어 있습니다.',
+      };
+    }
+
+    if (res.status === 'concurrent_in_progress') {
+      return {
+        allowed: false,
+        status: 'concurrent_in_progress',
+        errorCode: 'CONCURRENT_EXECUTION_BLOCKED',
+        message: res.message || '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
+      };
+    }
 
     if (!res.allowed) {
       return {
@@ -180,7 +205,7 @@ export async function reserveTrialCredit(
 
     return {
       allowed: true,
-      status: res.status || 'reserved',
+      status: res.status || 'processing',
       remaining: res.remaining,
     };
   } catch (err) {
@@ -193,15 +218,41 @@ export async function reserveTrialCredit(
 }
 
 /**
- * Settles a previously reserved trial credit after successful generation.
+ * Records AI output as result_ready before attempting DB persistence.
+ */
+export async function recordTrialResultReady(
+  userId: string,
+  taskId: string,
+  result: unknown
+): Promise<{ success: boolean; status?: string; error?: string }> {
+  try {
+    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const { data, error } = await client.rpc('record_trial_result_ready', {
+      p_task_id: taskId,
+      p_result: result,
+      p_user_id: userId,
+    });
+    if (error || !data || typeof data !== 'object') {
+      return { success: false, error: '결과 보존 처리 중 오류가 발생했습니다.' };
+    }
+    const res = data as { success?: boolean; status?: string };
+    return { success: Boolean(res.success), status: res.status };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : '결과 보존 통신 오류' };
+  }
+}
+
+/**
+ * Settles a previously reserved trial credit after successful generation and persistence.
+ * Service-role only execution.
  */
 export async function settleTrialCredit(
   userId: string,
   taskId: string
 ): Promise<{ success: boolean; status?: string; error?: string }> {
   try {
-    const supabase = await createClient();
-    const { data, error } = await supabase.rpc('settle_trial_credit', {
+    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const { data, error } = await client.rpc('settle_trial_credit', {
       p_task_id: taskId,
       p_user_id: userId,
     });
@@ -216,7 +267,8 @@ export async function settleTrialCredit(
 }
 
 /**
- * Releases/refunds a reserved trial credit back to the user balance on failure before generation.
+ * Releases/refunds a reserved trial credit back to the user balance on pre-generation failure.
+ * Service-role only execution.
  */
 export async function releaseTrialCredit(
   userId: string,
@@ -224,8 +276,8 @@ export async function releaseTrialCredit(
   reason?: string
 ): Promise<{ success: boolean; status?: string; remaining?: number; error?: string }> {
   try {
-    const supabase = await createClient();
-    const { data, error } = await supabase.rpc('release_trial_credit', {
+    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const { data, error } = await client.rpc('release_trial_credit', {
       p_task_id: taskId,
       p_reason: reason || 'cancelled_or_failed',
       p_user_id: userId,

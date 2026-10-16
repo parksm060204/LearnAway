@@ -99,7 +99,7 @@ export function resolveAiConfig(env: Record<string, string | undefined>): AiConf
     }
     const defaults = PROVIDER_DEFAULTS[provider];
     const isSchool = provider === 'school_gateway';
-    const rawBase = value(defaults.baseEnv) || defaults.apiBase;
+    const rawBase = value(defaults.baseEnv) || (isSchool ? value('BAZE_API_BASE') : '') || defaults.apiBase;
     const minRaw = Number(value('BAZE_MIN_OUTPUT_TOKENS'));
     return {
       provider,
@@ -137,60 +137,30 @@ export const AI_CONFIG = resolveAiConfig(process.env);
 export function isAiConfigured(): boolean { return Boolean(AI_CONFIG.apiKey); }
 
 /**
- * Resolves the operator AI configuration strictly for unspecified/public users
- * (trial credits and explicit operator fallback).
+ * Resolves the operator AI configuration for trial credits and operator operations.
  *
- * POLICY: Unspecified users MUST ONLY be served via the Gemini API.
- * Even if the server has AI_PROVIDER=school_gateway or another provider configured
- * for administrative/internal/developer use, trial credits and operator fallback
- * are strictly restricted to Gemini.
- * Under no circumstance will a non-Gemini operator key (e.g. school BAZE Gateway)
- * be used for unspecified users.
+ * POLICY: Allows configured operator provider (e.g. school BAZE Gateway with deepseek-v4.1-flash,
+ * Gemini, OpenAI, or DeepSeek).
+ * Provider credentials, Base URL, and model are resolved together as one unified configuration.
+ * Different providers' keys and URLs are NEVER mixed.
+ * If no operator provider is configured with a valid key, returns null.
  */
-export function resolveOperatorGeminiConfig(
+export function resolveOperatorAiConfig(
   env: Record<string, string | undefined> = process.env
 ): AiConfig | null {
-  const value = (key: string) => env[key]?.trim() || '';
-
-  const geminiKey = value('GEMINI_API_KEY');
-  const aiKey = value('AI_API_KEY');
-  const requestedProvider = value('AI_PROVIDER').toLowerCase();
-
-  // If AI_PROVIDER is explicitly set to a non-gemini provider (e.g. 'school_gateway', 'openai', 'deepseek'),
-  // we MUST NOT use AI_API_KEY or AI_CONFIG as a gemini fallback: only GEMINI_API_KEY is accepted!
-  if (requestedProvider && requestedProvider !== 'gemini') {
-    if (!geminiKey) return null;
+  const config = resolveAiConfig(env);
+  if (config.apiKey && !config.providerError) {
+    return config;
   }
-
-  let apiKey = geminiKey || aiKey;
-
-  // Only fall back to AI_CONFIG if it is truly a Gemini configuration
-  // AND AI_PROVIDER is not set to another provider.
-  if (!apiKey && (!requestedProvider || requestedProvider === 'gemini') && AI_CONFIG.provider === 'gemini' && AI_CONFIG.apiKey) {
-    apiKey = AI_CONFIG.apiKey;
+  if (AI_CONFIG && AI_CONFIG.apiKey && !AI_CONFIG.providerError && env === process.env) {
+    return AI_CONFIG;
   }
-
-  if (!apiKey) return null;
-
-  const defaults = PROVIDER_DEFAULTS.gemini;
-  const rawBase =
-    value('GEMINI_API_BASE') ||
-    value('AI_API_BASE') ||
-    (AI_CONFIG.provider === 'gemini' ? AI_CONFIG.apiBase : '') ||
-    defaults.apiBase;
-  const model =
-    value('GEMINI_MODEL') ||
-    value('AI_MODEL') ||
-    (AI_CONFIG.provider === 'gemini' ? AI_CONFIG.model : '') ||
-    defaults.model;
-
-  return {
-    provider: 'gemini',
-    apiKey,
-    model,
-    apiBase: rawBase.replace(/\/+$/, ''),
-    minOutputTokens: 0,
-    jsonMode: 'none',
-  };
+  return null;
 }
+
+/**
+ * Backward compatibility alias for resolveOperatorAiConfig.
+ */
+export const resolveOperatorGeminiConfig = resolveOperatorAiConfig;
+
 

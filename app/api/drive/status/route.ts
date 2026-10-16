@@ -82,15 +82,17 @@ export async function GET(request: NextRequest) {
           lastBackup: sessionData.lastBackup || null,
         });
 
-        res.cookies.set({
-          name: DRIVE_SESSION_COOKIE_NAME,
-          value: updatedEncrypted,
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
-          maxAge: 7 * 24 * 60 * 60,
-          path: '/',
-        });
+        if (updatedEncrypted) {
+          res.cookies.set({
+            name: DRIVE_SESSION_COOKIE_NAME,
+            value: updatedEncrypted,
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'lax',
+            maxAge: 7 * 24 * 60 * 60,
+            path: '/',
+          });
+        }
 
         return res;
       } catch {

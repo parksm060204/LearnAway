@@ -95,7 +95,7 @@ def convert_pdf_to_markdown(pdf_path, max_pages=250):
                 "hasText": False,
                 "pageCount": page_count,
                 "code": "PDF_NO_TEXT",
-                "error": "이미지 기반 PDF이거나 텍스트 레이어가 없어 텍스트를 추출하지 못했습니다. 원본 확인이 필요합니다.",
+                "error": "스캔된 이미지 기반 PDF이거나 텍스트 레이어가 없어 텍스트를 추출하지 못했습니다 (OCR 미지원). 텍스트가 포함된 원본 PDF를 등록해 주세요.",
                 "pages": pages,
                 "fullMarkdown": ""
             }

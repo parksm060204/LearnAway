@@ -6,6 +6,7 @@ import {
   validateTrialAnalysisInput,
   settleTrialCredit,
   releaseTrialCredit,
+  recordTrialResultReady,
   MAX_TRIAL_EXECUTION_TIMEOUT_MS,
   MAX_TRIAL_OUTPUT_TOKENS,
 } from '../../../lib/trialCredits';
@@ -585,17 +586,29 @@ export async function POST(req: NextRequest) {
       isSaveRetry: action === 'retry_save',
     });
 
-    if (!cred.ok && action !== 'status' && action !== 'retry_save' && action !== 'pause') {
-      const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
-      return NextResponse.json(
-        {
-          success: false,
-          error: cred.message,
-          errorCode: cred.code === 'no_credentials' ? 'AI_CONNECTION_REQUIRED' : cred.code,
-          needsAiConnection,
-        },
-        { status: needsAiConnection ? 400 : 502 }
-      );
+    if (!cred.ok && action === 'process') {
+      if (cred.code === 'concurrent_in_progress') {
+        return NextResponse.json(
+          {
+            success: false,
+            error: cred.message,
+            errorCode: 'CONCURRENT_EXECUTION_BLOCKED',
+          },
+          { status: 409 }
+        );
+      }
+      if (cred.code !== 'already_completed') {
+        const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
+        return NextResponse.json(
+          {
+            success: false,
+            error: cred.message,
+            errorCode: cred.code === 'no_credentials' ? 'AI_CONNECTION_REQUIRED' : cred.code,
+            needsAiConnection,
+          },
+          { status: needsAiConnection ? 400 : 502 }
+        );
+      }
     }
     const resolvedModelId =
       (dbJobForIdentity?.model_id as string) || (cred.ok ? cred.config.model : 'deepseek-v4.1-flash');
@@ -695,6 +708,35 @@ export async function POST(req: NextRequest) {
           { status: 500 }
         );
       }
+    }
+
+    if (!cred.ok && cred.code === 'already_completed' && action !== 'status' && action !== 'retry_save') {
+      const progress = getSessionProgress(session);
+      const cachedDrafts = (cred.cachedResult && typeof cred.cachedResult === 'object' && Array.isArray((cred.cachedResult as { drafts?: unknown[] }).drafts))
+        ? (cred.cachedResult as { drafts: ConceptDraft[] }).drafts
+        : progress.allDrafts;
+      return NextResponse.json({
+        success: true,
+        jobKey,
+        materialId: session.materialId,
+        subjectId: session.subjectId,
+        domain: session.domain,
+        markdownHash: session.markdownHash,
+        modelId: session.modelId,
+        promptVersion: session.promptVersion,
+        chunkingVersion: session.chunkingVersion,
+        checkpointStatus: 'completed',
+        draftsPersistStatus: 'persisted',
+        status: 'completed',
+        totalChunks: progress.totalChunks || 1,
+        completedChunks: progress.completedChunks || progress.totalChunks || 1,
+        runningChunks: 0,
+        pendingChunks: 0,
+        failedChunks: 0,
+        isAllComplete: true,
+        drafts: cachedDrafts.length > 0 ? cachedDrafts : progress.allDrafts,
+        fromCache: true,
+      });
     }
 
     // Handle job initialization: creates persistent DB job/chunks without calling AI
@@ -1546,7 +1588,7 @@ ${chunk.text}
     // 8. Aggregate progress across the session ledger
     const progress = getSessionProgress(session);
     if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial) {
-      await settleTrialCredit(auth.user.id, jobKey);
+      await recordTrialResultReady(auth.user.id, jobKey, { drafts: progress.allDrafts });
     }
 
     // 9. Persist drafts server-side
@@ -1572,6 +1614,13 @@ ${chunk.text}
       }
     } else if (!supabaseClient) {
       outcome = { persisted: true, drafts: progress.allDrafts };
+    }
+
+    if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial && outcome.persisted) {
+      const settleResult = await settleTrialCredit(auth.user.id, jobKey);
+      if (!settleResult.success) {
+        console.warn('Trial credit settlement warning in analyze-concepts:', settleResult.error);
+      }
     }
 
     if (outcome.persisted === false && progress.allDrafts.length > 0) {

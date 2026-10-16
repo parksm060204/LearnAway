@@ -27,6 +27,11 @@ export async function GET(request: NextRequest) {
   }
 
   const state = createOAuthState(auth.user.id);
+  if (!state) {
+    const settingsUrl = new URL('/', origin);
+    settingsUrl.searchParams.set('drive_error', 'encryption_key_missing');
+    return NextResponse.redirect(settingsUrl);
+  }
   const authUrl = buildGoogleOAuthUrl(config, state);
 
   const response = NextResponse.redirect(authUrl);

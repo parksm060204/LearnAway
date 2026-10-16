@@ -1,9 +1,12 @@
 'use client';
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Material, MaterialKind, MaterialPage, Subject } from '../lib/types';
 import { MATERIAL_INPUT_LIMITS, findDuplicateMaterial, parseMaterialText, validateMaterialInputFile, validateMaterialText } from '../lib/materialIngestion';
-import { saveMaterialContent } from '../lib/materialStorage';
+import { saveMaterialContent, saveMaterialOriginal } from '../lib/materialStorage';
+import { convertPdfInBrowser } from '../lib/pdf/browserPdfConverter';
+import type { PdfServiceHealth } from '../lib/pdf/types';
+import { createClient as createBrowserSupabaseClient } from '../lib/supabase/client';
 import {
   X,
   Upload,
@@ -16,6 +19,8 @@ import {
   ArrowRight,
   FileUp,
   ExternalLink,
+  Monitor,
+  Server,
 } from 'lucide-react';
 
 interface MaterialUploadModalProps {
@@ -55,6 +60,10 @@ export function MaterialUploadModal({
   const [title, setTitle] = useState('');
   const [sourceRefs, setSourceRefs] = useState('');
 
+  // Engine choice: 'browser' (PDF.js, default, zero-upload) vs 'precision' (PyMuPDF4LLM service)
+  const [engineMode, setEngineMode] = useState<'browser' | 'precision'>('browser');
+  const [serverHealth, setServerHealth] = useState<PdfServiceHealth>({ available: false, configured: false });
+
   // PDF conversion state
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [isConvertingPdf, setIsConvertingPdf] = useState(false);
@@ -62,9 +71,14 @@ export function MaterialUploadModal({
     'idle' | 'converting' | 'success' | 'needs_review' | 'error'
   >('idle');
   const [pdfConvertMessage, setPdfConvertMessage] = useState<string>('');
+  const [pdfWarnings, setPdfWarnings] = useState<string[]>([]);
   const [pdfPages, setPdfPages] = useState<MaterialPage[]>([]);
   const [pdfFullMarkdown, setPdfFullMarkdown] = useState<string>('');
   const [pageCount, setPageCount] = useState<number | undefined>(undefined);
+  const [progressPercent, setProgressPercent] = useState<number>(0);
+  const [progressStage, setProgressStage] = useState<string>('loading');
+  const [progressPage, setProgressPage] = useState<{ current: number; total: number }>({ current: 0, total: 0 });
+  const [previewTab, setPreviewTab] = useState<'preview' | 'edit'>('preview');
 
   // Duplicate detection state
   const [duplicateMatch, setDuplicateMatch] = useState<{ id: string; title: string } | null>(null);
@@ -83,10 +97,35 @@ export function MaterialUploadModal({
   const pdfAbortRef = useRef<AbortController | null>(null);
   const pdfConversionIdRef = useRef(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // Stable id/job reused across retries so a failed attempt never creates a
-  // duplicate row, version, or Storage folder.
   const materialIdRef = useRef<string | null>(null);
   const jobIdRef = useRef<string | null>(null);
+
+  // Check health of precision convert service when modal opens
+  useEffect(() => {
+    if (!isOpen) return;
+    let isMounted = true;
+    fetch('/api/convert')
+      .then((res) => res.json())
+      .then((data) => {
+        if (isMounted) {
+          setServerHealth({
+            available: Boolean(data?.available),
+            engine: data?.engine,
+            version: data?.version,
+            configured: Boolean(data?.configured),
+            message: data?.message,
+          });
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setServerHealth({ available: false, configured: false, message: '서버 확인 불가' });
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [isOpen]);
 
   const checkDuplicates = (targetMd: string, targetRaw: string) => {
     if (!existingMaterials || existingMaterials.length === 0) {
@@ -132,7 +171,10 @@ export function MaterialUploadModal({
     setIsConvertingPdf(false);
     setPdfConvertStatus('idle');
     setPdfConvertMessage('');
+    setProgressPercent(0);
+    setProgressPage({ current: 0, total: 0 });
     setPdfPages([]);
+    setPdfWarnings([]);
     setPdfFullMarkdown('');
     setPageCount(undefined);
     setDuplicateMatch(null);
@@ -157,6 +199,7 @@ export function MaterialUploadModal({
     if (validationError) {
       setPdfFile(null);
       setPdfPages([]);
+      setPdfWarnings([]);
       setPdfFullMarkdown('');
       setPageCount(undefined);
       setPdfConvertStatus('error');
@@ -169,64 +212,182 @@ export function MaterialUploadModal({
     pdfAbortRef.current = controller;
     setPdfFile(file);
     setPdfPages([]);
+    setPdfWarnings([]);
     setPdfFullMarkdown('');
     setPageCount(undefined);
     if (!title.trim()) {
       setTitle(file.name);
     }
 
-    // Auto-trigger PyMuPDF4LLM conversion
-    await runPdfConversion(file, conversionId, controller);
+    // Auto-trigger conversion with the selected engine
+    await runPdfConversion(file, conversionId, controller, engineMode);
   };
 
-  const runPdfConversion = async (file: File, conversionId: number, controller: AbortController) => {
+  const runPdfConversion = async (
+    file: File,
+    conversionId: number,
+    controller: AbortController,
+    mode: 'browser' | 'precision'
+  ) => {
     setIsConvertingPdf(true);
     setPdfConvertStatus('converting');
-    setPdfConvertMessage('PyMuPDF4LLM 변환 파이프라인 구동 중...');
+    setProgressPercent(5);
+    setProgressStage('loading');
+    setPdfWarnings([]);
 
     try {
-      const formData = new FormData();
-      formData.append('file', file);
+      if (mode === 'browser') {
+        // --- 1. Browser Client-Side Conversion (PDF.js) ---
+        setPdfConvertMessage('이 기기(브라우저)에서 PDF.js로 페이지와 텍스트 구조를 분석하는 중...');
 
-      const res = await fetch('/api/convert', {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal,
-      });
-      if (conversionId !== pdfConversionIdRef.current) return;
+        const result = await convertPdfInBrowser(file, {
+          signal: controller.signal,
+          onProgress: (p) => {
+            if (conversionId !== pdfConversionIdRef.current) return;
+            setProgressPercent(p.percent);
+            setProgressStage(p.stage || 'parsing');
+            setProgressPage({ current: p.page, total: p.totalPages });
+          },
+        });
 
-      const data = await res.json();
-      if (conversionId !== pdfConversionIdRef.current) return;
+        if (conversionId !== pdfConversionIdRef.current) return;
 
-      if (!res.ok || !data.success) {
-        if (data.code === 'PDF_NO_TEXT' && data.hasText === false && data.pageCount > 0) {
-          // Image-only PDF or zero extractable text
-          setPdfConvertStatus('needs_review');
-          setPdfConvertMessage(
-            data.error ||
-              '이미지 기반 PDF이거나 텍스트 레이어가 없어 텍스트를 추출하지 못했습니다. 원본 확인이 필요합니다.'
-          );
-          setPdfPages(data.pages || []);
-          setPageCount(data.pageCount || 1);
-        } else {
-          setPdfConvertStatus('error');
-          setPdfConvertMessage(data.error || 'PDF 변환 처리 중 오류가 발생했습니다.');
+        if (!result.success) {
+          if (result.code === 'PDF_NO_TEXT') {
+            setPdfConvertStatus('needs_review');
+            setPdfConvertMessage(
+              result.error ||
+                '스캔된 이미지 기반 PDF이거나 텍스트 레이어가 없어 텍스트를 추출하지 못했습니다 (OCR 미지원).'
+            );
+            setPdfPages(result.pages || []);
+            setPageCount(result.pageCount || 1);
+          } else {
+            setPdfConvertStatus('error');
+            setPdfConvertMessage(result.error || '브라우저 PDF 변환 중 오류가 발생했습니다.');
+          }
+          return;
         }
-        return;
-      }
 
-      // Success
-      setPdfConvertStatus('success');
-      setPdfConvertMessage(
-        `PyMuPDF4LLM 변환 완료: 총 ${data.pageCount}페이지 구조화 성공`
-      );
-      setPdfPages(data.pages || []);
-      setPdfFullMarkdown(data.fullMarkdown || '');
-      setPageCount(data.pageCount);
-      checkDuplicates(data.fullMarkdown || '', '');
+        // Success
+        setPdfConvertStatus('success');
+        setPdfConvertMessage(
+          `브라우저 변환 완료 (PDF.js): 총 ${result.pageCount}페이지 구조화 성공`
+        );
+        setPdfPages(result.pages || []);
+        setPdfFullMarkdown(result.fullMarkdown || '');
+        setPageCount(result.pageCount);
+        setPdfWarnings(result.warnings || []);
+        checkDuplicates(result.fullMarkdown || '', '');
 
-      if (!sourceRefs.trim()) {
-        setSourceRefs(`제1페이지 ~ 제${data.pageCount}페이지`);
+        if (!sourceRefs.trim()) {
+          setSourceRefs(`제1페이지 ~ 제${result.pageCount}페이지`);
+        }
+      } else {
+        // --- 2. Server Precision Conversion (PyMuPDF4LLM) ---
+        setPdfConvertMessage('PyMuPDF4LLM 정밀 변환 마이크로서비스로 전송 및 분석 중...');
+
+        let data: {
+          success: boolean;
+          hasText: boolean;
+          pageCount: number;
+          pages?: MaterialPage[];
+          fullMarkdown?: string;
+          markdown?: string;
+          code?: string;
+          errorCode?: string;
+          error?: string | null;
+        };
+
+        // For large PDFs (> 4.5MB), use direct Supabase Storage ticket path to bypass Vercel limits
+        if (file.size > 4.5 * 1024 * 1024) {
+          setPdfConvertMessage('대용량 PDF (4.5MB 초과): 임시 스토리지 전송 후 정밀 변환 중...');
+          const ticketRes = await fetch('/api/convert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'create_storage_ticket',
+              fileName: file.name,
+              fileSize: file.size,
+            }),
+            signal: controller.signal,
+          });
+          const ticket = await ticketRes.json();
+          if (!ticketRes.ok || !ticket.success) {
+            throw new Error(ticket.error || '스토리지 변환 티켓 발급 실패');
+          }
+
+          let supabaseClient;
+          try {
+            supabaseClient = createBrowserSupabaseClient();
+          } catch {
+            throw new Error('스토리지 클라이언트를 생성할 수 없습니다. "이 기기에서 변환"을 이용해 주세요.');
+          }
+
+          const { error: uploadErr } = await supabaseClient.storage
+            .from(ticket.bucket || 'materials')
+            .upload(ticket.storagePath, file, { upsert: true });
+
+          if (uploadErr) {
+            throw new Error(`임시 스토리지 업로드 실패: ${uploadErr.message}`);
+          }
+
+          const convertRes = await fetch('/api/convert', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'convert_storage',
+              jobId: ticket.jobId,
+              storagePath: ticket.storagePath,
+            }),
+            signal: controller.signal,
+          });
+          data = await convertRes.json();
+        } else {
+          // Standard size direct form proxy
+          const formData = new FormData();
+          formData.append('file', file);
+          const res = await fetch('/api/convert', {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal,
+          });
+          data = await res.json();
+        }
+
+        if (conversionId !== pdfConversionIdRef.current) return;
+
+        if (!data.success) {
+          const errCode = data.code || data.errorCode;
+          if (errCode === 'PDF_NO_TEXT') {
+            setPdfConvertStatus('needs_review');
+            setPdfConvertMessage(
+              data.error ||
+                '스캔된 이미지 기반 PDF이거나 텍스트 레이어가 없어 텍스트를 추출하지 못했습니다 (OCR 미지원).'
+            );
+            setPdfPages(data.pages || []);
+            setPageCount(data.pageCount || 1);
+          } else {
+            setPdfConvertStatus('error');
+            setPdfConvertMessage(data.error || '정밀 변환 중 오류가 발생했습니다.');
+          }
+          return;
+        }
+
+        // Success
+        setPdfConvertStatus('success');
+        setPdfConvertMessage(
+          `PyMuPDF4LLM 정밀 변환 완료: 총 ${data.pageCount}페이지 구조화 성공`
+        );
+        const pagesList = data.pages || [];
+        setPdfPages(pagesList);
+        const fullMd = data.fullMarkdown || data.markdown || '';
+        setPdfFullMarkdown(fullMd);
+        setPageCount(data.pageCount);
+        checkDuplicates(fullMd, '');
+
+        if (!sourceRefs.trim()) {
+          setSourceRefs(`제1페이지 ~ 제${data.pageCount}페이지`);
+        }
       }
     } catch (err) {
       if (conversionId !== pdfConversionIdRef.current) return;
@@ -303,7 +464,6 @@ export function MaterialUploadModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // Prevent duplicate submissions while a save is in flight.
     if (isSubmitting) return;
     if (!title.trim()) {
       alert('자료 제목을 입력해 주세요.');
@@ -332,15 +492,13 @@ export function MaterialUploadModal({
         statusMsg = pdfConvertMessage;
       } else if (pdfConvertStatus === 'success') {
         status = 'ready';
-        statusMsg = 'PyMuPDF4LLM 변환 완료';
+        statusMsg = engineMode === 'browser' ? 'PDF.js 브라우저 변환 완료' : 'PyMuPDF4LLM 정밀 변환 완료';
       } else {
-        // If user submitted without file
         status = 'needs_review';
         statusMsg = 'PDF 원본 파일이 첨부되지 않았습니다.';
       }
       finalMarkdown = pdfFullMarkdown;
     } else {
-      // Transcript or Markdown handout.
       const textError = validateMaterialText(transcriptRawText);
       if (textError) {
         alert(textError);
@@ -372,24 +530,33 @@ export function MaterialUploadModal({
       status,
       statusMessage: statusMsg,
       isConverted: status === 'ready',
-      isDemo: false, // User uploaded material
+      isDemo: false,
       uploadedAt: new Date().toISOString(),
       speakerCount: transcriptSpeakers.length > 0 ? transcriptSpeakers.length : undefined,
       speakers: transcriptSpeakers.length > 0 ? transcriptSpeakers : undefined,
-      hasAiConcepts: false, // Transparent: AI concept extraction deferred to next stage
+      hasAiConcepts: false,
       hasAiProblems: false,
     };
 
     setIsSubmitting(true);
     try {
-      // 1. Save heavy content to the local cache (kept even if the server fails).
+      // 1. Save heavy content to the local IndexedDB cache
       const saveResult = await saveMaterialContent(newMaterial.id, {
         markdown: finalMarkdown,
         rawText: finalRawText,
         pages: kind === 'pdf' ? pdfPages : undefined,
       });
 
-      // 2. Persist metadata + original + body to the server and wait for it.
+      // 1.1 Persist local original PDF in IndexedDB
+      if (kind === 'pdf' && pdfFile) {
+        try {
+          await saveMaterialOriginal(newMaterial.id, pdfFile, 'application/pdf');
+        } catch {
+          // IndexedDB storage of original is best effort
+        }
+      }
+
+      // 2. Persist metadata + server copy
       const serverOk = await onAddMaterial(
         newMaterial,
         kind === 'pdf' ? pdfFile ?? undefined : undefined,
@@ -397,26 +564,18 @@ export function MaterialUploadModal({
       );
 
       if (!serverOk) {
-        // Keep the form open and preserve inputs; the same id is reused on retry.
-        alert(
-          '서버에 자료를 저장하지 못했습니다. 입력 내용은 그대로 유지됩니다. 다시 시도해 주세요.'
-        );
+        alert('서버에 자료를 저장하지 못했습니다. 입력 내용은 그대로 유지됩니다. 다시 시도해 주세요.');
         return;
       }
 
       if (!saveResult.persisted) {
-        // Distinguish the local cache result from the server result.
-        alert(
-          `서버 저장은 완료됐지만 브라우저 캐시에는 메모리로만 보관되었습니다.\n사유: ${saveResult.error}`
-        );
+        alert(`서버 저장은 완료됐지만 브라우저 캐시에는 메모리로만 보관되었습니다.\n사유: ${saveResult.error}`);
       }
 
-      // Success: reset the id/job so the next upload is a new material.
       materialIdRef.current = null;
       jobIdRef.current = null;
       onClose();
 
-      // 3. Option to immediately open editor
       if (onOpenEditor) {
         onOpenEditor(newMaterial);
       }
@@ -508,7 +667,7 @@ export function MaterialUploadModal({
                 }`}
               >
                 <FileText className="w-4 h-4" />
-                <span>PDF 강의 교재 (PyMuPDF4LLM)</span>
+                <span>PDF 강의 교재</span>
               </button>
 
               <button
@@ -553,9 +712,91 @@ export function MaterialUploadModal({
               <div className="flex items-center justify-between">
                 <span className="font-academic-mono text-[11px] font-bold text-[#191817] flex items-center gap-1.5">
                   <FileUp className="w-4 h-4 text-[#c52828]" />
-                  실제 PDF 파일 선택 및 PyMuPDF4LLM 변환
+                  PDF 변환 방식 선택
                 </span>
                 <span className="text-[10px] text-[#827d73] font-academic-mono">.pdf · 최대 {(MATERIAL_INPUT_LIMITS.pdfBytes / 1024 / 1024).toFixed(0)}MB</span>
+              </div>
+
+              {/* Conversion Engine Toggle (Browser vs Precision) */}
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEngineMode('browser');
+                    if (pdfFile && !isConvertingPdf) {
+                      const controller = new AbortController();
+                      pdfAbortRef.current = controller;
+                      const conversionId = ++pdfConversionIdRef.current;
+                      void runPdfConversion(pdfFile, conversionId, controller, 'browser');
+                    }
+                  }}
+                  className={`p-2.5 rounded-xs border text-left flex flex-col gap-1 transition-all ${
+                    engineMode === 'browser'
+                      ? 'border-[#c52828] bg-[#fef2f2] text-[#c52828] shadow-2xs'
+                      : 'border-[#ded6c8] bg-white text-[#57544e] hover:bg-[#faf8f4]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-xs flex items-center gap-1.5">
+                      <Monitor className="w-3.5 h-3.5" />
+                      이 기기에서 변환 (권장)
+                    </span>
+                    <span className="text-[10px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-academic-mono">
+                      PDF.js 로컬
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-[#827d73] leading-tight">
+                    서버로 원본을 전송하지 않고 브라우저에서 안전하고 빠르게 변환합니다.
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!serverHealth.available}
+                  onClick={() => {
+                    if (!serverHealth.available) return;
+                    setEngineMode('precision');
+                    if (pdfFile && !isConvertingPdf) {
+                      const controller = new AbortController();
+                      pdfAbortRef.current = controller;
+                      const conversionId = ++pdfConversionIdRef.current;
+                      void runPdfConversion(pdfFile, conversionId, controller, 'precision');
+                    }
+                  }}
+                  className={`p-2.5 rounded-xs border text-left flex flex-col gap-1 transition-all ${
+                    !serverHealth.available
+                      ? 'opacity-60 bg-[#f5f3ef] border-[#ded6c8] cursor-not-allowed text-[#827d73]'
+                      : engineMode === 'precision'
+                      ? 'border-[#c52828] bg-[#fef2f2] text-[#c52828] shadow-2xs'
+                      : 'border-[#ded6c8] bg-white text-[#57544e] hover:bg-[#faf8f4]'
+                  }`}
+                  title={
+                    !serverHealth.available
+                      ? '정밀 변환 마이크로서비스가 설정되지 않았거나 오프라인 상태입니다.'
+                      : 'PyMuPDF4LLM 서버 정밀 변환'
+                  }
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-xs flex items-center gap-1.5">
+                      <Server className="w-3.5 h-3.5" />
+                      정밀 변환
+                    </span>
+                    <span
+                      className={`text-[10px] px-1.5 py-0.5 rounded font-academic-mono ${
+                        serverHealth.available
+                          ? 'bg-blue-100 text-blue-800'
+                          : 'bg-amber-100 text-amber-800'
+                      }`}
+                    >
+                      {serverHealth.available ? 'PyMuPDF4LLM' : '서버 미연결'}
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-[#827d73] leading-tight">
+                    {serverHealth.available
+                      ? '수식·표·레이아웃 구조를 정밀 분석합니다. (마이크로서비스 연결됨)'
+                      : '정밀 변환 서버가 준비되지 않아 브라우저 변환을 기본 사용합니다.'}
+                  </span>
+                </button>
               </div>
 
               <input
@@ -577,36 +818,92 @@ export function MaterialUploadModal({
                 <span className="text-[10px] text-[#827d73]">
                   {pdfFile
                     ? `${(pdfFile.size / 1024 / 1024).toFixed(2)} MB • 다른 파일 선택하려면 클릭`
-                    : 'PyMuPDF4LLM 엔진이 페이지별 Markdown과 수식을 보존하며 변환합니다.'}
+                    : engineMode === 'browser'
+                    ? '선택한 파일은 외부 서버로 전송되지 않고 이 기기에서 안전하게 변환됩니다.'
+                    : 'PyMuPDF4LLM 독립 서비스가 페이지별 Markdown과 수식을 정밀 분석합니다.'}
                 </span>
               </div>
 
-              {/* Conversion State Indicators */}
+              {/* Conversion Progress Indicator */}
               {isConvertingPdf && (
-                <div className="p-3 bg-blue-50 border border-blue-200 rounded text-blue-900 text-xs flex items-center gap-2">
-                  <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
-                  <span>PyMuPDF4LLM으로 PDF 페이지를 분석하고 Markdown을 추출하는 중입니다...</span>
+                <div className="p-3 bg-blue-50 border border-blue-200 rounded text-blue-900 text-xs space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                      <span className="font-bold">
+                        {engineMode === 'browser'
+                          ? '브라우저(PDF.js)에서 페이지 분석 및 Markdown 구성 중...'
+                          : 'PyMuPDF4LLM 서버에서 문서 정밀 분석 중...'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={cancelPdfConversion}
+                      className="px-2 py-0.5 text-[11px] bg-white border border-blue-300 rounded text-blue-800 hover:bg-blue-100 font-academic-mono"
+                    >
+                      변환 취소
+                    </button>
+                  </div>
+                  <div className="w-full bg-blue-200 h-1.5 rounded-full overflow-hidden">
+                    <div
+                      className="bg-blue-600 h-full transition-all duration-300"
+                      style={{ width: `${progressPercent}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] text-blue-700 font-academic-mono">
+                    <span>
+                      진행 상태:{' '}
+                      {progressStage === 'loading'
+                        ? '문서 로딩'
+                        : progressStage === 'parsing'
+                        ? '페이지 파싱'
+                        : '서식 구성'}
+                    </span>
+                    <span>
+                      {progressPercent}%{' '}
+                      {progressPage.total > 0
+                        ? `(${progressPage.current}/${progressPage.total}페이지)`
+                        : ''}
+                    </span>
+                  </div>
                 </div>
               )}
 
+              {/* Warnings / Quality Notice Badges */}
+              {pdfWarnings.length > 0 && (
+                <div className="p-2.5 bg-amber-50 border border-amber-300 rounded text-amber-900 text-[11px] space-y-1">
+                  <div className="font-bold flex items-center gap-1.5 text-amber-800">
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                    <span>학습 자료 구조 검토 권장 항목:</span>
+                  </div>
+                  <ul className="list-disc list-inside space-y-0.5 text-amber-800 pl-1">
+                    {pdfWarnings.map((w, idx) => (
+                      <li key={idx}>{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Success Result Status */}
               {pdfConvertStatus === 'success' && (
                 <div className="p-3 bg-emerald-50 border border-emerald-300 rounded text-emerald-900 text-xs flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                   <div>
                     <span className="font-bold">{pdfConvertMessage}</span>
                     <div className="text-[11px] text-emerald-800 mt-0.5">
-                      변환된 Markdown과 페이지 원본 대조가 등록 후 편집 화면에 바로 연결됩니다.
+                      변환된 Markdown과 원본 페이지 번호가 연결되었습니다. 아래에서 내용을 미리 보고 필요 시 수정할 수 있습니다.
                     </div>
                   </div>
                 </div>
               )}
 
+              {/* Scanned/No Text Notice */}
               {pdfConvertStatus === 'needs_review' && (
                 <div className="p-3 bg-amber-50 border border-amber-300 rounded text-amber-900 text-xs flex flex-col gap-2">
                   <div className="flex items-start gap-2">
                     <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
                     <div>
-                      <span className="font-bold">⚠️ 원본 확인 필요 (스캔/이미지 기반 PDF)</span>
+                      <span className="font-bold">⚠️ 원본 확인 필요 (스캔/이미지 기반 PDF - OCR 미지원)</span>
                       <p className="text-[11px] leading-relaxed mt-0.5">
                         {pdfConvertMessage}
                         <br />
@@ -637,10 +934,66 @@ export function MaterialUploadModal({
                 </div>
               )}
 
+              {/* Error Status */}
               {pdfConvertStatus === 'error' && (
                 <div className="p-3 bg-red-50 border border-red-300 rounded text-red-900 text-xs flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 text-red-600" />
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
                   <span>{pdfConvertMessage}</span>
+                </div>
+              )}
+
+              {/* Markdown Preview & Live Editor before save */}
+              {(pdfConvertStatus === 'success' || pdfFullMarkdown.trim().length > 0) && (
+                <div className="space-y-1.5 pt-1 border-t border-[#ded6c8]">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setPreviewTab('preview')}
+                        className={`px-2.5 py-1 text-[11px] rounded font-academic-mono transition-colors ${
+                          previewTab === 'preview'
+                            ? 'bg-[#191817] text-white font-bold'
+                            : 'bg-white border border-[#ded6c8] text-[#57544e]'
+                        }`}
+                      >
+                        본문 미리보기
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPreviewTab('edit')}
+                        className={`px-2.5 py-1 text-[11px] rounded font-academic-mono transition-colors ${
+                          previewTab === 'edit'
+                            ? 'bg-[#191817] text-white font-bold'
+                            : 'bg-white border border-[#ded6c8] text-[#57544e]'
+                        }`}
+                      >
+                        Markdown 원문 직접 수정
+                      </button>
+                    </div>
+                    <span className="text-[10px] text-[#827d73] font-academic-mono">
+                      총 {pageCount || 1}페이지 · {pdfFullMarkdown.length}자
+                    </span>
+                  </div>
+
+                  {previewTab === 'edit' ? (
+                    <textarea
+                      value={pdfFullMarkdown}
+                      onChange={(e) => {
+                        setPdfFullMarkdown(e.target.value);
+                        checkDuplicates(e.target.value, '');
+                      }}
+                      rows={6}
+                      className="w-full p-2.5 border border-[#ded6c8] rounded-xs bg-white text-[#191817] text-xs font-academic-mono resize-y"
+                      placeholder="변환된 Markdown 본문을 검토하고 필요 시 직접 수정할 수 있습니다."
+                    />
+                  ) : (
+                    <div className="p-3 bg-white border border-[#ded6c8] rounded-xs max-h-40 overflow-y-auto">
+                      <pre className="whitespace-pre-wrap break-words font-academic-mono text-[11px] text-[#33302b]">
+                        {pdfFullMarkdown.slice(0, 3000)}
+                        {pdfFullMarkdown.length > 3000 ? '\n\n... (더 많은 내용이 있습니다) ...' : ''}
+                      </pre>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -782,7 +1135,7 @@ export function MaterialUploadModal({
               • <strong>보관 방식:</strong> 원본 파일과 본문 텍스트는 브라우저 로컬 저장소(IndexedDB)에 우선 보관되며, 클라우드 동기화 사용 시에만 안전하게 백업됩니다.
             </div>
             <div className="text-[11px] text-[#57544e]">
-              • <strong>전송 및 처리:</strong> PDF 구조화 변환 및 AI 개념 분석 요청 시에는 본문 내용이 전송되어 안전하게 처리된 후 즉시 휘발됩니다. (로컬 보관 설정이 AI 처리 전송까지 차단하는 것은 아닙니다)
+              • <strong>로컬 변환 보장:</strong> &apos;이 기기에서 변환&apos;을 선택하면 PDF 원본 파일이 서버나 외부로 전송되지 않고 브라우저 내에서만 안전하게 변환됩니다.
             </div>
             <div className="text-[10px] text-[#827d73]">
               ※ 대학 시험 수준의 엄밀성을 위해 숫자만 바꾼 문제가 아닌 복합 개념 문제가 생성되며, 가짜 성공이나 임의 완료 처리를 하지 않습니다.

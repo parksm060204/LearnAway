@@ -12,7 +12,7 @@ export default async function Page() {
     return <AuthSetupNotice message={state.message} />;
   }
 
-  if (state.status === 'error') {
+  if (state.status === 'error' || state.status === 'forbidden') {
     return <AuthSetupNotice message={state.message} variant="error" />;
   }
 

@@ -16,6 +16,7 @@ export type AuthState =
   | { status: 'authenticated'; user: AppUser }
   | { status: 'unauthenticated' }
   | { status: 'unconfigured'; message: string }
+  | { status: 'forbidden'; message: string }
   | { status: 'error'; message: string };
 
 export const getAuthState = cache(async (): Promise<AuthState> => {
@@ -43,6 +44,14 @@ export const getAuthState = cache(async (): Promise<AuthState> => {
     }
 
     const email = typeof claims?.email === 'string' ? (claims.email as string) : null;
+
+    if (email?.toLowerCase() === 'guest@learnaway.ai') {
+      return {
+        status: 'forbidden',
+        message: '공용 게스트 계정은 보안 및 데이터 격리를 위해 서비스가 종료되었습니다. 간편 회원가입 또는 Google 로그인을 이용해 주세요.',
+      };
+    }
+
     return { status: 'authenticated', user: { id, email } };
   } catch (error) {
     return {
@@ -54,3 +63,41 @@ export const getAuthState = cache(async (): Promise<AuthState> => {
     };
   }
 });
+
+export function isSharedLegacyGuestUser(user?: { email?: string | null } | null): boolean {
+  if (!user || !user.email) return false;
+  return user.email.toLowerCase() === 'guest@learnaway.ai';
+}
+
+export interface SupabaseAuthClientLike {
+  auth: {
+    getUser: () => Promise<{
+      data: { user: { id: string; email?: string | null } | null };
+      error: unknown;
+    }>;
+  };
+}
+
+export async function getSessionUser(supabaseClient?: SupabaseAuthClientLike): Promise<
+  | { user: AppUser; errorCode?: undefined }
+  | { user: null; errorCode: string; message: string }
+> {
+  try {
+    const client = (supabaseClient as unknown as { auth: { getUser: () => Promise<{ data: { user: { id: string; email?: string | null } | null }; error: unknown }> } }) || (await createClient());
+    const { data, error } = await client.auth.getUser();
+    if (error || !data?.user) {
+      return { user: null, errorCode: 'UNAUTHENTICATED', message: '로그인이 필요합니다.' };
+    }
+    if (isSharedLegacyGuestUser(data.user)) {
+      return {
+        user: null,
+        errorCode: 'FORBIDDEN_SHARED_ACCOUNT',
+        message: '공용 게스트 계정은 보안 및 데이터 격리를 위해 이용이 중단되었습니다.',
+      };
+    }
+    return { user: { id: data.user.id, email: data.user.email || null } };
+  } catch (err) {
+    return { user: null, errorCode: 'AUTH_ERROR', message: err instanceof Error ? err.message : '인증 오류' };
+  }
+}
+

@@ -90,6 +90,10 @@ export async function GET(request: NextRequest) {
     };
 
     const encryptedSession = encryptPayload(JSON.stringify(sessionData));
+    if (!encryptedSession) {
+      redirectTarget.searchParams.set('drive_error', 'encryption_failed');
+      return NextResponse.redirect(redirectTarget);
+    }
 
     redirectTarget.searchParams.set('drive_status', 'connected');
     const response = NextResponse.redirect(redirectTarget);

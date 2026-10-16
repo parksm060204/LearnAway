@@ -1,7 +1,8 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 export interface GoogleDriveConfig {
   configured: boolean;
+  encryptionConfigured?: boolean;
   clientId: string;
   clientSecret: string;
   redirectUri: string;
@@ -51,16 +52,44 @@ export interface OAuthStatePayload {
 }
 
 /**
+ * Derives a secure 32-byte encryption key strictly from AI_CREDENTIAL_ENCRYPTION_KEY.
+ * Falls back to NULL if not configured (never uses fixed public fallback string).
+ */
+export function getDriveEncryptionKey(env: Record<string, string | undefined> = process.env): Buffer | null {
+  const explicitKey = (env.AI_CREDENTIAL_ENCRYPTION_KEY || '').trim();
+  if (!explicitKey) return null;
+
+  try {
+    const buf = Buffer.from(explicitKey, 'base64');
+    if (buf.length === 32) return buf;
+  } catch {
+    // fall through
+  }
+  if (/^[0-9a-fA-F]{64}$/.test(explicitKey)) {
+    return Buffer.from(explicitKey, 'hex');
+  }
+  if (Buffer.byteLength(explicitKey, 'utf8') === 32) {
+    return Buffer.from(explicitKey, 'utf8');
+  }
+
+  return null;
+}
+
+/**
  * Returns Google Drive API configuration from environment variables.
+ * Requires both valid OAuth credentials and a valid 32-byte encryption key.
  */
 export function getGoogleDriveConfig(env: Record<string, string | undefined> = process.env): GoogleDriveConfig {
   const clientId = (env.GOOGLE_DRIVE_CLIENT_ID || '').trim();
   const clientSecret = (env.GOOGLE_DRIVE_CLIENT_SECRET || '').trim();
   const redirectUri = (env.GOOGLE_DRIVE_REDIRECT_URI || '').trim() || 'http://localhost:3000/api/drive/callback';
+  const encryptionKey = getDriveEncryptionKey(env);
+  const encryptionConfigured = Boolean(encryptionKey);
 
-  const configured = Boolean(clientId && clientSecret && redirectUri);
+  const configured = Boolean(clientId && clientSecret && redirectUri && encryptionConfigured);
   return {
     configured,
+    encryptionConfigured,
     clientId,
     clientSecret,
     redirectUri,
@@ -68,35 +97,12 @@ export function getGoogleDriveConfig(env: Record<string, string | undefined> = p
 }
 
 /**
- * Derives a secure 32-byte encryption key from environment secrets.
+ * Encrypts arbitrary text using AES-256-GCM with server encryption key.
+ * Returns null if server encryption key is unconfigured.
  */
-function getDriveEncryptionKey(): Buffer {
-  const explicitKey = (process.env.AI_CREDENTIAL_ENCRYPTION_KEY || '').trim();
-  if (explicitKey) {
-    try {
-      const buf = Buffer.from(explicitKey, 'base64');
-      if (buf.length === 32) return buf;
-    } catch {
-      // fall through
-    }
-    if (/^[0-9a-fA-F]{64}$/.test(explicitKey)) {
-      return Buffer.from(explicitKey, 'hex');
-    }
-    if (Buffer.byteLength(explicitKey, 'utf8') === 32) {
-      return Buffer.from(explicitKey, 'utf8');
-    }
-  }
-
-  // Derive stable fallback from available server secret
-  const seed = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.CRON_SECRET || 'learnaway-drive-secure-fallback-seed';
-  return createHash('sha256').update(seed).digest();
-}
-
-/**
- * Encrypts arbitrary text using AES-256-GCM.
- */
-export function encryptPayload(plaintext: string): string {
+export function encryptPayload(plaintext: string): string | null {
   const key = getDriveEncryptionKey();
+  if (!key) return null;
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
@@ -108,6 +114,7 @@ export function encryptPayload(plaintext: string): string {
 
 /**
  * Decrypts text encrypted by encryptPayload.
+ * Returns null on decryption or integrity check failure or if encryption key is unconfigured.
  */
 export function decryptPayload(packed: string): string | null {
   try {
@@ -115,6 +122,7 @@ export function decryptPayload(packed: string): string | null {
     if (parts.length !== 3) return null;
     const [ivB64, tagB64, dataB64] = parts;
     const key = getDriveEncryptionKey();
+    if (!key) return null;
     const iv = Buffer.from(ivB64, 'base64');
     const tag = Buffer.from(tagB64, 'base64');
     const data = Buffer.from(dataB64, 'base64');
@@ -131,7 +139,7 @@ export function decryptPayload(packed: string): string | null {
 /**
  * Creates a signed CSRF state token for OAuth.
  */
-export function createOAuthState(userId: string): string {
+export function createOAuthState(userId: string): string | null {
   const payload: OAuthStatePayload = {
     userId,
     timestamp: Date.now(),
@@ -384,6 +392,7 @@ export async function findOrCreateBackupFolder(accessToken: string): Promise<str
 
 /**
  * Checks if a backup with the given jobId already exists in the backup folder (idempotency guard).
+ * Throws on API/network errors rather than falsely assuming the file does not exist.
  */
 export async function findExistingBackupByJobId(
   accessToken: string,
@@ -395,19 +404,129 @@ export async function findExistingBackupByJobId(
   );
   const url = `https://www.googleapis.com/drive/v3/files?q=${query}&spaces=drive&fields=files(id,name)`;
 
-  try {
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { files?: Array<{ id: string; name: string }> };
-    if (data.files && data.files.length > 0 && data.files[0].id) {
-      return data.files[0];
-    }
-  } catch {
-    // best-effort idempotency lookup
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    const error = categorizeDriveError(res.status, text);
+    throw new Error(`Google Drive 파일 조회 실패 (${res.status}): ${error.message}`);
+  }
+  const data = (await res.json()) as { files?: Array<{ id: string; name: string }> };
+  if (data.files && data.files.length > 0 && data.files[0].id) {
+    return data.files[0];
   }
   return null;
+}
+
+export interface ResumableSessionOptions {
+  fileName: string;
+  totalBytes: number;
+  jobId: string;
+  completeness: 'complete' | 'partial';
+  totalMaterials: number;
+  withFiles: number;
+}
+
+/**
+ * Creates a resumable upload session on Google Drive.
+ * Returns the official Google Drive resumable upload URI.
+ */
+export async function createResumableUploadSession(
+  accessToken: string,
+  folderId: string,
+  options: ResumableSessionOptions
+): Promise<string> {
+  const metadata = {
+    name: options.fileName,
+    parents: [folderId],
+    mimeType: 'application/json',
+    description: `LearnAway 자료 백업 (${options.completeness === 'complete' ? '완전 백업' : '부분 백업'})`,
+    appProperties: {
+      learnawayApp: 'true',
+      jobId: options.jobId,
+      completeness: options.completeness,
+      totalMaterials: String(options.totalMaterials),
+      withFiles: String(options.withFiles),
+    },
+  };
+
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json; charset=UTF-8',
+      'X-Upload-Content-Type': 'application/json',
+      'X-Upload-Content-Length': String(options.totalBytes),
+    },
+    body: JSON.stringify(metadata),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    const error = categorizeDriveError(res.status, text);
+    throw new Error(error.message);
+  }
+
+  const location = res.headers.get('Location') || res.headers.get('location');
+  if (!location) {
+    throw new Error('Google Drive로부터 재개 가능한 업로드 세션 주소를 받지 못했습니다.');
+  }
+
+  return location;
+}
+
+export interface ChunkUploadResult {
+  complete: boolean;
+  fileId?: string;
+  fileName?: string;
+  range?: string | null;
+}
+
+/**
+ * Streams a chunk to the Google Drive resumable upload URI.
+ * Validates the URI domain strictly to prevent SSRF.
+ */
+export async function uploadResumableChunk(
+  resumableUri: string,
+  chunkBuffer: Buffer,
+  rangeStart: number,
+  rangeEnd: number,
+  totalBytes: number
+): Promise<ChunkUploadResult> {
+  if (!resumableUri.startsWith('https://www.googleapis.com/upload/drive/v3/files')) {
+    throw new Error('유효하지 않은 Google Drive 업로드 대상 주소입니다.');
+  }
+
+  const res = await fetch(resumableUri, {
+    method: 'PUT',
+    headers: {
+      'Content-Range': `bytes ${rangeStart}-${rangeEnd}/${totalBytes}`,
+      'Content-Length': String(chunkBuffer.length),
+      'Content-Type': 'application/json',
+    },
+    body: new Uint8Array(chunkBuffer),
+  });
+
+  if (res.status === 308) {
+    return {
+      complete: false,
+      range: res.headers.get('Range') || res.headers.get('range'),
+    };
+  }
+
+  if (res.status === 200 || res.status === 201) {
+    const data = (await res.json()) as { id: string; name: string };
+    return {
+      complete: true,
+      fileId: data.id,
+      fileName: data.name,
+    };
+  }
+
+  const text = await res.text();
+  const error = categorizeDriveError(res.status, text);
+  throw new Error(error.message);
 }
 
 export interface UploadBackupOptions {

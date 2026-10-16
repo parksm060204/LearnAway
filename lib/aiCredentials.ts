@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { resolveOperatorGeminiConfig, type AiConfig } from './aiConfig';
-export { resolveOperatorGeminiConfig };
+import { resolveOperatorAiConfig, resolveOperatorGeminiConfig, type AiConfig } from './aiConfig';
+export { resolveOperatorAiConfig, resolveOperatorGeminiConfig };
 
 /**
  * Server-only storage/encryption for per-user AI credentials.
@@ -194,8 +194,11 @@ export type AiConfigResolution =
         | 'encryption_not_configured'
         | 'insufficient_credits'
         | 'operator_disabled'
-        | 'trial_limit_exceeded';
+        | 'trial_limit_exceeded'
+        | 'already_completed'
+        | 'concurrent_in_progress';
       message: string;
+      cachedResult?: unknown;
       needsAiConnection?: boolean;
     };
 
@@ -269,7 +272,6 @@ export async function resolveAiConfigForUser(
   }
 
   // Confirmed unregistered: check trial credit reservation or explicit fallback.
-  // POLICY: Unspecified/unregistered users are strictly restricted to the Gemini API only.
   if (trialContext && userId) {
     if (isOperatorEmergencyStopped()) {
       return {
@@ -280,13 +282,13 @@ export async function resolveAiConfigForUser(
       };
     }
 
-    const operatorConfig = resolveOperatorGeminiConfig();
+    const operatorConfig = resolveOperatorAiConfig();
     if (!operatorConfig) {
       return {
         ok: false,
         code: 'no_credentials',
         needsAiConnection: true,
-        message: '운영자 Gemini AI 체험 API가 설정되지 않았습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+        message: '운영자 AI 체험 API가 설정되지 않았습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
       };
     }
 
@@ -300,6 +302,23 @@ export async function resolveAiConfigForUser(
       trialContext.taskType,
       trialContext.inputIdentifier
     );
+
+    if (reservation.status === 'already_completed') {
+      return {
+        ok: false,
+        code: 'already_completed',
+        cachedResult: reservation.cachedResult,
+        message: '이미 완료된 작업의 결과가 보존되어 있습니다.',
+      };
+    }
+
+    if (reservation.status === 'concurrent_in_progress') {
+      return {
+        ok: false,
+        code: 'concurrent_in_progress',
+        message: reservation.message || '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
+      };
+    }
 
     if (reservation.allowed) {
       return {
@@ -316,7 +335,7 @@ export async function resolveAiConfigForUser(
         ok: false,
         code: 'insufficient_credits',
         needsAiConnection: true,
-        message: reservation.message || 'AI 체험 크레딧(3회)이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+        message: reservation.message || 'AI 체험 크레딧이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
       };
     }
 
@@ -337,9 +356,8 @@ export async function resolveAiConfigForUser(
   }
 
   // Confirmed unregistered: operator key only under an explicit policy.
-  // Unspecified users are strictly restricted to the Gemini API only.
   if (operatorFallbackAllowed()) {
-    const operatorConfig = resolveOperatorGeminiConfig();
+    const operatorConfig = resolveOperatorAiConfig();
     if (operatorConfig) {
       return { ok: true, source: 'operator', config: operatorConfig };
     }

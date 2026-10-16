@@ -37,33 +37,53 @@ export function GatewayPage({ nextPath, initialError }: GatewayPageProps) {
   const [password, setPassword] = useState('');
   const [isEmailSubmitting, setIsEmailSubmitting] = useState(false);
 
-  const [showGuestLogin, setShowGuestLogin] = useState(false);
-  const [guestCode, setGuestCode] = useState('');
-  const [guestError, setGuestError] = useState<string | null>(null);
-  const [isGuestSubmitting, setIsGuestSubmitting] = useState(false);
+  const [showUsernameAuth, setShowUsernameAuth] = useState(false);
+  const [usernameTab, setUsernameTab] = useState<'login' | 'register'>('login');
+  const [username, setUsername] = useState('');
+  const [usernamePassword, setUsernamePassword] = useState('');
+  const [usernamePasswordConfirm, setUsernamePasswordConfirm] = useState('');
+  const [usernameError, setUsernameError] = useState<string | null>(null);
+  const [isUsernameSubmitting, setIsUsernameSubmitting] = useState(false);
 
-  const handleGuestLogin = async (e: React.FormEvent) => {
+  const handleUsernameAuth = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!guestCode.trim()) {
-      setGuestError('게스트 코드를 입력해 주세요. (코드: abc)');
+    const cleanUsername = username.trim().toLowerCase();
+    if (!cleanUsername) {
+      setUsernameError('아이디를 입력해 주세요.');
+      return;
+    }
+    if (!usernamePassword) {
+      setUsernameError('비밀번호를 입력해 주세요.');
+      return;
+    }
+    if (usernamePassword.length < 6) {
+      setUsernameError('비밀번호는 최소 6자 이상이어야 합니다.');
+      return;
+    }
+    if (usernameTab === 'register' && usernamePassword !== usernamePasswordConfirm) {
+      setUsernameError('비밀번호 확인이 일치하지 않습니다.');
       return;
     }
 
-    setIsGuestSubmitting(true);
-    setGuestError(null);
+    setIsUsernameSubmitting(true);
+    setUsernameError(null);
 
     try {
-      const res = await fetch('/api/guest-login', {
+      const res = await fetch('/api/auth/username', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: guestCode.trim() }),
+        body: JSON.stringify({
+          action: usernameTab,
+          username: cleanUsername,
+          password: usernamePassword,
+        }),
       });
 
       const data = await res.json().catch(() => ({}));
 
       if (!res.ok || !data.success) {
-        setGuestError(data.error || '게스트 코드가 일치하지 않습니다.');
-        setIsGuestSubmitting(false);
+        setUsernameError(data.error || '요청 처리 중 오류가 발생했습니다.');
+        setIsUsernameSubmitting(false);
         return;
       }
 
@@ -74,8 +94,8 @@ export function GatewayPage({ nextPath, initialError }: GatewayPageProps) {
 
       window.location.assign(nextPath || '/');
     } catch {
-      setGuestError('로그인 처리 중 오류가 발생했습니다.');
-      setIsGuestSubmitting(false);
+      setUsernameError('통신 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
+      setIsUsernameSubmitting(false);
     }
   };
 
@@ -207,71 +227,157 @@ export function GatewayPage({ nextPath, initialError }: GatewayPageProps) {
               )}
             </button>
 
-            {/* Guest Login */}
-            {!showGuestLogin ? (
+            {/* Username Auth (간편 회원가입 / 아이디 로그인) */}
+            {!showUsernameAuth ? (
               <button
                 type="button"
-                id="btn-guest-login-toggle"
+                id="btn-username-auth-toggle"
                 onClick={() => {
-                  setShowGuestLogin(true);
-                  setGuestError(null);
+                  setShowUsernameAuth(true);
+                  setUsernameError(null);
                 }}
                 className="inline-flex items-center justify-center gap-2 rounded-xs border border-[#c8c2b5] bg-white px-5 py-2.5 text-xs font-semibold text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] transition-colors shadow-2xs w-full max-w-xs"
               >
                 <UserCheck className="w-4 h-4 text-[#827d73]" />
-                게스트 로그인 (체험하기)
+                간편 회원가입 / 아이디 로그인
               </button>
             ) : (
-              <form
-                onSubmit={handleGuestLogin}
-                className="w-full max-w-xs flex flex-col gap-2 p-3.5 bg-white border border-[#c8c2b5] rounded-xs shadow-2xs text-left"
-              >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-[#191817] flex items-center gap-1.5">
-                    <UserCheck className="w-3.5 h-3.5 text-[#c52828]" />
-                    게스트 로그인
-                  </span>
+              <div className="w-full max-w-xs p-3.5 bg-white border border-[#c8c2b5] rounded-xs shadow-2xs text-left space-y-3">
+                <div className="flex items-center justify-between border-b border-[#e2ded6] pb-2">
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      id="tab-username-login"
+                      onClick={() => {
+                        setUsernameTab('login');
+                        setUsernameError(null);
+                      }}
+                      className={`text-xs font-semibold pb-0.5 border-b-2 transition-colors ${
+                        usernameTab === 'login'
+                          ? 'border-[#191817] text-[#191817]'
+                          : 'border-transparent text-[#827d73] hover:text-[#191817]'
+                      }`}
+                    >
+                      아이디 로그인
+                    </button>
+                    <button
+                      type="button"
+                      id="tab-username-register"
+                      onClick={() => {
+                        setUsernameTab('register');
+                        setUsernameError(null);
+                      }}
+                      className={`text-xs font-semibold pb-0.5 border-b-2 transition-colors ${
+                        usernameTab === 'register'
+                          ? 'border-[#191817] text-[#191817]'
+                          : 'border-transparent text-[#827d73] hover:text-[#191817]'
+                      }`}
+                    >
+                      간편 회원가입
+                    </button>
+                  </div>
                   <button
                     type="button"
                     onClick={() => {
-                      setShowGuestLogin(false);
-                      setGuestError(null);
+                      setShowUsernameAuth(false);
+                      setUsernameError(null);
                     }}
                     className="text-[11px] text-[#827d73] hover:text-[#191817] underline"
                   >
                     닫기
                   </button>
                 </div>
-                <div className="flex gap-1.5">
-                  <input
-                    type="text"
-                    id="guest-code-input"
-                    value={guestCode}
-                    onChange={(e) => {
-                      setGuestCode(e.target.value);
-                      if (guestError) setGuestError(null);
-                    }}
-                    placeholder="코드 입력 (abc)"
-                    className="flex-1 px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#c52828]"
-                    autoFocus
-                  />
+
+                <form onSubmit={handleUsernameAuth} className="space-y-2.5">
+                  <div>
+                    <label
+                      htmlFor="username-input"
+                      className="block text-[11px] font-semibold text-[#57544e] mb-1"
+                    >
+                      아이디
+                    </label>
+                    <input
+                      type="text"
+                      id="username-input"
+                      value={username}
+                      onChange={(e) => {
+                        setUsername(e.target.value);
+                        if (usernameError) setUsernameError(null);
+                      }}
+                      placeholder="3~30자 영문, 숫자, _, -"
+                      className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
+                      autoFocus
+                    />
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="username-password-input"
+                      className="block text-[11px] font-semibold text-[#57544e] mb-1"
+                    >
+                      비밀번호
+                    </label>
+                    <input
+                      type="password"
+                      id="username-password-input"
+                      value={usernamePassword}
+                      onChange={(e) => {
+                        setUsernamePassword(e.target.value);
+                        if (usernameError) setUsernameError(null);
+                      }}
+                      placeholder="6자 이상 입력"
+                      className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
+                    />
+                  </div>
+
+                  {usernameTab === 'register' && (
+                    <div>
+                      <label
+                        htmlFor="username-password-confirm-input"
+                        className="block text-[11px] font-semibold text-[#57544e] mb-1"
+                      >
+                        비밀번호 확인
+                      </label>
+                      <input
+                        type="password"
+                        id="username-password-confirm-input"
+                        value={usernamePasswordConfirm}
+                        onChange={(e) => {
+                          setUsernamePasswordConfirm(e.target.value);
+                          if (usernameError) setUsernameError(null);
+                        }}
+                        placeholder="비밀번호 다시 입력"
+                        className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
+                      />
+                    </div>
+                  )}
+
+                  {usernameError && (
+                    <p className="text-[11px] text-[#c52828] leading-tight">{usernameError}</p>
+                  )}
+
+                  {usernameTab === 'register' && (
+                    <div className="p-2 bg-[#f4f2ee] rounded-xs text-[10.5px] text-[#78716c] leading-relaxed">
+                      ⚠️ 이메일 없는 간편 계정은 비밀번호 분실 시 재설정이나 복구가 지원되지 않습니다. 비밀번호를 반드시 기억해 주세요.
+                    </div>
+                  )}
+
                   <button
                     type="submit"
-                    id="btn-guest-login-submit"
-                    disabled={isGuestSubmitting}
-                    className="px-3.5 py-1.5 bg-[#191817] text-white text-xs font-semibold rounded-xs hover:bg-[#333] transition-colors disabled:opacity-60 shrink-0"
+                    id="btn-username-submit"
+                    disabled={isUsernameSubmitting}
+                    className="w-full py-2 bg-[#191817] text-white text-xs font-semibold rounded-xs hover:bg-[#333] transition-colors disabled:opacity-60 flex items-center justify-center gap-1.5"
                   >
-                    {isGuestSubmitting ? (
+                    {isUsernameSubmitting ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : usernameTab === 'register' ? (
+                      '간편 가입 완료'
                     ) : (
-                      '입장'
+                      '아이디로 로그인'
                     )}
                   </button>
-                </div>
-                {guestError && (
-                  <p className="text-[11px] text-[#c52828] leading-tight">{guestError}</p>
-                )}
-              </form>
+                </form>
+              </div>
             )}
 
             <p className="text-xs text-[#827d73]">

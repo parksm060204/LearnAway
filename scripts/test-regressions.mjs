@@ -28,7 +28,8 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/cloud/historyMigration.ts',
   'lib/cloud/mockExamSync.ts', 'lib/cloud/pendingExamAnswers.ts', 'lib/cloud/draftPersistence.ts',
   'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts', 'app/api/analyze-concepts/route.ts', 'lib/supabase/admin.ts', 'app/api/reminders/cron/route.ts',
-  'lib/trialCredits.ts', 'lib/drive/googleDrive.ts',
+  'lib/trialCredits.ts', 'lib/drive/googleDrive.ts', 'app/api/auth/username/route.ts', 'app/api/guest-login/route.ts', 'lib/auth/session.ts', 'lib/auth/apiAuth.ts',
+  'lib/pdf/token.ts', 'lib/pdf/browserPdfConverter.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -628,6 +629,7 @@ exports.requireApiUser = async () => {
       rpcResult: options.rpcResult,
       rpcResults: options.rpcResults || {},
       rpcImpl: options.rpcImpl || null,
+      isAdmin: options.isAdmin !== undefined ? options.isAdmin : true,
     };
     // Seed any additional table arrays provided in options.
     for (const key of Object.keys(options)) {
@@ -656,6 +658,11 @@ exports.requireApiUser = async () => {
           ctx.ignoreDuplicates = Boolean(opts && opts.ignoreDuplicates);
           return builder;
         },
+        insert(payload) {
+          ctx.op = 'insert';
+          ctx.payload = payload;
+          return builder;
+        },
         delete() { ctx.op = 'delete'; return builder; },
         maybeSingle() { return exec(true); },
         single() { return exec(false); },
@@ -665,14 +672,14 @@ exports.requireApiUser = async () => {
       async function exec(maybe) {
         const rows = (state[table] = state[table] || []);
         try {
-          if (!state.isAdmin && (table === 'ai_trial_credits' || table === 'ai_trial_reservations')) {
+          if (table === 'ai_trial_credits' || table === 'ai_trial_reservations') {
             if (ctx.op === 'upsert' || ctx.op === 'update' || ctx.op === 'delete') {
               return { data: null, error: { message: 'permission denied for table ' + table, code: '42501' } };
             }
           }
           if (ctx.op === 'select') {
             let result = matchFilters(rows, ctx.filters);
-            if (!state.isAdmin && (table === 'ai_trial_credits' || table === 'ai_trial_reservations')) {
+            if (table === 'ai_trial_credits' || table === 'ai_trial_reservations') {
               if (state.user) {
                 result = result.filter((r) => r.user_id === state.user.id);
               } else {
@@ -720,6 +727,26 @@ exports.requireApiUser = async () => {
                 saved = { created_at: nowIso(), updated_at: nowIso(), ...payload };
                 rows.push(saved);
               }
+              savedItems.push(saved);
+            }
+            if (maybe === false) return { data: clone(savedItems[0] ?? null), error: null };
+            if (maybe === true) return { data: savedItems[0] ? clone(savedItems[0]) : null, error: null };
+            return { data: savedItems.map(clone), error: null };
+          }
+          if (ctx.op === 'insert') {
+            const items = Array.isArray(ctx.payload) ? ctx.payload : [ctx.payload];
+            const savedItems = [];
+            for (const raw of items) {
+              const payload = { ...raw };
+              if (payload.user_id === undefined && state.user) payload.user_id = state.user.id;
+              if (table === 'username_accounts') {
+                const exists = rows.some((r) => r.username === payload.username);
+                if (exists) {
+                  return { data: null, error: { message: 'duplicate key value violates unique constraint', code: '23505' } };
+                }
+              }
+              const saved = { created_at: nowIso(), updated_at: nowIso(), ...payload };
+              rows.push(saved);
               savedItems.push(saved);
             }
             if (maybe === false) return { data: clone(savedItems[0] ?? null), error: null };
@@ -809,6 +836,34 @@ exports.requireApiUser = async () => {
           if (state.fail.authUser) return { data: { user: null }, error: null };
           return { data: { user: state.user }, error: null };
         },
+        async signInWithPassword({ email }) {
+          if (state.fail.signInWithPassword) {
+            return { data: { user: null, session: null }, error: { message: 'Invalid login credentials' } };
+          }
+          const user = state.user || { id: 'usr-signed-in', email };
+          return {
+            data: {
+              user,
+              session: { access_token: 'fake-access-token', refresh_token: 'fake-refresh-token', user },
+            },
+            error: null,
+          };
+        },
+        admin: {
+          async createUser({ email, user_metadata }) {
+            if (state.fail.createUser) {
+              return { data: null, error: { message: state.fail.createUserMessage || 'User already registered' } };
+            }
+            const userId = 'usr-' + Math.random().toString(36).substring(2, 9);
+            const user = { id: userId, email, user_metadata };
+            return { data: { user }, error: null };
+          },
+          async deleteUser(userId) {
+            state.deletedUsers = state.deletedUsers || [];
+            state.deletedUsers.push(userId);
+            return { data: { user: null }, error: null };
+          },
+        },
       },
       from(table) { return tableBuilder(table); },
       rpc(name, params) {
@@ -832,6 +887,31 @@ exports.requireApiUser = async () => {
         if (name === 'get_ai_connection_secret') {
           return Promise.resolve({ data: null, error: null });
         }
+        if (name === 'check_and_increment_rate_limit') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function check_and_increment_rate_limit', code: '42501' } });
+          }
+          const limits = (state.auth_rate_limits = state.auth_rate_limits || []);
+          const key = params.p_key;
+          const maxAttempts = params.p_max_attempts || 5;
+          const windowSeconds = params.p_window_seconds || 60;
+          let rec = limits.find((l) => l.key === key);
+          const now = Date.now();
+          if (!rec) {
+            limits.push({ key, attempts: 1, window_start: now });
+            return Promise.resolve({ data: true, error: null });
+          }
+          if (now - rec.window_start > windowSeconds * 1000) {
+            rec.attempts = 1;
+            rec.window_start = now;
+            return Promise.resolve({ data: true, error: null });
+          }
+          if (rec.attempts >= maxAttempts) {
+            return Promise.resolve({ data: false, error: null });
+          }
+          rec.attempts += 1;
+          return Promise.resolve({ data: true, error: null });
+        }
         if (name === 'get_or_create_trial_credits') {
           const userId = (params && params.p_user_id) || (state.user ? state.user.id : 'test-user');
           const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
@@ -839,16 +919,16 @@ exports.requireApiUser = async () => {
           if (!entry) {
             entry = {
               user_id: userId,
-              granted_credits: 3,
-              balance: 3,
+              granted_credits: 1,
+              balance: 1,
               granted_at: nowIso(),
               updated_at: nowIso(),
             };
             creditsList.push(entry);
             return Promise.resolve({
               data: {
-                granted: 3,
-                balance: 3,
+                granted: 1,
+                balance: 1,
                 hasPersonalKey: false,
               },
               error: null,
@@ -864,6 +944,9 @@ exports.requireApiUser = async () => {
           });
         }
         if (name === 'reserve_trial_credit') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function reserve_trial_credit', code: '42501' } });
+          }
           const userId = (params && params.p_user_id) || (state.user ? state.user.id : 'test-user');
           const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
@@ -871,8 +954,8 @@ exports.requireApiUser = async () => {
           if (!userCredits) {
             userCredits = {
               user_id: userId,
-              granted_credits: 3,
-              balance: 3,
+              granted_credits: 1,
+              balance: 1,
               granted_at: nowIso(),
               updated_at: nowIso(),
             };
@@ -903,10 +986,35 @@ exports.requireApiUser = async () => {
                 error: null,
               });
             }
+            if (existing.status === 'settled' || existing.status === 'result_ready') {
+              return Promise.resolve({
+                data: {
+                  allowed: false,
+                  status: 'already_completed',
+                  cached_result: existing.cached_result,
+                  remaining: userCredits.balance,
+                },
+                error: null,
+              });
+            }
+            if (existing.status === 'processing' && existing.lease_expires_at && new Date(existing.lease_expires_at).getTime() > Date.now()) {
+              return Promise.resolve({
+                data: {
+                  allowed: false,
+                  status: 'concurrent_in_progress',
+                  error_code: 'CONCURRENT_EXECUTION_BLOCKED',
+                  message: '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
+                },
+                error: null,
+              });
+            }
+            existing.status = 'processing';
+            existing.attempt_count = (existing.attempt_count || 1) + 1;
+            existing.lease_expires_at = new Date(Date.now() + 60000).toISOString();
             return Promise.resolve({
               data: {
                 allowed: true,
-                status: existing.status === 'settled' ? 'already_settled' : 'already_reserved',
+                status: 'processing',
                 remaining: userCredits.balance,
               },
               error: null,
@@ -919,7 +1027,7 @@ exports.requireApiUser = async () => {
                 allowed: false,
                 error_code: 'INSUFFICIENT_CREDITS',
                 remaining: 0,
-                message: 'AI 체험 크레딧(3회)이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+                message: 'AI 체험 크레딧이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
               },
               error: null,
             });
@@ -933,7 +1041,9 @@ exports.requireApiUser = async () => {
             task_id: taskId,
             task_type: taskType,
             input_identifier: inputIdentifier,
-            status: 'reserved',
+            status: 'processing',
+            attempt_count: 1,
+            lease_expires_at: new Date(Date.now() + 60000).toISOString(),
             created_at: nowIso(),
             updated_at: nowIso(),
           };
@@ -942,19 +1052,38 @@ exports.requireApiUser = async () => {
           return Promise.resolve({
             data: {
               allowed: true,
-              status: 'reserved',
+              status: 'processing',
               remaining: userCredits.balance,
             },
             error: null,
           });
         }
+        if (name === 'record_trial_result_ready') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function record_trial_result_ready', code: '42501' } });
+          }
+          const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
+          const taskId = params && params.p_task_id;
+          const res = resList.find((r) => r.task_id === taskId);
+          if (res) {
+            res.status = 'result_ready';
+            res.cached_result = params.p_result;
+            res.lease_expires_at = null;
+            res.updated_at = nowIso();
+          }
+          return Promise.resolve({ data: { success: true, status: 'result_ready' }, error: null });
+        }
         if (name === 'settle_trial_credit') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function settle_trial_credit', code: '42501' } });
+          }
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           const taskId = params && params.p_task_id;
           const res = resList.find((r) => r.task_id === taskId);
           if (res) {
             res.status = 'settled';
             res.settled_at = nowIso();
+            res.lease_expires_at = null;
             res.updated_at = nowIso();
           }
           return Promise.resolve({
@@ -966,19 +1095,23 @@ exports.requireApiUser = async () => {
           });
         }
         if (name === 'release_trial_credit') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function release_trial_credit', code: '42501' } });
+          }
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
           const taskId = params && params.p_task_id;
           const res = resList.find((r) => r.task_id === taskId);
-          if (res && res.status === 'reserved') {
+          if (res && (res.status === 'processing' || res.status === 'reserved')) {
             res.status = 'released';
             res.released_at = nowIso();
             res.release_reason = (params && params.p_reason) || 'failure';
+            res.lease_expires_at = null;
             res.updated_at = nowIso();
 
             const userCredits = creditsList.find((c) => c.user_id === res.user_id);
             if (userCredits) {
-              userCredits.balance += 1;
+              userCredits.balance = Math.min(userCredits.balance + 1, userCredits.granted_credits);
               userCredits.updated_at = nowIso();
             }
             return Promise.resolve({
@@ -11078,21 +11211,21 @@ exports.requireApiUser = async () => {
   // AI Trial Credits (3 Credits per Account) Tests (Section 7)
   // =========================================================================
 
-  await checkAsync('AI 체험 크레딧 1: 최초 지급 3회, 재로그인·동시 최초 요청에도 중복 지급 없음', async () => {
+  await checkAsync('AI 체험 크레딧 1: 신규 계정 1회 지급, 재로그인·동시 최초 요청에도 중복 지급 없음, 기존 3회 계정 보존', async () => {
     await withFakeSupabase({
       user: { id: 'user-trial-1' },
       ai_trial_credits: [],
       ai_trial_reservations: [],
     }, async (client) => {
-      // 1. First grant gives 3 credits
+      // 1. First grant gives 1 credit for new user
       const r1 = await client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' });
-      assert.equal(r1.data.granted, 3);
-      assert.equal(r1.data.balance, 3);
+      assert.equal(r1.data.granted, 1);
+      assert.equal(r1.data.balance, 1);
 
       // 2. Re-login / page refresh / multiple calls: returns existing balance without duplicate grant
       const r2 = await client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' });
-      assert.equal(r2.data.granted, 3);
-      assert.equal(r2.data.balance, 3);
+      assert.equal(r2.data.granted, 1);
+      assert.equal(r2.data.balance, 1);
 
       // 3. Concurrent requests with Promise.all
       const [c1, c2, c3] = await Promise.all([
@@ -11100,12 +11233,24 @@ exports.requireApiUser = async () => {
         client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' }),
         client.rpc('get_or_create_trial_credits', { p_user_id: 'user-trial-1' }),
       ]);
-      assert.equal(c1.data.balance, 3);
-      assert.equal(c2.data.balance, 3);
-      assert.equal(c3.data.balance, 3);
+      assert.equal(c1.data.balance, 1);
+      assert.equal(c2.data.balance, 1);
+      assert.equal(c3.data.balance, 1);
 
       // Table has exactly one row
       assert.equal(client.__state.ai_trial_credits.length, 1);
+
+      // 4. Existing account with 3 credits is preserved and NOT overwritten
+      client.__state.ai_trial_credits.push({
+        user_id: 'existing-legacy-user',
+        granted_credits: 3,
+        balance: 3,
+        granted_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      const legacyRes = await client.rpc('get_or_create_trial_credits', { p_user_id: 'existing-legacy-user' });
+      assert.equal(legacyRes.data.granted, 3, '기존 3회 지급 계정은 1회로 덮어쓰지 않고 보존됨');
+      assert.equal(legacyRes.data.balance, 3);
     });
   });
 
@@ -11146,7 +11291,7 @@ exports.requireApiUser = async () => {
     });
   });
 
-  await checkAsync('AI 체험 크레딧 3: 같은 작업 재시도 -> 중복 차감·중복 호출 없음 (멱등성)', async () => {
+  await checkAsync('AI 체험 크레딧 3: 같은 작업 재시도 -> 중복 차감·중복 호출 없음 (임대 락 및 완료 캐시 반환)', async () => {
     await withFakeSupabase({
       user: { id: 'user-trial-3' },
       ai_trial_credits: [{ user_id: 'user-trial-3', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
@@ -11160,32 +11305,39 @@ exports.requireApiUser = async () => {
         p_user_id: 'user-trial-3',
       });
       assert.equal(first.data.allowed, true);
-      assert.equal(first.data.status, 'reserved');
+      assert.equal(first.data.status, 'processing');
       assert.equal(first.data.remaining, 2);
 
-      // Duplicate network send or retry with identical task_id and input
+      // Duplicate concurrent network send while processing: lease blocks duplicate AI execution
       const retry = await client.rpc('reserve_trial_credit', {
         p_task_id: 'task-idempotent-1',
         p_task_type: 'analyze_concepts',
         p_input_identifier: 'hash-same-input',
         p_user_id: 'user-trial-3',
       });
-      assert.equal(retry.data.allowed, true);
-      assert.equal(retry.data.status, 'already_reserved');
-      assert.equal(retry.data.remaining, 2, '중복 호출 시 잔액 재차감 없음');
+      assert.equal(retry.data.allowed, false);
+      assert.equal(retry.data.status, 'concurrent_in_progress');
+      assert.equal(retry.data.error_code, 'CONCURRENT_EXECUTION_BLOCKED');
+
+      // Record result ready
+      await client.rpc('record_trial_result_ready', {
+        p_task_id: 'task-idempotent-1',
+        p_result: { drafts: [{ id: 'd1', title: '개념 1' }] },
+      });
 
       // Now settle it
       await client.rpc('settle_trial_credit', { p_task_id: 'task-idempotent-1' });
 
-      // Call reserve after settled (e.g. repeated submission)
+      // Call reserve after settled: returns already_completed and cached result, AI not called again!
       const postSettle = await client.rpc('reserve_trial_credit', {
         p_task_id: 'task-idempotent-1',
         p_task_type: 'analyze_concepts',
         p_input_identifier: 'hash-same-input',
         p_user_id: 'user-trial-3',
       });
-      assert.equal(postSettle.data.allowed, true);
-      assert.equal(postSettle.data.status, 'already_settled');
+      assert.equal(postSettle.data.allowed, false, '완료된 작업은 AI 재호출 허용 안 함');
+      assert.equal(postSettle.data.status, 'already_completed');
+      assert.deepEqual(postSettle.data.cached_result, { drafts: [{ id: 'd1', title: '개념 1' }] });
       assert.equal(postSettle.data.remaining, 2);
 
       // Remaining credits remain 2 (only 1 deducted)
@@ -11355,7 +11507,7 @@ exports.requireApiUser = async () => {
     });
   });
 
-  await checkAsync('AI 체험 크레딧 9: 응답 유실·작업 중단 -> 사용 상태 복구', async () => {
+  await checkAsync('AI 체험 크레딧 9: 응답 유실·작업 중단 -> 임대 만료 후 재시도 또는 진행 중 차단', async () => {
     await withFakeSupabase({
       user: { id: 'user-restore' },
       ai_trial_credits: [{ user_id: 'user-restore', granted_credits: 3, balance: 2, granted_at: nowIso(), updated_at: nowIso() }],
@@ -11365,7 +11517,9 @@ exports.requireApiUser = async () => {
         task_id: 'task-lost-resp',
         task_type: 'evaluate_answer',
         input_identifier: 'hash-lost',
-        status: 'reserved',
+        status: 'processing',
+        attempt_count: 1,
+        lease_expires_at: new Date(Date.now() - 5000).toISOString(),
         created_at: nowIso(),
         updated_at: nowIso(),
       }],
@@ -11379,7 +11533,7 @@ exports.requireApiUser = async () => {
       });
 
       assert.equal(checkRes.data.allowed, true);
-      assert.equal(checkRes.data.status, 'already_reserved');
+      assert.equal(checkRes.data.status, 'processing');
       assert.equal(checkRes.data.remaining, 2, '진행 중 예약 상태로 복구되어 중복 차감 없음');
     });
   });
@@ -11487,60 +11641,71 @@ exports.requireApiUser = async () => {
     assert.equal(validateTrialEvaluateAnswerInput('답안', true).errorCode, 'MOCK_EXAM_TRIAL_PROHIBITED');
   });
 
-  await checkAsync('AI 체험 크레딧 13: 불특정 사용자/체험 크레딧은 Gemini API로만 엄격 제한', async () => {
+  await checkAsync('AI 체험 크레딧 13: 학교 BAZE Gateway / deepseek-v4.1-flash 및 설정된 운영자 모델 지원 (Gemini 전용 강제 해제)', async () => {
     const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
     const savedEnv = {
       AI_PROVIDER: process.env.AI_PROVIDER,
       BAZE_API_KEY: process.env.BAZE_API_KEY,
+      BAZE_API_BASE: process.env.BAZE_API_BASE,
+      BAZE_MODEL: process.env.BAZE_MODEL,
       GEMINI_API_KEY: process.env.GEMINI_API_KEY,
       AI_API_KEY: process.env.AI_API_KEY,
     };
 
     try {
-      // 1) Server has BAZE Gateway key, but Gemini key is also set
+      // 1) Server has School BAZE Gateway configured as AI_PROVIDER
       process.env.AI_PROVIDER = 'school_gateway';
       process.env.BAZE_API_KEY = 'baze-secret-key-1234';
-      process.env.GEMINI_API_KEY = 'gemini-secret-key-5678';
+      process.env.BAZE_API_BASE = 'https://gateway.school.edu/api/v1';
+      process.env.BAZE_MODEL = 'deepseek-v4.1-flash';
+      delete process.env.GEMINI_API_KEY;
       delete process.env.AI_API_KEY;
 
       await withFakeSupabase({
         user: { id: 'unregistered-trial-user' },
-        ai_trial_credits: [{ user_id: 'unregistered-trial-user', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+        ai_trial_credits: [{ user_id: 'unregistered-trial-user', granted_credits: 1, balance: 1, granted_at: nowIso(), updated_at: nowIso() }],
         ai_trial_reservations: [],
       }, async () => {
         const res = await resolveAiConfigForUser('unregistered-trial-user', {
-          taskId: 'task-trial-gemini-only',
+          taskId: 'task-trial-school-baze',
           taskType: 'analyze_concepts',
-          inputIdentifier: 'hash-gemini',
+          inputIdentifier: 'hash-baze',
         });
 
         assert.equal(res.ok, true);
         assert.equal(res.source, 'operator');
         assert.equal(res.isTrial, true);
-        assert.equal(res.config.provider, 'gemini', '불특정 사용자 체험은 반드시 gemini provider여야 함');
-        assert.equal(res.config.apiKey, 'gemini-secret-key-5678', 'Gemini 키가 사용됨');
-        assert.notEqual(res.config.apiKey, 'baze-secret-key-1234', '학교 BAZE 키는 절대 불특정 사용자에게 사용되지 않음');
+        assert.equal(res.config.provider, 'school_gateway', '학교 BAZE Gateway provider 지원');
+        assert.equal(res.config.apiKey, 'baze-secret-key-1234');
+        assert.equal(res.config.model, 'deepseek-v4.1-flash');
+        assert.equal(res.config.apiBase, 'https://gateway.school.edu/api/v1');
       });
 
-      // 2) Server has ONLY BAZE Gateway key, NO Gemini key set
+      // 2) Server has NO operator provider configured
+      delete process.env.BAZE_API_KEY;
       delete process.env.GEMINI_API_KEY;
       delete process.env.AI_API_KEY;
+      const prevConfigKey = AI_CONFIG.apiKey;
+      AI_CONFIG.apiKey = '';
 
-      await withFakeSupabase({
-        user: { id: 'unregistered-trial-user-2' },
-        ai_trial_credits: [{ user_id: 'unregistered-trial-user-2', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
-        ai_trial_reservations: [],
-      }, async () => {
-        const res = await resolveAiConfigForUser('unregistered-trial-user-2', {
-          taskId: 'task-trial-no-gemini',
-          taskType: 'analyze_concepts',
-          inputIdentifier: 'hash-no-gemini',
+      try {
+        await withFakeSupabase({
+          user: { id: 'unregistered-trial-user-2' },
+          ai_trial_credits: [{ user_id: 'unregistered-trial-user-2', granted_credits: 1, balance: 1, granted_at: nowIso(), updated_at: nowIso() }],
+          ai_trial_reservations: [],
+        }, async () => {
+          const res = await resolveAiConfigForUser('unregistered-trial-user-2', {
+            taskId: 'task-trial-no-operator',
+            taskType: 'analyze_concepts',
+            inputIdentifier: 'hash-no-op',
+          });
+
+          assert.equal(res.ok, false, '운영자 키가 없으면 체험 호출 차단');
+          assert.equal(res.code, 'no_credentials');
         });
-
-        assert.equal(res.ok, false, 'Gemini 키가 없으면 체험 호출 차단');
-        assert.equal(res.code, 'no_credentials');
-        assert.ok(res.message.includes('Gemini'), 'Gemini API 안내 메시지 포함');
-      });
+      } finally {
+        AI_CONFIG.apiKey = prevConfigKey;
+      }
     } finally {
       for (const [k, v] of Object.entries(savedEnv)) {
         if (v === undefined) delete process.env[k];
@@ -11570,19 +11735,32 @@ exports.requireApiUser = async () => {
     );
   });
 
-  check('Google Drive 백업 2: 환경변수 미설정 시 안전한 안내 및 로컬 백업 유지', () => {
+  check('Google Drive 백업 2: 환경변수 미설정 시 안전한 안내 및 로컬 백업 유지 (암호화 키 필수 검증)', () => {
     const unconfigured = googleDrive.getGoogleDriveConfig({});
     assert.equal(unconfigured.configured, false);
     assert.equal(unconfigured.clientId, '');
     assert.equal(unconfigured.clientSecret, '');
 
-    const configured = googleDrive.getGoogleDriveConfig({
+    // OAuth is set but encryption key is missing -> must be disabled (configured: false)
+    const missingEncryption = googleDrive.getGoogleDriveConfig({
       GOOGLE_DRIVE_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
       GOOGLE_DRIVE_CLIENT_SECRET: 'test-client-secret',
       GOOGLE_DRIVE_REDIRECT_URI: 'http://localhost:3000/api/drive/callback',
     });
-    assert.equal(configured.configured, true);
-    assert.equal(configured.clientId, 'test-client-id.apps.googleusercontent.com');
+    assert.equal(missingEncryption.configured, false, '암호화 키 누락 시 Drive 연결 비활성화');
+    assert.equal(missingEncryption.encryptionConfigured, false);
+
+    // Both OAuth and valid 32-byte encryption key are set -> configured: true
+    const validKeyB64 = Buffer.alloc(32, 9).toString('base64');
+    const fullyConfigured = googleDrive.getGoogleDriveConfig({
+      GOOGLE_DRIVE_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+      GOOGLE_DRIVE_CLIENT_SECRET: 'test-client-secret',
+      GOOGLE_DRIVE_REDIRECT_URI: 'http://localhost:3000/api/drive/callback',
+      AI_CREDENTIAL_ENCRYPTION_KEY: validKeyB64,
+    });
+    assert.equal(fullyConfigured.configured, true);
+    assert.equal(fullyConfigured.encryptionConfigured, true);
+    assert.equal(fullyConfigured.clientId, 'test-client-id.apps.googleusercontent.com');
   });
 
   check('Google Drive 백업 3: OAuth state 생성, 사용자 ID 바인딩 및 CSRF 위변조 거부', () => {
@@ -11735,6 +11913,505 @@ exports.requireApiUser = async () => {
     const summary = materialPolicy.summarizeBackupCompleteness(incompleteBackup);
     assert.equal(summary.complete, false, '본문이 누락된 백업은 완전 백업이 아님');
     assert.equal(summary.materialsWithIssues, 1);
+  });
+
+  // =========================================================================
+  // Comprehensive Verification Suite: Requirements 1 through 6
+  // =========================================================================
+
+  // --- Requirement 1: Username Signup / Login & Legacy Guest Removal ---
+  await checkAsync('간편 가입/로그인 1: 아이디 정규화, 허용 문자, 길이 검증', async () => {
+    const { normalizeUsername, validateUsername } = load(path.join(output, 'app/api/auth/username/route.js'));
+    assert.equal(normalizeUsername('  User_123  '), 'user_123');
+    assert.equal(validateUsername('abc').ok, true);
+    assert.equal(validateUsername('user-name_99').ok, true);
+    assert.equal(validateUsername('ab').ok, false, '3자 미만 거부');
+    assert.equal(validateUsername('a'.repeat(31)).ok, false, '30자 초과 거부');
+    assert.equal(validateUsername('user@domain').ok, false, '이메일 기호 거부');
+    assert.equal(validateUsername('user name').ok, false, '공백 포함 거부');
+    assert.equal(validateUsername('한글아이디').ok, false, '한글 등 허용되지 않은 문자 거부');
+  });
+
+  await checkAsync('간편 가입/로그인 2: 아이디 중복 방지 및 동시 가입 원자적 제약', async () => {
+    const { POST: usernameRoute } = load(path.join(output, 'app/api/auth/username/route.js'));
+    let usernameAccounts = [];
+    let authUsers = [];
+
+    await withFakeSupabase({
+      username_accounts: usernameAccounts,
+      auth_rate_limits: [],
+      rpcImpl: (name) => {
+        if (name === 'check_and_increment_rate_limit') return { data: true, error: null };
+        return { data: null, error: null };
+      },
+    }, async (client) => {
+      client.auth.admin = {
+        createUser: async ({ email }) => {
+          const uid = 'auth-uid-' + Math.random().toString(36).slice(2);
+          authUsers.push({ id: uid, email });
+          return { data: { user: { id: uid, email } }, error: null };
+        },
+        deleteUser: async (uid) => {
+          authUsers = authUsers.filter((u) => u.id !== uid);
+          return { data: {}, error: null };
+        },
+      };
+
+      // 1. Initial signup succeeds
+      const req1 = new NextRequest('http://localhost/api/auth/username', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'signup', username: 'student123', password: 'password1234' }),
+      });
+      const res1 = await usernameRoute(req1);
+      const data1 = await res1.json();
+      assert.equal(res1.status, 200);
+      assert.equal(data1.success, true);
+      assert.equal(data1.user.username, 'student123');
+
+      // 2. Duplicate signup fails with 409 USERNAME_ALREADY_EXISTS
+      const req2 = new NextRequest('http://localhost/api/auth/username', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'signup', username: 'Student123', password: 'password1234' }),
+      });
+      const res2 = await usernameRoute(req2);
+      const data2 = await res2.json();
+      assert.equal(res2.status, 409);
+      assert.equal(data2.errorCode, 'USERNAME_ALREADY_EXISTS');
+    });
+  });
+
+  await checkAsync('간편 가입/로그인 3: 서버 측 요청 제한(Rate Limit) 초과 시 429 차단', async () => {
+    const { POST: usernameRoute } = load(path.join(output, 'app/api/auth/username/route.js'));
+
+    await withFakeSupabase({
+      auth_rate_limits: [],
+    }, async () => {
+      // 5 attempts allowed
+      for (let i = 0; i < 5; i++) {
+        const req = new NextRequest('http://localhost/api/auth/username', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'login', username: 'ratelimituser', password: 'badpassword' }),
+        });
+        const res = await usernameRoute(req);
+        assert.notEqual(res.status, 429);
+      }
+
+      // 6th attempt blocked with 429
+      const reqBlocked = new NextRequest('http://localhost/api/auth/username', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'login', username: 'ratelimituser', password: 'badpassword' }),
+      });
+      const resBlocked = await usernameRoute(reqBlocked);
+      assert.equal(resBlocked.status, 429);
+      const dataBlocked = await resBlocked.json();
+      assert.equal(dataBlocked.errorCode, 'RATE_LIMIT_EXCEEDED');
+    });
+  });
+
+  await checkAsync('간편 가입/로그인 4: 공용 게스트 로그인 경로 및 기존 공유 세션 차단', async () => {
+    const { POST: guestLoginRoute } = load(path.join(output, 'app/api/guest-login/route.js'));
+    const { getSessionUser, isSharedLegacyGuestUser } = load(path.join(output, 'lib/auth/session.js'));
+
+    // 1. /api/guest-login route returns 410 GONE
+    const guestRes = await guestLoginRoute();
+    assert.equal(guestRes.status, 410);
+    const guestData = await guestRes.json();
+    assert.equal(guestData.errorCode, 'GUEST_LOGIN_DEPRECATED');
+
+    // 2. isSharedLegacyGuestUser detects guest@learnaway.ai
+    assert.equal(isSharedLegacyGuestUser({ email: 'guest@learnaway.ai' }), true);
+    assert.equal(isSharedLegacyGuestUser({ email: 'student123@id.learnaway.local' }), false);
+    assert.equal(isSharedLegacyGuestUser({ email: 'student@gmail.com' }), false);
+
+    // 3. getSessionUser rejects legacy guest session with 403
+    const legacyGuestClient = {
+      auth: {
+        getUser: async () => ({
+          data: { user: { id: 'legacy-shared-guest-uid', email: 'guest@learnaway.ai' } },
+          error: null,
+        }),
+      },
+    };
+    const sessionRes = await getSessionUser(legacyGuestClient);
+    assert.equal(sessionRes.user, null);
+    assert.equal(sessionRes.errorCode, 'FORBIDDEN_SHARED_ACCOUNT');
+  });
+
+  await checkAsync('간편 가입/로그인 5: 서로 다른 간편 가입 사용자 간 데이터 격리', async () => {
+    const userA = { id: 'uuid-user-a', email: 'alice@id.learnaway.local' };
+    const userB = { id: 'uuid-user-b', email: 'bob@id.learnaway.local' };
+
+    await withFakeSupabase({
+      user: userA,
+      subjects: [
+        { id: 'subj-a', user_id: userA.id, name: 'Alice의 통계학' },
+        { id: 'subj-b', user_id: userB.id, name: 'Bob의 알고리즘' },
+      ],
+      ai_trial_credits: [
+        { user_id: userA.id, granted_credits: 1, balance: 1, granted_at: nowIso(), updated_at: nowIso() },
+        { user_id: userB.id, granted_credits: 1, balance: 1, granted_at: nowIso(), updated_at: nowIso() },
+      ],
+    }, async (client) => {
+      // User A queries subjects: cannot see Bob's subject
+      const subs = await client.from('subjects').select('*').eq('user_id', userA.id);
+      assert.equal(subs.data.length, 1);
+      assert.equal(subs.data[0].name, 'Alice의 통계학');
+
+      // User A queries Bob's trial credits: isolated
+      const credits = await client.from('ai_trial_credits').select('*').eq('user_id', userB.id);
+      assert.equal(credits.data.length, 0);
+    });
+  });
+
+  // --- Requirement 2 & 3: Trial Operations, Exclusion & RPC Permissions ---
+  await checkAsync('AI 체험 크레딧 14: 일반 authenticated 사용자의 정산·환급·예약 RPC 직접 실행 거부', async () => {
+    await withFakeSupabase({
+      user: { id: 'normal-authenticated-user' },
+      isAdmin: false,
+    }, async (client) => {
+      const settleRes = await client.rpc('settle_trial_credit', { p_task_id: 'any-task' });
+      assert.ok(settleRes.error, '일반 사용자의 settle_trial_credit 직접 호출 거부');
+      assert.equal(settleRes.error.code, '42501');
+
+      const releaseRes = await client.rpc('release_trial_credit', { p_task_id: 'any-task', p_reason: 'tampered' });
+      assert.ok(releaseRes.error, '일반 사용자의 release_trial_credit 직접 호출 거부');
+      assert.equal(releaseRes.error.code, '42501');
+
+      const reserveRes = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'any-task',
+        p_task_type: 'generate_problems',
+        p_input_identifier: 'any-hash',
+      });
+      assert.ok(reserveRes.error, '일반 사용자의 reserve_trial_credit 직접 호출 거부');
+      assert.equal(reserveRes.error.code, '42501');
+    });
+  });
+
+  await checkAsync('AI 체험 크레딧 15: 모의시험 일괄 채점은 체험 대상 제외 (개인 API 키 필수)', async () => {
+    const { validateTrialEvaluateAnswerInput } = load(path.join(output, 'lib/trialCredits.js'));
+    const evalValidation = validateTrialEvaluateAnswerInput('모의시험 답안 내용', true);
+    assert.equal(evalValidation.ok, false);
+    assert.equal(evalValidation.errorCode, 'MOCK_EXAM_TRIAL_PROHIBITED');
+  });
+
+  await checkAsync('AI 체험 크레딧 16: 중복 동시 요청 임대 락(lease) 및 완료 작업 캐시 결과 즉시 반환 (AI 미호출)', async () => {
+    const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+    let aiCallCount = 0;
+
+    await withFakeSupabase({
+      user: { id: 'lease-test-user' },
+      ai_trial_credits: [{ user_id: 'lease-test-user', granted_credits: 1, balance: 1, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      // 1. First caller acquires lease
+      const cred1 = await resolveAiConfigForUser('lease-test-user', {
+        taskId: 'concurrent-task-1',
+        taskType: 'generate_problems',
+        inputIdentifier: 'input-hash-1',
+      });
+      assert.equal(cred1.ok, true);
+      assert.equal(cred1.isTrial, true);
+      aiCallCount++;
+
+      // 2. Concurrent second caller for same task: blocked with concurrent_in_progress
+      const cred2 = await resolveAiConfigForUser('lease-test-user', {
+        taskId: 'concurrent-task-1',
+        taskType: 'generate_problems',
+        inputIdentifier: 'input-hash-1',
+      });
+      assert.equal(cred2.ok, false);
+      assert.equal(cred2.code, 'concurrent_in_progress');
+
+      // 3. Mark task completed with cached result
+      const adminClient = globalThis.__fakeSupabaseAdminClient || client;
+      await adminClient.rpc('record_trial_result_ready', {
+        p_task_id: 'concurrent-task-1',
+        p_result: { problems: [{ id: 'prob-1', promptText: '문제 1' }] },
+      });
+      await adminClient.rpc('settle_trial_credit', { p_task_id: 'concurrent-task-1' });
+
+      // 4. Repeated caller after completion: returns cached result immediately without calling AI
+      const cred3 = await resolveAiConfigForUser('lease-test-user', {
+        taskId: 'concurrent-task-1',
+        taskType: 'generate_problems',
+        inputIdentifier: 'input-hash-1',
+      });
+      assert.equal(cred3.ok, false);
+      assert.equal(cred3.code, 'already_completed');
+      assert.deepEqual(cred3.cachedResult, { problems: [{ id: 'prob-1', promptText: '문제 1' }] });
+      assert.equal(aiCallCount, 1, 'AI는 단 1회만 호출됨');
+    });
+  });
+
+  // --- Requirement 4 & 5: Google Drive Encryption & Resumable Upload ---
+  await checkAsync('Google Drive 백업 9: 고정 문자열 fallback 제거 및 암호화 키 누락 시 연결 거부', async () => {
+    const emptyKey = googleDrive.getDriveEncryptionKey({});
+    assert.equal(emptyKey, null, '환경변수 누락 시 null 반환');
+
+    const shortKey = googleDrive.getDriveEncryptionKey({ AI_CREDENTIAL_ENCRYPTION_KEY: 'too-short' });
+    assert.equal(shortKey, null, '32바이트 미만 키 거부');
+  });
+
+  await checkAsync('Google Drive 백업 10: 대용량 청크 전송 시 SSRF 방지 및 바이트 범위 검증', async () => {
+    await assert.rejects(
+      async () => {
+        await googleDrive.uploadResumableChunk(
+          'https://malicious-site.example.com/evil',
+          Buffer.from('chunk-data'),
+          0,
+          9,
+          10
+        );
+      },
+      /유효하지 않은 Google Drive/,
+      '임의 외부 URL 전송 차단 (SSRF 방지)'
+    );
+  });
+
+  // --- Requirement 6: PDF Conversion Deployment & Textless PDF ---
+  await checkAsync('PDF 변환 1: 배포 환경 Python 미설치 시 503 및 운영 안내 반환', async () => {
+    const { POST: convertPdf } = load(path.join(output, 'app/api/convert/route.js'));
+    const savedServiceUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    delete process.env.PDF_CONVERT_SERVICE_URL;
+
+    try {
+      const boundary = '----TestBoundary123';
+      const body = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="test.pdf"\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4 dummy\r\n--${boundary}--\r\n`;
+      const req = new NextRequest('http://localhost/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+        body,
+      });
+
+      const res = await convertPdf(req);
+      assert.ok([200, 422, 503].includes(res.status));
+      if (res.status === 503) {
+        const data = await res.json();
+        assert.equal(data.errorCode, 'PDF_SERVICE_UNCONFIGURED');
+        assert.ok(data.error.includes('PDF_CONVERT_SERVICE_URL'));
+      }
+    } finally {
+      if (savedServiceUrl) process.env.PDF_CONVERT_SERVICE_URL = savedServiceUrl;
+    }
+  });
+
+  await checkAsync('PDF 변환 2: 마이크로서비스 URL 설정 시 외부 서비스로 라우팅', async () => {
+    const { POST: convertPdf } = load(path.join(output, 'app/api/convert/route.js'));
+    const savedServiceUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    process.env.PDF_CONVERT_SERVICE_URL = 'http://127.0.0.1:8001';
+
+    let remoteServiceCalled = false;
+    const originalFetch = global.fetch;
+    global.fetch = async (url, options) => {
+      if (String(url).startsWith('http://127.0.0.1:8001')) {
+        remoteServiceCalled = true;
+        return new Response(JSON.stringify({
+          success: true,
+          markdown: '# 르베그 적분 개론\n\n외부 마이크로서비스에서 변환된 본문입니다.',
+          textLength: 35,
+          pageCount: 1,
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return originalFetch(url, options);
+    };
+
+    try {
+      const boundary = '----MicroserviceBoundary';
+      const body = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="lecture.pdf"\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4 dummy\r\n--${boundary}--\r\n`;
+      const req = new NextRequest('http://localhost/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+        body,
+      });
+
+      const res = await convertPdf(req);
+      const data = await res.json();
+      assert.equal(res.status, 200);
+      assert.equal(remoteServiceCalled, true, 'PDF_CONVERT_SERVICE_URL로 요청이 라우팅됨');
+      assert.equal(data.success, true);
+      assert.ok(data.markdown.includes('외부 마이크로서비스'));
+    } finally {
+      global.fetch = originalFetch;
+      if (savedServiceUrl) process.env.PDF_CONVERT_SERVICE_URL = savedServiceUrl;
+      else delete process.env.PDF_CONVERT_SERVICE_URL;
+    }
+  });
+
+  await checkAsync('PDF 변환 3: 스캔/이미지 PDF(텍스트 없음) 시 422 및 OCR 미지원 명확 안내', async () => {
+    const { POST: convertPdf } = load(path.join(output, 'app/api/convert/route.js'));
+    const savedServiceUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    process.env.PDF_CONVERT_SERVICE_URL = 'http://127.0.0.1:8001';
+
+    const originalFetch = global.fetch;
+    global.fetch = async (url, options) => {
+      if (String(url).startsWith('http://127.0.0.1:8001')) {
+        return new Response(JSON.stringify({
+          success: false,
+          errorCode: 'PDF_NO_TEXT',
+          error: 'PDF에서 텍스트를 추출할 수 없습니다. (스캔/이미지 전용 PDF는 OCR을 지원하지 않습니다)',
+        }), {
+          status: 422,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return originalFetch(url, options);
+    };
+
+    try {
+      const boundary = '----ScannedPdfBoundary';
+      const body = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="scanned.pdf"\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4 dummy\r\n--${boundary}--\r\n`;
+      const req = new NextRequest('http://localhost/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+        body,
+      });
+
+      const res = await convertPdf(req);
+      const data = await res.json();
+      assert.equal(res.status, 422);
+      assert.equal(data.errorCode, 'PDF_NO_TEXT');
+      assert.ok(data.error.includes('OCR'), 'OCR 미지원 안내 포함');
+    } finally {
+      global.fetch = originalFetch;
+      if (savedServiceUrl) process.env.PDF_CONVERT_SERVICE_URL = savedServiceUrl;
+      else delete process.env.PDF_CONVERT_SERVICE_URL;
+    }
+  });
+
+  await checkAsync('PDF 변환 4: GET /api/convert 정밀 변환 상태 확인 (URL 미설정 시 안내 반환 및 토큰 미노출)', async () => {
+    const { GET: getConvertHealth } = load(path.join(output, 'app/api/convert/route.js'));
+    const savedServiceUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    delete process.env.PDF_CONVERT_SERVICE_URL;
+
+    try {
+      const res = await getConvertHealth();
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.available, false);
+      assert.equal(data.configured, false);
+      assert.equal(data.engine, 'unavailable');
+      assert.ok(data.message.includes('PDF_CONVERT_SERVICE_URL') || data.message.includes('정밀 변환'));
+      assert.equal(data.token, undefined, '비밀 토큰 노출 금지');
+    } finally {
+      if (savedServiceUrl) process.env.PDF_CONVERT_SERVICE_URL = savedServiceUrl;
+    }
+  });
+
+  await checkAsync('PDF 변환 5: GET /api/convert 정밀 변환 상태 확인 (외부 서비스 상태 조회 성공)', async () => {
+    const { GET: getConvertHealth } = load(path.join(output, 'app/api/convert/route.js'));
+    const savedServiceUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    process.env.PDF_CONVERT_SERVICE_URL = 'http://127.0.0.1:8001';
+
+    const originalFetch = global.fetch;
+    global.fetch = async (url) => {
+      if (String(url).startsWith('http://127.0.0.1:8001/health')) {
+        return new Response(JSON.stringify({
+          status: 'ok',
+          service: 'learnaway-pdf-converter',
+          engine: 'pymupdf4llm',
+          version: '1.1.0',
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return originalFetch(url);
+    };
+
+    try {
+      const res = await getConvertHealth();
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.available, true);
+      assert.equal(data.configured, true);
+      assert.equal(data.engine, 'pymupdf4llm');
+    } finally {
+      global.fetch = originalFetch;
+      if (savedServiceUrl) process.env.PDF_CONVERT_SERVICE_URL = savedServiceUrl;
+      else delete process.env.PDF_CONVERT_SERVICE_URL;
+    }
+  });
+
+  await checkAsync('PDF 변환 6: 대용량 PDF 스토리지 티켓 생성 및 비인가 경로 격리 검증', async () => {
+    const { POST: convertPdf } = load(path.join(output, 'app/api/convert/route.js'));
+
+    // 1. Ticket creation
+    const ticketReq = new NextRequest('http://localhost/api/convert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'create_storage_ticket',
+        fileName: 'calculus_chapter1.pdf',
+        fileSize: 15 * 1024 * 1024,
+      }),
+    });
+    const ticketRes = await convertPdf(ticketReq);
+    assert.equal(ticketRes.status, 200);
+    const ticketData = await ticketRes.json();
+    assert.equal(ticketData.success, true);
+    assert.ok(ticketData.storagePath.includes('/temp-convert/'));
+    assert.ok(ticketData.storagePath.endsWith('.pdf'));
+
+    // 2. Reject tampering / unauthorized path access (other user or non-matching jobId)
+    const unauthorizedReq = new NextRequest('http://localhost/api/convert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'convert_storage',
+        jobId: 'fake-job-id',
+        storagePath: 'other-user-uuid/temp-convert/fake-job-id/secret.pdf',
+      }),
+    });
+    const unauthorizedRes = await convertPdf(unauthorizedReq);
+    assert.equal(unauthorizedRes.status, 403, '타 사용자 경로 접근 거부');
+  });
+
+  await checkAsync('PDF 변환 7: HMAC 작업 토큰 생성 및 만료 시한 검증', async () => {
+    const { createPdfJobToken } = load(path.join(output, 'lib/pdf/token.js'));
+    const savedToken = process.env.PDF_CONVERT_SERVICE_TOKEN;
+    process.env.PDF_CONVERT_SERVICE_TOKEN = 'secret-test-token-xyz';
+
+    try {
+      const token = createPdfJobToken('user-123', 'job-abc', 200, 60);
+      assert.ok(token && typeof token === 'string');
+      const [payloadB64, signature] = token.split('.');
+      assert.ok(payloadB64 && signature);
+      const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8'));
+      assert.equal(payload.userId, 'user-123');
+      assert.equal(payload.jobId, 'job-abc');
+      assert.equal(payload.maxPages, 200);
+      assert.ok(payload.exp > Math.floor(Date.now() / 1000));
+    } finally {
+      if (savedToken) process.env.PDF_CONVERT_SERVICE_TOKEN = savedToken;
+      else delete process.env.PDF_CONVERT_SERVICE_TOKEN;
+    }
+  });
+
+  await checkAsync('PDF 변환 8: 브라우저 PDF.js 버퍼 시그니처 검증 (%PDF- 매직 바이트 및 크기 한도)', async () => {
+    const { validatePdfBuffer } = load(path.join(output, 'lib/pdf/browserPdfConverter.js'));
+
+    // Empty buffer
+    const emptyRes = validatePdfBuffer(new ArrayBuffer(0));
+    assert.equal(emptyRes.ok, false);
+    assert.equal(emptyRes.code, 'PDF_EMPTY');
+
+    // Wrong signature (e.g. text/html)
+    const htmlBuf = new TextEncoder().encode('<!DOCTYPE html><html>').buffer;
+    const invalidSigRes = validatePdfBuffer(htmlBuf);
+    assert.equal(invalidSigRes.ok, false);
+    assert.equal(invalidSigRes.code, 'PDF_SIGNATURE_INVALID');
+
+    // Valid PDF signature
+    const validPdfBuf = new TextEncoder().encode('%PDF-1.7 sample data').buffer;
+    const validRes = validatePdfBuffer(validPdfBuf);
+    assert.equal(validRes.ok, true);
   });
 
   console.log(`${passed} regression checks passed`);

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '@/lib/aiClient';
@@ -6,6 +7,7 @@ import {
   validateTrialProblemGenInput,
   settleTrialCredit,
   releaseTrialCredit,
+  recordTrialResultReady,
   MAX_TRIAL_EXECUTION_TIMEOUT_MS,
   MAX_TRIAL_OUTPUT_TOKENS,
 } from '@/lib/trialCredits';
@@ -246,6 +248,23 @@ export async function POST(req: NextRequest) {
       inputIdentifier,
     });
     if (!cred.ok) {
+      if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
+        const cached = cred.cachedResult as { drafts?: ProblemDraft[]; count?: number; generationJobId?: string };
+        return NextResponse.json({
+          success: true,
+          drafts: cached.drafts || [],
+          count: cached.count || (cached.drafts ? cached.drafts.length : 0),
+          generationJobId: cached.generationJobId || taskId || randomUUID(),
+          persisted: true,
+          fromCache: true,
+        });
+      }
+      if (cred.code === 'concurrent_in_progress') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'CONCURRENT_EXECUTION_BLOCKED' },
+          { status: 409 }
+        );
+      }
       const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
       return NextResponse.json(
         { success: false, error: cred.message, errorCode: cred.code === 'no_credentials' ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
@@ -563,6 +582,14 @@ ${combinedSource}
         id: `${generationJobId}-p${index + 1}`,
       }));
 
+      if (cred.isTrial && draftsWithIds.length > 0) {
+        await recordTrialResultReady(auth.user.id, taskId, {
+          drafts: draftsWithIds,
+          count: draftsWithIds.length,
+          generationJobId,
+        });
+      }
+
       // Return the SERVER drafts on success (DB updatedAt / contentVersion /
       // approval) so a first approval cannot hit DRAFT_STALE. On failure the
       // generated drafts are preserved so saving can be retried without AI.
@@ -583,7 +610,10 @@ ${combinedSource}
       }
 
       if (cred.isTrial && draftsWithIds.length > 0) {
-        await settleTrialCredit(auth.user.id, taskId);
+        const settleResult = await settleTrialCredit(auth.user.id, taskId);
+        if (!settleResult.success) {
+          console.warn('Trial credit settlement warning:', settleResult.error);
+        }
       }
 
       return NextResponse.json({

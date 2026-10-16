@@ -10,6 +10,11 @@ type ServerClient = ReturnType<typeof createServerClient>;
  * because it reads the request cookies.
  */
 export async function createClient(): Promise<ServerClient> {
+  const testClient = (globalThis as unknown as { __fakeSupabaseClient?: ServerClient }).__fakeSupabaseClient;
+  if (testClient) {
+    return testClient;
+  }
+
   const env = readSupabaseEnv();
   if (!env) {
     throw new Error(SUPABASE_SETUP_MESSAGE);
