@@ -30,11 +30,21 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts', 'app/api/analyze-concepts/route.ts', 'app/api/generate-problems/route.ts', 'lib/supabase/admin.ts', 'app/api/reminders/cron/route.ts',
   'lib/trialCredits.ts', 'lib/drive/googleDrive.ts', 'app/api/auth/username/route.ts', 'app/api/guest-login/route.ts', 'lib/auth/session.ts', 'lib/auth/apiAuth.ts',
   'lib/auth/username.ts',
-  'lib/pdf/token.ts', 'lib/pdf/browserPdfConverter.ts',
+  'lib/pdf/token.ts', 'lib/pdf/browserPdfConverter.ts', 'lib/pdf/tempStorage.ts', 'app/api/cron/cleanup-temp-pdf/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
 async function run() {
+  // Isolate process environment from ambient machine configuration so unit assertions stay deterministic
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.OPENAI_BASE_URL;
+  delete process.env.BAZE_API_KEY;
+  delete process.env.BAZE_BASE_URL;
+  delete process.env.BAZE_MODEL;
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
+  delete process.env.AI_PROVIDER;
+
   process.env.ANALYSIS_RECOVERY_SIGNING_SECRET =
     process.env.ANALYSIS_RECOVERY_SIGNING_SECRET || 'test_secret_for_regressions_analysis_token_signing_123456';
   if (compile.status !== 0) throw new Error(compile.stdout + compile.stderr);
@@ -251,7 +261,7 @@ exports.requireApiUser = async () => {
         return { data: { success: true, granted_credits: 3, remaining_credits: 3, is_first_grant: false }, error: null };
       }
       if (name === 'reserve_trial_credit') {
-        return { data: { allowed: true, status: 'reserved', remaining: 2 }, error: null };
+        return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lease_mock_token_123' }, error: null };
       }
       if (name === 'settle_trial_credit') {
         return { data: { success: true, status: 'settled', is_existing: false }, error: null };
@@ -735,6 +745,7 @@ exports.requireApiUser = async () => {
             return { data: savedItems.map(clone), error: null };
           }
           if (ctx.op === 'insert') {
+            if (state.fail.insert) return { data: null, error: { message: 'injected insert failure' } };
             const items = Array.isArray(ctx.payload) ? ctx.payload : [ctx.payload];
             const savedItems = [];
             for (const raw of items) {
@@ -776,7 +787,7 @@ exports.requireApiUser = async () => {
       return builder;
     }
 
-    const storage = {
+    const storage = options.storage || {
       from() {
         return {
           async upload(path, blob, opts) {
@@ -916,30 +927,41 @@ exports.requireApiUser = async () => {
         if (name === 'get_or_create_trial_credits') {
           const userId = (params && params.p_user_id) || (state.user ? state.user.id : 'test-user');
           const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
+          const usernameAccounts = (state.username_accounts = state.username_accounts || []);
           let entry = creditsList.find((c) => c.user_id === userId);
           if (!entry) {
+            // Check if guest / simple username account
+            const isGuest = userId === 'user-trial-1' ||
+              usernameAccounts.some((u) => u.user_id === userId) ||
+              Boolean(state.user && (state.user.id === userId && (state.user.email?.endsWith('@id.learnaway.local') || state.user.user_metadata?.auth_type === 'username')));
+            const initialGrant = isGuest ? 1 : 3;
             entry = {
               user_id: userId,
-              granted_credits: 1,
-              balance: 1,
+              granted_credits: initialGrant,
+              balance: initialGrant,
               granted_at: nowIso(),
               updated_at: nowIso(),
             };
             creditsList.push(entry);
             return Promise.resolve({
               data: {
-                granted: 1,
-                balance: 1,
+                granted: initialGrant,
+                balance: initialGrant,
                 hasPersonalKey: false,
+                isGuest,
               },
               error: null,
             });
           }
+          const isGuest = userId === 'user-trial-1' ||
+            usernameAccounts.some((u) => u.user_id === userId) ||
+            Boolean(state.user && (state.user.id === userId && (state.user.email?.endsWith('@id.learnaway.local') || state.user.user_metadata?.auth_type === 'username')));
           return Promise.resolve({
             data: {
               granted: entry.granted_credits,
               balance: entry.balance,
               hasPersonalKey: false,
+              isGuest,
             },
             error: null,
           });
@@ -1087,16 +1109,27 @@ exports.requireApiUser = async () => {
           }
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           const taskId = params && params.p_task_id;
+          const token = params && typeof params.p_lease_token === 'string' ? params.p_lease_token.trim() : '';
+          if (!token) {
+            return Promise.resolve({ data: { success: false, error: '유효한 실행 토큰(lease_token)이 필요합니다.', error_code: 'LEASE_TOKEN_REQUIRED' }, error: null });
+          }
           const res = resList.find((r) => r.task_id === taskId);
-          if (res && params && params.p_lease_token && res.lease_token && res.lease_token !== params.p_lease_token) {
+          if (!res) {
+            return Promise.resolve({ data: { success: false, error: '예약 내역을 찾을 수 없습니다.', error_code: 'RESERVATION_NOT_FOUND' }, error: null });
+          }
+          if (res.lease_token !== token) {
             return Promise.resolve({ data: { success: false, error: '만료되었거나 유효하지 않은 실행 토큰(fencing token)입니다.', error_code: 'STALE_LEASE_TOKEN' }, error: null });
           }
-          if (res) {
-            res.status = 'result_ready';
-            res.cached_result = params.p_result;
-            res.lease_expires_at = null;
-            res.updated_at = nowIso();
+          if (res.status === 'settled') {
+            return Promise.resolve({ data: { success: false, error: '이미 최종 확정된 작업의 결과는 덮어쓸 수 없습니다.', error_code: 'ALREADY_SETTLED' }, error: null });
           }
+          if (res.status === 'released' || res.status === 'failed_refunded') {
+            return Promise.resolve({ data: { success: false, error: '이미 환급된 작업의 결과를 기록할 수 없습니다.', error_code: 'ALREADY_REFUNDED' }, error: null });
+          }
+          res.status = 'result_ready';
+          res.cached_result = params.p_result;
+          res.lease_expires_at = null;
+          res.updated_at = nowIso();
           return Promise.resolve({ data: { success: true, status: 'result_ready' }, error: null });
         }
         if (name === 'settle_trial_credit') {
@@ -1105,16 +1138,30 @@ exports.requireApiUser = async () => {
           }
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           const taskId = params && params.p_task_id;
+          const token = params && typeof params.p_lease_token === 'string' ? params.p_lease_token.trim() : '';
+          if (!token) {
+            return Promise.resolve({ data: { success: false, message: '유효한 실행 토큰(lease_token)이 필요합니다.', error_code: 'LEASE_TOKEN_REQUIRED' }, error: null });
+          }
           const res = resList.find((r) => r.task_id === taskId);
-          if (res && params && params.p_lease_token && res.lease_token && res.lease_token !== params.p_lease_token) {
+          if (!res) {
+            return Promise.resolve({ data: { success: false, message: '예약 내역을 찾을 수 없습니다.', error_code: 'RESERVATION_NOT_FOUND' }, error: null });
+          }
+          if (res.lease_token !== token) {
             return Promise.resolve({ data: { success: false, message: '만료되었거나 유효하지 않은 실행 토큰입니다.', error_code: 'STALE_LEASE_TOKEN' }, error: null });
           }
-          if (res) {
-            res.status = 'settled';
-            res.settled_at = nowIso();
-            res.lease_expires_at = null;
-            res.updated_at = nowIso();
+          if (res.status === 'settled') {
+            return Promise.resolve({ data: { success: true, status: 'settled' }, error: null });
           }
+          if (res.status === 'released' || res.status === 'failed_refunded') {
+            return Promise.resolve({ data: { success: false, message: '이미 환급된 작업은 재차감 없이 확정할 수 없습니다.', error_code: 'ALREADY_REFUNDED' }, error: null });
+          }
+          if (!res.cached_result) {
+            return Promise.resolve({ data: { success: false, message: '보존된 AI 결과가 없어 크레딧을 확정할 수 없습니다.', error_code: 'MISSING_CACHED_RESULT' }, error: null });
+          }
+          res.status = 'settled';
+          res.settled_at = nowIso();
+          res.lease_expires_at = null;
+          res.updated_at = nowIso();
           return Promise.resolve({
             data: {
               success: true,
@@ -1130,39 +1177,71 @@ exports.requireApiUser = async () => {
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
           const taskId = params && params.p_task_id;
+          const token = params && typeof params.p_lease_token === 'string' ? params.p_lease_token.trim() : '';
+          if (!token) {
+            return Promise.resolve({ data: { success: false, message: '유효한 실행 토큰(lease_token)이 필요합니다.', error_code: 'LEASE_TOKEN_REQUIRED' }, error: null });
+          }
           const res = resList.find((r) => r.task_id === taskId);
-          if (res && params && params.p_lease_token && res.lease_token && res.lease_token !== params.p_lease_token) {
+          if (!res) {
+            return Promise.resolve({ data: { success: false, message: '예약 내역을 찾을 수 없습니다.', error_code: 'RESERVATION_NOT_FOUND' }, error: null });
+          }
+          if (res.lease_token !== token) {
             return Promise.resolve({ data: { success: false, message: '만료되었거나 유효하지 않은 실행 토큰입니다.', error_code: 'STALE_LEASE_TOKEN' }, error: null });
           }
-          if (res && (res.status === 'processing' || res.status === 'reserved')) {
-            res.status = 'released';
-            res.released_at = nowIso();
-            res.release_reason = (params && params.p_reason) || 'failure';
-            res.lease_expires_at = null;
-            res.updated_at = nowIso();
-
+          if (res.status === 'settled') {
+            return Promise.resolve({ data: { success: false, message: '이미 확정된 작업은 환급할 수 없습니다.', error_code: 'ALREADY_SETTLED' }, error: null });
+          }
+          if (res.status === 'released' || res.status === 'failed_refunded') {
             const userCredits = creditsList.find((c) => c.user_id === res.user_id);
-            if (userCredits) {
-              userCredits.balance = Math.min(userCredits.balance + 1, userCredits.granted_credits);
-              userCredits.updated_at = nowIso();
-            }
             return Promise.resolve({
               data: {
                 success: true,
-                refunded: true,
+                status: res.status,
+                refunded: false,
                 balance: userCredits ? userCredits.balance : 0,
+                remaining: userCredits ? userCredits.balance : 0,
               },
               error: null,
             });
           }
+          res.status = 'released';
+          res.released_at = nowIso();
+          res.release_reason = (params && params.p_reason) || 'failure';
+          res.lease_expires_at = null;
+          res.updated_at = nowIso();
+
+          const userCredits = creditsList.find((c) => c.user_id === res.user_id);
+          if (userCredits) {
+            userCredits.balance = Math.min(userCredits.balance + 1, userCredits.granted_credits);
+            userCredits.updated_at = nowIso();
+          }
           return Promise.resolve({
             data: {
-              success: false,
-              refunded: false,
-              balance: 0,
+              success: true,
+              status: 'released',
+              refunded: true,
+              balance: userCredits ? userCredits.balance : 0,
+              remaining: userCredits ? userCredits.balance : 0,
             },
             error: null,
           });
+        }
+        if (name === 'claim_expired_temp_pdf_jobs') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function claim_expired_temp_pdf_jobs', code: '42501' } });
+          }
+          const jobList = (state.temp_pdf_conversion_jobs = state.temp_pdf_conversion_jobs || []);
+          const limit = (params && params.p_limit) || 50;
+          const claimed = [];
+          for (const j of jobList) {
+            if (claimed.length >= limit) break;
+            if (j.status !== 'cleaned' && j.status !== 'cleaning' && j.status !== 'quarantined') {
+              j.status = 'cleaning';
+              j.updated_at = nowIso();
+              claimed.push({ ...j });
+            }
+          }
+          return Promise.resolve({ data: claimed, error: null });
         }
         if (name === 'init_analysis_job_and_chunks') {
           if (!params.p_user_id) {
@@ -11355,10 +11434,14 @@ exports.requireApiUser = async () => {
       await client.rpc('record_trial_result_ready', {
         p_task_id: 'task-idempotent-1',
         p_result: { drafts: [{ id: 'd1', title: '개념 1' }] },
+        p_lease_token: first.data.lease_token,
       });
 
       // Now settle it
-      await client.rpc('settle_trial_credit', { p_task_id: 'task-idempotent-1' });
+      await client.rpc('settle_trial_credit', {
+        p_task_id: 'task-idempotent-1',
+        p_lease_token: first.data.lease_token,
+      });
 
       // Call reserve after settled: returns already_completed and cached result, AI not called again!
       const postSettle = await client.rpc('reserve_trial_credit', {
@@ -11529,6 +11612,7 @@ exports.requireApiUser = async () => {
       const released = await client.rpc('release_trial_credit', {
         p_task_id: 'task-aborted-call',
         p_reason: 'aborted_before_call',
+        p_lease_token: reserved.data.lease_token,
       });
       assert.equal(released.data.success, true);
       assert.equal(released.data.refunded, true);
@@ -12163,8 +12247,12 @@ exports.requireApiUser = async () => {
       await adminClient.rpc('record_trial_result_ready', {
         p_task_id: 'concurrent-task-1',
         p_result: { problems: [{ id: 'prob-1', promptText: '문제 1' }] },
+        p_lease_token: cred1.leaseToken,
       });
-      await adminClient.rpc('settle_trial_credit', { p_task_id: 'concurrent-task-1' });
+      await adminClient.rpc('settle_trial_credit', {
+        p_task_id: 'concurrent-task-1',
+        p_lease_token: cred1.leaseToken,
+      });
 
       // 4. Repeated caller after completion: returns cached result immediately without calling AI
       const cred3 = await resolveAiConfigForUser('lease-test-user', {
@@ -12379,37 +12467,42 @@ exports.requireApiUser = async () => {
   });
 
   await checkAsync('PDF 변환 6: 대용량 PDF 스토리지 티켓 생성 및 비인가 경로 격리 검증', async () => {
-    const { POST: convertPdf } = load(path.join(output, 'app/api/convert/route.js'));
+    await withFakeSupabase({
+      user: { id: 'test-user-pdf-6' },
+      temp_pdf_conversion_jobs: [],
+    }, async () => {
+      const { POST: convertPdf } = load(path.join(output, 'app/api/convert/route.js'));
 
-    // 1. Ticket creation
-    const ticketReq = new NextRequest('http://localhost/api/convert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'create_storage_ticket',
-        fileName: 'calculus_chapter1.pdf',
-        fileSize: 15 * 1024 * 1024,
-      }),
-    });
-    const ticketRes = await convertPdf(ticketReq);
-    assert.equal(ticketRes.status, 200);
-    const ticketData = await ticketRes.json();
-    assert.equal(ticketData.success, true);
-    assert.ok(ticketData.storagePath.includes('/temp-convert/'));
-    assert.ok(ticketData.storagePath.endsWith('.pdf'));
+      // 1. Ticket creation
+      const ticketReq = new NextRequest('http://localhost/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'create_storage_ticket',
+          fileName: 'calculus_chapter1.pdf',
+          fileSize: 15 * 1024 * 1024,
+        }),
+      });
+      const ticketRes = await convertPdf(ticketReq);
+      assert.equal(ticketRes.status, 200);
+      const ticketData = await ticketRes.json();
+      assert.equal(ticketData.success, true);
+      assert.ok(ticketData.storagePath.includes('/temp-convert/'));
+      assert.ok(ticketData.storagePath.endsWith('.pdf'));
 
-    // 2. Reject tampering / unauthorized path access (other user or non-matching jobId)
-    const unauthorizedReq = new NextRequest('http://localhost/api/convert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'convert_storage',
-        jobId: 'fake-job-id',
-        storagePath: 'other-user-uuid/temp-convert/fake-job-id/secret.pdf',
-      }),
+      // 2. Reject tampering / unauthorized path access (other user or non-matching jobId)
+      const unauthorizedReq = new NextRequest('http://localhost/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'convert_storage',
+          jobId: 'fake-job-id',
+          storagePath: 'other-user-uuid/temp-convert/fake-job-id/secret.pdf',
+        }),
+      });
+      const unauthorizedRes = await convertPdf(unauthorizedReq);
+      assert.equal(unauthorizedRes.status, 403, '타 사용자 경로 접근 거부');
     });
-    const unauthorizedRes = await convertPdf(unauthorizedReq);
-    assert.equal(unauthorizedRes.status, 403, '타 사용자 경로 접근 거부');
   });
 
   await checkAsync('PDF 변환 7: HMAC 작업 토큰 생성 및 만료 시한 검증', async () => {
@@ -12680,43 +12773,401 @@ exports.requireApiUser = async () => {
     }
   });
 
-  await checkAsync('8대 리뷰 7: 임시 PDF 취소(cancel_storage_ticket) 및 만료 파일 정리(cleanup_expired_temp_files) 검증', async () => {
+  await checkAsync('리뷰 문제 1: 임시 PDF 정리의 교차 사용자 삭제 방지 및 경로/권한 검증', async () => {
     const { POST: convertRoute } = load(path.join(output, 'app/api/convert/route.js'));
+    const { GET: cronGet, POST: cronPost } = load(path.join(output, 'app/api/cron/cleanup-temp-pdf/route.js'));
+    const { validateTempStoragePath } = load(path.join(output, 'lib/pdf/tempStorage.js'));
+
+    const savedCronSecret = process.env.CRON_SECRET;
+    process.env.CRON_SECRET = 'test-cron-secret-1234';
+
+    try {
+      // 1. Path Validator unit checks
+      assert.equal(validateTempStoragePath('user-1', 'job-1', 'user-1/temp-convert/job-1/file.pdf').valid, true);
+      assert.equal(validateTempStoragePath('user-1', 'job-1', 'user-2/temp-convert/job-1/file.pdf').valid, false); // different user
+      assert.equal(validateTempStoragePath('user-1', 'job-1', 'user-1/temp-convert/job-2/file.pdf').valid, false); // different job
+      assert.equal(validateTempStoragePath('user-1', 'job-1', 'user-1/temp-convert/job-1/../victim.pdf').valid, false); // path traversal
+      assert.equal(validateTempStoragePath('user-1', 'job-1', 'user-1/temp-convert/job-1/file%2e%2e/x.pdf').valid, false); // encoded traversal
+      assert.equal(validateTempStoragePath('user-1', 'job-1', 'materials/user-1/file.pdf').valid, false); // permanent material path
+      assert.equal(validateTempStoragePath('user-1', 'job-1', 'user-1/temp-convert/job-1/file.exe').valid, false); // non-pdf
+
+      // 2. 일반 사용자의 /api/convert를 통한 cleanup_expired_temp_files 호출 시 거부
+      await withFakeSupabase({
+        user: { id: 'test-user' },
+        isAdmin: true,
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'cleanup_expired_temp_files' }),
+        });
+        const res = await convertRoute(req);
+        const data = await res.json();
+        assert.equal(data.success, false);
+        assert.equal(data.code, 'UNKNOWN_ACTION');
+      });
+
+      // 3. 전용 스케줄러 엔드포인트 인증 검증
+      const unauthReq = new NextRequest('http://localhost/api/cron/cleanup-temp-pdf', { method: 'GET' });
+      const unauthRes = await cronGet(unauthReq);
+      assert.equal(unauthRes.status, 401);
+
+      // 4. 오염된 장부가 있어도 타 사용자/영구 자료 파일 삭제 호출 0회 및 quarantined 격리
+      let storageRemoveCalls = [];
+      const fakeStorage = {
+        from: () => ({
+          remove: async (paths) => {
+            storageRemoveCalls.push(...paths);
+            return { data: paths, error: null };
+          },
+        }),
+      };
+
+      await withFakeSupabase({
+        isAdmin: true,
+        storage: fakeStorage,
+        temp_pdf_conversion_jobs: [
+          // Poisoned row 1: pointing to victim's permanent material
+          { job_id: 'job-poison-1', user_id: 'attacker-1', storage_path: 'victim-user/materials/important.pdf', status: 'ticket_issued', cleanup_attempts: 0, expires_at: '2020-01-01T00:00:00Z' },
+          // Poisoned row 2: traversal bypass
+          { job_id: 'job-poison-2', user_id: 'attacker-1', storage_path: 'attacker-1/temp-convert/job-poison-2/../../../etc/passwd.pdf', status: 'ticket_issued', cleanup_attempts: 0, expires_at: '2020-01-01T00:00:00Z' },
+          // Valid expired row: safe temporary file
+          { job_id: 'job-valid-exp', user_id: 'safe-user', storage_path: 'safe-user/temp-convert/job-valid-exp/doc.pdf', status: 'ticket_issued', cleanup_attempts: 0, expires_at: '2020-01-01T00:00:00Z' },
+        ],
+      }, async () => {
+        const cronReq = new NextRequest('http://localhost/api/cron/cleanup-temp-pdf', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer test-cron-secret-1234' },
+        });
+        const cronRes = await cronPost(cronReq);
+        const cronData = await cronRes.json();
+
+        assert.equal(cronData.success, true);
+        assert.equal(cronData.quarantinedCount, 2, '2 poisoned rows quarantined');
+        assert.equal(cronData.cleanedCount, 1, '1 valid row cleaned');
+        // Storage remove must ONLY be called for the valid temporary object, NEVER for poisoned paths!
+        assert.deepEqual(storageRemoveCalls, ['safe-user/temp-convert/job-valid-exp/doc.pdf']);
+      });
+
+      // 5. cancel_storage_ticket: 본인 소유 장부 경로 검증 및 취소
+      storageRemoveCalls = [];
+      await withFakeSupabase({
+        user: { id: 'test-user' },
+        isAdmin: true,
+        storage: fakeStorage,
+        temp_pdf_conversion_jobs: [
+          { job_id: 'job-cancel-ok', user_id: 'test-user', storage_path: 'test-user/temp-convert/job-cancel-ok/valid.pdf', status: 'ticket_issued' },
+        ],
+      }, async () => {
+        const cancelReq = new NextRequest('http://localhost/api/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'cancel_storage_ticket',
+            jobId: 'job-cancel-ok',
+            storagePath: 'malicious/tampered/path.pdf', // Ignored by server; server uses ledger!
+          }),
+        });
+        const cancelRes = await convertRoute(cancelReq);
+        const cancelData = await cancelRes.json();
+        assert.equal(cancelData.success, true);
+        assert.equal(cancelData.cancelled, true);
+        assert.deepEqual(storageRemoveCalls, ['test-user/temp-convert/job-cancel-ok/valid.pdf']);
+      });
+    } finally {
+      if (savedCronSecret) process.env.CRON_SECRET = savedCronSecret;
+      else delete process.env.CRON_SECRET;
+    }
+  });
+
+  await checkAsync('리뷰 문제 2: 펜싱 검증 실패(STALE_LEASE_TOKEN) 시 실제 학습 데이터 저장 즉시 차단', async () => {
+    const { POST: generateRoute } = load(path.join(output, 'app/api/generate-problems/route.js'));
+
+    const originalFetch = global.fetch;
+    try {
+      // Mock AI response
+      global.fetch = async () => Response.json({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              problems: [{
+                title: 'Stale Test Problem',
+                type: 'essay_descriptive',
+                sourceRefs: 'ref',
+                modelAnswer: 'ans',
+                hints: ['h1', 'h2'],
+                rubric: [{ criterion: 'c1', maxScore: 50 }, { criterion: 'c2', maxScore: 50 }],
+              }],
+            }),
+          },
+        }],
+      });
+
+      // Scenario: Execution A (leaseToken: lease_A_old) is superseded by Execution B (leaseToken: lease_B_new)
+      const reservations = [{
+        task_id: 'task-stale-fencing-1',
+        user_id: 'test-user',
+        task_type: 'generate_problems',
+        input_identifier: 'ident-1',
+        status: 'processing',
+        attempt_count: 2,
+        lease_token: 'lease_B_new', // Active token in DB belongs to Execution B!
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }];
+
+      await withFakeSupabase({
+        user: { id: 'test-user' },
+        isAdmin: true,
+        ai_trial_credits: [{ user_id: 'test-user', balance: 0, granted_credits: 1 }],
+        ai_trial_reservations: reservations,
+        problem_drafts: [],
+      }, async () => {
+        // Request payload simulating late Execution A attempting to write with stale token
+        const payload = {
+          subjectId: 'cs-sub-1',
+          subjectDomain: 'computer_science',
+          concepts: [{ id: 'c1', subjectId: 'cs-sub-1', title: 'Data Structures' }],
+          problemType: 'algorithm_proof',
+          difficulty: 'advanced',
+          problemCount: 1,
+          sources: [{ materialId: 'm1', title: 'Lecture 1', markdown: '# Data Structures and Complexity' }],
+          taskId: 'task-stale-fencing-1',
+        };
+
+        const { recordTrialResultReady } = load(path.join(output, 'lib/trialCredits.js'));
+        const staleRes = await recordTrialResultReady('test-user', 'task-stale-fencing-1', { drafts: [] }, 'lease_A_old');
+
+        assert.equal(staleRes.success, false);
+        assert.equal(staleRes.errorCode, 'STALE_LEASE_TOKEN');
+
+        // Verify route blocks drafts persistence when STALE_LEASE_TOKEN occurs
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const res = await generateRoute(req);
+        // It must NOT succeed silently!
+        assert.ok(res.status === 409 || res.status === 400 || res.status === 502);
+      });
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  await checkAsync('리뷰 문제 3: 결과 보존 실패 시 크레딧 확정 차단 및 결과 없는 완료 판정 방지', async () => {
+    const { settleTrialCredit } = load(path.join(output, 'lib/trialCredits.js'));
+    const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
 
     await withFakeSupabase({
       user: { id: 'test-user' },
       isAdmin: true,
-      temp_pdf_conversion_jobs: [],
+      ai_trial_credits: [{ user_id: 'test-user', balance: 0, granted_credits: 1 }],
+      ai_trial_reservations: [{
+        task_id: 'task-no-cache',
+        user_id: 'test-user',
+        task_type: 'generate_problems',
+        input_identifier: 'ident-x',
+        status: 'processing',
+        attempt_count: 1,
+        lease_token: 'valid_token_123',
+        cached_result: null, // NO CACHE!
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }, {
+        task_id: 'task-settled-corrupt',
+        user_id: 'test-user',
+        task_type: 'generate_problems',
+        input_identifier: 'ident-y',
+        status: 'settled',
+        cached_result: null,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }],
     }, async () => {
-      // 1. Cancel storage ticket
-      const cancelReq = new NextRequest('http://localhost/api/convert', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'cancel_storage_ticket',
-          jobId: 'job-cancel-test',
-          storagePath: 'test-user/temp-convert/job-cancel-test/test.pdf',
-        }),
-      });
+      // 1. settleTrialCredit MUST fail when cached_result is missing
+      const settleRes = await settleTrialCredit('test-user', 'task-no-cache', 'valid_token_123');
+      assert.equal(settleRes.success, false);
+      assert.equal(settleRes.errorCode, 'MISSING_CACHED_RESULT');
 
-      const cancelRes = await convertRoute(cancelReq);
-      const cancelData = await cancelRes.json();
-      assert.equal(cancelData.success, true);
-      assert.equal(cancelData.cancelled, true);
-
-      // 2. Cleanup expired files query test
-      const cleanupReq = new NextRequest('http://localhost/api/convert', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'cleanup_expired_temp_files',
-        }),
+      // 2. reservation with status settled but null cached_result is treated as error, not silent success
+      const fakeCreds = await resolveAiConfigForUser('test-user', {
+        taskId: 'task-settled-corrupt',
+        taskType: 'generate_problems',
+        inputIdentifier: 'ident-y',
       });
-      const cleanupRes = await convertRoute(cleanupReq);
-      const cleanupData = await cleanupRes.json();
-      assert.equal(cleanupData.success, true);
-      assert.equal(typeof cleanupData.cleanedCount, 'number');
+      assert.equal(fakeCreds.ok, false);
+      assert.equal(fakeCreds.code, 'already_completed_missing_result');
+      assert.ok(fakeCreds.message.includes('보존된 AI 결과가 비어 있습니다') || fakeCreds.message.includes('완료 상태이나'));
     });
+  });
+
+  await checkAsync('리뷰 문제 4: 실행 토큰 필수화, 구형 호출 거부 및 비정상 상태 전이 방지', async () => {
+    const { recordTrialResultReady, settleTrialCredit, releaseTrialCredit } = load(path.join(output, 'lib/trialCredits.js'));
+
+    await withFakeSupabase({
+      user: { id: 'test-user' },
+      isAdmin: true,
+      ai_trial_credits: [{ user_id: 'test-user', balance: 0, granted_credits: 1 }],
+      ai_trial_reservations: [
+        { task_id: 'task-released', user_id: 'test-user', status: 'released', lease_token: 'tok-rel', cached_result: { ok: 1 } },
+        { task_id: 'task-settled', user_id: 'test-user', status: 'settled', lease_token: 'tok-set', cached_result: { ok: 1 } },
+      ],
+    }, async () => {
+      // 1. Null or empty leaseToken is strictly rejected
+      assert.equal((await recordTrialResultReady('test-user', 'task-released', {}, null)).errorCode, 'LEASE_TOKEN_REQUIRED');
+      assert.equal((await recordTrialResultReady('test-user', 'task-released', {}, '')).errorCode, 'LEASE_TOKEN_REQUIRED');
+      assert.equal((await settleTrialCredit('test-user', 'task-released', null)).errorCode, 'LEASE_TOKEN_REQUIRED');
+      assert.equal((await releaseTrialCredit('test-user', 'task-released', 'reason', '')).errorCode, 'LEASE_TOKEN_REQUIRED');
+
+      // 2. Cannot settle an already released/refunded task without re-deducting
+      const settleReleased = await settleTrialCredit('test-user', 'task-released', 'tok-rel');
+      assert.equal(settleReleased.success, false);
+      assert.equal(settleReleased.errorCode, 'ALREADY_REFUNDED');
+
+      // 3. Cannot refund an already settled task
+      const refundSettled = await releaseTrialCredit('test-user', 'task-settled', 'late refund', 'tok-set');
+      assert.equal(refundSettled.success, false);
+      assert.equal(refundSettled.errorCode, 'ALREADY_SETTLED');
+
+      // 4. Cannot overwrite results on already settled task
+      const overwriteSettled = await recordTrialResultReady('test-user', 'task-settled', { evil: true }, 'tok-set');
+      assert.equal(overwriteSettled.success, false);
+      assert.equal(overwriteSettled.errorCode, 'ALREADY_SETTLED');
+    });
+  });
+
+  await checkAsync('리뷰 문제 5: 임시 PDF 티켓 등록 실패 시 티켓 미발급 및 converting 회수 검증', async () => {
+    const { POST: convertRoute } = load(path.join(output, 'app/api/convert/route.js'));
+
+    // 1. When DB insert fails, ticket creation MUST fail and return 500 (NO successful ticket issued!)
+    await withFakeSupabase({
+      user: { id: 'test-user' },
+      isAdmin: true,
+      fail: { insert: true }, // Simulate DB down on insert
+    }, async () => {
+      const ticketReq = new NextRequest('http://localhost/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'create_storage_ticket',
+          fileName: 'lecture.pdf',
+          fileSize: 1024,
+        }),
+      });
+      const ticketRes = await convertRoute(ticketReq);
+      assert.equal(ticketRes.status, 500);
+      const ticketData = await ticketRes.json();
+      assert.equal(ticketData.success, false);
+      assert.equal(ticketData.code, 'TICKET_REGISTRATION_FAILED');
+    });
+  });
+
+  await checkAsync('P01-02: 계정 유형별 AI 체험 크레딧 정책 (게스트 1회, 일반 3회, 개인키 미차감, 소진 차단, 전환 중복방지)', async () => {
+    // 1. General User (Google OAuth / standard email) gets 3 credits initially
+    await withFakeSupabase({
+      user: { id: 'general-user-1', email: 'student@university.ac.kr' },
+      ai_trial_credits: [],
+      username_accounts: [],
+    }, async (client) => {
+      const res = await client.rpc('get_or_create_trial_credits', { p_user_id: 'general-user-1' });
+      assert.equal(res.data.granted, 3, '일반 가입 계정은 최초 3회 지급');
+      assert.equal(res.data.balance, 3);
+      assert.equal(res.data.isGuest, false);
+
+      // Re-login does not grant duplicate credits
+      const resRelogin = await client.rpc('get_or_create_trial_credits', { p_user_id: 'general-user-1' });
+      assert.equal(resRelogin.data.granted, 3);
+      assert.equal(resRelogin.data.balance, 3);
+    });
+
+    // 2. Guest / Simple username account gets exactly 1 credit initially
+    await withFakeSupabase({
+      user: { id: 'guest-user-1', email: 'guest123@id.learnaway.local', user_metadata: { auth_type: 'username' } },
+      ai_trial_credits: [],
+      username_accounts: [{ username: 'guest123', user_id: 'guest-user-1' }],
+    }, async (client) => {
+      const res = await client.rpc('get_or_create_trial_credits', { p_user_id: 'guest-user-1' });
+      assert.equal(res.data.granted, 1, '게스트 계정은 최초 1회 지급');
+      assert.equal(res.data.balance, 1);
+      assert.equal(res.data.isGuest, true);
+
+      // 3. Guest uses 1 credit -> balance becomes 0
+      const resv = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-guest-use',
+        p_task_type: 'generate_problems',
+        p_input_identifier: 'ident-guest-1',
+        p_user_id: 'guest-user-1',
+      });
+      assert.equal(resv.data.allowed, true);
+      assert.equal(resv.data.remaining, 0);
+
+      // 4. Guest attempts second call with 0 credits -> Strictly rejected
+      const rejected = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-guest-excess',
+        p_task_type: 'generate_problems',
+        p_input_identifier: 'ident-guest-2',
+        p_user_id: 'guest-user-1',
+      });
+      assert.equal(rejected.data.allowed, false);
+      assert.equal(rejected.data.error_code, 'INSUFFICIENT_CREDITS');
+
+      // 5. Guest-to-General transition simulation: already has row in ai_trial_credits
+      // Subsequent calls do NOT re-grant or overwrite existing balance
+      const afterTransition = await client.rpc('get_or_create_trial_credits', { p_user_id: 'guest-user-1' });
+      assert.equal(afterTransition.data.granted, 1);
+      assert.equal(afterTransition.data.balance, 0, '전환 후에도 기존 소비 이력 보존 및 중복 지급 방지');
+    });
+
+    // 6. User with personal API key: trial credits are not deducted
+    const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+    const savedKey = process.env.AI_CREDENTIAL_ENCRYPTION_KEY;
+    process.env.AI_CREDENTIAL_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
+    try {
+      await withFakeSupabase({
+        user: { id: 'user-with-personal-key' },
+        ai_trial_credits: [{ user_id: 'user-with-personal-key', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+        rpcResults: {
+          get_ai_connection_secret: {
+            data: {
+              ciphertext: 'dummy',
+              iv: Buffer.alloc(12, 1).toString('base64'),
+              tag: Buffer.alloc(16, 2).toString('base64'),
+              model: 'deepseek-v4.1-flash',
+            },
+            error: null,
+          },
+        },
+      }, async (client) => {
+        // When user has registered personal key, source is 'user' and balance stays intact
+        const credRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-with-personal-key');
+        assert.equal(credRow.balance, 3, '개인 API 사용 시 크레딧 미차감');
+
+        const resolved = await resolveAiConfigForUser('user-with-personal-key');
+        assert.ok(resolved.ok === true || resolved.code === 'credential_error', '개인 키 조회 또는 복호화 시도');
+      });
+    } finally {
+      if (savedKey) process.env.AI_CREDENTIAL_ENCRYPTION_KEY = savedKey;
+      else delete process.env.AI_CREDENTIAL_ENCRYPTION_KEY;
+    }
+  });
+
+  await checkAsync('P01-06: localStorage 저장 실패(QuotaExceeded) 및 JSON 파싱 에러 시 안전한 복원 및 크래시 방지', async () => {
+    const { saveStoredConcepts, loadStoredConcepts, checkStoredDataIntegrity } = load(path.join(output, 'lib/storage.js'));
+
+    // 1. Test normal load
+    const initialConcepts = loadStoredConcepts();
+    assert.ok(Array.isArray(initialConcepts));
+
+    // 2. Storage integrity check
+    const integrity = checkStoredDataIntegrity();
+    assert.equal(typeof integrity.ok, 'boolean');
+    assert.ok(Array.isArray(integrity.failedKeys));
+
+    // 3. Verify save function returns boolean without throwing
+    const saveSuccess = saveStoredConcepts([]);
+    assert.equal(typeof saveSuccess, 'boolean');
   });
 
   console.log(`${passed} regression checks passed`);

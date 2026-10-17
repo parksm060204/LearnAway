@@ -98,7 +98,7 @@ function safeGetItem<T>(baseKey: string, fallback: T): T {
   }
 }
 
-function safeSetItem<T>(baseKey: string, val: T): void {
+function safeSetItem<T>(baseKey: string, val: T): boolean {
   const key = scopedStorageKey(baseKey);
   try {
     const serialized = JSON.stringify(val);
@@ -107,8 +107,15 @@ function safeSetItem<T>(baseKey: string, val: T): void {
     } else {
       inMemoryStore[key] = serialized;
     }
+    return true;
   } catch (e) {
     console.error(`Failed to write localStorage key ${key}`, e);
+    try {
+      inMemoryStore[key] = JSON.stringify(val);
+    } catch {
+      // ignore
+    }
+    return false;
   }
 }
 
@@ -836,8 +843,8 @@ function persistMaterialsMetadata(materials: Material[], verify: boolean): boole
   return readBack.every((m, i) => JSON.stringify(m) === JSON.stringify(light[i]));
 }
 
-export function saveStoredMaterials(materials: Material[]): void {
-  persistMaterialsMetadata(materials, false);
+export function saveStoredMaterials(materials: Material[]): boolean {
+  return persistMaterialsMetadata(materials, false);
 }
 
 /**
@@ -1063,16 +1070,16 @@ export function loadStoredConcepts(referenceDate: Date = new Date()): Concept[] 
   });
 }
 
-export function saveStoredConcepts(concepts: Concept[]): void {
-  safeSetItem(STORAGE_KEYS.CONCEPTS, concepts);
+export function saveStoredConcepts(concepts: Concept[]): boolean {
+  return safeSetItem(STORAGE_KEYS.CONCEPTS, concepts);
 }
 
 export function loadStoredConceptDrafts(): ConceptDraft[] {
   return safeGetItem<ConceptDraft[]>(STORAGE_KEYS.CONCEPT_DRAFTS, []);
 }
 
-export function saveStoredConceptDrafts(drafts: ConceptDraft[]): void {
-  safeSetItem(STORAGE_KEYS.CONCEPT_DRAFTS, drafts);
+export function saveStoredConceptDrafts(drafts: ConceptDraft[]): boolean {
+  return safeSetItem(STORAGE_KEYS.CONCEPT_DRAFTS, drafts);
 }
 
 export function approveConceptDraft(draftId: string): {
