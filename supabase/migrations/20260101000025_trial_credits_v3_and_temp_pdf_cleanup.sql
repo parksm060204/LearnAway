@@ -16,7 +16,12 @@
 -- ----------------------------------------------------------------------------
 -- 1. Clean up legacy 4-argument reserve_trial_credit overload
 -- ----------------------------------------------------------------------------
-revoke execute on function public.reserve_trial_credit(text, text, text, uuid) from public, anon, authenticated;
+do $$
+begin
+  revoke execute on function public.reserve_trial_credit(text, text, text, uuid) from public, anon, authenticated;
+exception
+  when undefined_function then null;
+end $$;
 drop function if exists public.reserve_trial_credit(text, text, text, uuid);
 
 -- ----------------------------------------------------------------------------

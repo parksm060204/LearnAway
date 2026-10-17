@@ -26,19 +26,34 @@
 -- ----------------------------------------------------------------------------
 -- 1. Clean up legacy overloaded RPC functions
 -- ----------------------------------------------------------------------------
-revoke execute on function public.record_trial_result_ready(text, jsonb, uuid) from public, anon, authenticated;
+do $$ begin
+  revoke execute on function public.record_trial_result_ready(text, jsonb, uuid) from public, anon, authenticated;
+exception when undefined_function then null;
+end $$;
 drop function if exists public.record_trial_result_ready(text, jsonb, uuid);
 
-revoke execute on function public.settle_trial_credit(text) from public, anon, authenticated;
+do $$ begin
+  revoke execute on function public.settle_trial_credit(text) from public, anon, authenticated;
+exception when undefined_function then null;
+end $$;
 drop function if exists public.settle_trial_credit(text);
 
-revoke execute on function public.settle_trial_credit(text, uuid) from public, anon, authenticated;
+do $$ begin
+  revoke execute on function public.settle_trial_credit(text, uuid) from public, anon, authenticated;
+exception when undefined_function then null;
+end $$;
 drop function if exists public.settle_trial_credit(text, uuid);
 
-revoke execute on function public.release_trial_credit(text, text) from public, anon, authenticated;
+do $$ begin
+  revoke execute on function public.release_trial_credit(text, text) from public, anon, authenticated;
+exception when undefined_function then null;
+end $$;
 drop function if exists public.release_trial_credit(text, text);
 
-revoke execute on function public.release_trial_credit(text, text, uuid) from public, anon, authenticated;
+do $$ begin
+  revoke execute on function public.release_trial_credit(text, text, uuid) from public, anon, authenticated;
+exception when undefined_function then null;
+end $$;
 drop function if exists public.release_trial_credit(text, text, uuid);
 
 -- ----------------------------------------------------------------------------

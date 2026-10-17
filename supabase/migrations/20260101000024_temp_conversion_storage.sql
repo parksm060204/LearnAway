@@ -15,6 +15,8 @@
 -- 3. Non-Permanent: Temporary upload does not imply consent for permanent backup.
 -- ============================================================================
 
--- Add a comment to explicitly document the temp-convert prefix in the materials bucket
-comment on table storage.objects is
-  'LearnAway private materials bucket with isolated user namespaces (<auth.uid()>/materials, <auth.uid()>/temp-convert)';
+-- Ensure materials bucket exists for temp-convert uploads
+insert into storage.buckets (id, name, public)
+values ('materials', 'materials', false)
+on conflict (id) do nothing;
+
