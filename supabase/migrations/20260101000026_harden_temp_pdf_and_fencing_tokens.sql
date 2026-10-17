@@ -3,9 +3,7 @@
 --
 -- 1. Drops legacy overloaded RPCs for trial credits:
 --    - record_trial_result_ready(text, jsonb, uuid)
---    - settle_trial_credit(text)
 --    - settle_trial_credit(text, uuid)
---    - release_trial_credit(text, text)
 --    - release_trial_credit(text, text, uuid)
 -- 2. Enforces mandatory, non-empty fencing lease tokens on record_trial_result_ready,
 --    settle_trial_credit, and release_trial_credit. Null/empty/mismatched tokens are strictly rejected.
@@ -33,22 +31,10 @@ end $$;
 drop function if exists public.record_trial_result_ready(text, jsonb, uuid);
 
 do $$ begin
-  revoke execute on function public.settle_trial_credit(text) from public, anon, authenticated;
-exception when undefined_function then null;
-end $$;
-drop function if exists public.settle_trial_credit(text);
-
-do $$ begin
   revoke execute on function public.settle_trial_credit(text, uuid) from public, anon, authenticated;
 exception when undefined_function then null;
 end $$;
 drop function if exists public.settle_trial_credit(text, uuid);
-
-do $$ begin
-  revoke execute on function public.release_trial_credit(text, text) from public, anon, authenticated;
-exception when undefined_function then null;
-end $$;
-drop function if exists public.release_trial_credit(text, text);
 
 do $$ begin
   revoke execute on function public.release_trial_credit(text, text, uuid) from public, anon, authenticated;
@@ -420,13 +406,21 @@ alter table public.temp_pdf_conversion_jobs
   add constraint temp_pdf_conversion_jobs_status_check
   check (status in ('ticket_issued', 'uploaded', 'converting', 'completed', 'failed', 'cancelled', 'cleaned', 'cleaning', 'quarantined'));
 
+-- Add lease_token and lease_expires_at for atomic lease/fencing on transient jobs
+alter table public.temp_pdf_conversion_jobs
+  add column if not exists lease_token text,
+  add column if not exists lease_expires_at timestamptz;
+
+create index if not exists temp_pdf_jobs_lease_idx
+  on public.temp_pdf_conversion_jobs (status, lease_expires_at);
+
 -- ----------------------------------------------------------------------------
--- 6. Atomic Concurrency-Safe Cleanup Claim RPC
+-- 6. Atomic Concurrency-Safe Cleanup Claim RPC with Interrupted Cleaning Recovery
 -- ----------------------------------------------------------------------------
 -- Drops legacy get_expired_temp_pdf_jobs if existing
 drop function if exists public.get_expired_temp_pdf_jobs(integer);
 
--- Atomically claims expired jobs and stalled converting jobs (>10m) using FOR UPDATE SKIP LOCKED
+-- Atomically claims expired jobs, stalled converting (>10m), and interrupted cleaning (>5m) using FOR UPDATE SKIP LOCKED
 create or replace function public.claim_expired_temp_pdf_jobs(
   p_limit integer default 50
 )
@@ -440,19 +434,31 @@ begin
     raise exception 'service_role permission required';
   end if;
 
+  -- 1. Automatically quarantine repeatedly failing jobs to prevent infinite reclaim loops
+  update public.temp_pdf_conversion_jobs
+  set status = 'quarantined',
+      cleanup_error = coalesce(cleanup_error, 'MAX_CLEANUP_ATTEMPTS_EXCEEDED'),
+      updated_at = now()
+  where status not in ('cleaned', 'quarantined')
+    and cleanup_attempts >= 5;
+
+  -- 2. Atomically select and claim eligible candidates with fresh fencing lease tokens
   return query
   with candidates as (
     select job_id
     from public.temp_pdf_conversion_jobs
     where (
-      -- Expired normal uncleaned jobs
-      (expires_at < now() and status not in ('cleaned', 'cleaning', 'quarantined', 'converting'))
+      -- Expired uncleaned jobs (under max attempts)
+      (expires_at < now() and status not in ('cleaned', 'cleaning', 'quarantined', 'converting') and cleanup_attempts < 5)
       or
-      -- Abandoned/stalled converting jobs older than 10 minutes
-      (status = 'converting' and updated_at < now() - interval '10 minutes')
+      -- Abandoned/stalled converting jobs older than 10 minutes or expired lease
+      (status = 'converting' and (lease_expires_at is null or lease_expires_at < now()) and updated_at < now() - interval '10 minutes' and cleanup_attempts < 5)
       or
-      -- Uploaded or ticket_issued jobs older than 2 hours (stranded uploads)
-      (status in ('ticket_issued', 'uploaded') and created_at < now() - interval '2 hours')
+      -- Stranded uploads or unused tickets older than 2 hours
+      (status in ('ticket_issued', 'uploaded') and created_at < now() - interval '2 hours' and cleanup_attempts < 5)
+      or
+      -- Interrupted cleaning jobs older than 5 minutes or expired lease (Safe Re-claim)
+      (status = 'cleaning' and (lease_expires_at is null or lease_expires_at < now()) and updated_at < now() - interval '5 minutes' and cleanup_attempts < 5)
     )
     order by expires_at asc
     limit coalesce(p_limit, 50)
@@ -460,6 +466,8 @@ begin
   )
   update public.temp_pdf_conversion_jobs j
   set status = 'cleaning',
+      lease_token = gen_random_uuid()::text,
+      lease_expires_at = now() + interval '5 minutes',
       updated_at = now()
   from candidates c
   where j.job_id = c.job_id
@@ -469,3 +477,109 @@ $$;
 
 revoke all on function public.claim_expired_temp_pdf_jobs(integer) from public, anon, authenticated;
 grant execute on function public.claim_expired_temp_pdf_jobs(integer) to service_role;
+
+-- ----------------------------------------------------------------------------
+-- 7. Atomic Concurrency-Safe Conversion Claim RPC (Anti-Race with Cleanup)
+-- ----------------------------------------------------------------------------
+create or replace function public.claim_temp_pdf_job_for_conversion(
+  p_job_id text,
+  p_user_id uuid,
+  p_lease_token text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_job public.temp_pdf_conversion_jobs%rowtype;
+  v_token text := coalesce(nullif(trim(p_lease_token), ''), gen_random_uuid()::text);
+begin
+  if auth.role() <> 'service_role' then
+    return jsonb_build_object(
+      'success', false,
+      'code', 'FORBIDDEN',
+      'error', 'service_role 권한이 필요합니다.'
+    );
+  end if;
+
+  if coalesce(p_job_id, '') = '' or p_user_id is null then
+    return jsonb_build_object(
+      'success', false,
+      'code', 'INVALID_PARAMETERS',
+      'error', '작업 식별자 또는 사용자 식별자가 누락되었습니다.'
+    );
+  end if;
+
+  select * into v_job
+  from public.temp_pdf_conversion_jobs
+  where job_id = p_job_id
+  for update;
+
+  if not found then
+    return jsonb_build_object(
+      'success', false,
+      'code', 'JOB_NOT_FOUND',
+      'error', '임시 작업 내역을 찾을 수 없습니다.'
+    );
+  end if;
+
+  if v_job.user_id <> p_user_id then
+    return jsonb_build_object(
+      'success', false,
+      'code', 'STORAGE_ACCESS_DENIED',
+      'error', '작업 접근 권한이 없습니다.'
+    );
+  end if;
+
+  -- Block jobs already claimed by Cron cleanup or terminal states
+  if v_job.status in ('cleaned', 'cleaning', 'quarantined', 'cancelled') then
+    return jsonb_build_object(
+      'success', false,
+      'code', 'JOB_NOT_CONVERTIBLE',
+      'status', v_job.status,
+      'error', '해당 작업은 이미 정리 중이거나 종료되어 변환할 수 없습니다.'
+    );
+  end if;
+
+  -- Block expired jobs: never sign or convert expired transient files!
+  if v_job.expires_at <= now() then
+    return jsonb_build_object(
+      'success', false,
+      'code', 'JOB_EXPIRED',
+      'status', v_job.status,
+      'error', '임시 파일 유효시간이 만료되었습니다.'
+    );
+  end if;
+
+  -- Block concurrent duplicate conversions actively leased
+  if v_job.status = 'converting' and v_job.lease_expires_at is not null and v_job.lease_expires_at > now() then
+    return jsonb_build_object(
+      'success', false,
+      'code', 'CONCURRENT_CONVERSION',
+      'status', v_job.status,
+      'error', '동일한 작업이 현재 변환 처리 중입니다.'
+    );
+  end if;
+
+  -- Transition atomically to converting with fencing lease
+  update public.temp_pdf_conversion_jobs
+  set status = 'converting',
+      lease_token = v_token,
+      lease_expires_at = now() + interval '10 minutes',
+      updated_at = now()
+  where job_id = p_job_id;
+
+  return jsonb_build_object(
+    'success', true,
+    'job_id', v_job.job_id,
+    'storage_path', v_job.storage_path,
+    'file_name', v_job.file_name,
+    'lease_token', v_token
+  );
+end;
+$$;
+
+revoke all on function public.claim_temp_pdf_job_for_conversion(text, uuid, text) from public, anon, authenticated;
+grant execute on function public.claim_temp_pdf_job_for_conversion(text, uuid, text) to service_role;
+

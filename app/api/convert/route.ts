@@ -314,11 +314,53 @@ export async function POST(req: NextRequest) {
         }, { status: 503 });
       }
 
-      // Update ledger to converting
-      await adminClient.from('temp_pdf_conversion_jobs').update({
-        status: 'converting',
-        updated_at: new Date().toISOString(),
-      }).eq('job_id', jobId).eq('user_id', auth.user.id);
+      // 1. Atomic Preemption: Must acquire exclusive lease before creating signed URL or calling external service
+      const leaseToken = randomUUID();
+      let conversionLeaseToken: string = leaseToken;
+
+      const { data: claimData, error: claimErr } = await adminClient.rpc('claim_temp_pdf_job_for_conversion', {
+        p_job_id: jobId,
+        p_user_id: auth.user.id,
+        p_lease_token: leaseToken,
+      });
+
+      if (claimErr) {
+        // Fallback to strict atomic conditional UPDATE if RPC is not present or mock client
+        const { data: updatedRows, error: updateErr } = await adminClient
+          .from('temp_pdf_conversion_jobs')
+          .update({
+            status: 'converting',
+            lease_token: leaseToken,
+            lease_expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq('job_id', jobId)
+          .eq('user_id', auth.user.id)
+          .in('status', ['ticket_issued', 'uploaded', 'failed'])
+          .gt('expires_at', new Date().toISOString())
+          .select();
+
+        if (updateErr || !Array.isArray(updatedRows) || updatedRows.length === 0) {
+          // Preemption failed: Job is already expired, cleaning, or converted by another process
+          return NextResponse.json({
+            success: false,
+            code: 'CONVERSION_PREEMPTION_FAILED',
+            error: '임시 작업이 이미 만료되었거나 다른 작업(정리 또는 변환)에 의해 선점되어 변환을 시작할 수 없습니다.',
+          }, { status: 409 });
+        }
+      } else {
+        const res = claimData as { success?: boolean; code?: string; error?: string; lease_token?: string };
+        if (!res?.success) {
+          return NextResponse.json({
+            success: false,
+            code: res?.code || 'CONVERSION_PREEMPTION_FAILED',
+            error: res?.error || '변환 작업 선점에 실패했습니다.',
+          }, { status: res?.code === 'JOB_EXPIRED' ? 410 : 409 });
+        }
+        if (res.lease_token) {
+          conversionLeaseToken = res.lease_token;
+        }
+      }
 
       let signedUrl = '';
       try {
@@ -332,8 +374,10 @@ export async function POST(req: NextRequest) {
             status: 'failed',
             cleanup_attempts: 1,
             cleanup_error: `스토리지 원본 서명 URL 생성 실패: ${signError?.message || '알 수 없는 오류'}`,
+            lease_token: null,
+            lease_expires_at: null,
             updated_at: new Date().toISOString(),
-          }).eq('job_id', jobId).eq('user_id', auth.user.id);
+          }).eq('job_id', jobId).eq('user_id', auth.user.id).eq('lease_token', conversionLeaseToken);
 
           return NextResponse.json({
             success: false,
@@ -348,8 +392,10 @@ export async function POST(req: NextRequest) {
           status: 'failed',
           cleanup_attempts: 1,
           cleanup_error: `스토리지 서명 생성 예외: ${e instanceof Error ? e.message : '알 수 없는 오류'}`,
+          lease_token: null,
+          lease_expires_at: null,
           updated_at: new Date().toISOString(),
-        }).eq('job_id', jobId).eq('user_id', auth.user.id);
+        }).eq('job_id', jobId).eq('user_id', auth.user.id).eq('lease_token', conversionLeaseToken);
 
         return NextResponse.json({
           success: false,
@@ -422,7 +468,12 @@ export async function POST(req: NextRequest) {
         let cleanupErr: string | null = null;
         try {
           const { error: remErr } = await adminClient.storage.from('materials').remove([validatedStoragePath]);
-          if (remErr) cleanupErr = remErr.message;
+          if (remErr) {
+            const msg = remErr.message.toLowerCase();
+            if (!msg.includes('not found') && !msg.includes('does not exist') && !msg.includes('404')) {
+              cleanupErr = remErr.message;
+            }
+          }
         } catch (e) {
           cleanupErr = e instanceof Error ? e.message : '스토리지 삭제 실패';
         }
@@ -431,8 +482,10 @@ export async function POST(req: NextRequest) {
             status: cleanupErr ? 'failed' : 'cleaned',
             cleanup_attempts: 1,
             cleanup_error: cleanupErr,
+            lease_token: null,
+            lease_expires_at: null,
             updated_at: new Date().toISOString(),
-          }).eq('job_id', jobId).eq('user_id', auth.user.id);
+          }).eq('job_id', jobId).eq('user_id', auth.user.id).eq('lease_token', conversionLeaseToken);
         } catch {
           // best effort
         }

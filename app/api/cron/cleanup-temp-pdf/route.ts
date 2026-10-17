@@ -63,6 +63,7 @@ async function handleCleanup(req: NextRequest) {
       const jobId = String(job.job_id || '');
       const userId = String(job.user_id || '');
       const storagePath = String(job.storage_path || '');
+      const leaseToken = typeof job.lease_token === 'string' ? job.lease_token.trim() : '';
       const attempts = typeof job.cleanup_attempts === 'number' ? job.cleanup_attempts : 0;
 
       // 1. Strict Path Validation: Never trust stored storage_path blindly!
@@ -77,6 +78,8 @@ async function handleCleanup(req: NextRequest) {
             status: 'quarantined',
             cleanup_attempts: attempts + 1,
             cleanup_error: `POISONED_OR_INVALID_PATH: ${pathCheck.reason}`,
+            lease_token: null,
+            lease_expires_at: null,
             updated_at: new Date().toISOString(),
           })
           .eq('job_id', jobId);
@@ -85,37 +88,65 @@ async function handleCleanup(req: NextRequest) {
 
       // 2. Safe Deletion: storage_path is mathematically guaranteed to belong strictly
       // to this user's isolated temporary folder: `${userId}/temp-convert/${jobId}/...`
+      let isObjectRemoved = false;
       let removeError: string | null = null;
       try {
         const { error: remErr } = await admin.storage.from('materials').remove([storagePath]);
         if (remErr) {
-          removeError = remErr.message;
+          const msg = remErr.message.toLowerCase();
+          // Idempotent deletion: if file is already deleted or not found, treat as successfully removed
+          if (msg.includes('not found') || msg.includes('does not exist') || msg.includes('404')) {
+            isObjectRemoved = true;
+          } else {
+            removeError = remErr.message;
+          }
+        } else {
+          isObjectRemoved = true;
         }
       } catch (e) {
         removeError = e instanceof Error ? e.message : '스토리지 파일 삭제 예외';
       }
 
-      if (!removeError) {
-        cleanedCount++;
-        cleanedIds.push(jobId);
-        await admin
+      if (isObjectRemoved) {
+        // 3. Atomically finalize to 'cleaned' with fencing token verification
+        let updateQuery = admin
           .from('temp_pdf_conversion_jobs')
           .update({
             status: 'cleaned',
             cleanup_attempts: attempts + 1,
             cleanup_error: null,
+            lease_token: null,
+            lease_expires_at: null,
             updated_at: new Date().toISOString(),
           })
           .eq('job_id', jobId);
+
+        if (leaseToken) {
+          updateQuery = updateQuery.eq('lease_token', leaseToken);
+        }
+
+        const { data: updatedRows, error: updateErr } = await updateQuery.select();
+
+        // Strict result validation: if DB update fails or 0 rows updated (stale lease), do not count as cleaned!
+        if (updateErr || (Array.isArray(updatedRows) && updatedRows.length === 0)) {
+          failedCount++;
+          failedIds.push(jobId);
+        } else {
+          cleanedCount++;
+          cleanedIds.push(jobId);
+        }
       } else {
         failedCount++;
         failedIds.push(jobId);
+        const isExhausted = attempts + 1 >= 5;
         await admin
           .from('temp_pdf_conversion_jobs')
           .update({
-            status: attempts + 1 >= 5 ? 'failed' : 'ticket_issued', // allow retry or mark failed
+            status: isExhausted ? 'quarantined' : 'failed',
             cleanup_attempts: attempts + 1,
             cleanup_error: removeError,
+            lease_token: null,
+            lease_expires_at: null,
             updated_at: new Date().toISOString(),
           })
           .eq('job_id', jobId);

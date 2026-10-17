@@ -975,10 +975,15 @@ exports.requireApiUser = async () => {
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           let userCredits = creditsList.find((c) => c.user_id === userId);
           if (!userCredits) {
+            const usernameAccounts = (state.username_accounts = state.username_accounts || []);
+            const isGuest = userId === 'user-trial-1' ||
+              usernameAccounts.some((u) => u.user_id === userId) ||
+              Boolean(state.user && (state.user.id === userId && (state.user.email?.endsWith('@id.learnaway.local') || state.user.user_metadata?.auth_type === 'username')));
+            const initialGrant = isGuest ? 1 : 3;
             userCredits = {
               user_id: userId,
-              granted_credits: 1,
-              balance: 1,
+              granted_credits: initialGrant,
+              balance: initialGrant,
               granted_at: nowIso(),
               updated_at: nowIso(),
             };
@@ -1233,15 +1238,86 @@ exports.requireApiUser = async () => {
           const jobList = (state.temp_pdf_conversion_jobs = state.temp_pdf_conversion_jobs || []);
           const limit = (params && params.p_limit) || 50;
           const claimed = [];
+          const now = Date.now();
+
+          // Auto quarantine max attempts
+          for (const j of jobList) {
+            if (j.status !== 'cleaned' && j.status !== 'quarantined' && (j.cleanup_attempts || 0) >= 5) {
+              j.status = 'quarantined';
+              j.cleanup_error = 'MAX_CLEANUP_ATTEMPTS_EXCEEDED';
+              j.updated_at = nowIso();
+            }
+          }
+
           for (const j of jobList) {
             if (claimed.length >= limit) break;
-            if (j.status !== 'cleaned' && j.status !== 'cleaning' && j.status !== 'quarantined') {
+            const attempts = j.cleanup_attempts || 0;
+            if (attempts >= 5 || j.status === 'cleaned' || j.status === 'quarantined') continue;
+
+            const isExpired = j.expires_at && new Date(j.expires_at).getTime() < now;
+            const isStalledConverting = j.status === 'converting' && (
+              !j.lease_expires_at || new Date(j.lease_expires_at).getTime() < now ||
+              (j.updated_at && new Date(j.updated_at).getTime() < now - 10 * 60 * 1000)
+            );
+            const isStrandedUpload = (j.status === 'ticket_issued' || j.status === 'uploaded') &&
+              j.created_at && new Date(j.created_at).getTime() < now - 2 * 60 * 60 * 1000;
+            const isInterruptedCleaning = j.status === 'cleaning' && (
+              !j.lease_expires_at || new Date(j.lease_expires_at).getTime() < now ||
+              (j.updated_at && new Date(j.updated_at).getTime() < now - 5 * 60 * 1000)
+            );
+
+            if ((isExpired && j.status !== 'cleaning' && j.status !== 'converting') || isStalledConverting || isStrandedUpload || isInterruptedCleaning) {
+              const leaseToken = 'lease_clean_' + Math.random().toString(36).slice(2);
               j.status = 'cleaning';
+              j.lease_token = leaseToken;
+              j.lease_expires_at = new Date(now + 5 * 60 * 1000).toISOString();
               j.updated_at = nowIso();
               claimed.push({ ...j });
             }
           }
           return Promise.resolve({ data: claimed, error: null });
+        }
+        if (name === 'claim_temp_pdf_job_for_conversion') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function claim_temp_pdf_job_for_conversion', code: '42501' } });
+          }
+          const jobList = (state.temp_pdf_conversion_jobs = state.temp_pdf_conversion_jobs || []);
+          const jobId = params && params.p_job_id;
+          const userId = params && params.p_user_id;
+          const token = (params && params.p_lease_token) || ('lease_conv_' + Math.random().toString(36).slice(2));
+
+          const job = jobList.find((j) => j.job_id === jobId);
+          if (!job) {
+            return Promise.resolve({ data: { success: false, code: 'JOB_NOT_FOUND', error: '작업 내역을 찾을 수 없습니다.' }, error: null });
+          }
+          if (job.user_id !== userId) {
+            return Promise.resolve({ data: { success: false, code: 'STORAGE_ACCESS_DENIED', error: '작업 접근 권한이 없습니다.' }, error: null });
+          }
+          if (['cleaned', 'cleaning', 'quarantined', 'cancelled'].includes(job.status)) {
+            return Promise.resolve({ data: { success: false, code: 'JOB_NOT_CONVERTIBLE', status: job.status, error: '해당 작업은 이미 정리 중이거나 종료되어 변환할 수 없습니다.' }, error: null });
+          }
+          if (job.expires_at && new Date(job.expires_at).getTime() <= Date.now()) {
+            return Promise.resolve({ data: { success: false, code: 'JOB_EXPIRED', status: job.status, error: '임시 파일 유효시간이 만료되었습니다.' }, error: null });
+          }
+          if (job.status === 'converting' && job.lease_expires_at && new Date(job.lease_expires_at).getTime() > Date.now()) {
+            return Promise.resolve({ data: { success: false, code: 'CONCURRENT_CONVERSION', status: job.status, error: '동일한 작업이 현재 변환 처리 중입니다.' }, error: null });
+          }
+
+          job.status = 'converting';
+          job.lease_token = token;
+          job.lease_expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+          job.updated_at = nowIso();
+
+          return Promise.resolve({
+            data: {
+              success: true,
+              job_id: job.job_id,
+              storage_path: job.storage_path,
+              file_name: job.file_name,
+              lease_token: token,
+            },
+            error: null,
+          });
         }
         if (name === 'init_analysis_job_and_chunks') {
           if (!params.p_user_id) {
@@ -13168,6 +13244,466 @@ exports.requireApiUser = async () => {
     // 3. Verify save function returns boolean without throwing
     const saveSuccess = saveStoredConcepts([]);
     assert.equal(typeof saveSuccess, 'boolean');
+  });
+
+  // =========================================================================
+  // 안정화 4대 핵심 과제 검증 (Plan-01 Stabilization Hardening)
+  // =========================================================================
+
+  await checkAsync('안정화 1: Migration 26 허위 함수 REVOKE 배제 및 실제 구형 오버로드 제거/권한 검증', async () => {
+    const mig26Sql = fs.readFileSync(
+      path.join(process.cwd(), 'supabase/migrations/20260101000026_harden_temp_pdf_and_fencing_tokens.sql'),
+      'utf-8'
+    );
+
+    // 1. Must NOT revoke or drop non-existent function signatures (prevents PostgreSQL 42883)
+    assert.ok(!mig26Sql.includes('settle_trial_credit(text);'), 'settle_trial_credit(text) 가짜 서명 배제');
+    assert.ok(!mig26Sql.includes('release_trial_credit(text, text);'), 'release_trial_credit(text, text) 가짜 서명 배제');
+
+    // 2. Must clean up actual existing legacy 3 overloads safely with undefined_function exception handling
+    assert.ok(mig26Sql.includes('drop function if exists public.record_trial_result_ready(text, jsonb, uuid);'), '구형 3인자 record_trial_result_ready 제거');
+    assert.ok(mig26Sql.includes('drop function if exists public.settle_trial_credit(text, uuid);'), '구형 2인자 settle_trial_credit 제거');
+    assert.ok(mig26Sql.includes('drop function if exists public.release_trial_credit(text, text, uuid);'), '구형 3인자 release_trial_credit 제거');
+    assert.ok(mig26Sql.includes('exception when undefined_function then null;'), '함수 부재 시에도 42883 없이 안전한 실행 보장');
+
+    // 3. Verify service_role lockdown on new atomic RPCs
+    assert.ok(mig26Sql.includes('grant execute on function public.claim_expired_temp_pdf_jobs(integer) to service_role;'), '정리 RPC service_role 전용');
+    assert.ok(mig26Sql.includes('grant execute on function public.claim_temp_pdf_job_for_conversion(text, uuid, text) to service_role;'), '변환 선점 RPC service_role 전용');
+
+    // 4. Regular users (isAdmin: false) cannot execute privileged RPCs
+    await withFakeSupabase({
+      user: { id: 'regular-user' },
+      isAdmin: false,
+    }, async (client) => {
+      const claimRes = await client.rpc('claim_expired_temp_pdf_jobs', { p_limit: 10 });
+      assert.ok(claimRes.error && (claimRes.error.code === '42501' || claimRes.error.message.includes('permission denied')));
+
+      const convRes = await client.rpc('claim_temp_pdf_job_for_conversion', { p_job_id: 'j1', p_user_id: 'regular-user' });
+      assert.ok(convRes.error && (convRes.error.code === '42501' || convRes.error.message.includes('permission denied')));
+    });
+  });
+
+  await checkAsync('안정화 2: PDF 변환과 Cron 정리의 경쟁 조건 방지 및 원자적 선점 검증', async () => {
+    const { POST: convertHandler } = load(path.join(output, 'app/api/convert/route.js'));
+    const testUser = { id: 'test-user' };
+    const savedToken = process.env.PDF_CONVERT_SERVICE_TOKEN;
+    const savedUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    process.env.PDF_CONVERT_SERVICE_TOKEN = 'test-token-123';
+    process.env.PDF_CONVERT_SERVICE_URL = 'http://127.0.0.1:54321';
+
+    let externalServiceCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = async (url) => {
+      if (String(url).includes('54321')) {
+        externalServiceCalls++;
+        return Response.json({ success: true, fullMarkdown: '변환 완료 텍스트', pageCount: 1, pages: [] });
+      }
+      return originalFetch(url);
+    };
+
+    try {
+      // 1. Cron claimed job for cleaning -> Conversion request MUST be strictly rejected (409) without calling external service
+      await withFakeSupabase({
+        user: testUser,
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-cleaning-race',
+            user_id: testUser.id,
+            file_name: 'test.pdf',
+            storage_path: `${testUser.id}/temp-convert/job-cleaning-race/test.pdf`,
+            status: 'cleaning',
+            cleanup_attempts: 1,
+            expires_at: new Date(Date.now() - 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'convert_storage', jobId: 'job-cleaning-race' }),
+        });
+        const res = await convertHandler(req);
+        assert.equal(res.status, 409, '정리 중인 작업은 변환 거부(409)');
+        const data = await res.json();
+        assert.ok(data.code === 'JOB_NOT_CONVERTIBLE' || data.code === 'CONVERSION_PREEMPTION_FAILED', '정리 중인 작업 선점 거부 코드');
+        assert.equal(externalServiceCalls, 0, '선점 실패 시 외부 변환 호출 없음');
+      });
+
+      // 2. Expired job -> Conversion request rejected without calling external service
+      await withFakeSupabase({
+        user: testUser,
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-expired-test',
+            user_id: testUser.id,
+            file_name: 'test.pdf',
+            storage_path: `${testUser.id}/temp-convert/job-expired-test/test.pdf`,
+            status: 'uploaded',
+            cleanup_attempts: 0,
+            expires_at: new Date(Date.now() - 5000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'convert_storage', jobId: 'job-expired-test' }),
+        });
+        const res = await convertHandler(req);
+        assert.ok(res.status === 409 || res.status === 410, '만료된 작업은 변환 거부');
+        assert.equal(externalServiceCalls, 0, '만료 작업은 외부 변환 호출 없음');
+      });
+
+      // 3. Active converting job with unexpired lease is protected from Cron cleanup
+      await withFakeSupabase({
+        user: testUser,
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-actively-converting',
+            user_id: testUser.id,
+            file_name: 'active.pdf',
+            storage_path: `${testUser.id}/temp-convert/job-actively-converting/active.pdf`,
+            status: 'converting',
+            lease_token: 'active-lease-tok',
+            lease_expires_at: new Date(Date.now() + 8 * 60 * 1000).toISOString(),
+            cleanup_attempts: 0,
+            expires_at: new Date(Date.now() + 50 * 60 * 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async (client) => {
+        const claimRes = await client.rpc('claim_expired_temp_pdf_jobs', { p_limit: 10 });
+        assert.equal(claimRes.data.length, 0, '활성 변환 중인 작업은 Cron 정리 대상에서 엄격히 제외되어 원본 보존');
+      });
+
+      // 4. Concurrent duplicate conversion requests on the same job -> Exactly 1 succeeds, other rejected
+      await withFakeSupabase({
+        user: testUser,
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-duplicate-convert',
+            user_id: testUser.id,
+            file_name: 'dup.pdf',
+            storage_path: `${testUser.id}/temp-convert/job-duplicate-convert/dup.pdf`,
+            status: 'uploaded',
+            cleanup_attempts: 0,
+            expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async () => {
+        const req1 = new NextRequest('http://localhost/api/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'convert_storage', jobId: 'job-duplicate-convert' }),
+        });
+        const req2 = new NextRequest('http://localhost/api/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'convert_storage', jobId: 'job-duplicate-convert' }),
+        });
+
+        const [res1, res2] = await Promise.all([convertHandler(req1), convertHandler(req2)]);
+        const successCount = [res1, res2].filter((r) => r.status === 200).length;
+        const rejectCount = [res1, res2].filter((r) => r.status === 409).length;
+
+        assert.equal(successCount, 1, '동일 작업 동시 변환 요청 중 정확히 1건만 선점 성공');
+        assert.equal(rejectCount, 1, '나머지 동시 요청은 409 CONVERSION_PREEMPTION_FAILED로 즉시 거부');
+      });
+    } finally {
+      global.fetch = originalFetch;
+      if (savedToken) process.env.PDF_CONVERT_SERVICE_TOKEN = savedToken;
+      else delete process.env.PDF_CONVERT_SERVICE_TOKEN;
+      if (savedUrl) process.env.PDF_CONVERT_SERVICE_URL = savedUrl;
+      else delete process.env.PDF_CONVERT_SERVICE_URL;
+    }
+  });
+
+  await checkAsync('안정화 3: 중단된 PDF 정리 작업 복구, 펜싱 토큰 보호 및 거짓 성공 보고 차단 검증', async () => {
+    const { GET: cleanupHandler } = load(path.join(output, 'app/api/cron/cleanup-temp-pdf/route.js'));
+    const savedCronSecret = process.env.CRON_SECRET;
+    process.env.CRON_SECRET = 'valid-cron-secret-123';
+
+    try {
+      // 1. Interrupted cleaning recovery: Job in 'cleaning' status for > 5 min is safely re-claimed by next Cron
+      await withFakeSupabase({
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-interrupted-cleaning',
+            user_id: 'user-interrupted',
+            file_name: 'stalled.pdf',
+            storage_path: 'user-interrupted/temp-convert/job-interrupted-cleaning/stalled.pdf',
+            status: 'cleaning',
+            lease_token: 'old-stale-lease',
+            lease_expires_at: new Date(Date.now() - 60000).toISOString(), // expired lease
+            cleanup_attempts: 1,
+            expires_at: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+            created_at: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+            updated_at: new Date(Date.now() - 6 * 60 * 1000).toISOString(),
+          },
+        ],
+      }, async (client) => {
+        const req = new NextRequest('http://localhost/api/cron/cleanup-temp-pdf', {
+          method: 'GET',
+          headers: { authorization: 'Bearer valid-cron-secret-123' },
+        });
+        const res = await cleanupHandler(req);
+        assert.equal(res.status, 200);
+        const data = await res.json();
+        assert.equal(data.claimedCount, 1, '중단된 cleaning 작업 재선점 성공');
+        assert.equal(data.cleanedCount, 1, '재선점된 작업 정상 정리 완료');
+
+        const jobInDb = client.__state.temp_pdf_conversion_jobs.find((j) => j.job_id === 'job-interrupted-cleaning');
+        assert.equal(jobInDb.status, 'cleaned');
+      });
+
+      // 2. Storage object already deleted (404 / Not Found) is handled as safe idempotent success
+      await withFakeSupabase({
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-already-removed',
+            user_id: 'user-idempotent',
+            file_name: 'gone.pdf',
+            storage_path: 'user-idempotent/temp-convert/job-already-removed/gone.pdf',
+            status: 'uploaded',
+            cleanup_attempts: 0,
+            expires_at: new Date(Date.now() - 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async (client) => {
+        // Inject 404 from storage.remove
+        client.storage = {
+          from: () => ({
+            remove: async () => ({ error: { message: 'The resource was not found (404)' } }),
+          }),
+        };
+
+        const req = new NextRequest('http://localhost/api/cron/cleanup-temp-pdf', {
+          method: 'GET',
+          headers: { authorization: 'Bearer valid-cron-secret-123' },
+        });
+        const res = await cleanupHandler(req);
+        assert.equal(res.status, 200);
+        const data = await res.json();
+        assert.equal(data.cleanedCount, 1, '이미 삭제된 파일은 안전하게 cleaned로 확정');
+        assert.equal(data.failedCount, 0);
+      });
+
+      // 3. DB update failure is NOT falsely reported as cleanedCount
+      await withFakeSupabase({
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-db-fail',
+            user_id: 'user-db-fail',
+            file_name: 'db.pdf',
+            storage_path: 'user-db-fail/temp-convert/job-db-fail/db.pdf',
+            status: 'uploaded',
+            cleanup_attempts: 0,
+            expires_at: new Date(Date.now() - 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+        fail: {
+          upsert: true, // will fail updates
+        },
+      }, async (client) => {
+        // Mock tableBuilder update select to return empty (simulating stale lease / zero rows updated)
+        const origFrom = client.from;
+        client.from = (table) => {
+          const b = origFrom.call(client, table);
+          if (table === 'temp_pdf_conversion_jobs') {
+            b.select = () => Promise.resolve({ data: [], error: new Error('DB connection lost during update') });
+          }
+          return b;
+        };
+
+        const req = new NextRequest('http://localhost/api/cron/cleanup-temp-pdf', {
+          method: 'GET',
+          headers: { authorization: 'Bearer valid-cron-secret-123' },
+        });
+        const res = await cleanupHandler(req);
+        assert.equal(res.status, 200);
+        const data = await res.json();
+        assert.equal(data.cleanedCount, 0, 'DB 갱신 실패 시 성공(cleanedCount)으로 잘못 보고되지 않음');
+        assert.equal(data.failedCount, 1, 'DB 갱신 실패는 failedCount에 정확히 집계');
+      });
+
+      // 4. Poisoned/foreign path is strictly quarantined without calling storage remove
+      await withFakeSupabase({
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-poisoned-path',
+            user_id: 'victim-user',
+            file_name: 'poison.pdf',
+            storage_path: 'other-user/permanent/important-document.pdf', // MALICIOUS PATH!
+            status: 'uploaded',
+            cleanup_attempts: 0,
+            expires_at: new Date(Date.now() - 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async (client) => {
+        let storageRemoveCalled = false;
+        client.storage = {
+          from: () => ({
+            remove: async () => {
+              storageRemoveCalled = true;
+              return { error: null };
+            },
+          }),
+        };
+
+        const req = new NextRequest('http://localhost/api/cron/cleanup-temp-pdf', {
+          method: 'GET',
+          headers: { authorization: 'Bearer valid-cron-secret-123' },
+        });
+        const res = await cleanupHandler(req);
+        assert.equal(res.status, 200);
+        const data = await res.json();
+        assert.equal(data.quarantinedCount, 1, '오염된 경로는 즉시 격리(quarantined)');
+        assert.equal(storageRemoveCalled, false, '오염된 경로는 파일 삭제(remove)를 절대 실행하지 않음');
+
+        const quarantinedJob = client.__state.temp_pdf_conversion_jobs.find((j) => j.job_id === 'job-poisoned-path');
+        assert.equal(quarantinedJob.status, 'quarantined');
+      });
+    } finally {
+      if (savedCronSecret) process.env.CRON_SECRET = savedCronSecret;
+      else delete process.env.CRON_SECRET;
+    }
+  });
+
+  await checkAsync('안정화 4: 체험 크레딧 초기화 정책 통일 (조회/예약 실행 순서 무관 및 계정 유형별 최초 지급 보장)', async () => {
+    const { reserveTrialCredit } = load(path.join(output, 'lib/trialCredits.js'));
+
+    // 1. New GENERAL account: Calls reserveTrialCredit FIRST without calling getTrialCreditStatus
+    // Policy: MUST be granted 3 credits initially, and after deducting 1, balance MUST be 2!
+    await withFakeSupabase({
+      user: { id: 'usr-new-general-first-reserve', email: 'student@university.edu' },
+      username_accounts: [], // NOT a guest account!
+      ai_trial_credits: [],  // Brand new user!
+      ai_trial_reservations: [],
+    }, async (client) => {
+      const reservation = await reserveTrialCredit(
+        'usr-new-general-first-reserve',
+        'task-general-init-1',
+        'generate_problems',
+        'hash-source-1'
+      );
+
+      assert.equal(reservation.allowed, true, '일반 계정 첫 예약 성공');
+      assert.equal(reservation.remaining, 2, '일반 계정은 최초 3회 지급 후 1회 차감되어 잔액 2가 남음');
+
+      const creditRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'usr-new-general-first-reserve');
+      assert.equal(creditRow.granted_credits, 3, '초기 지급액 3회 엄격 보장');
+      assert.equal(creditRow.balance, 2, '잔액 2 보장');
+    });
+
+    // 2. New GUEST account: Calls reserveTrialCredit FIRST
+    // Policy: MUST be granted 1 credit initially, and after deducting 1, balance MUST be 0!
+    await withFakeSupabase({
+      user: { id: 'usr-new-guest-first-reserve', email: 'guest123@id.learnaway.local', user_metadata: { auth_type: 'username' } },
+      username_accounts: [{ user_id: 'usr-new-guest-first-reserve', username: 'guest123' }],
+      ai_trial_credits: [],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      const reservation = await reserveTrialCredit(
+        'usr-new-guest-first-reserve',
+        'task-guest-init-1',
+        'analyze_concepts',
+        'hash-source-guest'
+      );
+
+      assert.equal(reservation.allowed, true, '간편 계정 첫 예약 성공');
+      assert.equal(reservation.remaining, 0, '간편 계정은 최초 1회 지급 후 1회 차감되어 잔액 0이 남음');
+
+      const creditRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'usr-new-guest-first-reserve');
+      assert.equal(creditRow.granted_credits, 1, '간편 계정 초기 지급액 1회 엄격 보장');
+      assert.equal(creditRow.balance, 0, '잔액 0 보장');
+
+      // Second reservation attempt strictly blocked
+      const secondRes = await reserveTrialCredit(
+        'usr-new-guest-first-reserve',
+        'task-guest-init-2',
+        'analyze_concepts',
+        'hash-source-guest-2'
+      );
+      assert.equal(secondRes.allowed, false, '크레딧 소진 후 추가 예약 차단');
+      assert.equal(secondRes.errorCode, 'INSUFFICIENT_CREDITS');
+    });
+
+    // 3. Existing account: Balance and granted_credits are strictly preserved (no reset, no tampering)
+    await withFakeSupabase({
+      user: { id: 'usr-existing-account' },
+      ai_trial_credits: [
+        {
+          user_id: 'usr-existing-account',
+          granted_credits: 3,
+          balance: 1, // already used 2 credits in the past
+          granted_at: '2026-01-01T00:00:00.000Z',
+          updated_at: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      // Calling get_or_create does NOT reset balance back to 3
+      const getRes = await client.rpc('get_or_create_trial_credits', { p_user_id: 'usr-existing-account' });
+      assert.equal(getRes.data.granted, 3);
+      assert.equal(getRes.data.balance, 1, '기존 계정 잔액 1회 보존');
+
+      // Reserving deducts from remaining balance
+      const resv = await reserveTrialCredit(
+        'usr-existing-account',
+        'task-existing-1',
+        'evaluate_answer',
+        'hash-eval-1'
+      );
+      assert.equal(resv.allowed, true);
+      assert.equal(resv.remaining, 0, '잔액 1에서 차감되어 0');
+
+      const creditRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'usr-existing-account');
+      assert.equal(creditRow.granted_credits, 3, '기존 지급 이력 3회 보존');
+      assert.equal(creditRow.balance, 0);
+    });
+
+    // 4. Same taskId retry: idempotent return without double deduction
+    await withFakeSupabase({
+      user: { id: 'usr-retry-test' },
+      ai_trial_credits: [{ user_id: 'usr-retry-test', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [
+        {
+          id: 'res-done-1',
+          user_id: 'usr-retry-test',
+          task_id: 'task-completed-idempotent',
+          task_type: 'generate_problems',
+          input_identifier: 'ident-same-1',
+          status: 'settled',
+          cached_result: { problems: [{ id: 'p1', title: '문제' }] },
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        },
+      ],
+    }, async (client) => {
+      const res = await reserveTrialCredit(
+        'usr-retry-test',
+        'task-completed-idempotent',
+        'generate_problems',
+        'ident-same-1'
+      );
+      assert.equal(res.allowed, false);
+      assert.equal(res.status, 'already_completed');
+      assert.ok(res.cachedResult);
+      assert.equal(client.__state.ai_trial_credits[0].balance, 3, '완료된 작업 재시도는 추가 차감 없음');
+    });
   });
 
   console.log(`${passed} regression checks passed`);

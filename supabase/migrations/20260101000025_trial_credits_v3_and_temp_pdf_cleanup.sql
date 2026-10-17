@@ -53,6 +53,8 @@ declare
   v_daily_count integer;
   v_cap integer := coalesce(p_daily_cap, 500);
   v_lease_token text;
+  v_is_guest boolean := false;
+  v_initial_grant integer := 3;
 begin
   -- 1. Enforce server-only execution (service_role required)
   if auth.role() <> 'service_role' then
@@ -211,8 +213,30 @@ begin
   end if;
 
   -- 3. First-time reservation: lock user credit row second
+  -- Determine account tier (Guest = 1, General = 3)
+  select exists (
+    select 1 from public.username_accounts where user_id = v_uid
+  ) into v_is_guest;
+
+  if not v_is_guest then
+    select exists (
+      select 1 from auth.users
+      where id = v_uid
+        and (
+          (raw_user_meta_data->>'auth_type') = 'username'
+          or email like '%@id.learnaway.local'
+        )
+    ) into v_is_guest;
+  end if;
+
+  if v_is_guest then
+    v_initial_grant := 1;
+  else
+    v_initial_grant := 3;
+  end if;
+
   insert into public.ai_trial_credits (user_id, granted_credits, balance, granted_at, updated_at)
-  values (v_uid, 1, 1, now(), now())
+  values (v_uid, v_initial_grant, v_initial_grant, now(), now())
   on conflict (user_id) do nothing;
 
   select balance, granted_credits into v_balance, v_granted
