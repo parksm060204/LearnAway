@@ -3,6 +3,9 @@ import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { createClient } from '../../../lib/supabase/server';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser, lookupConnectionSecret, operatorFallbackAllowed, type TrialContext } from '../../../lib/aiCredentials';
+
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 import { computeMarkdownHash } from '../../../lib/markdownUtils';
 import {
   validateTrialEvaluateAnswerInput,

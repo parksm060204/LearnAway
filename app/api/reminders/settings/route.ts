@@ -9,6 +9,8 @@ import {
   rowToDeliveryLog,
 } from '@/lib/reviewNotifications';
 
+export const dynamic = 'force-dynamic';
+
 export async function GET() {
   const auth = await requireApiUser();
   if (!auth.ok) return auth.response;

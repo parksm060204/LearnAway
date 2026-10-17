@@ -6,6 +6,7 @@ import { createPdfJobToken } from '../../../lib/pdf/token';
 import { validateTempStoragePath, buildTempStoragePath } from '../../../lib/pdf/tempStorage';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20MB
 const MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 128 * 1024;

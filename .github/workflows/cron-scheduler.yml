@@ -1,0 +1,71 @@
+name: LearnAway Background Cron Runner
+
+# Triggers scheduled jobs when running on Vercel Hobby plan
+# Vercel Hobby is restricted to 1 cron execution per day.
+# This GitHub Actions workflow runs free of charge on GitHub's hosted runners
+# to trigger hourly reminders and 15-minute temporary PDF cleanups.
+
+on:
+  schedule:
+    # Every hour on the hour (for hourly KST review notifications)
+    - cron: '0 * * * *'
+    # Every 15 minutes (for temporary PDF storage cleanup)
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target endpoint to invoke'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - reminders
+          - cleanup
+
+jobs:
+  run-cron:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger Daily Review Reminders (Hourly)
+        if: ${{ github.event.inputs.target == 'all' || github.event.inputs.target == 'reminders' || github.event.schedule == '0 * * * *' }}
+        env:
+          APP_URL: ${{ secrets.VERCEL_DEPLOYMENT_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "Skipping reminders: VERCEL_DEPLOYMENT_URL or CRON_SECRET not configured in repository secrets."
+            exit 0
+          fi
+          echo "Invoking $APP_URL/api/reminders/cron ..."
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X GET "$APP_URL/api/reminders/cron" \
+            -H "Authorization: Bearer $CRON_SECRET")
+          STATUS=$(echo "$RESPONSE" | tr -d '\r' | sed -e 's/.*HTTP_STATUS://')
+          BODY=$(echo "$RESPONSE" | sed -e 's/HTTP_STATUS:.*//')
+          echo "Response ($STATUS): $BODY"
+          if [ "$STATUS" -ge 400 ]; then
+            echo "Reminders cron failed with HTTP $STATUS"
+            exit 1
+          fi
+
+      - name: Trigger Temporary PDF Cleanup (Every 15 min)
+        if: ${{ github.event.inputs.target == 'all' || github.event.inputs.target == 'cleanup' || github.event.schedule == '*/15 * * * *' }}
+        env:
+          APP_URL: ${{ secrets.VERCEL_DEPLOYMENT_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "Skipping temp PDF cleanup: VERCEL_DEPLOYMENT_URL or CRON_SECRET not configured in repository secrets."
+            exit 0
+          fi
+          echo "Invoking $APP_URL/api/cron/cleanup-temp-pdf ..."
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X GET "$APP_URL/api/cron/cleanup-temp-pdf" \
+            -H "Authorization: Bearer $CRON_SECRET")
+          STATUS=$(echo "$RESPONSE" | tr -d '\r' | sed -e 's/.*HTTP_STATUS://')
+          BODY=$(echo "$RESPONSE" | sed -e 's/HTTP_STATUS:.*//')
+          echo "Response ($STATUS): $BODY"
+          if [ "$STATUS" -ge 400 ]; then
+            echo "Temp PDF cleanup failed with HTTP $STATUS"
+            exit 1
+          fi

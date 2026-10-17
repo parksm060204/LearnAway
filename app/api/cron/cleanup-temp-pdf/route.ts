@@ -3,6 +3,7 @@ import { createAdminClient, hasAdminClientConfig } from '../../../../lib/supabas
 import { validateTempStoragePath } from '../../../../lib/pdf/tempStorage';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 /**
  * Atomically finalize a cleaning job ensuring strict lease token and status verification.

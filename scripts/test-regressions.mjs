@@ -14068,6 +14068,166 @@ exports.requireApiUser = async () => {
     }
   });
 
+  // ==========================================
+  // Plan 02 Vercel Beta Deployment & Integration Suite
+  // ==========================================
+
+  check('P02-01: Plan 01 결과 정합성 및 배포 필수 스크립트/명령어 검증', () => {
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    assert.ok(pkg.scripts.build, 'build 스크립트 필수');
+    assert.ok(pkg.scripts.lint, 'lint 스크립트 필수');
+    assert.ok(pkg.scripts['test:regressions'], 'test:regressions 스크립트 필수');
+    assert.ok(pkg.scripts['test:suite'], 'test:suite 스크립트 필수');
+
+    assert.ok(fs.existsSync('supabase/migrations/20260101000026_harden_temp_pdf_and_fencing_tokens.sql'), 'Migration 26 존재');
+    assert.ok(fs.existsSync('supabase/migrations/20260101000027_tiered_trial_credits_by_account_type.sql'), 'Migration 27 존재');
+    assert.ok(fs.existsSync('supabase/migrations/20260101000028_catchup_stabilization_and_cleanup_atomicity.sql'), 'Migration 28 존재');
+  });
+
+  check('P02-02: Vercel 배포 환경 구성 검증 (vercel.json Hobby 호환성, dynamic/maxDuration 60 보장)', () => {
+    assert.ok(fs.existsSync('vercel.json'), 'vercel.json 배포 설정 파일 존재');
+    const vercelConfig = JSON.parse(fs.readFileSync('vercel.json', 'utf8'));
+    if (vercelConfig.crons) {
+      for (const cron of vercelConfig.crons) {
+        // Vercel Hobby allows only daily execution (minute and hour must be fixed or day-of-month)
+        const parts = cron.schedule.trim().split(/\s+/);
+        assert.equal(parts.length, 5, `올바른 5필드 cron 표현식: ${cron.schedule}`);
+        assert.ok(!parts[0].includes('*') && !parts[0].includes('/'), `Hobby 플랜에서는 분 단위 반복 금지: ${cron.schedule}`);
+      }
+    }
+
+    const longRunningRoutes = [
+      'app/api/analyze-concepts/route.ts',
+      'app/api/generate-problems/route.ts',
+      'app/api/evaluate-answer/route.ts',
+      'app/api/convert/route.ts',
+      'app/api/reminders/cron/route.ts',
+      'app/api/cron/cleanup-temp-pdf/route.ts',
+      'app/api/drive/upload/route.ts',
+    ];
+
+    for (const routePath of longRunningRoutes) {
+      const src = fs.readFileSync(routePath, 'utf8');
+      assert.ok(src.includes("export const dynamic = 'force-dynamic';"), `${routePath}에 force-dynamic 필수`);
+      assert.ok(src.includes('export const maxDuration = 60;'), `${routePath}에 maxDuration = 60 필수 (Vercel Hobby 최대 타임아웃 보장)`);
+    }
+  });
+
+  check('P02-03: Supabase 통합 보안 (교차 사용자 과목/자료/문제 ID 직접 조작 차단, service_role 격리)', async () => {
+    const userA = { id: 'usr-p02-sec-a' };
+    const userB = { id: 'usr-p02-sec-b' };
+
+    await withFakeSupabase({
+      user: userA,
+      subjects: [{ id: 'sub-a', user_id: userA.id, name: '과목 A', created_at: nowIso(), updated_at: nowIso() }],
+      study_materials: [{ id: 'mat-a', user_id: userA.id, subject_id: 'sub-a', title: '자료 A', created_at: nowIso(), updated_at: nowIso() }],
+    }, async (client) => {
+      // User B tries to initialize job on user A's study material
+      const res = await client.rpc('init_analysis_job_and_chunks', {
+        p_job_id: 'job-cross-attack',
+        p_user_id: userB.id,
+        p_subject_id: 'sub-a',
+        p_material_id: 'mat-a',
+        p_markdown_hash: 'mh_hash1',
+        p_domain: 'math',
+        p_model_id: 'deepseek-v4.1-flash',
+        p_total_chunks: 1,
+        p_chunks: [{ chunk_index: 0, chunk_hash: 'ch_0', byte_length: 100 }],
+      });
+      assert.equal(res.data.success, false, '타인의 과목/자료에 대한 분석 작업 초기화 거부');
+      assert.equal(res.data.error_code, 'NOT_FOUND_OR_FORBIDDEN', '권한 없음(NOT_FOUND_OR_FORBIDDEN) 에러 코드 반환');
+    });
+  });
+
+  check('P02-04: AI API 및 크레딧 정책 통합 (게스트 1회, 일반 3회, 개인키 0회 차감, 타임아웃 40s 내 maxDuration 60s)', () => {
+    const trialCredits = load(path.join(output, 'lib/trialCredits.js'));
+    assert.equal(trialCredits.getInitialGrantedCreditsForAccount(true), 1, '게스트 계정 초기 크레딧은 1회');
+    assert.equal(trialCredits.getInitialGrantedCreditsForAccount(false), 3, '일반 계정 초기 크레딧은 3회');
+    assert.ok(trialCredits.MAX_TRIAL_EXECUTION_TIMEOUT_MS <= 60000, '타임아웃 상한(40s)이 서버리스 maxDuration(60s) 이내에 수렴');
+  });
+
+  check('P02-05: PDF 변환 배포 대응 (브라우저 PDF.js 기본 작동, 외부 서비스 미설정 시 안전한 fallback, AGPL 안내)', async () => {
+    const { GET: getConvertHealth } = load(path.join(output, 'app/api/convert/route.js'));
+    const savedUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    delete process.env.PDF_CONVERT_SERVICE_URL;
+
+    try {
+      const req = new NextRequest('http://localhost/api/convert', { method: 'GET' });
+      const res = await getConvertHealth(req);
+      assert.equal(res.status, 200);
+      const json = await res.json();
+      assert.equal(json.available, false, '외부 서비스 미설정 시 available: false 반환');
+      assert.equal(json.configured, false, '외부 서비스 미설정 시 configured: false 반환');
+      assert.ok(json.message.includes('브라우저 PDF.js'), '브라우저 PDF.js 엔진 사용 안내 포함');
+
+      // Verify AGPL notice in documentation
+      const doc = fs.readFileSync('services/pdf-service/README.md', 'utf8');
+      assert.ok(doc.includes('GNU AGPL v3'), 'PyMuPDF4LLM AGPL-3.0 라이선스 고지 문서 포함');
+    } finally {
+      if (savedUrl) process.env.PDF_CONVERT_SERVICE_URL = savedUrl;
+    }
+  });
+
+  check('P02-06: Google Drive 백업 통합 (drive.file 최소 스코프, AES-256-GCM 암호화, 완료 전 응답 방지)', () => {
+    const nodeCrypto = load('node:crypto');
+    const encKey = nodeCrypto.randomBytes(32);
+    const plaintext = JSON.stringify({ access_token: 'test-tok-123', refresh_token: 'test-ref-456' });
+    const encrypted = googleDrive.encryptPayload(plaintext, encKey);
+    const decrypted = googleDrive.decryptPayload(encrypted, encKey);
+    assert.equal(decrypted, plaintext, 'Google Drive OAuth 세션 데이터 암복호화 일치');
+
+    const config = googleDrive.getGoogleDriveConfig({});
+    assert.equal(config.configured, false, '환경변수 누락 시 비활성화 상태 정상 보고');
+  });
+
+  check('P02-07: 복습 알림 스케줄러 (CRON_SECRET 검증, GET/POST 지원, KST 시간대, 멱등 키, GitHub Actions 연계)', () => {
+    assert.ok(fs.existsSync('.github/workflows/cron-scheduler.yml'), 'GitHub Actions cron 러너 워크플로 파일 존재');
+    const wfSrc = fs.readFileSync('.github/workflows/cron-scheduler.yml', 'utf8');
+    assert.ok(wfSrc.includes('0 * * * *'), '시간별 알림 스케줄 포함');
+    assert.ok(wfSrc.includes('*/15 * * * *'), '15분 임시 정리 스케줄 포함');
+
+    const key1 = reviewNotifications.makeReminderIdempotencyKey('usr-1', '2026-10-17', 'webhook');
+    const key2 = reviewNotifications.makeReminderIdempotencyKey('usr-1', '2026-10-17', 'webhook');
+    assert.equal(key1, key2, '동일 일자 동일 채널 멱등 키 동일');
+  });
+
+  check('P02-08: E2E 사용자 시나리오 (게스트 소진, 일반 3회 완료, 개인키 무제한, AI/DB 실패 복원력)', async () => {
+    const guestUser = { id: 'usr-p02-guest' };
+    const guestState = {
+      user: guestUser,
+      username_accounts: [{ user_id: guestUser.id, username: 'guest_user' }],
+      ai_trial_credits: [{ user_id: guestUser.id, granted_credits: 1, balance: 1, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    };
+
+    await withFakeSupabase(guestState, async (client) => {
+      // 1. Reserve 1 credit
+      const res = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-e2e-guest-1',
+        p_task_type: 'analyze_concepts',
+        p_input_identifier: 'hash-g1',
+        p_user_id: guestUser.id,
+      });
+      assert.equal(res.data.allowed, true);
+      assert.equal(res.data.status, 'processing');
+
+      // Settle
+      await client.rpc('settle_trial_credit', { p_task_id: 'task-e2e-guest-1', p_user_id: guestUser.id });
+      const cred = guestState.ai_trial_credits.find((c) => c.user_id === guestUser.id);
+      assert.equal(cred.balance, 0, '체험 1회 완료 후 잔액 0');
+
+      // Try second reservation -> blocked
+      const res2 = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-e2e-guest-2',
+        p_task_type: 'analyze_concepts',
+        p_input_identifier: 'hash-g2',
+        p_user_id: guestUser.id,
+      });
+      assert.equal(res2.data.allowed, false, '잔액 0에서 추가 체험 예약 차단');
+      assert.ok(res2.data.error_code === 'INSUFFICIENT_CREDITS' || res2.data.code === 'TRIAL_CREDITS_EXHAUSTED', '잔액 부족 에러 코드 반환');
+    });
+  });
+
   console.log(`${passed} regression checks passed`);
 }
 

@@ -3,6 +3,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser, lookupConnectionSecret } from '../../../lib/aiCredentials';
+
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 import {
   validateTrialProblemGenInput,
   settleTrialCredit,

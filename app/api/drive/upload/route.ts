@@ -16,6 +16,7 @@ import {
 } from '@/lib/drive/googleDrive';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 interface ResumableUploadTokenData {
   userId: string;

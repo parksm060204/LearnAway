@@ -8,6 +8,9 @@ import {
   formatReviewReminderMessage,
 } from '../../../../lib/reviewNotifications';
 
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
+
 /**
  * Scheduled Cron Endpoint for Daily Review Notifications.
  * Intended to be invoked hourly by a cron runner (e.g. Vercel Cron, GitHub Actions, or crontab).

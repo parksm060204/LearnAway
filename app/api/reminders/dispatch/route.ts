@@ -11,6 +11,9 @@ import {
   formatReviewReminderMessage,
 } from '../../../../lib/reviewNotifications';
 
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
+
 export async function POST(req: NextRequest) {
   const auth = await requireApiUser();
   if (!auth.ok) return auth.response;
