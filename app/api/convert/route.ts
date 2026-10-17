@@ -362,50 +362,28 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      let signedUrl = '';
       try {
-        const { data: signData, error: signError } = await adminClient.storage
-          .from('materials')
-          .createSignedUrl(validatedStoragePath, 300); // 5 min TTL
-        if (signError || !signData?.signedUrl) {
-          // Immediately clean up storage object on sign failure to avoid abandoned objects
-          await adminClient.storage.from('materials').remove([validatedStoragePath]);
-          await adminClient.from('temp_pdf_conversion_jobs').update({
-            status: 'failed',
-            cleanup_attempts: 1,
-            cleanup_error: `스토리지 원본 서명 URL 생성 실패: ${signError?.message || '알 수 없는 오류'}`,
-            lease_token: null,
-            lease_expires_at: null,
-            updated_at: new Date().toISOString(),
-          }).eq('job_id', jobId).eq('user_id', auth.user.id).eq('lease_token', conversionLeaseToken);
-
+        let signedUrl = '';
+        try {
+          const { data: signData, error: signError } = await adminClient.storage
+            .from('materials')
+            .createSignedUrl(validatedStoragePath, 300); // 5 min TTL
+          if (signError || !signData?.signedUrl) {
+            return NextResponse.json({
+              success: false,
+              code: 'STORAGE_SIGN_FAILED',
+              error: `스토리지 원본 서명 URL 생성 실패: ${signError?.message || '알 수 없는 오류'}`,
+            }, { status: 502 });
+          }
+          signedUrl = signData.signedUrl;
+        } catch (e) {
           return NextResponse.json({
             success: false,
             code: 'STORAGE_SIGN_FAILED',
-            error: `스토리지 원본 서명 URL 생성 실패: ${signError?.message || '알 수 없는 오류'}`,
+            error: `스토리지 서명 생성 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`,
           }, { status: 502 });
         }
-        signedUrl = signData.signedUrl;
-      } catch (e) {
-        await adminClient.storage.from('materials').remove([validatedStoragePath]);
-        await adminClient.from('temp_pdf_conversion_jobs').update({
-          status: 'failed',
-          cleanup_attempts: 1,
-          cleanup_error: `스토리지 서명 생성 예외: ${e instanceof Error ? e.message : '알 수 없는 오류'}`,
-          lease_token: null,
-          lease_expires_at: null,
-          updated_at: new Date().toISOString(),
-        }).eq('job_id', jobId).eq('user_id', auth.user.id).eq('lease_token', conversionLeaseToken);
 
-        return NextResponse.json({
-          success: false,
-          code: 'STORAGE_SIGN_FAILED',
-          error: `스토리지 서명 생성 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`,
-        }, { status: 502 });
-      }
-
-      // Call Python service convert/storage inside try/finally to strictly guarantee cleanup
-      try {
         const headers: Record<string, string> = {
           'Content-Type': 'application/json',
           'X-Service-Token': serviceToken,
@@ -464,30 +442,85 @@ export async function POST(req: NextRequest) {
           error: `정밀 변환 서비스 통신 실패: ${extErr instanceof Error ? extErr.message : '알 수 없는 오류'}`,
         }, { status: 502 });
       } finally {
-        // Enforce cleanup: Delete temporary PDF object from Storage after conversion
-        let cleanupErr: string | null = null;
+        // Enforce safe cleanup:
+        // 1. MUST acquire cleanup ownership in DB BEFORE removing anything from Storage!
+        // If lease expired or preempted by another worker/Cron, do NOT touch Storage!
+        let cleanupToken: string | null = null;
         try {
-          const { error: remErr } = await adminClient.storage.from('materials').remove([validatedStoragePath]);
-          if (remErr) {
-            const msg = remErr.message.toLowerCase();
-            if (!msg.includes('not found') && !msg.includes('does not exist') && !msg.includes('404')) {
-              cleanupErr = remErr.message;
+          const { data: claimCleanData, error: claimCleanErr } = await adminClient.rpc('claim_temp_pdf_cleanup_by_converter', {
+            p_job_id: jobId,
+            p_user_id: auth.user.id,
+            p_lease_token: conversionLeaseToken,
+          });
+
+          if (!claimCleanErr && claimCleanData && (claimCleanData as { success?: boolean }).success) {
+            cleanupToken = (claimCleanData as { cleanup_token?: string }).cleanup_token || null;
+          } else if (claimCleanErr) {
+            // Fallback conditional UPDATE: only if status='converting' and lease_token=conversionLeaseToken
+            const fallbackToken = randomUUID();
+            const { data: updRows } = await adminClient
+              .from('temp_pdf_conversion_jobs')
+              .update({
+                status: 'cleaning',
+                lease_token: fallbackToken,
+                lease_expires_at: new Date(Date.now() + 60 * 1000).toISOString(),
+                updated_at: new Date().toISOString(),
+              })
+              .eq('job_id', jobId)
+              .eq('user_id', auth.user.id)
+              .eq('lease_token', conversionLeaseToken)
+              .eq('status', 'converting')
+              .select();
+
+            if (Array.isArray(updRows) && updRows.length > 0) {
+              cleanupToken = fallbackToken;
             }
           }
-        } catch (e) {
-          cleanupErr = e instanceof Error ? e.message : '스토리지 삭제 실패';
-        }
-        try {
-          await adminClient.from('temp_pdf_conversion_jobs').update({
-            status: cleanupErr ? 'failed' : 'cleaned',
-            cleanup_attempts: 1,
-            cleanup_error: cleanupErr,
-            lease_token: null,
-            lease_expires_at: null,
-            updated_at: new Date().toISOString(),
-          }).eq('job_id', jobId).eq('user_id', auth.user.id).eq('lease_token', conversionLeaseToken);
         } catch {
-          // best effort
+          cleanupToken = null;
+        }
+
+        // Only delete file if we successfully transitioned job to 'cleaning' with a valid cleanup lease
+        if (cleanupToken) {
+          let cleanupErr: string | null = null;
+          try {
+            const { error: remErr } = await adminClient.storage.from('materials').remove([validatedStoragePath]);
+            if (remErr) {
+              const msg = remErr.message.toLowerCase();
+              if (!msg.includes('not found') && !msg.includes('does not exist') && !msg.includes('404')) {
+                cleanupErr = remErr.message;
+              }
+            }
+          } catch (e) {
+            cleanupErr = e instanceof Error ? e.message : '스토리지 삭제 실패';
+          }
+
+          try {
+            const { error: finErr } = await adminClient.rpc('finalize_temp_pdf_cleanup', {
+              p_job_id: jobId,
+              p_lease_token: cleanupToken,
+              p_target_status: cleanupErr ? 'failed' : 'cleaned',
+              p_cleanup_error: cleanupErr,
+            });
+
+            if (finErr) {
+              await adminClient
+                .from('temp_pdf_conversion_jobs')
+                .update({
+                  status: cleanupErr ? 'failed' : 'cleaned',
+                  cleanup_attempts: 1,
+                  cleanup_error: cleanupErr,
+                  lease_token: null,
+                  lease_expires_at: null,
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('job_id', jobId)
+                .eq('lease_token', cleanupToken)
+                .eq('status', 'cleaning');
+            }
+          } catch {
+            // Best effort; if DB update fails here, Cron will safely reclaim after 60s
+          }
         }
       }
     }

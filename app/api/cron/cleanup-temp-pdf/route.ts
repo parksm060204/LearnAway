@@ -5,6 +5,69 @@ import { validateTempStoragePath } from '../../../../lib/pdf/tempStorage';
 export const dynamic = 'force-dynamic';
 
 /**
+ * Atomically finalize a cleaning job ensuring strict lease token and status verification.
+ * Prevents stale workers from overwriting newer worker state or counters.
+ */
+async function finalizeCleanupJob(
+  admin: ReturnType<typeof createAdminClient>,
+  jobId: string,
+  leaseToken: string,
+  targetStatus: 'cleaned' | 'failed' | 'quarantined',
+  attempts: number,
+  errorMsg: string | null
+): Promise<{ success: boolean; finalStatus: string }> {
+  if (!jobId || !leaseToken) {
+    return { success: false, finalStatus: targetStatus };
+  }
+
+  // 1. Try atomic database RPC
+  try {
+    const { data: finData, error: finErr } = await admin.rpc('finalize_temp_pdf_cleanup', {
+      p_job_id: jobId,
+      p_lease_token: leaseToken,
+      p_target_status: targetStatus,
+      p_cleanup_error: errorMsg,
+    });
+
+    if (!finErr && finData && (finData as { success?: boolean }).success) {
+      return { success: true, finalStatus: (finData as { status?: string }).status || targetStatus };
+    }
+  } catch {
+    // Fall back to conditional update below
+  }
+
+  // 2. Fallback to strict atomic conditional UPDATE
+  // CRITICAL: Must require job_id + lease_token + status='cleaning'
+  const isExhausted = targetStatus === 'failed' && attempts + 1 >= 5;
+  const resolvedStatus = isExhausted ? 'quarantined' : targetStatus;
+
+  try {
+    const { data: updatedRows, error: updateErr } = await admin
+      .from('temp_pdf_conversion_jobs')
+      .update({
+        status: resolvedStatus,
+        cleanup_attempts: attempts + 1,
+        cleanup_error: errorMsg,
+        lease_token: null,
+        lease_expires_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('job_id', jobId)
+      .eq('lease_token', leaseToken)
+      .eq('status', 'cleaning')
+      .select();
+
+    if (!updateErr && Array.isArray(updatedRows) && updatedRows.length > 0) {
+      return { success: true, finalStatus: resolvedStatus };
+    }
+  } catch {
+    // update failed
+  }
+
+  return { success: false, finalStatus: resolvedStatus };
+}
+
+/**
  * Dedicated server/cron endpoint for scheduled cleanup of expired temporary PDF files.
  * Supports both GET (Vercel Cron standard) and POST (custom schedulers / curl).
  * Protected strictly via CRON_SECRET header authentication.
@@ -69,20 +132,23 @@ async function handleCleanup(req: NextRequest) {
       // 1. Strict Path Validation: Never trust stored storage_path blindly!
       const pathCheck = validateTempStoragePath(userId, jobId, storagePath);
       if (!pathCheck.valid) {
-        // Path is invalid, poisoned, or foreign. Do NOT delete file! Quarantine the ledger row.
-        quarantinedCount++;
-        quarantinedIds.push(jobId);
-        await admin
-          .from('temp_pdf_conversion_jobs')
-          .update({
-            status: 'quarantined',
-            cleanup_attempts: attempts + 1,
-            cleanup_error: `POISONED_OR_INVALID_PATH: ${pathCheck.reason}`,
-            lease_token: null,
-            lease_expires_at: null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('job_id', jobId);
+        // Path is invalid, poisoned, or foreign. Do NOT delete file!
+        // Atomically quarantine only if we hold the active lease token on the cleaning job.
+        const res = await finalizeCleanupJob(
+          admin,
+          jobId,
+          leaseToken,
+          'quarantined',
+          attempts,
+          `POISONED_OR_INVALID_PATH: ${pathCheck.reason}`
+        );
+        if (res.success) {
+          quarantinedCount++;
+          quarantinedIds.push(jobId);
+        } else {
+          failedCount++;
+          failedIds.push(jobId);
+        }
         continue;
       }
 
@@ -109,47 +175,29 @@ async function handleCleanup(req: NextRequest) {
 
       if (isObjectRemoved) {
         // 3. Atomically finalize to 'cleaned' with fencing token verification
-        let updateQuery = admin
-          .from('temp_pdf_conversion_jobs')
-          .update({
-            status: 'cleaned',
-            cleanup_attempts: attempts + 1,
-            cleanup_error: null,
-            lease_token: null,
-            lease_expires_at: null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('job_id', jobId);
-
-        if (leaseToken) {
-          updateQuery = updateQuery.eq('lease_token', leaseToken);
-        }
-
-        const { data: updatedRows, error: updateErr } = await updateQuery.select();
-
-        // Strict result validation: if DB update fails or 0 rows updated (stale lease), do not count as cleaned!
-        if (updateErr || (Array.isArray(updatedRows) && updatedRows.length === 0)) {
-          failedCount++;
-          failedIds.push(jobId);
-        } else {
+        const res = await finalizeCleanupJob(admin, jobId, leaseToken, 'cleaned', attempts, null);
+        if (res.success) {
           cleanedCount++;
           cleanedIds.push(jobId);
+        } else {
+          failedCount++;
+          failedIds.push(jobId);
         }
       } else {
-        failedCount++;
-        failedIds.push(jobId);
-        const isExhausted = attempts + 1 >= 5;
-        await admin
-          .from('temp_pdf_conversion_jobs')
-          .update({
-            status: isExhausted ? 'quarantined' : 'failed',
-            cleanup_attempts: attempts + 1,
-            cleanup_error: removeError,
-            lease_token: null,
-            lease_expires_at: null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('job_id', jobId);
+        // 4. File remove failed: transition to failed or quarantine after 5 attempts
+        const res = await finalizeCleanupJob(admin, jobId, leaseToken, 'failed', attempts, removeError);
+        if (res.success) {
+          if (res.finalStatus === 'quarantined') {
+            quarantinedCount++;
+            quarantinedIds.push(jobId);
+          } else {
+            failedCount++;
+            failedIds.push(jobId);
+          }
+        } else {
+          failedCount++;
+          failedIds.push(jobId);
+        }
       }
     }
 

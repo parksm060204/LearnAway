@@ -86,7 +86,10 @@ async function run() {
 let mode = 'authenticated';
 exports.__setMode = (m) => { mode = m; };
 exports.requireApiUser = async () => {
-  if (mode === 'authenticated') return { ok: true, user: { id: 'test-user', email: 'test@example.com' } };
+  if (mode === 'authenticated') {
+    const u = globalThis.__fakeSupabaseClient?.__state?.user || { id: 'test-user', email: 'test@example.com' };
+    return { ok: true, user: { id: u.id || 'test-user', email: u.email || 'test@example.com' } };
+  }
   return { ok: false, response: NextResponse.json({ success: false, authError: true, code: 'UNAUTHENTICATED', error: 'login required' }, { status: 401 }) };
 };
 `);
@@ -1316,6 +1319,71 @@ exports.requireApiUser = async () => {
               file_name: job.file_name,
               lease_token: token,
             },
+            error: null,
+          });
+        }
+        if (name === 'claim_temp_pdf_cleanup_by_converter') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function claim_temp_pdf_cleanup_by_converter', code: '42501' } });
+          }
+          if (state.fail && (state.fail.upsert || state.fail.rpc)) {
+            return Promise.resolve({ data: null, error: { message: 'simulated database error in claim_temp_pdf_cleanup_by_converter' } });
+          }
+          const jobList = (state.temp_pdf_conversion_jobs = state.temp_pdf_conversion_jobs || []);
+          const job = jobList.find((j) => j.job_id === params.p_job_id);
+          if (!job) {
+            return Promise.resolve({ data: { success: false, error: 'JOB_NOT_FOUND' }, error: null });
+          }
+          if (job.user_id !== params.p_user_id) {
+            return Promise.resolve({ data: { success: false, error: 'STORAGE_ACCESS_DENIED' }, error: null });
+          }
+          if (job.lease_token !== params.p_lease_token) {
+            return Promise.resolve({ data: { success: false, error: 'STALE_LEASE_TOKEN' }, error: null });
+          }
+          if (job.status !== 'converting') {
+            return Promise.resolve({ data: { success: false, error: 'INVALID_STATUS', status: job.status }, error: null });
+          }
+          if (job.lease_expires_at && new Date(job.lease_expires_at).getTime() <= Date.now()) {
+            return Promise.resolve({ data: { success: false, error: 'LEASE_EXPIRED' }, error: null });
+          }
+          const cleanupToken = 'lease_clean_' + Math.random().toString(36).slice(2);
+          job.status = 'cleaning';
+          job.lease_token = cleanupToken;
+          job.lease_expires_at = new Date(Date.now() + 60 * 1000).toISOString();
+          job.updated_at = nowIso();
+          return Promise.resolve({ data: { success: true, job_id: job.job_id, cleanup_token: cleanupToken }, error: null });
+        }
+        if (name === 'finalize_temp_pdf_cleanup') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function finalize_temp_pdf_cleanup', code: '42501' } });
+          }
+          if (state.fail && (state.fail.upsert || state.fail.rpc)) {
+            return Promise.resolve({ data: null, error: { message: 'simulated database error in finalize_temp_pdf_cleanup' } });
+          }
+          const jobList = (state.temp_pdf_conversion_jobs = state.temp_pdf_conversion_jobs || []);
+          const job = jobList.find((j) => j.job_id === params.p_job_id);
+          if (!job) {
+            return Promise.resolve({ data: { success: false, error: 'JOB_NOT_FOUND' }, error: null });
+          }
+          if (job.lease_token !== params.p_lease_token) {
+            return Promise.resolve({ data: { success: false, error: 'STALE_LEASE_TOKEN' }, error: null });
+          }
+          if (job.status !== 'cleaning') {
+            return Promise.resolve({ data: { success: false, error: 'INVALID_STATUS', status: job.status }, error: null });
+          }
+          const attempts = (job.cleanup_attempts || 0) + 1;
+          let finalStatus = params.p_target_status || 'cleaned';
+          if (finalStatus === 'failed' && attempts >= 5) {
+            finalStatus = 'quarantined';
+          }
+          job.status = finalStatus;
+          job.cleanup_attempts = attempts;
+          job.cleanup_error = params.p_cleanup_error || null;
+          job.lease_token = null;
+          job.lease_expires_at = null;
+          job.updated_at = nowIso();
+          return Promise.resolve({
+            data: { success: true, job_id: job.job_id, status: finalStatus, cleanup_attempts: attempts },
             error: null,
           });
         }
@@ -13704,6 +13772,300 @@ exports.requireApiUser = async () => {
       assert.ok(res.cachedResult);
       assert.equal(client.__state.ai_trial_credits[0].balance, 3, '완료된 작업 재시도는 추가 차감 없음');
     });
+  });
+
+  // =========================================================================
+  // 후속 안정화 4대 과제 정밀 검증 (Follow-up Stabilization Suite)
+  // =========================================================================
+
+  await checkAsync('P1-01: 신규 AI 체험 예약의 SQL 오류(42703 updated_at) 수정 및 스키마·RPC 무결성 검증', async () => {
+    // 1. Verify SQL Migration 27 and 28 do NOT attempt to insert into nonexistent updated_at column
+    const mig27Sql = fs.readFileSync(
+      path.join(process.cwd(), 'supabase/migrations/20260101000027_tiered_trial_credits_by_account_type.sql'),
+      'utf-8'
+    );
+    const mig28Sql = fs.readFileSync(
+      path.join(process.cwd(), 'supabase/migrations/20260101000028_catchup_stabilization_and_cleanup_atomicity.sql'),
+      'utf-8'
+    );
+
+    const checkInsertNoUpdatedAt = (sql, filename) => {
+      const insertRegex = /insert\s+into\s+public\.ai_trial_reservations\s*\(([^)]+)\)\s*values/gi;
+      let match;
+      while ((match = insertRegex.exec(sql)) !== null) {
+        const columns = match[1].split(',').map((c) => c.trim());
+        assert.ok(!columns.includes('updated_at'), `${filename} INSERT에 미존재 컬럼 updated_at 미포함 보장`);
+      }
+    };
+    checkInsertNoUpdatedAt(mig27Sql, 'migration 27');
+    checkInsertNoUpdatedAt(mig28Sql, 'migration 28');
+
+    // 2. RPC call execution: Initial grant + reservation atomicity
+    await withFakeSupabase({
+      user: { id: 'usr-p1-general', email: 'grad@uni.ac.kr' },
+      username_accounts: [],
+      ai_trial_credits: [],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      const res = await client.rpc('reserve_trial_credit', {
+        p_task_id: 'task-p1-1',
+        p_task_type: 'generate_problems',
+        p_input_identifier: 'ident-p1-1',
+        p_user_id: 'usr-p1-general',
+      });
+
+      assert.equal(res.data.allowed, true, '신규 일반 계정 예약 성공');
+      assert.equal(res.data.remaining, 2, '최초 3회 중 1회 차감되어 2회 유지');
+      assert.ok(res.data.lease_token, '유효한 펜싱 lease_token 발급');
+
+      const credit = client.__state.ai_trial_credits.find((c) => c.user_id === 'usr-p1-general');
+      assert.equal(credit.granted_credits, 3);
+      assert.equal(credit.balance, 2);
+
+      const reservation = client.__state.ai_trial_reservations.find((r) => r.task_id === 'task-p1-1');
+      assert.equal(reservation.status, 'processing');
+      assert.equal(reservation.attempt_count, 1);
+    });
+  });
+
+  await checkAsync('P1-02: 기존 DB용 후속 마이그레이션 28 적용성, 데이터 보존 및 권한 검증', async () => {
+    const mig28Path = path.join(process.cwd(), 'supabase/migrations/20260101000028_catchup_stabilization_and_cleanup_atomicity.sql');
+    assert.ok(fs.existsSync(mig28Path), '후속 마이그레이션 28 파일 존재');
+    const mig28Sql = fs.readFileSync(mig28Path, 'utf-8');
+
+    // 1. Column enhancements with IF NOT EXISTS
+    assert.ok(mig28Sql.includes('alter table if exists public.temp_pdf_conversion_jobs'), 'temp_pdf_conversion_jobs 스키마 보강');
+    assert.ok(mig28Sql.includes('add column if not exists lease_token text'), 'lease_token 컬럼 추가');
+    assert.ok(mig28Sql.includes('add column if not exists lease_expires_at timestamptz'), 'lease_expires_at 컬럼 추가');
+    assert.ok(mig28Sql.includes('alter table if exists public.ai_trial_reservations'), 'ai_trial_reservations 스키마 보강');
+    assert.ok(mig28Sql.includes('create index if not exists temp_pdf_conversion_jobs_lease_idx'), '인덱스 추가');
+
+    // 2. Safe cleanup of legacy functions
+    assert.ok(mig28Sql.includes('when undefined_function then null;'), '구형 함수 안전 제거');
+    assert.ok(!mig28Sql.includes('settle_trial_credit(text);'), '가짜 서명 배제');
+    assert.ok(!mig28Sql.includes('release_trial_credit(text, text);'), '가짜 서명 배제');
+
+    // 3. Complete canonical RPC definitions
+    assert.ok(mig28Sql.includes('create or replace function public.determine_initial_trial_credits'), 'determine_initial_trial_credits 단일 원천');
+    assert.ok(mig28Sql.includes('create or replace function public.claim_temp_pdf_cleanup_by_converter'), '변환자 정리 선점 RPC');
+    assert.ok(mig28Sql.includes('create or replace function public.finalize_temp_pdf_cleanup'), '정리 최종 확정 RPC');
+
+    // 4. Permissions lockdown
+    assert.ok(mig28Sql.includes('grant execute on function public.finalize_temp_pdf_cleanup(text, text, text, text) to service_role;'), 'finalize RPC service_role 전용');
+    assert.ok(mig28Sql.includes('grant execute on function public.claim_temp_pdf_cleanup_by_converter(text, uuid, text) to service_role;'), 'claim_cleanup RPC service_role 전용');
+
+    // 5. Existing data preservation: balances and histories untouched
+    await withFakeSupabase({
+      user: { id: 'usr-mig28-existing' },
+      ai_trial_credits: [{ user_id: 'usr-mig28-existing', granted_credits: 3, balance: 1, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [{ task_id: 'task-mig28-old', user_id: 'usr-mig28-existing', task_type: 'generate_problems', input_identifier: 'id-old', status: 'settled', attempt_count: 1, created_at: nowIso(), updated_at: nowIso() }],
+    }, async (client) => {
+      const getRes = await client.rpc('get_or_create_trial_credits', { p_user_id: 'usr-mig28-existing' });
+      assert.equal(getRes.data.balance, 1, '기존 잔액 보존');
+      assert.equal(getRes.data.granted, 3, '기존 지급액 보존');
+
+      const creditRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'usr-mig28-existing');
+      assert.equal(creditRow.balance, 1);
+      const resRow = client.__state.ai_trial_reservations.find((r) => r.task_id === 'task-mig28-old');
+      assert.equal(resRow.status, 'settled');
+    });
+  });
+
+  await checkAsync('P2-03: Cron의 모든 종료 경로(성공·실패·격리) 실행 토큰 검증 및 오래된 작업자 덮어쓰기 차단', async () => {
+    const savedCronSecret = process.env.CRON_SECRET;
+    process.env.CRON_SECRET = 'valid-cron-secret-p2';
+
+    try {
+      // Scenario: Worker A claimed job previously (lease: 'lease-A-stale').
+      // Lease expired, and Worker B has reclaimed this job (lease: 'lease-B-active', status: 'cleaning').
+      // Now Worker A attempts to finish under 3 different paths:
+
+      // 1. Worker A reports remove success: Rejected due to STALE_LEASE_TOKEN
+      await withFakeSupabase({
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-stale-cron-success',
+            user_id: 'user-p2',
+            file_name: 'test.pdf',
+            storage_path: 'user-p2/temp-convert/job-stale-cron-success/test.pdf',
+            status: 'cleaning',
+            lease_token: 'lease-B-active', // Worker B holds active lease!
+            lease_expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+            cleanup_attempts: 1,
+            expires_at: new Date(Date.now() - 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async (client) => {
+        // Worker A calls finalize_temp_pdf_cleanup with stale lease-A-stale
+        const finRes = await client.rpc('finalize_temp_pdf_cleanup', {
+          p_job_id: 'job-stale-cron-success',
+          p_lease_token: 'lease-A-stale',
+          p_target_status: 'cleaned',
+        });
+
+        assert.equal(finRes.data.success, false);
+        assert.equal(finRes.data.error, 'STALE_LEASE_TOKEN', '오래된 Cron A의 성공 처리는 즉각 거부');
+
+        const job = client.__state.temp_pdf_conversion_jobs.find((j) => j.job_id === 'job-stale-cron-success');
+        assert.equal(job.status, 'cleaning', 'Worker B의 cleaning 상태 보존');
+        assert.equal(job.lease_token, 'lease-B-active', 'Worker B의 active lease_token 보존');
+      });
+
+      // 2. Worker A reports remove failure: Rejected without incrementing Worker B's attempt count
+      await withFakeSupabase({
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-stale-cron-fail',
+            user_id: 'user-p2',
+            file_name: 'test.pdf',
+            storage_path: 'user-p2/temp-convert/job-stale-cron-fail/test.pdf',
+            status: 'cleaning',
+            lease_token: 'lease-B-active',
+            lease_expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+            cleanup_attempts: 1,
+            expires_at: new Date(Date.now() - 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async (client) => {
+        const finRes = await client.rpc('finalize_temp_pdf_cleanup', {
+          p_job_id: 'job-stale-cron-fail',
+          p_lease_token: 'lease-A-stale',
+          p_target_status: 'failed',
+          p_cleanup_error: 'some transient network error',
+        });
+
+        assert.equal(finRes.data.success, false);
+        assert.equal(finRes.data.error, 'STALE_LEASE_TOKEN');
+
+        const job = client.__state.temp_pdf_conversion_jobs.find((j) => j.job_id === 'job-stale-cron-fail');
+        assert.equal(job.cleanup_attempts, 1, 'Worker B의 재시도 카운터 보존(오래된 실패로 증가되지 않음)');
+      });
+
+      // 3. Worker A attempts quarantine with stale token: Rejected
+      await withFakeSupabase({
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-stale-cron-quarantine',
+            user_id: 'user-p2',
+            file_name: 'test.pdf',
+            storage_path: 'user-p2/temp-convert/job-stale-cron-quarantine/test.pdf',
+            status: 'cleaning',
+            lease_token: 'lease-B-active',
+            lease_expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+            cleanup_attempts: 1,
+            expires_at: new Date(Date.now() - 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async (client) => {
+        const finRes = await client.rpc('finalize_temp_pdf_cleanup', {
+          p_job_id: 'job-stale-cron-quarantine',
+          p_lease_token: 'lease-A-stale',
+          p_target_status: 'quarantined',
+          p_cleanup_error: 'POISONED_OR_INVALID_PATH',
+        });
+
+        assert.equal(finRes.data.success, false);
+        assert.equal(finRes.data.error, 'STALE_LEASE_TOKEN');
+
+        const job = client.__state.temp_pdf_conversion_jobs.find((j) => j.job_id === 'job-stale-cron-quarantine');
+        assert.equal(job.status, 'cleaning', 'Worker B의 active 상태 보존');
+      });
+    } finally {
+      if (savedCronSecret) process.env.CRON_SECRET = savedCronSecret;
+      else delete process.env.CRON_SECRET;
+    }
+  });
+
+  await checkAsync('P2-04: 오래된 변환 작업의 Storage 삭제 원천 차단 및 원자적 정리 선점 검증', async () => {
+    const { POST: convertHandler } = load(path.join(output, 'app/api/convert/route.js'));
+    const testUser = { id: 'usr-p2-conv' };
+    const savedToken = process.env.PDF_CONVERT_SERVICE_TOKEN;
+    const savedUrl = process.env.PDF_CONVERT_SERVICE_URL;
+    process.env.PDF_CONVERT_SERVICE_TOKEN = 'test-token-p2';
+    process.env.PDF_CONVERT_SERVICE_URL = 'http://127.0.0.1:54321';
+
+    const originalFetch = global.fetch;
+    global.fetch = async () => Response.json({ success: true, fullMarkdown: '변환 완료 텍스트', pageCount: 1, pages: [] });
+
+    try {
+      // 1. Conversion A lease expired -> Reclaimed by B -> A finishes -> Storage.remove MUST NOT be called!
+      const fakeStorage = {
+        from: () => ({
+          createSignedUrl: async () => ({ data: { signedUrl: 'http://signed.url' }, error: null }),
+          remove: async () => ({ error: null }),
+        }),
+      };
+
+      await withFakeSupabase({
+        user: testUser,
+        storage: fakeStorage,
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-conv-stale-leak',
+            user_id: testUser.id,
+            file_name: 'important.pdf',
+            storage_path: `${testUser.id}/temp-convert/job-conv-stale-leak/important.pdf`,
+            status: 'converting',
+            lease_token: 'lease-worker-B', // Stolen / Reclaimed by worker B!
+            lease_expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+            cleanup_attempts: 0,
+            expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async (client) => {
+        // Converter A calls claim_temp_pdf_cleanup_by_converter with stale token 'lease-worker-A'
+        const claimCleanRes = await client.rpc('claim_temp_pdf_cleanup_by_converter', {
+          p_job_id: 'job-conv-stale-leak',
+          p_user_id: testUser.id,
+          p_lease_token: 'lease-worker-A', // Stale token!
+        });
+
+        assert.equal(claimCleanRes.data.success, false);
+        assert.equal(claimCleanRes.data.error, 'STALE_LEASE_TOKEN', '토큰 불일치 시 정리 권한 획득 거부');
+      });
+
+      // 2. Active cleaning job strictly blocks new conversion requests
+      await withFakeSupabase({
+        user: testUser,
+        temp_pdf_conversion_jobs: [
+          {
+            job_id: 'job-active-cleaning-block',
+            user_id: testUser.id,
+            file_name: 'test.pdf',
+            storage_path: `${testUser.id}/temp-convert/job-active-cleaning-block/test.pdf`,
+            status: 'cleaning',
+            lease_token: 'active-cleaning-token',
+            lease_expires_at: new Date(Date.now() + 60000).toISOString(),
+            cleanup_attempts: 0,
+            expires_at: new Date(Date.now() + 20 * 60 * 1000).toISOString(),
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          },
+        ],
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'convert_storage', jobId: 'job-active-cleaning-block' }),
+        });
+        const res = await convertHandler(req);
+        assert.equal(res.status, 409, '정리 중인 작업은 변환 선점 불가 (409)');
+      });
+    } finally {
+      global.fetch = originalFetch;
+      if (savedToken) process.env.PDF_CONVERT_SERVICE_TOKEN = savedToken;
+      else delete process.env.PDF_CONVERT_SERVICE_TOKEN;
+      if (savedUrl) process.env.PDF_CONVERT_SERVICE_URL = savedUrl;
+      else delete process.env.PDF_CONVERT_SERVICE_URL;
+    }
   });
 
   console.log(`${passed} regression checks passed`);

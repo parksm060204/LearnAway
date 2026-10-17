@@ -451,14 +451,14 @@ begin
       -- Expired uncleaned jobs (under max attempts)
       (expires_at < now() and status not in ('cleaned', 'cleaning', 'quarantined', 'converting') and cleanup_attempts < 5)
       or
-      -- Abandoned/stalled converting jobs older than 10 minutes or expired lease
-      (status = 'converting' and (lease_expires_at is null or lease_expires_at < now()) and updated_at < now() - interval '10 minutes' and cleanup_attempts < 5)
+      -- Abandoned/stalled converting jobs: expired lease or older than 10 minutes
+      (status = 'converting' and ((lease_expires_at is not null and lease_expires_at < now()) or updated_at < now() - interval '10 minutes') and cleanup_attempts < 5)
       or
       -- Stranded uploads or unused tickets older than 2 hours
       (status in ('ticket_issued', 'uploaded') and created_at < now() - interval '2 hours' and cleanup_attempts < 5)
       or
-      -- Interrupted cleaning jobs older than 5 minutes or expired lease (Safe Re-claim)
-      (status = 'cleaning' and (lease_expires_at is null or lease_expires_at < now()) and updated_at < now() - interval '5 minutes' and cleanup_attempts < 5)
+      -- Interrupted cleaning jobs: expired lease or older than 5 minutes (Safe Re-claim)
+      (status = 'cleaning' and ((lease_expires_at is not null and lease_expires_at < now()) or updated_at < now() - interval '5 minutes') and cleanup_attempts < 5)
     )
     order by expires_at asc
     limit coalesce(p_limit, 50)
@@ -582,4 +582,149 @@ $$;
 
 revoke all on function public.claim_temp_pdf_job_for_conversion(text, uuid, text) from public, anon, authenticated;
 grant execute on function public.claim_temp_pdf_job_for_conversion(text, uuid, text) to service_role;
+
+-- ----------------------------------------------------------------------------
+-- 8. Atomic Converter Cleanup Claim RPC (Anti-Race with Concurrent Converters & Cron)
+-- ----------------------------------------------------------------------------
+create or replace function public.claim_temp_pdf_cleanup_by_converter(
+  p_job_id text,
+  p_user_id uuid,
+  p_lease_token text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_job public.temp_pdf_conversion_jobs%rowtype;
+  v_cleanup_token text;
+begin
+  if auth.role() <> 'service_role' then
+    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED', 'message', 'service_role permission required');
+  end if;
+
+  if p_job_id is null or p_lease_token is null or trim(p_lease_token) = '' then
+    return jsonb_build_object('success', false, 'error', 'INVALID_PARAMETERS');
+  end if;
+
+  select * into v_job
+  from public.temp_pdf_conversion_jobs
+  where job_id = p_job_id
+  for update;
+
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'JOB_NOT_FOUND');
+  end if;
+
+  if v_job.user_id <> p_user_id then
+    return jsonb_build_object('success', false, 'error', 'STORAGE_ACCESS_DENIED');
+  end if;
+
+  if v_job.lease_token is distinct from p_lease_token then
+    return jsonb_build_object('success', false, 'error', 'STALE_LEASE_TOKEN');
+  end if;
+
+  if v_job.status <> 'converting' then
+    return jsonb_build_object('success', false, 'error', 'INVALID_STATUS', 'status', v_job.status);
+  end if;
+
+  if v_job.lease_expires_at is not null and v_job.lease_expires_at <= now() then
+    return jsonb_build_object('success', false, 'error', 'LEASE_EXPIRED');
+  end if;
+
+  v_cleanup_token := gen_random_uuid()::text;
+
+  update public.temp_pdf_conversion_jobs
+  set status = 'cleaning',
+      lease_token = v_cleanup_token,
+      lease_expires_at = now() + interval '60 seconds',
+      updated_at = now()
+  where job_id = p_job_id
+    and lease_token = p_lease_token
+    and status = 'converting';
+
+  return jsonb_build_object(
+    'success', true,
+    'job_id', p_job_id,
+    'cleanup_token', v_cleanup_token
+  );
+end;
+$$;
+
+revoke all on function public.claim_temp_pdf_cleanup_by_converter(text, uuid, text) from public, anon, authenticated;
+grant execute on function public.claim_temp_pdf_cleanup_by_converter(text, uuid, text) to service_role;
+
+-- ----------------------------------------------------------------------------
+-- 9. Atomic Cleanup Finalization RPC (Strict Token Verification on All Exit Paths)
+-- ----------------------------------------------------------------------------
+create or replace function public.finalize_temp_pdf_cleanup(
+  p_job_id text,
+  p_lease_token text,
+  p_target_status text,
+  p_cleanup_error text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_job public.temp_pdf_conversion_jobs%rowtype;
+  v_new_attempts integer;
+  v_final_status text;
+begin
+  if auth.role() <> 'service_role' then
+    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED', 'message', 'service_role permission required');
+  end if;
+
+  if p_job_id is null or p_lease_token is null or trim(p_lease_token) = '' then
+    return jsonb_build_object('success', false, 'error', 'INVALID_PARAMETERS');
+  end if;
+
+  select * into v_job
+  from public.temp_pdf_conversion_jobs
+  where job_id = p_job_id
+  for update;
+
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'JOB_NOT_FOUND');
+  end if;
+
+  if v_job.lease_token is distinct from p_lease_token then
+    return jsonb_build_object('success', false, 'error', 'STALE_LEASE_TOKEN');
+  end if;
+
+  if v_job.status <> 'cleaning' then
+    return jsonb_build_object('success', false, 'error', 'INVALID_STATUS', 'status', v_job.status);
+  end if;
+
+  v_new_attempts := coalesce(v_job.cleanup_attempts, 0) + 1;
+  v_final_status := coalesce(p_target_status, 'cleaned');
+  if v_final_status = 'failed' and v_new_attempts >= 5 then
+    v_final_status := 'quarantined';
+  end if;
+
+  update public.temp_pdf_conversion_jobs
+  set status = v_final_status,
+      cleanup_attempts = v_new_attempts,
+      cleanup_error = p_cleanup_error,
+      lease_token = null,
+      lease_expires_at = null,
+      updated_at = now()
+  where job_id = p_job_id
+    and lease_token = p_lease_token
+    and status = 'cleaning';
+
+  return jsonb_build_object(
+    'success', true,
+    'job_id', p_job_id,
+    'status', v_final_status,
+    'cleanup_attempts', v_new_attempts
+  );
+end;
+$$;
+
+revoke all on function public.finalize_temp_pdf_cleanup(text, text, text, text) from public, anon, authenticated;
+grant execute on function public.finalize_temp_pdf_cleanup(text, text, text, text) to service_role;
 

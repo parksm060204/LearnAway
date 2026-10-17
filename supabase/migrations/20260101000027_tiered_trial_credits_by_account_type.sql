@@ -389,10 +389,10 @@ begin
 
   insert into public.ai_trial_reservations (
     task_id, user_id, task_type, input_identifier, status,
-    attempt_count, lease_token, lease_expires_at, created_at, updated_at
+    attempt_count, lease_token, lease_expires_at, created_at
   ) values (
     p_task_id, v_uid, p_task_type, p_input_identifier, 'processing',
-    1, v_lease_token, now() + interval '60 seconds', now(), now()
+    1, v_lease_token, now() + interval '60 seconds', now()
   );
 
   return jsonb_build_object(
