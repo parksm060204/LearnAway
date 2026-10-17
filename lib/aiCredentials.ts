@@ -197,6 +197,7 @@ export type AiConfigResolution =
         | 'operator_disabled'
         | 'trial_limit_exceeded'
         | 'already_completed'
+        | 'already_completed_missing_result'
         | 'concurrent_in_progress';
       message: string;
       cachedResult?: unknown;
@@ -305,6 +306,13 @@ export async function resolveAiConfigForUser(
     );
 
     if (reservation.status === 'already_completed') {
+      if (!reservation.cachedResult) {
+        return {
+          ok: false,
+          code: 'already_completed_missing_result',
+          message: '작업은 완료 상태이나 보존된 AI 결과가 비어 있습니다. 새로운 작업 식별자로 다시 시도해 주세요.',
+        };
+      }
       return {
         ok: false,
         code: 'already_completed',

@@ -1587,9 +1587,27 @@ ${chunk.text}
 
     // 8. Aggregate progress across the session ledger
     const progress = getSessionProgress(session);
+    let cacheSuccess = true;
     if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial) {
       const recRes = await recordTrialResultReady(auth.user.id, jobKey, { drafts: progress.allDrafts }, cred.leaseToken);
       if (!recRes.success) {
+        cacheSuccess = false;
+        if (
+          recRes.errorCode === 'STALE_LEASE_TOKEN' ||
+          recRes.errorCode === 'ALREADY_SETTLED' ||
+          recRes.errorCode === 'ALREADY_REFUNDED' ||
+          recRes.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+          recRes.errorCode === 'LEASE_TOKEN_REQUIRED'
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: recRes.error || '작업 실행권이 만료되었거나 다른 요청에 의해 선점되었습니다.',
+              errorCode: recRes.errorCode,
+            },
+            { status: 409 }
+          );
+        }
         console.warn('Record trial result warning in analyze-concepts:', recRes.error);
       }
     }
@@ -1619,10 +1637,14 @@ ${chunk.text}
       outcome = { persisted: true, drafts: progress.allDrafts };
     }
 
-    if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial && outcome.persisted) {
-      const settleResult = await settleTrialCredit(auth.user.id, jobKey, cred.leaseToken);
-      if (!settleResult.success) {
-        console.warn('Trial credit settlement warning in analyze-concepts:', settleResult.error);
+    if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial) {
+      if (cacheSuccess && outcome.persisted) {
+        const settleResult = await settleTrialCredit(auth.user.id, jobKey, cred.leaseToken);
+        if (!settleResult.success) {
+          console.warn('Trial credit settlement warning in analyze-concepts:', settleResult.error);
+        }
+      } else {
+        console.warn('Trial credit settlement withheld in analyze-concepts: cache or persistence not confirmed');
       }
     }
 

@@ -853,6 +853,7 @@ ${
       }
     }
 
+    let cacheSuccess = true;
     if (cred.isTrial && taskId) {
       const cacheRes = await recordTrialResultReady(
         auth.user.id,
@@ -868,11 +869,33 @@ ${
         cred.leaseToken
       );
       if (!cacheRes.success) {
+        cacheSuccess = false;
+        if (
+          cacheRes.errorCode === 'STALE_LEASE_TOKEN' ||
+          cacheRes.errorCode === 'ALREADY_SETTLED' ||
+          cacheRes.errorCode === 'ALREADY_REFUNDED' ||
+          cacheRes.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+          cacheRes.errorCode === 'LEASE_TOKEN_REQUIRED'
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: cacheRes.error || '답안 평가 실행권이 만료되었거나 다른 요청에 의해 선점되었습니다.',
+              errorCode: cacheRes.errorCode,
+            },
+            { status: 409 }
+          );
+        }
         console.warn('Record trial result warning:', cacheRes.error);
       }
-      const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
-      if (!settleResult.success) {
-        console.warn('Trial credit settlement warning:', settleResult.error);
+
+      if (cacheSuccess) {
+        const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
+        if (!settleResult.success) {
+          console.warn('Trial credit settlement warning:', settleResult.error);
+        }
+      } else {
+        console.warn('Trial credit settlement withheld in evaluate-answer: cache not confirmed');
       }
     }
 

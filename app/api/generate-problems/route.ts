@@ -600,6 +600,7 @@ ${combinedSource}
         id: `${generationJobId}-p${index + 1}`,
       }));
 
+      let cacheSuccess = true;
       if (cred.isTrial && draftsWithIds.length > 0) {
         const cacheRes = await recordTrialResultReady(
           auth.user.id,
@@ -612,6 +613,24 @@ ${combinedSource}
           cred.leaseToken
         );
         if (!cacheRes.success) {
+          cacheSuccess = false;
+          // Fencing violation or ownership mismatch: abort persistence and settlement immediately!
+          if (
+            cacheRes.errorCode === 'STALE_LEASE_TOKEN' ||
+            cacheRes.errorCode === 'ALREADY_SETTLED' ||
+            cacheRes.errorCode === 'ALREADY_REFUNDED' ||
+            cacheRes.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+            cacheRes.errorCode === 'LEASE_TOKEN_REQUIRED'
+          ) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: cacheRes.error || '작업 실행권이 만료되었거나 다른 요청에 의해 선점되었습니다.',
+                errorCode: cacheRes.errorCode,
+              },
+              { status: 409 }
+            );
+          }
           console.warn('Record trial result warning:', cacheRes.error);
         }
       }
@@ -635,12 +654,22 @@ ${combinedSource}
         };
       }
 
+      // Settle credit ONLY when result cache is verified AND database persistence succeeds
       let settlementError: string | undefined;
+      let isSettled = false;
       if (cred.isTrial && draftsWithIds.length > 0) {
-        const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
-        if (!settleResult.success) {
-          settlementError = settleResult.error;
-          console.warn('Trial credit settlement warning:', settleResult.error);
+        if (cacheSuccess && outcome.persisted) {
+          const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
+          if (!settleResult.success) {
+            settlementError = settleResult.error;
+            console.warn('Trial credit settlement warning:', settleResult.error);
+          } else {
+            isSettled = true;
+          }
+        } else {
+          settlementError = !cacheSuccess
+            ? '결과 캐시 보존이 완료되지 않아 크레딧 확정을 보류했습니다.'
+            : '초안 DB 저장이 완료되지 않아 크레딧 확정을 보류했습니다.';
         }
       }
 
@@ -650,6 +679,7 @@ ${combinedSource}
         count: outcome.drafts.length,
         generationJobId,
         persisted: outcome.persisted,
+        settled: isSettled,
         persistError: outcome.persistError,
         settlementError,
       });

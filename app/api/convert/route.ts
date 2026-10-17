@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { createAdminClient, hasAdminClientConfig } from '../../../lib/supabase/admin';
 import { createPdfJobToken } from '../../../lib/pdf/token';
+import { validateTempStoragePath, buildTempStoragePath } from '../../../lib/pdf/tempStorage';
 
 export const dynamic = 'force-dynamic';
 
@@ -149,26 +150,42 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ success: false, code: 'PDF_TOO_LARGE', error: 'PDF는 20MB 이하만 등록할 수 있습니다.' }, { status: 413 });
       }
 
-      const jobId = randomUUID();
-      const safeFileName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-      // Isolated path scoped strictly to auth.user.id
-      const storagePath = `${auth.user.id}/temp-convert/${jobId}/${safeFileName}`;
+      if (!hasAdminClientConfig()) {
+        return NextResponse.json({
+          success: false,
+          code: 'STORAGE_UNAVAILABLE',
+          error: '서버 관리자 클라이언트가 구성되지 않아 업로드 티켓을 발급할 수 없습니다.',
+        }, { status: 500 });
+      }
 
-      if (hasAdminClientConfig()) {
-        try {
-          const admin = createAdminClient();
-          await admin.from('temp_pdf_conversion_jobs').insert({
-            job_id: jobId,
-            user_id: auth.user.id,
-            storage_path: storagePath,
-            file_name: fileName,
-            file_size: fileSize,
-            status: 'ticket_issued',
-            expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-          });
-        } catch (trackErr) {
-          console.warn('Failed to register temp pdf conversion job:', trackErr);
+      const jobId = randomUUID();
+      const storagePath = buildTempStoragePath(auth.user.id, jobId, fileName);
+
+      try {
+        const admin = createAdminClient();
+        const { error: insErr } = await admin.from('temp_pdf_conversion_jobs').insert({
+          job_id: jobId,
+          user_id: auth.user.id,
+          storage_path: storagePath,
+          file_name: fileName,
+          file_size: fileSize,
+          status: 'ticket_issued',
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        });
+
+        if (insErr) {
+          return NextResponse.json({
+            success: false,
+            code: 'TICKET_REGISTRATION_FAILED',
+            error: `임시 변환 작업 장부 등록 실패: ${insErr.message}`,
+          }, { status: 500 });
         }
+      } catch (trackErr) {
+        return NextResponse.json({
+          success: false,
+          code: 'TICKET_REGISTRATION_FAILED',
+          error: `임시 변환 작업 장부 등록 예외: ${trackErr instanceof Error ? trackErr.message : '알 수 없는 오류'}`,
+        }, { status: 500 });
       }
 
       return NextResponse.json({
@@ -181,63 +198,72 @@ export async function POST(req: NextRequest) {
 
     // Action: Cancel and immediately delete an unneeded or aborted upload
     if (action === 'cancel_storage_ticket') {
-      const jobId = typeof body.jobId === 'string' ? body.jobId : '';
-      const storagePath = typeof body.storagePath === 'string' ? body.storagePath : '';
-      if (!jobId || !storagePath) {
-        return NextResponse.json({ success: false, code: 'INVALID_PARAMETERS', error: 'jobId와 storagePath가 필요합니다.' }, { status: 400 });
+      const jobId = typeof body.jobId === 'string' ? body.jobId.trim() : '';
+      if (!jobId) {
+        return NextResponse.json({ success: false, code: 'INVALID_PARAMETERS', error: 'jobId가 필요합니다.' }, { status: 400 });
       }
-      const expectedPrefix = `${auth.user.id}/temp-convert/${jobId}/`;
-      if (!storagePath.startsWith(expectedPrefix)) {
-        return NextResponse.json({ success: false, code: 'STORAGE_ACCESS_DENIED', error: '접근 권한이 없습니다.' }, { status: 403 });
+
+      if (!hasAdminClientConfig()) {
+        return NextResponse.json({ success: false, code: 'STORAGE_UNAVAILABLE', error: '스토리지 클라이언트를 사용할 수 없습니다.' }, { status: 500 });
+      }
+
+      const admin = createAdminClient();
+      let jobRecord: { job_id: string; user_id: string; storage_path: string } | null = null;
+      try {
+        const { data: job, error: jobErr } = await admin
+          .from('temp_pdf_conversion_jobs')
+          .select('job_id, user_id, storage_path')
+          .eq('job_id', jobId)
+          .eq('user_id', auth.user.id)
+          .maybeSingle();
+
+        if (jobErr || !job) {
+          return NextResponse.json({ success: false, code: 'JOB_NOT_FOUND', error: '작업 내역을 찾을 수 없습니다.' }, { status: 404 });
+        }
+        jobRecord = job as { job_id: string; user_id: string; storage_path: string };
+      } catch {
+        return NextResponse.json({ success: false, code: 'DB_ERROR', error: '작업 조회 중 오류가 발생했습니다.' }, { status: 500 });
+      }
+
+      // Validate storage path against server ledger
+      const pathCheck = validateTempStoragePath(auth.user.id, jobId, jobRecord.storage_path);
+      if (!pathCheck.valid) {
+        // Poisoned path: quarantine row without calling Storage remove
+        await admin.from('temp_pdf_conversion_jobs').update({
+          status: 'quarantined',
+          cleanup_error: `POISONED_OR_INVALID_PATH: ${pathCheck.reason}`,
+          updated_at: new Date().toISOString(),
+        }).eq('job_id', jobId);
+
+        return NextResponse.json({
+          success: false,
+          code: 'STORAGE_ACCESS_DENIED',
+          error: '오염되었거나 허용되지 않은 임시 파일 경로입니다.',
+        }, { status: 400 });
       }
 
       let removeError: string | null = null;
-      if (hasAdminClientConfig()) {
-        const admin = createAdminClient();
-        try {
-          const { error: remErr } = await admin.storage.from('materials').remove([storagePath]);
-          if (remErr) removeError = remErr.message;
-          await admin.from('temp_pdf_conversion_jobs').update({
-            status: 'cancelled',
-            cleanup_attempts: 1,
-            cleanup_error: removeError,
-            updated_at: new Date().toISOString(),
-          }).eq('job_id', jobId).eq('user_id', auth.user.id);
-        } catch (e) {
-          removeError = e instanceof Error ? e.message : '스토리지 삭제 실패';
-        }
+      try {
+        const { error: remErr } = await admin.storage.from('materials').remove([jobRecord.storage_path]);
+        if (remErr) removeError = remErr.message;
+        await admin.from('temp_pdf_conversion_jobs').update({
+          status: 'cancelled',
+          cleanup_attempts: 1,
+          cleanup_error: removeError,
+          updated_at: new Date().toISOString(),
+        }).eq('job_id', jobId).eq('user_id', auth.user.id);
+      } catch (e) {
+        removeError = e instanceof Error ? e.message : '스토리지 삭제 실패';
       }
+
       return NextResponse.json({ success: true, cancelled: true, cleanupError: removeError });
     }
 
     // Action 2: Convert a pre-uploaded PDF from Supabase Storage
     if (action === 'convert_storage') {
-      const jobId = typeof body.jobId === 'string' ? body.jobId : '';
-      const storagePath = typeof body.storagePath === 'string' ? body.storagePath : '';
-
-      if (!jobId || !storagePath) {
-        return NextResponse.json({ success: false, code: 'INVALID_PARAMETERS', error: 'jobId와 storagePath가 필요합니다.' }, { status: 400 });
-      }
-
-      // Security check: Must start with authenticated user's isolated prefix
-      const expectedPrefix = `${auth.user.id}/temp-convert/${jobId}/`;
-      if (!storagePath.startsWith(expectedPrefix)) {
-        return NextResponse.json({
-          success: false,
-          code: 'STORAGE_ACCESS_DENIED',
-          error: '다른 사용자의 임시 파일이나 허용되지 않은 경로를 참조할 수 없습니다.',
-        }, { status: 403 });
-      }
-
-      const externalServiceUrl = (process.env.PDF_CONVERT_SERVICE_URL || '').trim().replace(/\/+$/, '');
-      const serviceToken = (process.env.PDF_CONVERT_SERVICE_TOKEN || '').trim();
-      if (!externalServiceUrl || !serviceToken) {
-        return NextResponse.json({
-          success: false,
-          code: 'PDF_SERVICE_UNCONFIGURED',
-          errorCode: 'PDF_SERVICE_UNCONFIGURED',
-          error: '정밀 변환 서비스(PDF_CONVERT_SERVICE_URL) 또는 인증 토큰이 설정되지 않았습니다. 브라우저 내 "이 기기에서 변환 (브라우저 PDF.js)"을 이용해 주세요.',
-        }, { status: 503 });
+      const jobId = typeof body.jobId === 'string' ? body.jobId.trim() : '';
+      if (!jobId) {
+        return NextResponse.json({ success: false, code: 'INVALID_PARAMETERS', error: 'jobId가 필요합니다.' }, { status: 400 });
       }
 
       if (!hasAdminClientConfig()) {
@@ -250,22 +276,65 @@ export async function POST(req: NextRequest) {
 
       const adminClient = createAdminClient();
 
-      // Mark converting in ledger
-      try {
-        await adminClient.from('temp_pdf_conversion_jobs').update({
-          status: 'converting',
-          updated_at: new Date().toISOString(),
-        }).eq('job_id', jobId).eq('user_id', auth.user.id);
-      } catch {
-        // non-fatal
+      // Look up server ledger row and strictly verify ownership
+      const { data: job, error: jobErr } = await adminClient
+        .from('temp_pdf_conversion_jobs')
+        .select('*')
+        .eq('job_id', jobId)
+        .eq('user_id', auth.user.id)
+        .maybeSingle();
+
+      if (jobErr || !job) {
+        return NextResponse.json({
+          success: false,
+          code: 'STORAGE_ACCESS_DENIED',
+          error: '임시 작업 내역을 찾을 수 없거나 접근 권한이 없습니다.',
+        }, { status: 403 });
       }
+
+      const pathCheck = validateTempStoragePath(auth.user.id, jobId, job.storage_path);
+      if (!pathCheck.valid) {
+        return NextResponse.json({
+          success: false,
+          code: 'STORAGE_ACCESS_DENIED',
+          error: '유효하지 않거나 오염된 임시 파일 경로입니다.',
+        }, { status: 403 });
+      }
+
+      const validatedStoragePath = job.storage_path;
+
+      const externalServiceUrl = (process.env.PDF_CONVERT_SERVICE_URL || '').trim().replace(/\/+$/, '');
+      const serviceToken = (process.env.PDF_CONVERT_SERVICE_TOKEN || '').trim();
+      if (!externalServiceUrl || !serviceToken) {
+        return NextResponse.json({
+          success: false,
+          code: 'PDF_SERVICE_UNCONFIGURED',
+          errorCode: 'PDF_SERVICE_UNCONFIGURED',
+          error: '정밀 변환 서비스(PDF_CONVERT_SERVICE_URL) 또는 인증 토큰이 설정되지 않았습니다. 브라우저 내 "이 기기에서 변환 (브라우저 PDF.js)"을 이용해 주세요.',
+        }, { status: 503 });
+      }
+
+      // Update ledger to converting
+      await adminClient.from('temp_pdf_conversion_jobs').update({
+        status: 'converting',
+        updated_at: new Date().toISOString(),
+      }).eq('job_id', jobId).eq('user_id', auth.user.id);
 
       let signedUrl = '';
       try {
         const { data: signData, error: signError } = await adminClient.storage
           .from('materials')
-          .createSignedUrl(storagePath, 300); // 5 min TTL
+          .createSignedUrl(validatedStoragePath, 300); // 5 min TTL
         if (signError || !signData?.signedUrl) {
+          // Immediately clean up storage object on sign failure to avoid abandoned objects
+          await adminClient.storage.from('materials').remove([validatedStoragePath]);
+          await adminClient.from('temp_pdf_conversion_jobs').update({
+            status: 'failed',
+            cleanup_attempts: 1,
+            cleanup_error: `스토리지 원본 서명 URL 생성 실패: ${signError?.message || '알 수 없는 오류'}`,
+            updated_at: new Date().toISOString(),
+          }).eq('job_id', jobId).eq('user_id', auth.user.id);
+
           return NextResponse.json({
             success: false,
             code: 'STORAGE_SIGN_FAILED',
@@ -274,6 +343,14 @@ export async function POST(req: NextRequest) {
         }
         signedUrl = signData.signedUrl;
       } catch (e) {
+        await adminClient.storage.from('materials').remove([validatedStoragePath]);
+        await adminClient.from('temp_pdf_conversion_jobs').update({
+          status: 'failed',
+          cleanup_attempts: 1,
+          cleanup_error: `스토리지 서명 생성 예외: ${e instanceof Error ? e.message : '알 수 없는 오류'}`,
+          updated_at: new Date().toISOString(),
+        }).eq('job_id', jobId).eq('user_id', auth.user.id);
+
         return NextResponse.json({
           success: false,
           code: 'STORAGE_SIGN_FAILED',
@@ -281,17 +358,17 @@ export async function POST(req: NextRequest) {
         }, { status: 502 });
       }
 
-      // Call Python service convert/storage
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'X-Service-Token': serviceToken,
-      };
-      const jobToken = createPdfJobToken(auth.user.id, jobId, MAX_PDF_PAGES, 300, storagePath);
-      if (jobToken) {
-        headers['X-Job-Token'] = jobToken;
-      }
-
+      // Call Python service convert/storage inside try/finally to strictly guarantee cleanup
       try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'X-Service-Token': serviceToken,
+        };
+        const jobToken = createPdfJobToken(auth.user.id, jobId, MAX_PDF_PAGES, 300, validatedStoragePath);
+        if (jobToken) {
+          headers['X-Job-Token'] = jobToken;
+        }
+
         const extRes = await fetch(`${externalServiceUrl}/convert/storage`, {
           method: 'POST',
           headers,
@@ -299,7 +376,7 @@ export async function POST(req: NextRequest) {
             signedUrl,
             jobId,
             userId: auth.user.id,
-            storagePath,
+            storagePath: validatedStoragePath,
           }),
         });
 
@@ -344,7 +421,7 @@ export async function POST(req: NextRequest) {
         // Enforce cleanup: Delete temporary PDF object from Storage after conversion
         let cleanupErr: string | null = null;
         try {
-          const { error: remErr } = await adminClient.storage.from('materials').remove([storagePath]);
+          const { error: remErr } = await adminClient.storage.from('materials').remove([validatedStoragePath]);
           if (remErr) cleanupErr = remErr.message;
         } catch (e) {
           cleanupErr = e instanceof Error ? e.message : '스토리지 삭제 실패';
@@ -359,42 +436,6 @@ export async function POST(req: NextRequest) {
         } catch {
           // best effort
         }
-      }
-    }
-
-    // Action: Scheduled or maintenance cleanup of expired temporary files
-    if (action === 'cleanup_expired_temp_files') {
-      if (!hasAdminClientConfig()) {
-        return NextResponse.json({ success: false, code: 'STORAGE_UNAVAILABLE', error: '서버 관리자 클라이언트가 구성되지 않았습니다.' }, { status: 500 });
-      }
-      const admin = createAdminClient();
-      try {
-        const { data: expiredJobs, error: rpcErr } = await admin.rpc('get_expired_temp_pdf_jobs', { p_limit: 50 });
-        if (rpcErr) {
-          return NextResponse.json({ success: false, error: rpcErr.message }, { status: 500 });
-        }
-        const cleaned: string[] = [];
-        const failed: string[] = [];
-        for (const job of ((expiredJobs as { job_id: string; storage_path: string; cleanup_attempts: number }[]) || [])) {
-          const { error: remErr } = await admin.storage.from('materials').remove([job.storage_path]);
-          if (!remErr) {
-            await admin.from('temp_pdf_conversion_jobs').update({
-              status: 'cleaned',
-              updated_at: new Date().toISOString(),
-            }).eq('job_id', job.job_id);
-            cleaned.push(job.job_id);
-          } else {
-            await admin.from('temp_pdf_conversion_jobs').update({
-              cleanup_attempts: (job.cleanup_attempts || 0) + 1,
-              cleanup_error: remErr.message,
-              updated_at: new Date().toISOString(),
-            }).eq('job_id', job.job_id);
-            failed.push(job.job_id);
-          }
-        }
-        return NextResponse.json({ success: true, cleanedCount: cleaned.length, failedCount: failed.length, cleaned, failed });
-      } catch (err) {
-        return NextResponse.json({ success: false, error: err instanceof Error ? err.message : '정리 중 오류' }, { status: 500 });
       }
     }
 
