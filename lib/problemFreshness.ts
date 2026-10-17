@@ -42,7 +42,12 @@ export function applyMaterialEditToProblems(
       );
       if (mismatched) {
         outdatedIds.push(problem.id);
-        return { ...problem, isOutdated: true, needsSourceReview: false };
+        return {
+          ...problem,
+          isOutdated: true,
+          needsSourceReview: false,
+          sourceVerificationStatus: 'needs_review' as const,
+        };
       }
       unchangedIds.push(problem.id);
       return problem;
@@ -53,7 +58,11 @@ export function applyMaterialEditToProblems(
     );
     if (usesMaterial && problem.sourceMarkdownHash && problem.sourceMarkdownHash !== newHash) {
       reviewIds.push(problem.id);
-      return { ...problem, needsSourceReview: true };
+      return {
+        ...problem,
+        needsSourceReview: true,
+        sourceVerificationStatus: 'needs_review' as const,
+      };
     }
 
     unchangedIds.push(problem.id);

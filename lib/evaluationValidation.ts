@@ -1,4 +1,13 @@
-import { ErrorType, EvaluationResult, RubricCriterion } from './types';
+import {
+  AcademicErrorType,
+  ErrorType,
+  EvaluationResult,
+  RubricCriterion,
+  RubricResult,
+  StructuredErrorRecord,
+  toAcademicErrorType,
+  toLegacyErrorType,
+} from './types';
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('평가 결과 형식이 올바르지 않습니다.');
@@ -27,8 +36,19 @@ export function validateEvaluationRubric(value: unknown): RubricCriterion[] {
   return rubric;
 }
 
+export interface ValidateEvaluationOutputOptions {
+  conceptId?: string;
+  conceptTitle?: string;
+  sourceMaterialId?: string;
+  userAnswer?: string;
+}
+
 /** Missing or malformed model output is an API failure, never a student's zero. */
-export function validateEvaluationOutput(value: unknown, rubric: RubricCriterion[]): EvaluationResult {
+export function validateEvaluationOutput(
+  value: unknown,
+  rubric: RubricCriterion[],
+  options?: ValidateEvaluationOutputOptions
+): EvaluationResult {
   const parsed = object(value);
   if (!Array.isArray(parsed.rubricResults) || parsed.rubricResults.length !== rubric.length) {
     throw new Error('AI 평가에 누락되거나 불필요한 채점 항목이 있습니다. 다시 평가해 주세요.');
@@ -41,9 +61,9 @@ export function validateEvaluationOutput(value: unknown, rubric: RubricCriterion
     }
     seen.add(result.criterionId);
   }
-  const text = (value: unknown, fallback = '') => typeof value === 'string' ? value : fallback;
+  const text = (val: unknown, fallback = '') => typeof val === 'string' ? val : fallback;
   let needsReview = parsed.needsReview !== false;
-  const rubricResults = rubric.map((criterion) => {
+  const rubricResults: RubricResult[] = rubric.map((criterion) => {
     const result = results.find((r) => r.criterionId === criterion.id)!;
     if (typeof result.score !== 'number' || !Number.isFinite(result.score) ||
       result.score < 0 || result.score > criterion.maxScore) {
@@ -51,18 +71,83 @@ export function validateEvaluationOutput(value: unknown, rubric: RubricCriterion
     }
     const evidenceQuote = text(result.evidenceQuote);
     if (!evidenceQuote.trim()) needsReview = true;
-    return { criterionId: criterion.id, label: criterion.label, score: result.score,
-      maxScore: criterion.maxScore, isVulnerable: result.score < criterion.maxScore * 0.7,
+    return {
+      criterionId: criterion.id,
+      label: criterion.label,
+      score: result.score,
+      maxScore: criterion.maxScore,
+      isVulnerable: result.score < criterion.maxScore * 0.7,
       feedback: text(result.feedback, text(result.deductionReason)),
       evidenceQuote: evidenceQuote || 'AI가 평가 근거를 제공하지 않았습니다. 검토가 필요합니다.',
-      deductionReason: text(result.deductionReason), improvementTip: text(result.improvementTip) };
+      deductionReason: text(result.deductionReason, result.score === criterion.maxScore ? '감점 요인 없음 (만점 기준 충족)' : '부분 감점'),
+      improvementTip: text(result.improvementTip, '풀이 과정의 엄밀성을 보완해 주세요.'),
+    };
   });
+
   const calculatedScore = Number(rubricResults.reduce((sum, r) => sum + r.score, 0).toFixed(2));
-  const errorTypes: ErrorType[] = ['none', 'concept_confusion', 'condition_misinterpretation', 'calc_or_impl_mistake', 'method_selection_error'];
-  return { calculatedScore, rubricResults, feedback: text(parsed.feedback, '종합 피드백이 제공되지 않았습니다.'),
-    strengths: text(parsed.strengths), criticalImprovements: text(parsed.criticalImprovements),
-    recommendedErrorType: errorTypes.includes(parsed.recommendedErrorType as ErrorType)
-      ? parsed.recommendedErrorType as ErrorType : calculatedScore >= 90 ? 'none' : 'concept_confusion',
+
+  // Resolve Canonical Academic Error Type & Legacy Error Type
+  const rawError = parsed.academicErrorType || parsed.errorType || parsed.recommendedErrorType;
+  let academicErrorType: AcademicErrorType;
+  let legacyErrorType: ErrorType;
+
+  if (calculatedScore >= 90) {
+    academicErrorType = 'NO_ERROR';
+    legacyErrorType = 'none';
+  } else if (rawError) {
+    academicErrorType = toAcademicErrorType(rawError);
+    legacyErrorType = toLegacyErrorType(academicErrorType);
+  } else {
+    academicErrorType = 'CONCEPT_MISUNDERSTANDING';
+    legacyErrorType = 'concept_confusion';
+  }
+
+  // Construct or validate Structured Error Record (P03-05)
+  let structuredError: StructuredErrorRecord;
+  if (parsed.structuredError && typeof parsed.structuredError === 'object' && !Array.isArray(parsed.structuredError)) {
+    const rawStructured = parsed.structuredError as Record<string, unknown>;
+    const resolvedError = rawStructured.errorType ? toAcademicErrorType(rawStructured.errorType) : academicErrorType;
+    const severityRaw = String(rawStructured.severity || '').toLowerCase();
+    const severity = (['critical', 'moderate', 'minor', 'none'].includes(severityRaw)
+      ? severityRaw
+      : calculatedScore >= 90 ? 'none' : calculatedScore < 50 ? 'critical' : calculatedScore < 80 ? 'moderate' : 'minor') as StructuredErrorRecord['severity'];
+
+    structuredError = {
+      errorType: calculatedScore >= 90 ? 'NO_ERROR' : resolvedError,
+      legacyErrorType: toLegacyErrorType(resolvedError),
+      severity: calculatedScore >= 90 ? 'none' : severity,
+      conceptId: text(rawStructured.conceptId, options?.conceptId || ''),
+      conceptTitle: text(rawStructured.conceptTitle, options?.conceptTitle || ''),
+      evidence: text(rawStructured.evidence, text(parsed.criticalImprovements, '답안 확인 완료')),
+      feedback: text(rawStructured.feedback, text(parsed.feedback, '보완이 필요합니다.')),
+      evaluationVersion: 'p03-eval-v1',
+      evaluatedAt: new Date().toISOString(),
+    };
+  } else {
+    structuredError = {
+      errorType: academicErrorType,
+      legacyErrorType,
+      severity: calculatedScore >= 90 ? 'none' : calculatedScore < 50 ? 'critical' : calculatedScore < 80 ? 'moderate' : 'minor',
+      conceptId: options?.conceptId || '',
+      conceptTitle: options?.conceptTitle || '',
+      evidence: text(parsed.criticalImprovements, text(parsed.feedback, '답안 확인 완료')),
+      feedback: text(parsed.feedback, '학술 피드백을 확인해 주세요.'),
+      evaluationVersion: 'p03-eval-v1',
+      evaluatedAt: new Date().toISOString(),
+    };
+  }
+
+  return {
+    calculatedScore,
+    rubricResults,
+    feedback: text(parsed.feedback, '종합 피드백이 제공되지 않았습니다.'),
+    strengths: text(parsed.strengths, '핵심 전개 방향을 성실히 서술했습니다.'),
+    criticalImprovements: text(parsed.criticalImprovements, '전제조건 및 세부 식 전개의 엄밀성을 보완해 주세요.'),
+    recommendedErrorType: legacyErrorType,
+    academicErrorType,
+    structuredError,
     staticAnalysisNotice: '본 평가는 AI의 정적 분석 및 논증 검토이며, 코드를 실행하거나 동적 테스트하지 않았습니다.',
-    needsReview, isAiEvaluated: true };
+    needsReview,
+    isAiEvaluated: true,
+  };
 }

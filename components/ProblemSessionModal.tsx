@@ -10,6 +10,9 @@ import {
   EvaluationResult,
   ProblemReportType,
   METHOD_REASON_RATING_LABELS,
+  ACADEMIC_DIFFICULTY_LEVELS,
+  toAcademicDifficultyLevel,
+  ACADEMIC_ERROR_LABELS,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
 import { AcademicMathView } from './AcademicMathView';
@@ -455,6 +458,8 @@ export function ProblemSessionModal({
       staticAnalysisNotice: evaluationResult.staticAnalysisNotice,
       needsReview: evaluationResult.needsReview,
       isAiEvaluated: evaluationResult.isAiEvaluated,
+      academicErrorType: evaluationResult.academicErrorType,
+      structuredError: evaluationResult.structuredError,
       modelAnswerSnapshot: problem.modelAnswer,
       problemTitleSnapshot: problem.title,
       problemPromptSnapshot: problem.promptText,
@@ -561,6 +566,18 @@ export function ProblemSessionModal({
                 <span className="font-academic-mono text-xs font-bold text-[#c52828]">
                   {problem.categoryLabel} · 표준 소요: {problem.timeStandardMinutes}분
                 </span>
+                {(() => {
+                  const diffLevel = toAcademicDifficultyLevel(problem.difficultyLevel);
+                  const diffInfo = ACADEMIC_DIFFICULTY_LEVELS[diffLevel];
+                  return (
+                    <span
+                      className="text-[10px] font-academic-mono bg-purple-50 border border-purple-200 text-purple-800 px-1.5 py-0.5 rounded-2xs font-semibold"
+                      title={diffInfo.description}
+                    >
+                      Level {diffInfo.level} ({diffInfo.label})
+                    </span>
+                  );
+                })()}
                 {problem.isDemo ? (
                   <span className="text-[10px] font-academic-mono bg-[#f4f1ea] border border-[#ded6c8] text-[#827d73] px-1.5 py-0.5 rounded-2xs">
                     0단계 데모 문제
@@ -573,7 +590,13 @@ export function ProblemSessionModal({
                 <span className="text-[10px] font-academic-mono bg-[#ded6c8]/60 text-[#57544e] px-1.5 py-0.5 rounded-2xs font-semibold">
                   v{problem.version || 1}
                 </span>
-                {problem.needsSourceReview && (
+                {problem.sourceVerificationStatus === 'verified' && (
+                  <span className="text-[10px] font-academic-mono bg-emerald-50 border border-emerald-300 text-emerald-800 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">
+                    <ShieldCheck className="w-2.5 h-2.5 text-emerald-600" />
+                    출처 검증 완료
+                  </span>
+                )}
+                {(problem.needsSourceReview || problem.sourceVerificationStatus === 'needs_review') && (
                   <span className="text-[10px] font-academic-mono bg-amber-50 border border-amber-300 text-amber-800 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">
                     <AlertTriangle className="w-2.5 h-2.5 text-amber-600" />
                     출처 검토 필요
@@ -628,6 +651,18 @@ export function ProblemSessionModal({
                   <strong className="font-bold">출처 검토 필요 안내: </strong>
                   <span>이 문제의 근거 자료 본문이 수정되어 출처 검토가 필요한 상태입니다. 풀이 전 최신 본문 내용을 확인해 주세요.</span>
                 </div>
+              </div>
+            )}
+
+            {problem.sourceExcerpt && (
+              <div className="p-2.5 bg-[#f4f1ea] border border-[#ded6c8] rounded-xs text-[11.5px] text-[#57544e] space-y-1">
+                <div className="flex items-center gap-1.5 font-bold text-[#191817]">
+                  <BookOpen className="w-3.5 h-3.5 text-[#827d73]" />
+                  <span>강의자료 출처 근거 {problem.sourcePage ? `(p.${problem.sourcePage})` : ''}:</span>
+                </div>
+                <p className="italic text-[#33302a] text-[11px] leading-relaxed line-clamp-3">
+                  &ldquo;{problem.sourceExcerpt}&rdquo;
+                </p>
               </div>
             )}
 
@@ -1262,6 +1297,38 @@ export function ProblemSessionModal({
                 </strong>
                 <AcademicMathView content={evaluationResult.feedback} />
               </div>
+
+              {/* Plan 03: Academic Error Classification & Weakness Diagnosis */}
+              {evaluationResult.structuredError && evaluationResult.structuredError.errorType !== 'NO_ERROR' && (
+                <div className="p-3.5 bg-rose-50/70 border border-rose-200 rounded-xs text-xs space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-1.5 border-b border-rose-200/70 pb-2">
+                    <div className="flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4 text-rose-600" />
+                      <strong className="font-bold text-rose-950 font-academic-serif text-sm">
+                        학술 오답 원인 정밀 진단: {ACADEMIC_ERROR_LABELS[evaluationResult.structuredError.errorType]?.label || evaluationResult.structuredError.errorType}
+                      </strong>
+                    </div>
+                    <span className="text-[10px] font-academic-mono bg-rose-100 text-rose-900 border border-rose-300 px-1.5 py-0.5 rounded-2xs font-semibold">
+                      심각도: {
+                        evaluationResult.structuredError.severity === 'critical' ? '치명적 (핵심 개념 누락)' :
+                        evaluationResult.structuredError.severity === 'moderate' ? '보통 (부분적 적용 오류)' : '경미 (사소한 실수)'
+                      }
+                    </span>
+                  </div>
+                  {evaluationResult.structuredError.evidence && (
+                    <div className="text-[11.5px] text-rose-900 leading-relaxed">
+                      <strong className="font-academic-mono font-bold text-rose-950">답안 내 오류 근거: </strong>
+                      <span className="italic">&ldquo;{evaluationResult.structuredError.evidence}&rdquo;</span>
+                    </div>
+                  )}
+                  {evaluationResult.structuredError.feedback && (
+                    <div className="text-[11.5px] text-[#33302a] leading-relaxed">
+                      <strong className="font-academic-mono font-bold text-[#191817]">개념 보완 가이드: </strong>
+                      <span>{evaluationResult.structuredError.feedback}</span>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Stage 8: Method Selection Reason Diagnosis Zone (Independent from rubric score) */}
               <div className="border border-indigo-200 bg-indigo-50/40 p-4 rounded-xs space-y-3">

@@ -23,6 +23,10 @@ import {
   PROBLEM_DIFFICULTY_LABELS,
   Concept,
   RubricCriterion,
+  AcademicDifficultyLevel,
+  ACADEMIC_DIFFICULTY_LEVELS,
+  toAcademicDifficultyLevel,
+  SourceVerificationStatus,
 } from '../../../lib/types';
 import { computeMarkdownHash } from '../../../lib/markdownUtils';
 
@@ -52,6 +56,10 @@ const MATH_PROBLEM_TYPES: ProblemType[] = [
   'calc_derivation',
   'proof_counterexample',
   'error_spotting',
+  'concept_explanation',
+  'multiple_choice',
+  'short_answer',
+  'composite_application',
 ];
 
 const CS_PROBLEM_TYPES: ProblemType[] = [
@@ -59,6 +67,10 @@ const CS_PROBLEM_TYPES: ProblemType[] = [
   'algorithm_optimization',
   'complexity_proof',
   'debug_counterexample',
+  'concept_explanation',
+  'multiple_choice',
+  'short_answer',
+  'composite_application',
 ];
 
 const PROBLEM_TYPE_LABELS: Record<ProblemType, { label: string; num: number; desc: string }> = {
@@ -102,6 +114,26 @@ const PROBLEM_TYPE_LABELS: Record<ProblemType, { label: string; num: number; des
     num: 4,
     desc: '경계 조건(Corner Case), 무한 루프, 메모리 누수 또는 실패 테스트케이스 제시',
   },
+  concept_explanation: {
+    label: '5. 개념 설명형',
+    num: 5,
+    desc: '핵심 개념의 정의, 직관적 원리, 적용 범위 및 의의 상세 서술',
+  },
+  multiple_choice: {
+    label: '6. 객관식',
+    num: 6,
+    desc: '개념 적용 및 명제 참/거짓 판별형 객관식 문항',
+  },
+  short_answer: {
+    label: '7. 단답형',
+    num: 7,
+    desc: '정확한 수치, 공식, 또는 핵심 키워드를 요구하는 단답형 문항',
+  },
+  composite_application: {
+    label: '8. 복합 개념 응용형',
+    num: 8,
+    desc: '복수의 개념을 유기적으로 결합하여 새로운 상황에 응용하는 고차원 복합 문제',
+  },
 };
 
 export async function POST(req: NextRequest) {
@@ -130,10 +162,11 @@ export async function POST(req: NextRequest) {
     const subjectDomain: 'math_stats' | 'computer_science' =
       payload.subjectDomain === 'computer_science' ? 'computer_science' : 'math_stats';
     const problemType = asString(payload.problemType) as ProblemType;
+    const difficultyLevel: AcademicDifficultyLevel = toAcademicDifficultyLevel(payload.difficultyLevel ?? payload.difficulty);
     const difficulty = (
       ['advanced_college', 'intermediate', 'graduate_challenging'].includes(asString(payload.difficulty))
         ? asString(payload.difficulty)
-        : 'advanced_college'
+        : ACADEMIC_DIFFICULTY_LEVELS[difficultyLevel].legacyDifficulty
     ) as ProblemDifficulty;
     const problemCount = typeof payload.problemCount === 'number' ? payload.problemCount : 1;
     const concepts: Concept[] = (Array.isArray(payload.concepts) ? payload.concepts : []).filter(
@@ -215,7 +248,8 @@ export async function POST(req: NextRequest) {
     }
 
     const typeMeta = PROBLEM_TYPE_LABELS[problemType];
-    const difficultyLabel = PROBLEM_DIFFICULTY_LABELS[difficulty] || difficulty;
+    const levelMeta = ACADEMIC_DIFFICULTY_LEVELS[difficultyLevel];
+    const difficultyLabel = `${levelMeta.label} — ${levelMeta.description} (하위 호환: ${PROBLEM_DIFFICULTY_LABELS[difficulty]})`;
     const count = Math.min(Math.max(problemCount, 1), 3);
 
     // Distinct material sources with their individual body hashes.
@@ -522,13 +556,14 @@ ${combinedSource}
         );
         const hasConceptLink = conceptIds.length > 0;
 
-        const quote = asString(raw.sourceEvidenceQuote).trim();
+        const quote = (asString(raw.sourceExcerpt) || asString(raw.sourceEvidenceQuote)).trim();
         // A quote only counts as verified when it actually appears in the supplied sources.
         const isSourceVerified = quote ? verifyQuoteInSources(quote) : false;
 
-        const isVerified = hasRequiredFields && isScore100 && hasConceptLink && isSourceVerified;
-
+        // Plan 03: Difficulty and Structural consistency check (P03-03)
+        const rawDifficultyLevel = toAcademicDifficultyLevel(raw.difficultyLevel ?? difficultyLevel);
         const verificationNotes: string[] = [];
+
         if (!hasRequiredFields) verificationNotes.push('필수 항목(제목/지문/모범답안/힌트/루브릭) 누락');
         if (finalRubric.length === 0) verificationNotes.push('채점 루브릭 항목 누락 (배점 없음)');
         else if (!isScore100) verificationNotes.push(`루브릭 배점 합계 ${scoreSum}점 (100점 아님)`);
@@ -536,7 +571,33 @@ ${combinedSource}
         if (!quote) verificationNotes.push('원문 인용 근거 없음');
         else if (!isSourceVerified) verificationNotes.push('원문 인용 근거가 제공된 자료에서 확인되지 않음');
 
+        let isDifficultyStructureConsistent = true;
+        if (rawDifficultyLevel >= 4) {
+          if (finalRubric.length < 3 || (typeof raw.timeStandardMinutes === 'number' && raw.timeStandardMinutes < 15)) {
+            isDifficultyStructureConsistent = false;
+            verificationNotes.push(`고난도/복합 난이도(${rawDifficultyLevel}단계) 대비 배점 기준 또는 풀이 시간이 부족함`);
+          }
+        } else if (rawDifficultyLevel === 1) {
+          if (finalRubric.length >= 4 && typeof raw.timeStandardMinutes === 'number' && raw.timeStandardMinutes > 25) {
+            isDifficultyStructureConsistent = false;
+            verificationNotes.push(`기초 난이도(1단계) 대비 배점 기준 또는 풀이 시간이 과도함`);
+          }
+        }
+
+        // Duplicate or near-identical problem detection
+        const isDuplicate = generatedDrafts.some(
+          (d) => d.promptText.trim() === promptText || (promptText.length > 50 && d.promptText.includes(promptText.slice(0, 50)))
+        );
+        if (isDuplicate) {
+          verificationNotes.push('동일 생성 배치 내 중복 또는 유사 문제 감지');
+        }
+
+        const isVerified = hasRequiredFields && isScore100 && hasConceptLink && isSourceVerified && isDifficultyStructureConsistent && !isDuplicate;
+
         const conceptTitles = asStringArray(raw.conceptTitles);
+        const sourceMaterialId = asString(raw.sourceMaterialId) || sources[0]?.materialId || undefined;
+        const sourcePage = asString(raw.sourcePage) || sources[0]?.sourceRefs || undefined;
+        const sourceVerificationStatus: SourceVerificationStatus = isSourceVerified ? 'verified' : (quote ? 'needs_review' : 'unverified');
 
         const draft: ProblemDraft = {
           id: `draft-prob-${Date.now()}-${i}-${Math.random().toString(36).substring(7)}`,
@@ -546,6 +607,7 @@ ${combinedSource}
           title: title || `${concepts[0]?.title || '과목'} [${typeMeta.label}]`,
           type: problemType,
           difficulty,
+          difficultyLevel: rawDifficultyLevel,
           categoryLabel: typeMeta.label,
           categoryNumber: typeMeta.num,
           promptText,
@@ -561,6 +623,12 @@ ${combinedSource}
           sourceEvidenceQuote: quote || undefined,
           sourceMarkdownHash: markdownHash,
           sourceMaterials,
+          sourceMaterialId,
+          sourceConceptIds: conceptIds.length > 0 ? conceptIds : concepts.map((c) => c.id),
+          sourcePage,
+          sourceExcerpt: quote || undefined,
+          sourceContentVersion: sourceMaterials[0]?.markdownHash || markdownHash,
+          sourceVerificationStatus,
           timeStandardMinutes:
             typeof raw.timeStandardMinutes === 'number' ? raw.timeStandardMinutes : 20,
           timeBreakdownDesc:

@@ -11,7 +11,7 @@ const load = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
-  'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts', 'lib/materialRestore.ts',
+  'lib/types.ts', 'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts', 'lib/materialRestore.ts',
   'lib/materialDraft.ts', 'lib/materialEditSave.ts', 'lib/materialIngestion.ts', 'lib/analysisCheckpoint.ts', 'lib/reviewNotifications.ts', 'lib/dashboardUrl.ts',
   'lib/practiceAnswerDraft.ts', 'lib/sessionAffiliation.ts', 'lib/analysisRecovery.ts', 'lib/recoveryToken.ts',
   'lib/todayStudy.ts', 'lib/reviewStats.ts',
@@ -14226,6 +14226,317 @@ exports.requireApiUser = async () => {
       assert.equal(res2.data.allowed, false, '잔액 0에서 추가 체험 예약 차단');
       assert.ok(res2.data.error_code === 'INSUFFICIENT_CREDITS' || res2.data.code === 'TRIAL_CREDITS_EXHAUSTED', '잔액 부족 에러 코드 반환');
     });
+  });
+
+  check('P03-01: 대학 전공 시험 학술 오답 분류 체계 (9대 범주, NO_ERROR, 레거시 양방향 변환 및 레이블)', () => {
+    const expectedTypes = [
+      'NO_ERROR',
+      'CONCEPT_MISUNDERSTANDING',
+      'FORMULA_MISAPPLICATION',
+      'CALCULATION_ERROR',
+      'LOGICAL_ERROR',
+      'CONDITION_OMISSION',
+      'TERMINOLOGY_ERROR',
+      'INCOMPLETE_REASONING',
+      'ANSWER_FORMAT_ERROR',
+      'UNCERTAIN',
+    ];
+
+    for (const t of expectedTypes) {
+      assert.ok(types.ACADEMIC_ERROR_LABELS[t], `레이블 정의 존재: ${t}`);
+      assert.ok(types.ACADEMIC_ERROR_LABELS[t].label.length > 0, `한글 라벨 존재: ${t}`);
+      assert.ok(types.ACADEMIC_ERROR_LABELS[t].description.length > 0, `설명 존재: ${t}`);
+    }
+
+    assert.equal(types.toAcademicErrorType('concept'), 'CONCEPT_MISUNDERSTANDING');
+    assert.equal(types.toAcademicErrorType('calculation'), 'CALCULATION_ERROR');
+    assert.equal(types.toAcademicErrorType('logic'), 'LOGICAL_ERROR');
+    assert.equal(types.toAcademicErrorType('none'), 'NO_ERROR');
+    assert.equal(types.toAcademicErrorType('unknown_foo'), 'UNCERTAIN');
+
+    assert.equal(types.toLegacyErrorType('CONCEPT_MISUNDERSTANDING'), 'concept_confusion');
+    assert.equal(types.toLegacyErrorType('FORMULA_MISAPPLICATION'), 'method_selection_error');
+    assert.equal(types.toLegacyErrorType('CALCULATION_ERROR'), 'calc_or_impl_mistake');
+    assert.equal(types.toLegacyErrorType('LOGICAL_ERROR'), 'concept_confusion');
+    assert.equal(types.toLegacyErrorType('CONDITION_OMISSION'), 'condition_misinterpretation');
+    assert.equal(types.toLegacyErrorType('NO_ERROR'), 'none');
+    assert.equal(types.toLegacyErrorType('UNCERTAIN'), 'concept_confusion');
+  });
+
+  check('P03-02: StructuredErrorRecord 구성, 점수 임계값(>=90점 NO_ERROR 강제) 및 검증 무결성', () => {
+    const rawTemplate = {
+      rubricResults: [
+        { criterionId: 'c1', label: '개념 이해', maxScore: 50, score: 48, isVulnerable: false },
+        { criterionId: 'c2', label: '유도 과정', maxScore: 50, score: 47, isVulnerable: false },
+      ],
+      strengths: '개념과 전개가 완벽함',
+      criticalImprovements: '특이사항 없음',
+      feedback: '훌륭한 풀이입니다.',
+    };
+
+    const highScoreResult = validation.validateEvaluationOutput(
+      { ...rawTemplate, academicErrorType: 'CALCULATION_ERROR' },
+      [
+        { id: 'c1', label: '개념 이해', maxScore: 50 },
+        { id: 'c2', label: '유도 과정', maxScore: 50 },
+      ],
+      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: '풀이...' }
+    );
+    assert.equal(highScoreResult.calculatedScore, 95);
+    assert.equal(highScoreResult.academicErrorType, 'NO_ERROR');
+    assert.equal(highScoreResult.structuredError.errorType, 'NO_ERROR');
+    assert.equal(highScoreResult.structuredError.severity, 'none');
+
+    const lowScoreResult = validation.validateEvaluationOutput(
+      {
+        rubricResults: [
+          { criterionId: 'c1', label: '개념 이해', maxScore: 50, score: 20, isVulnerable: true },
+          { criterionId: 'c2', label: '유도 과정', maxScore: 50, score: 25, isVulnerable: true },
+        ],
+        strengths: '기본 공식 접근 시도',
+        criticalImprovements: '제약조건 미반영',
+        feedback: '라그랑주 함수 구성 시 부호 오류 발생',
+        academicErrorType: 'FORMULA_MISAPPLICATION',
+        structuredError: {
+          errorType: 'FORMULA_MISAPPLICATION',
+          severity: 'critical',
+          evidence: 'L = f(x, y) + lambda(g - c)에서 부호 혼동',
+          feedback: '목적함수와 제약식의 결합 공식을 재검토하세요.',
+        },
+      },
+      [
+        { id: 'c1', label: '개념 이해', maxScore: 50 },
+        { id: 'c2', label: '유도 과정', maxScore: 50 },
+      ],
+      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: 'L = f + lambda * g' }
+    );
+    assert.equal(lowScoreResult.calculatedScore, 45);
+    assert.equal(lowScoreResult.academicErrorType, 'FORMULA_MISAPPLICATION');
+    assert.equal(lowScoreResult.recommendedErrorType, 'method_selection_error');
+    assert.equal(lowScoreResult.structuredError.errorType, 'FORMULA_MISAPPLICATION');
+    assert.equal(lowScoreResult.structuredError.severity, 'critical');
+    assert.equal(lowScoreResult.structuredError.conceptId, 'con-1');
+    assert.equal(lowScoreResult.structuredError.evaluationVersion, 'p03-eval-v1');
+    assert.ok(lowScoreResult.structuredError.evaluatedAt);
+  });
+
+  check('P03-03: 5단계 학술 난이도 분류(Level 1~5) 및 문제 구조적 난이도 검증 규칙', () => {
+    assert.equal(types.toAcademicDifficultyLevel(1), 1);
+    assert.equal(types.toAcademicDifficultyLevel(5), 5);
+    assert.equal(types.toAcademicDifficultyLevel(6), 5, '상한값 5로 보정');
+    assert.equal(types.toAcademicDifficultyLevel(0), 1, '하한값 1로 보정');
+    assert.equal(types.toAcademicDifficultyLevel('easy'), 1);
+    assert.equal(types.toAcademicDifficultyLevel('medium'), 3);
+    assert.equal(types.toAcademicDifficultyLevel('hard'), 5);
+
+    for (let l = 1; l <= 5; l++) {
+      assert.ok(types.ACADEMIC_DIFFICULTY_LEVELS[l], `난이도 정의: ${l}`);
+      assert.equal(types.ACADEMIC_DIFFICULTY_LEVELS[l].level, l);
+      assert.ok(types.ACADEMIC_DIFFICULTY_LEVELS[l].label.length > 0);
+      assert.ok(types.ACADEMIC_DIFFICULTY_LEVELS[l].description.length > 0);
+    }
+
+    const highLevelValid = {
+      difficultyLevel: 4,
+      timeStandardMinutes: 20,
+      rubric: [{ id: 'r1' }, { id: 'r2' }, { id: 'r3' }],
+    };
+    const isLevel4Valid = highLevelValid.rubric.length >= 3 && highLevelValid.timeStandardMinutes >= 15;
+    assert.ok(isLevel4Valid, '고난도 문제는 최소 3개 루브릭 기준 및 15분 이상 소요 요구');
+
+    const level1Heavy = {
+      difficultyLevel: 1,
+      timeStandardMinutes: 30,
+      rubric: [{ id: 'r1' }, { id: 'r2' }, { id: 'r3' }, { id: 'r4' }],
+    };
+    const isLevel1Discrepant = level1Heavy.rubric.length >= 4 && level1Heavy.timeStandardMinutes > 25;
+    assert.ok(isLevel1Discrepant, '기초 난이도에 과도한 루브릭/시간 설정 시 불일치 감지');
+  });
+
+  check('P03-04: 서술형·계산형 루브릭 평가 (수학적 동등성, 전개 과정 부분점수 70~90%, 단답형 감점 규정)', () => {
+    const maxDerivation = 40;
+    const minPartial = Math.round(maxDerivation * 0.7);
+    const maxPartial = Math.round(maxDerivation * 0.9);
+    assert.ok(minPartial >= 28 && maxPartial <= 36, '계산 실수 부분점수 범위 보장');
+
+    const answerOnlyRubric = [
+      { criterionId: 'concept', maxScore: 30, score: 30 },
+      { criterionId: 'derivation', maxScore: 50, score: 5, deductionReason: '전개 과정 누락' },
+      { criterionId: 'conclusion', maxScore: 20, score: 20 },
+    ];
+    const totalScore = answerOnlyRubric.reduce((s, r) => s + r.score, 0);
+    assert.equal(totalScore, 55, '유도 과정 누락 시 정답만 맞아도 부분점수만 부여됨');
+  });
+
+  check('P03-05: 강의자료·개념·문제 출처 추적 (sourceProvenance, 해시 불일치 시 needs_review 전이 및 문제 보존)', () => {
+    const editedMaterial = { id: 'mat-p03', subjectId: 'sub-math', parsedMarkdown: '# 개정된 선형대수\n차원정리 최신 내용' };
+    const oldHash = 'mh_old_v1';
+
+    const existingProblems = [
+      {
+        id: 'prob-p03-1',
+        conceptIds: ['con-dim'],
+        subjectId: 'sub-math',
+        title: '차원정리 증명 문제',
+        type: 'proof',
+        difficultyLevel: 5,
+        sourceMaterials: [{ materialId: 'mat-p03', markdownHash: oldHash }],
+        sourceVerificationStatus: 'verified',
+        needsSourceReview: false,
+        version: 1,
+      },
+      {
+        id: 'prob-p03-2',
+        conceptIds: ['con-unrelated'],
+        subjectId: 'sub-math',
+        title: '미적분학 기본정리',
+        type: 'derivation',
+        difficultyLevel: 2,
+        sourceMaterials: [{ materialId: 'mat-other', markdownHash: 'other-hash' }],
+        sourceVerificationStatus: 'verified',
+        needsSourceReview: false,
+        version: 1,
+      },
+    ];
+
+    const concepts = [
+      { id: 'con-dim', subjectId: 'sub-math', title: '차원정리', materialIds: ['mat-p03'] },
+    ];
+
+    const result = problemFreshness.applyMaterialEditToProblems(
+      existingProblems,
+      editedMaterial,
+      concepts
+    );
+
+    assert.equal(result.updatedProblems.length, 2, '기존 문제 삭제 없이 전체 보존');
+    assert.equal(result.outdatedIds.length, 1);
+    assert.equal(result.outdatedIds[0], 'prob-p03-1');
+
+    const updatedProb1 = result.updatedProblems.find((p) => p.id === 'prob-p03-1');
+    assert.equal(updatedProb1.isOutdated, true, '구버전 플래그 설정');
+    assert.equal(updatedProb1.sourceVerificationStatus, 'needs_review', '출처 검토 필요 상태로 전이');
+    assert.equal(updatedProb1.version, 1, '사용자 승인된 기존 문제 버전 유지');
+
+    const updatedProb2 = result.updatedProblems.find((p) => p.id === 'prob-p03-2');
+    assert.equal(updatedProb2.isOutdated, undefined);
+    assert.equal(updatedProb2.sourceVerificationStatus, 'verified');
+  });
+
+  check('P03-06: 대학 전공 시험 특화 신규 문제 유형 및 중복 문항 탐지 방지', () => {
+    const prompt1 = '정규분포 N(mu, sigma^2)에서 표본평균의 분포를 유도하고 중심극한정리를 서술하시오.';
+    const prompt2 = '정규분포 N(mu, sigma^2)에서 표본평균의 분포를 유도하고 중심극한정리를 서술하시오.';
+    const prompt3 = '회귀모형의 다중공선성을 검정하기 위한 VIF 계산 공식을 유도하시오.';
+
+    const norm = (s) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+    const isDuplicate = norm(prompt1) === norm(prompt2);
+    const isDistinct = norm(prompt1) !== norm(prompt3);
+    assert.ok(isDuplicate, '동일 문항 탐지');
+    assert.ok(isDistinct, '서로 다른 문항 분리');
+  });
+
+  check('P03-07: 전이 문제(Transfer Problem) 생성 검증 및 학술 난이도·출처 연결 무결성', () => {
+    const rawTransfer = {
+      title: '통계학 개념의 금융 리스크 전이 문제',
+      promptText: '정규분포 가정을 주식 수익률 VaR 추정에 적용할 때의 한계를 설명하시오.',
+      type: 'essay_descriptive',
+      difficulty: 'advanced_college',
+      conceptIds: ['con-stats-1'],
+      transferKind: 'precondition_change',
+      originalCondition: '정규분포 가정 성립',
+      newCondition: '팻 테일 및 왜도 극단값 발생',
+      transferChanges: '정규분포 가정을 팻 테일 분포 상황으로 확장',
+      understandingFocus: '극단값 위험 인식 및 추론',
+      timeStandardMinutes: 20,
+      modelAnswer: '팻 테일로 인해 99% VaR가 실제 최대 손실을 심각하게 과소평가하게 됩니다.',
+      rubric: [
+        { id: 'r1', label: 'Fat-tail 개념 적용', maxScore: 50, weight: 0.5, description: '개념 적용' },
+        { id: 'r2', label: 'VaR 한계 비판적 추론', maxScore: 50, weight: 0.5, description: '한계 추론' },
+      ],
+      hints: ['정규분포와 실제 시장의 첨도 차이를 비교하세요.'],
+      designIntent: '전공 시험 수준의 금융 통학 전이 평가',
+      sourceRefs: '통계학 원론 7장',
+      difficultyLevel: 4,
+      sourceVerificationStatus: 'verified',
+    };
+
+    const ctx = {
+      allowedConceptIds: ['con-stats-1'],
+      requiredType: 'essay_descriptive',
+      requiredDifficulty: 'advanced_college',
+      originalPrompt: '정규분포의 성질을 서술하시오.',
+      originalAnswer: '평균과 분산으로 정의되는 대칭형 종모양 분포이다.',
+    };
+
+    const validated = transferValidation.validateTransferProblemOutput(rawTransfer, ctx);
+    assert.equal(validated.title, rawTransfer.title);
+    assert.equal(validated.difficultyLevel, 4, '전이 문제 난이도 보존');
+    assert.equal(validated.sourceVerificationStatus, 'verified', '출처 검증 상태 보존');
+  });
+
+  check('P03-08: Supabase 저장 및 ReviewEvent 학술 오류·취약점 영속화 하위 호환성', () => {
+    const concept = {
+      id: 'con-p03-sub',
+      subjectId: 'sub-stats',
+      title: '베이즈 정리',
+      status: 'unstudied',
+      intervalDays: 1,
+      easeFactor: 2.5,
+      events: [],
+    };
+    storage.saveStoredConcepts([concept]);
+    storage.saveStoredAttempts([]);
+
+    const attempt = {
+      id: 'att-p03-save',
+      problemId: 'prob-p03-bayes',
+      conceptId: concept.id,
+      conceptIds: [concept.id],
+      subjectId: 'sub-stats',
+      at: nowIso(),
+      answer: 'P(A|B) = P(B|A)P(A)/P(B)',
+      confidence: 4,
+      errorType: 'concept_confusion',
+      hintCount: 0,
+      reasoningNotes: '사후확률 공식 유도',
+      calculatedScore: 75,
+      rubricResults: [{ criterionId: 'c1', label: '전체확률의 법칙 분모 전개', maxScore: 100, score: 75 }],
+      evaluatorFeedback: '분모 P(B)를 전체확률의 법칙으로 전개하는 과정이 축약됨',
+      strengths: '기본 공식 숙지',
+      criticalImprovements: '분모 분할 전개 보완',
+      academicErrorType: 'INCOMPLETE_REASONING',
+      structuredError: {
+        errorType: 'INCOMPLETE_REASONING',
+        severity: 'minor',
+        conceptId: concept.id,
+        conceptTitle: concept.title,
+        evidence: '분모 P(B) 단순 대입',
+        feedback: 'P(B) = sum P(B|Ai)P(Ai)로 명시하여 풀이하세요.',
+        evaluationVersion: 'p03-v1',
+        evaluatedAt: nowIso(),
+      },
+    };
+
+    const saveResult = storage.recordAttemptAndUpdateConcept(attempt);
+    assert.equal(saveResult.status, 'complete');
+
+    const updatedConcepts = storage.loadStoredConcepts();
+    const updatedConcept = updatedConcepts.find((c) => c.id === concept.id);
+    assert.ok(updatedConcept);
+    const event = updatedConcept.events.find((e) => e.attemptId === attempt.id);
+
+    assert.ok(event, 'ReviewEvent 생성 완료');
+    assert.equal(event.academicErrorType, 'INCOMPLETE_REASONING', 'ReviewEvent에 학술 오답 유형 보존');
+    assert.ok(event.structuredError, 'ReviewEvent에 structuredError 보존');
+    assert.equal(event.structuredError.errorType, 'INCOMPLETE_REASONING');
+    assert.equal(event.structuredError.severity, 'minor');
+    assert.equal(event.errorType, 'concept_confusion', '레거시 errorType과 완전 하위 호환');
+
+    const jsonStr = JSON.stringify(event);
+    const restored = JSON.parse(jsonStr);
+    assert.equal(restored.academicErrorType, 'INCOMPLETE_REASONING');
+    assert.equal(restored.structuredError.errorType, 'INCOMPLETE_REASONING');
+    assert.equal(restored.structuredError.severity, 'minor');
   });
 
   console.log(`${passed} regression checks passed`);

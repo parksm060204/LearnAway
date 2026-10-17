@@ -553,44 +553,55 @@ export async function POST(req: NextRequest) {
 
 ### [필수 평가 원칙]
 1. **수학적 동치성 및 대안적 해법 인정 (가장 중요)**:
-   - 학생의 답안이 모범 답안과 표현, 기호 표기법, 또는 전개 방식이 다르더라도, 수학적/논리적으로 동치이거나 타당한 대안 풀이(예: 대우명제 증명, 톤넬리 정리 연계, 다른 보조정리 활용 등)라면 만점으로 인정하십시오.
+   - 학생의 답안이 모범 답안과 표현, 기호 표기법, 또는 전개 방식이 다르더라도, 수학적/논리적으로 동치이거나 타당한 대안 풀이(예: 대우명제 증명, 톤넬리 정리 연계, 다른 보조정리 활용, $1/2$ vs $0.5$ 등)라면 만점으로 인정하십시오.
    - 단순히 모범 답안의 문장 구조나 특정 단어가 일치하지 않는다는 이유로 감점하는 것은 절대 금지됩니다.
 
 2. **개념 오류 vs 단순 계산 실수의 엄격한 구별과 부분 점수**:
-   - 논리적 뼈대와 증명 전개가 타당하나 단순 부호 착오나 사칙연산 실수가 발생한 경우, 개념 혼동과 엄격히 구별하여 80~90% 이상의 부분 점수를 부여하십시오.
+   - 논리적 뼈대와 증명 전개가 타당하나 단순 부호 착오나 사칙연산 실수가 발생한 경우, 개념 혼동과 엄격히 구별하여 해당 계산 유도 기준에서 70~90% 이상의 부분 점수를 부여하십시오. 절대 전체 0점 처리하지 마십시오.
    - 반면 정리의 필수 전제조건(예: 절대수렴성, 가측성, 미분가능성, 루프 불변식, RBT 블랙 높이)을 누락한 경우는 핵심 논증 결함으로 간주하여 해당 기준 배점에서 적절히 감점하십시오.
 
-3. **코딩 답안 정적 검토 한계 고지**:
+3. **정답만 제시한 경우(Answer-Only) 감점 규칙**:
+   - 학생이 풀이 과정, 유도 식, 또는 논리적 근거 없이 최종 수치나 결론만 단답식으로 작성한 경우, 풀이 과정/접근법/논리 전개에 해당하는 루브릭 배점은 대폭 감점하고 최종 결론 배점만 인정하십시오.
+
+4. **코딩 답안 정적 검토 한계 고지**:
    - 코딩 문제의 경우, 서버에서 코드를 직접 컴파일하거나 실행하지 않고 알고리즘의 정확성, 시간/공간 복잡도 증명, 경계 조건(Corner Cases), 루프 불변식의 정합성만을 정적으로 검토합니다.
 
-4. **근거 제시의 사실성(Grounding)과 날조 금지**:
+5. **근거 제시의 사실성(Grounding)과 날조 금지**:
    - 학생 답안이나 이유 설명에 실제로 없는 내용을 임의로 지어내거나 날조하여 칭찬하지 마십시오.
    - 각 기준별로 학생 답안에서 직접 확인한 근거 문장을 "evidenceQuote" / "evidence"에 명시하십시오. 만약 답안에 해당 내용이 전혀 없다면 "답안에 해당 서술 없음"으로 표기하십시오.
 
-5. **정오 확정 불가 시 '검토 필요(needsReview)' 플래그**:
+6. **정오 확정 불가 시 '검토 필요(needsReview)' 플래그**:
    - 학생의 증명이나 코드가 극히 모호하거나 독창적이어서 AI가 기계적으로 정오를 확정하기 어렵다면, 추측으로 감점하지 말고 needsReview를 true로 설정하고 검토 사유를 피드백에 적으십시오.
 
-6. **배점 및 점수 규칙 (0~100점)**:
+7. **배점 및 점수 규칙 (0~100점)**:
    - 각 루브릭 기준의 score는 0 이상 해당 maxScore 이하의 수치여야 합니다.
    - 총점(calculatedScore)은 각 루브릭 기준 score의 단순 합계(0~100점)입니다.
 
-7. **[8단계 핵심] 방법 선택 이유(Method Selection Reason) 독립 진단 원칙**:
+8. **[P03-05 핵심] 9대 학술 오류 원인 분류 (Academic Error Taxonomy)**:
+   - 답안에서 감점이 발생한 경우 가장 본질적인 원인을 다음 9개 중 1개로 정확히 분류하십시오:
+     - "NO_ERROR": 정답 완제 (점수 90점 이상)
+     - "CONCEPT_MISUNDERSTANDING": 개념 이해 부족 (핵심 개념·정의 오해)
+     - "FORMULA_MISAPPLICATION": 공식의 잘못된 적용 (부적합한 공식/정리 적용 또는 전제조건 위반)
+     - "CALCULATION_ERROR": 계산 실수 (접근법은 옳으나 중간 산술/대수/부호 실수)
+     - "LOGICAL_ERROR": 논리 전개 오류 (단계 간 인과 결여, 순환논증, 논리 비약)
+     - "CONDITION_OMISSION": 조건 누락 (주어진 제약조건, 정의역, 경계조건 간과)
+     - "TERMINOLOGY_ERROR": 용어 사용 오류 (학술 용어 또는 기호의 부적절한 사용)
+     - "INCOMPLETE_REASONING": 풀이 과정 부족 (정답만 작성, 핵심 증명/유도 생략)
+     - "ANSWER_FORMAT_ERROR": 답안 형식 오류 (단위 누락, 제출 양식 미준수)
+     - "UNCERTAIN": 원인 확정 불가 (답안이 극히 짧거나 모호하여 단정할 수 없음)
+   - 원인을 확정할 수 없는 경우 임의로 "개념 이해 부족"으로 단정하지 말고 "UNCERTAIN"으로 분류하십시오.
+
+9. **[8단계 핵심] 방법 선택 이유(Method Selection Reason) 독립 진단 원칙**:
    - 학생이 작성한 [풀이 및 결론]과 [방법 선택 이유]를 분리하여 진단합니다.
    - **점수 독립성 (불변 규칙)**:
      - 기존 루브릭 점수(calculatedScore, 0-100점)는 '풀이 및 결론'의 루브릭 달성도로만 산출합니다.
      - '방법 선택 이유' 진단 결과는 calculatedScore에 가감되거나 점수를 변조하지 않습니다 (중복 감점 및 점수 왜곡 금지).
-   - **독립적 판정 원칙**:
-     - 최종 정답이 맞았더라도 방법 선택 이유가 얕거나 직관에만 의존했다면 이유는 '보완 필요'일 수 있습니다.
-     - 반대로 최종 수식 계산 실수가 있어 답안 점수가 낮더라도, 정리/알고리즘 선택 이유와 전제조건 인식이 훌륭하다면 이유는 '충분'일 수 있습니다. 두 평가는 상호 구속되지 않고 독립적으로 설명해야 합니다.
    - **4대 진단 항목**:
-     1) appropriate_method (적절한 방법 선택): 문제 해결을 위해 선택한 정리/공식/알고리즘/자료구조의 적절성
-     2) precondition_understanding (전제조건 이해): 정리가 성립하기 위한 전제조건(가측성, 미분가능성, 음수 사이클 부재 등)의 이해와 서술
-     3) constraint_alignment (문제의 제약과의 연결): 문제의 입력 크기, 제약조건, 시간/공간 복잡도 요구사항과의 부합성
-     4) alternatives_limitations (대안·한계 인식): 다른 방법(단순 완전탐색, 타 정리 등)보다 이 접근이 적합한 이유 또는 이 방법의 한계 인식
-   - 각 항목의 rating은 반드시 'proficient' (충분) | 'partially_met' (부분 충족) | 'needs_improvement' (보완 필요) | 'not_applicable' (평가 불가) 중 하나여야 합니다.
-   - 학생이 '해당 없음'을 선택한 경우: 문제 유형을 보고 실제로 방법 선택의 여지가 없는 문항인지 AI가 판단하여 isApplicable을 설정하고, applicabilityAssessment에 그 이유를 밝히십시오.
-   - 모호하거나 평가하기 어려운 이유는 억지로 점수를 매기지 말고 'not_applicable' 또는 needsReview를 설정하십시오.
-   - 학생을 위한 구체적인 보완 제안 문장(suggestedImprovements, 1~2개)과 다음에 확인할 개념(nextConceptsToReview, 1~2개)을 구체적으로 제시하십시오.
+     1) appropriate_method (적절한 방법 선택)
+     2) precondition_understanding (전제조건 이해)
+     3) constraint_alignment (문제의 제약과의 연결)
+     4) alternatives_limitations (대안·한계 인식)
+   - 각 항목의 rating은 반드시 'proficient' | 'partially_met' | 'needs_improvement' | 'not_applicable' 중 하나여야 합니다.
 
 ### [출력 형식]
 반드시 다음 JSON 구조로만 응답하십시오 (Markdown 코드 블록 없이 순수 JSON만 반환):
@@ -610,7 +621,16 @@ export async function POST(req: NextRequest) {
   ],
   "strengths": string, // 1~2문장의 잘한 점
   "criticalImprovements": string, // 1~2문장의 가장 중요한 보완할 점
+  "academicErrorType": "NO_ERROR" | "CONCEPT_MISUNDERSTANDING" | "FORMULA_MISAPPLICATION" | "CALCULATION_ERROR" | "LOGICAL_ERROR" | "CONDITION_OMISSION" | "TERMINOLOGY_ERROR" | "INCOMPLETE_REASONING" | "ANSWER_FORMAT_ERROR" | "UNCERTAIN",
   "recommendedErrorType": "none" | "concept_confusion" | "condition_misinterpretation" | "calc_or_impl_mistake" | "method_selection_error",
+  "structuredError": {
+    "errorType": "NO_ERROR" | "CONCEPT_MISUNDERSTANDING" | "FORMULA_MISAPPLICATION" | "CALCULATION_ERROR" | "LOGICAL_ERROR" | "CONDITION_OMISSION" | "TERMINOLOGY_ERROR" | "INCOMPLETE_REASONING" | "ANSWER_FORMAT_ERROR" | "UNCERTAIN",
+    "severity": "critical" | "moderate" | "minor" | "none",
+    "conceptId": "${conceptId}",
+    "conceptTitle": "${problemTitle}",
+    "evidence": string, // 오류를 확인한 답안 인용구
+    "feedback": string // 오류 개선을 위한 핵심 학술 조언
+  },
   "staticAnalysisNotice": "본 평가는 AI 모델의 정적 분석 및 논증 검토를 바탕으로 산출되었으며, 코드를 서버에서 직접 실행하거나 동적 테스트를 거치지 않았습니다.",
   "needsReview": boolean,
   "feedback": string, // 종합 학술 첨삭 총평 (문단 형태의 완성된 피드백)
@@ -728,7 +748,15 @@ ${
       if (typeof content !== 'string') throw new Error('AI 평가 응답이 텍스트가 아닙니다.');
       const cleanJson = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
       parsed = JSON.parse(cleanJson);
-      evaluationResult = validateEvaluationOutput(parsed, checkedRubric);
+      evaluationResult = validateEvaluationOutput(parsed, checkedRubric, {
+        conceptId,
+        conceptTitle: problemTitle,
+        userAnswer,
+      });
+      evaluationResult.sourceProvenance = {
+        sourceConceptIds: conceptIds.length > 0 ? conceptIds : [conceptId],
+        sourceVerificationStatus: 'verified',
+      };
     } catch (cause) {
       if (cred.isTrial && taskId) {
         await releaseTrialCredit(auth.user.id, taskId, 'validation_failed', cred.leaseToken);

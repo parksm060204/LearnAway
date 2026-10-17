@@ -7,7 +7,7 @@
  * Unverifiable or invalid output is rejected, never saved as success.
  */
 
-import { Problem, ProblemDifficulty, ProblemType, RubricCriterion } from './types';
+import { AcademicDifficultyLevel, Problem, ProblemDifficulty, ProblemType, RubricCriterion, toAcademicDifficultyLevel } from './types';
 import { validateEvaluationRubric } from './evaluationValidation';
 
 /**
@@ -60,6 +60,7 @@ export interface TransferProblemOutput {
   promptText: string;
   type: ProblemType;
   difficulty: ProblemDifficulty;
+  difficultyLevel?: AcademicDifficultyLevel;
   conceptIds: string[];
   transferKind: TransferKind;
   originalCondition: string;
@@ -76,6 +77,7 @@ export interface TransferProblemOutput {
   answerEvidenceVerified: boolean;   // 원답안에서 인용을 확인함
   materialEvidenceVerified: false;   // 강의 자료 근거는 별도 검증 없이는 false
   numericOnlySuspected: boolean;     // 숫자/변수명만 바뀐 것으로 의심됨
+  sourceVerificationStatus?: 'verified' | 'unverified' | 'needs_review';
   mathFormula?: string;
   codeSnippet?: string;
 }
@@ -226,6 +228,7 @@ export function validateTransferProblemOutput(
     promptText,
     type,
     difficulty,
+    difficultyLevel: toAcademicDifficultyLevel(parsed.difficultyLevel || difficulty),
     conceptIds: rawConceptIds,
     transferKind: transferKindRaw,
     originalCondition,
@@ -242,6 +245,9 @@ export function validateTransferProblemOutput(
     answerEvidenceVerified,
     materialEvidenceVerified: false,
     numericOnlySuspected: looksNumericOnly(context.originalPrompt, promptText),
+    sourceVerificationStatus: parsed.sourceVerificationStatus === 'verified' || parsed.sourceVerificationStatus === 'needs_review'
+      ? parsed.sourceVerificationStatus
+      : 'unverified',
     mathFormula: asString(parsed.mathFormula).trim() || undefined,
     codeSnippet: asString(parsed.codeSnippet).trim() || undefined,
   };

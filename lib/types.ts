@@ -15,6 +15,131 @@ export const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
   method_selection_error: '방법 선택 오류',
 };
 
+// =========================================================================
+// Plan 03: Canonical Academic Error Taxonomy (P03-05)
+// =========================================================================
+export type AcademicErrorType =
+  | 'NO_ERROR'
+  | 'CONCEPT_MISUNDERSTANDING'
+  | 'FORMULA_MISAPPLICATION'
+  | 'CALCULATION_ERROR'
+  | 'LOGICAL_ERROR'
+  | 'CONDITION_OMISSION'
+  | 'TERMINOLOGY_ERROR'
+  | 'INCOMPLETE_REASONING'
+  | 'ANSWER_FORMAT_ERROR'
+  | 'UNCERTAIN';
+
+export interface AcademicErrorInfo {
+  code: AcademicErrorType;
+  label: string;
+  description: string;
+  legacyType: ErrorType;
+}
+
+export const ACADEMIC_ERROR_LABELS: Record<AcademicErrorType, AcademicErrorInfo> = {
+  NO_ERROR: {
+    code: 'NO_ERROR',
+    label: '정상 완제 (오류 없음)',
+    description: '핵심 개념, 풀이 전개 및 최종 결론이 학술적으로 타당함',
+    legacyType: 'none',
+  },
+  CONCEPT_MISUNDERSTANDING: {
+    code: 'CONCEPT_MISUNDERSTANDING',
+    label: '개념 이해 부족',
+    description: '핵심 개념의 정의, 성질, 또는 의미를 오해함',
+    legacyType: 'concept_confusion',
+  },
+  FORMULA_MISAPPLICATION: {
+    code: 'FORMULA_MISAPPLICATION',
+    label: '공식의 잘못된 적용',
+    description: '문제 조건에 맞지 않는 정리를 적용하거나 전제조건을 무시함',
+    legacyType: 'method_selection_error',
+  },
+  CALCULATION_ERROR: {
+    code: 'CALCULATION_ERROR',
+    label: '계산 실수',
+    description: '접근법과 논리는 맞으나 중간 산술/대수 계산 및 부호 착오',
+    legacyType: 'calc_or_impl_mistake',
+  },
+  LOGICAL_ERROR: {
+    code: 'LOGICAL_ERROR',
+    label: '논리 전개 오류',
+    description: '단계 간의 인과관계 결여, 순환논증, 또는 논리적 비약',
+    legacyType: 'concept_confusion',
+  },
+  CONDITION_OMISSION: {
+    code: 'CONDITION_OMISSION',
+    label: '조건 누락',
+    description: '문제에 주어진 필수 제약 조건, 정의역, 또는 특수 조건을 간과함',
+    legacyType: 'condition_misinterpretation',
+  },
+  TERMINOLOGY_ERROR: {
+    code: 'TERMINOLOGY_ERROR',
+    label: '용어 사용 오류',
+    description: '학술 용어, 표기법, 또는 기호의 부적절한 사용',
+    legacyType: 'concept_confusion',
+  },
+  INCOMPLETE_REASONING: {
+    code: 'INCOMPLETE_REASONING',
+    label: '풀이 과정 부족',
+    description: '정답만 제시하거나 핵심 증명/유도 단계가 생략됨',
+    legacyType: 'concept_confusion',
+  },
+  ANSWER_FORMAT_ERROR: {
+    code: 'ANSWER_FORMAT_ERROR',
+    label: '답안 형식 오류',
+    description: '요구된 단위, 표현 형태, 또는 제출 양식 미준수',
+    legacyType: 'condition_misinterpretation',
+  },
+  UNCERTAIN: {
+    code: 'UNCERTAIN',
+    label: '원인 확정 불가',
+    description: '답안 서술이 모호하여 오류 원인을 단정할 수 없음',
+    legacyType: 'concept_confusion',
+  },
+};
+
+export function toAcademicErrorType(val: unknown): AcademicErrorType {
+  if (typeof val === 'string') {
+    const upper = val.toUpperCase().trim();
+    if (upper in ACADEMIC_ERROR_LABELS) return upper as AcademicErrorType;
+    const lower = val.toLowerCase().trim();
+    if (lower === 'none' || lower === 'no_error') return 'NO_ERROR';
+    if (lower === 'concept_confusion' || lower === 'concept') return 'CONCEPT_MISUNDERSTANDING';
+    if (lower === 'condition_misinterpretation') return 'CONDITION_OMISSION';
+    if (lower === 'calc_or_impl_mistake' || lower === 'calculation') return 'CALCULATION_ERROR';
+    if (lower === 'method_selection_error' || lower === 'logic') return 'LOGICAL_ERROR';
+  }
+  return 'UNCERTAIN';
+}
+
+export function toLegacyErrorType(val: unknown): ErrorType {
+  if (typeof val === 'string') {
+    const upper = val.toUpperCase().trim();
+    if (upper in ACADEMIC_ERROR_LABELS) {
+      return ACADEMIC_ERROR_LABELS[upper as AcademicErrorType].legacyType;
+    }
+    const lower = val.toLowerCase().trim() as ErrorType;
+    if (['none', 'concept_confusion', 'condition_misinterpretation', 'calc_or_impl_mistake', 'method_selection_error'].includes(lower)) {
+      return lower;
+    }
+  }
+  return 'concept_confusion';
+}
+
+export interface StructuredErrorRecord {
+  errorType: AcademicErrorType;
+  legacyErrorType: ErrorType;
+  severity: 'critical' | 'moderate' | 'minor' | 'none';
+  conceptId?: string;
+  conceptTitle?: string;
+  evidence: string;
+  feedback: string;
+  evaluationVersion: string;
+  evaluatedAt: string;
+}
+
 export type ProblemType =
   // Math / Stats types
   | 'essay_descriptive'       // 대학 논술·서술형
@@ -25,7 +150,12 @@ export type ProblemType =
   | 'impl_descriptive'        // 구현 및 서술형
   | 'algorithm_optimization'  // 알고리즘 최적화 설명
   | 'complexity_proof'        // 시간/공간 복잡도 증명
-  | 'debug_counterexample';   // 디버깅 및 반례 분석
+  | 'debug_counterexample'    // 디버깅 및 반례 분석
+  // Plan 03 University Examination Types
+  | 'concept_explanation'     // 개념 설명형
+  | 'multiple_choice'         // 객관식
+  | 'short_answer'            // 단답형
+  | 'composite_application';  // 복합 개념 응용형
 
 export type ConceptStatus =
   | 'review_target'   // 복습 대상 (SCORE < 50)
@@ -143,6 +273,9 @@ export interface ReviewEvent {
   needsReview?: boolean;
   solvingReason?: string;
   methodSelectionDiagnosis?: MethodSelectionDiagnosis;
+  // Plan 03 fields:
+  academicErrorType?: AcademicErrorType;
+  structuredError?: StructuredErrorRecord;
 }
 
 export interface ConceptEvidence {
@@ -252,6 +385,92 @@ export const PROBLEM_DIFFICULTY_LABELS: Record<ProblemDifficulty, string> = {
   graduate_challenging: '대학원·심화 도전형 (일반화 및 엄밀 증명)',
 };
 
+// =========================================================================
+// Plan 03: 5-Level Academic Difficulty (P03-03)
+// =========================================================================
+export type AcademicDifficultyLevel = 1 | 2 | 3 | 4 | 5;
+
+export interface AcademicDifficultyInfo {
+  level: AcademicDifficultyLevel;
+  label: string;
+  shortName: string;
+  description: string;
+  legacyDifficulty: ProblemDifficulty;
+}
+
+export const ACADEMIC_DIFFICULTY_LEVELS: Record<AcademicDifficultyLevel, AcademicDifficultyInfo> = {
+  1: {
+    level: 1,
+    label: 'Level 1 — 기초 (정의·공식·기본 개념)',
+    shortName: 'Level 1 (기초)',
+    description: '정의, 공식, 기본 개념을 정확히 이해했는지 확인',
+    legacyDifficulty: 'intermediate',
+  },
+  2: {
+    level: 2,
+    label: 'Level 2 — 적용 (단일 개념·공식 적용)',
+    shortName: 'Level 2 (적용)',
+    description: '하나의 개념이나 공식을 실제 문제 상황에 직접 적용',
+    legacyDifficulty: 'intermediate',
+  },
+  3: {
+    level: 3,
+    label: 'Level 3 — 응용 (조건 해석·다단계 전개)',
+    shortName: 'Level 3 (응용)',
+    description: '조건을 해석하고 둘 이상의 풀이 단계를 체계적으로 수행',
+    legacyDifficulty: 'advanced_college',
+  },
+  4: {
+    level: 4,
+    label: 'Level 4 — 복합 (다중 개념 융합)',
+    shortName: 'Level 4 (복합)',
+    description: '여러 개념을 연결하고 새로운 조건에 합성하여 적용',
+    legacyDifficulty: 'advanced_college',
+  },
+  5: {
+    level: 5,
+    label: 'Level 5 — 고난도 (엄밀 증명·복합 추론)',
+    shortName: 'Level 5 (고난도)',
+    description: '복합적 추론, 엄밀 증명, 계산 및 일반화·반례 분석 수행',
+    legacyDifficulty: 'graduate_challenging',
+  },
+};
+
+export function toAcademicDifficultyLevel(val: unknown): AcademicDifficultyLevel {
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    if (val <= 1) return 1;
+    if (val >= 5) return 5;
+    const rounded = Math.round(val);
+    if ([1, 2, 3, 4, 5].includes(rounded)) return rounded as AcademicDifficultyLevel;
+  }
+  if (typeof val === 'string') {
+    const parsed = parseInt(val, 10);
+    if (!isNaN(parsed)) {
+      if (parsed <= 1) return 1;
+      if (parsed >= 5) return 5;
+      return parsed as AcademicDifficultyLevel;
+    }
+    const lower = val.toLowerCase().trim();
+    if (lower === 'easy' || lower === 'basic') return 1;
+    if (lower === 'intermediate' || lower === 'standard') return 2;
+    if (lower === 'medium' || lower === 'advanced_college' || lower === 'advanced') return 3;
+    if (lower === 'challenging' || lower === 'applied') return 4;
+    if (lower === 'hard' || lower === 'graduate_challenging' || lower === 'research') return 5;
+  }
+  return 3;
+}
+
+export type SourceVerificationStatus = 'verified' | 'unverified' | 'needs_review';
+
+export interface ProblemSourceProvenance {
+  sourceMaterialId?: string;
+  sourceConceptIds?: string[];
+  sourcePage?: string;
+  sourceExcerpt?: string;
+  sourceContentVersion?: string;
+  sourceVerificationStatus?: SourceVerificationStatus;
+}
+
 /** Stage 11: per-material source reference captured at generation time. */
 export interface ProblemSourceRef {
   materialId: string;
@@ -314,6 +533,14 @@ export interface ProblemDraft {
   contentVersion?: number;
   approvalState?: 'pending' | 'approved' | 'failed';
   approvedProblemId?: string;
+  // Plan 03 academic assessment fields:
+  difficultyLevel?: AcademicDifficultyLevel;
+  sourceMaterialId?: string;
+  sourceConceptIds?: string[];
+  sourcePage?: string;
+  sourceExcerpt?: string;
+  sourceContentVersion?: string;
+  sourceVerificationStatus?: SourceVerificationStatus;
 }
 
 export interface Problem {
@@ -493,6 +720,14 @@ export interface Problem {
   versionHistory?: ProblemVersionSnapshot[]; // 이전 버전 스냅샷 이력
   lastReviewedAt?: string;               // 최근 검토 시각
   reviewNotes?: string;                  // 검토/처리 메모
+  // Plan 03 academic assessment fields:
+  difficultyLevel?: AcademicDifficultyLevel;
+  sourceMaterialId?: string;
+  sourceConceptIds?: string[];
+  sourcePage?: string;
+  sourceExcerpt?: string;
+  sourceContentVersion?: string;
+  sourceVerificationStatus?: SourceVerificationStatus;
 }
 
 // Stage 8: Solving Reason Explanation & Method Selection Diagnosis
@@ -553,6 +788,10 @@ export interface EvaluationResult {
   qualityStatusNotice?: string;
   // Stage 8 field:
   methodSelectionDiagnosis?: MethodSelectionDiagnosis;
+  // Plan 03 fields:
+  academicErrorType?: AcademicErrorType;
+  structuredError?: StructuredErrorRecord;
+  sourceProvenance?: ProblemSourceProvenance;
 }
 
 export interface Attempt {
@@ -598,6 +837,10 @@ export interface Attempt {
   planItemId?: string;                     // 실행한 학습 계획 항목 ID
   modelAnswerRevealed?: boolean;           // 풀이 중 모범답안을 열람했는지
   helpUsage?: 'independent' | 'hints' | 'model_answer' | 'assisted'; // 도움 사용 여부
+  // Plan 03 fields:
+  academicErrorType?: AcademicErrorType;
+  structuredError?: StructuredErrorRecord;
+  sourceProvenance?: ProblemSourceProvenance;
 }
 
 export interface MockExamSession {

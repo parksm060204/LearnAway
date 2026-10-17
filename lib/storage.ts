@@ -2317,6 +2317,8 @@ export function recordAttemptAndUpdateConcept(
       resultScore: effectiveAttempt.calculatedScore,
       confidence: effectiveAttempt.confidence,
       errorType: effectiveAttempt.errorType,
+      academicErrorType: effectiveAttempt.academicErrorType,
+      structuredError: effectiveAttempt.structuredError,
       hintCount: effectiveAttempt.hintCount,
       notes: effectiveAttempt.reasoningNotes,
       sourceRef: c.chapterRef,

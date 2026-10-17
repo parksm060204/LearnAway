@@ -52,6 +52,10 @@ const PROBLEM_TYPE_LABELS: Record<ProblemType | 'unknown', string> = {
   algorithm_optimization: '알고리즘 최적화',
   complexity_proof: '복잡도 증명',
   debug_counterexample: '디버깅·반례',
+  concept_explanation: '개념 설명형',
+  multiple_choice: '객관식',
+  short_answer: '단답형',
+  composite_application: '복합 개념 응용형',
   unknown: '유형 미확인',
 };
 

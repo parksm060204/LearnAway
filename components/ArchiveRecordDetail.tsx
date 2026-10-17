@@ -6,6 +6,7 @@ import {
   Problem,
   ProblemReportType,
   ERROR_TYPE_LABELS,
+  ACADEMIC_ERROR_LABELS,
   METHOD_REASON_RATING_LABELS,
   isProblemAvailableForPractice,
 } from '../lib/types';
@@ -132,17 +133,46 @@ export function ArchiveRecordDetail({
 
       {/* Evaluation Summary */}
       <div className="bg-[#faf8f4] border border-[#ded6c8] p-3.5 rounded-xs space-y-2">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-1.5">
           <span className="font-academic-mono text-[11px] font-bold text-[#827d73] uppercase tracking-wider">
             EVALUATION SUMMARY:
           </span>
-          {event.errorType && event.errorType !== 'none' && (
-            <span className="inline-flex items-center gap-1 text-[11px] font-academic-mono px-2 py-0.5 rounded-xs bg-[#fef2f2] border border-[#fecaca] text-[#c52828] font-semibold">
-              <AlertTriangle className="w-3 h-3" />
-              진단 오답 유형: {ERROR_TYPE_LABELS[event.errorType]}
-            </span>
-          )}
+          <div className="flex flex-wrap items-center gap-1.5">
+            {event.errorType && event.errorType !== 'none' && (
+              <span className="inline-flex items-center gap-1 text-[11px] font-academic-mono px-2 py-0.5 rounded-xs bg-[#fef2f2] border border-[#fecaca] text-[#c52828] font-semibold">
+                <AlertTriangle className="w-3 h-3" />
+                오답 유형: {ERROR_TYPE_LABELS[event.errorType]}
+              </span>
+            )}
+            {event.academicErrorType && event.academicErrorType !== 'NO_ERROR' && (
+              <span className="inline-flex items-center gap-1 text-[11px] font-academic-mono px-2 py-0.5 rounded-xs bg-rose-50 border border-rose-300 text-rose-800 font-semibold">
+                <AlertTriangle className="w-3 h-3 text-rose-600" />
+                학술 분류: {ACADEMIC_ERROR_LABELS[event.academicErrorType]?.label || event.academicErrorType}
+              </span>
+            )}
+          </div>
         </div>
+
+        {event.structuredError && event.structuredError.errorType !== 'NO_ERROR' && (
+          <div className="p-2.5 bg-rose-50/50 border border-rose-200 rounded-2xs text-xs space-y-1">
+            <div className="flex items-center justify-between text-[11px] font-academic-mono">
+              <span className="font-bold text-rose-950">심층 취약점 근거:</span>
+              <span className="text-rose-800 font-semibold">
+                심각도: {event.structuredError.severity}
+              </span>
+            </div>
+            {event.structuredError.evidence && (
+              <p className="text-[11.5px] text-rose-900 italic">
+                &ldquo;{event.structuredError.evidence}&rdquo;
+              </p>
+            )}
+            {event.structuredError.feedback && (
+              <p className="text-[11.5px] text-[#57544e]">
+                {event.structuredError.feedback}
+              </p>
+            )}
+          </div>
+        )}
 
         <p className="text-sm sm:text-base text-[#191817] leading-[1.75] korean-prose font-medium">
           &ldquo;{event.evaluationSummary || event.notes || '기록된 정밀 첨삭 요약이 없습니다.'}&rdquo;

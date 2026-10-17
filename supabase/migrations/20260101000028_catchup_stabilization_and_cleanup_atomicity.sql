@@ -41,6 +41,7 @@ create index if not exists ai_trial_reservations_lease_idx
 -- ----------------------------------------------------------------------------
 do $$
 begin
+  drop function if exists public.settle_trial_credit(text, uuid, text, jsonb);
   drop function if exists public.settle_trial_credit(text, uuid);
   drop function if exists public.release_trial_credit(text, text, uuid);
   drop function if exists public.record_trial_result_ready(text, jsonb, uuid);
@@ -176,7 +177,7 @@ create or replace function public.reserve_trial_credit(
   p_task_type text,
   p_input_identifier text,
   p_user_id uuid default null,
-  p_max_attempts integer default 3
+  p_daily_cap integer default 500
 )
 returns jsonb
 language plpgsql
@@ -190,11 +191,11 @@ declare
   v_granted integer;
   v_initial_grant integer;
   v_daily_count integer;
-  v_cap integer := 500;
+  v_cap integer := coalesce(p_daily_cap, 500);
   v_lease_token text;
 begin
   if auth.role() = 'service_role' then
-    v_uid := p_user_id;
+    v_uid := coalesce(p_user_id, auth.uid());
   else
     v_uid := auth.uid();
   end if;
@@ -203,6 +204,8 @@ begin
     return jsonb_build_object(
       'allowed', false,
       'error_code', 'UNAUTHENTICATED',
+      'code', 'UNAUTHENTICATED',
+      'error', 'UNAUTHENTICATED',
       'message', '인증된 사용자만 AI 체험을 이용할 수 있습니다.'
     );
   end if;
@@ -211,6 +214,8 @@ begin
     return jsonb_build_object(
       'allowed', false,
       'error_code', 'INVALID_TASK_ID',
+      'code', 'INVALID_TASK_ID',
+      'error', 'INVALID_TASK_ID',
       'message', '유효한 작업 식별자가 필요합니다.'
     );
   end if;
@@ -219,20 +224,25 @@ begin
     return jsonb_build_object(
       'allowed', false,
       'error_code', 'INVALID_TASK_TYPE',
+      'code', 'INVALID_TASK_TYPE',
+      'error', 'INVALID_TASK_TYPE',
       'message', '지원하지 않는 작업 유형입니다.'
     );
   end if;
 
-  -- 1. Check existing reservation for idempotency
+  -- 1. Check existing reservation for idempotency and state guards
   select * into v_existing
   from public.ai_trial_reservations
-  where task_id = p_task_id;
+  where task_id = p_task_id
+  for update;
 
   if found then
     if v_existing.user_id <> v_uid then
       return jsonb_build_object(
         'allowed', false,
         'error_code', 'TASK_OWNERSHIP_MISMATCH',
+        'code', 'TASK_OWNERSHIP_MISMATCH',
+        'error', 'TASK_OWNERSHIP_MISMATCH',
         'message', '해당 작업에 대한 접근 권한이 없습니다.'
       );
     end if;
@@ -241,39 +251,67 @@ begin
       return jsonb_build_object(
         'allowed', false,
         'error_code', 'TASK_INPUT_MISMATCH',
+        'code', 'TASK_INPUT_MISMATCH',
+        'error', 'TASK_INPUT_MISMATCH',
         'message', '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.'
       );
     end if;
 
+    select balance into v_balance
+    from public.ai_trial_credits
+    where user_id = v_uid;
+
+    -- If already finalized/settled, return preserved cached result immediately
     if v_existing.status = 'settled' then
       return jsonb_build_object(
         'allowed', false,
         'status', 'already_completed',
+        'remaining', coalesce(v_balance, 0),
         'cached_result', v_existing.cached_result,
         'message', '이미 정상 완료된 작업입니다.'
       );
     end if;
 
+    -- If AI result was already generated and preserved (result_ready or cached_result exists),
+    -- NEVER invoke AI again regardless of lease expiration! Return preserved result immediately.
+    if v_existing.status = 'result_ready' or v_existing.cached_result is not null then
+      return jsonb_build_object(
+        'allowed', false,
+        'status', 'already_completed',
+        'remaining', coalesce(v_balance, 0),
+        'cached_result', v_existing.cached_result,
+        'message', '이미 생성된 AI 결과가 보존되어 있습니다.'
+      );
+    end if;
+
+    -- If currently in flight with an active lease, block duplicate concurrent execution
     if v_existing.status in ('reserved', 'processing')
        and v_existing.lease_expires_at is not null
        and v_existing.lease_expires_at > now() then
       return jsonb_build_object(
         'allowed', false,
-        'status', 'already_processing',
+        'status', 'concurrent_in_progress',
         'error_code', 'CONCURRENT_EXECUTION',
+        'code', 'CONCURRENT_EXECUTION',
+        'error', 'CONCURRENT_EXECUTION',
+        'remaining', coalesce(v_balance, 0),
         'message', '동일한 작업이 현재 처리 중입니다.'
       );
     end if;
 
-    if v_existing.attempt_count >= coalesce(p_max_attempts, 3) then
+    -- Enforce maximum attempt limit (3 attempts)
+    if v_existing.attempt_count >= 3 then
       return jsonb_build_object(
         'allowed', false,
         'error_code', 'MAX_ATTEMPTS_EXCEEDED',
+        'code', 'MAX_ATTEMPTS_EXCEEDED',
+        'error', 'MAX_ATTEMPTS_EXCEEDED',
+        'remaining', coalesce(v_balance, 0),
         'message', '최대 재시도 횟수를 초과했습니다.'
       );
     end if;
 
-    -- Re-check balance if previous attempt was released/refunded
+    -- Re-check balance & deduct if previous attempt was released/refunded
     if v_existing.status in ('released', 'failed_refunded') then
       select balance into v_balance
       from public.ai_trial_credits
@@ -284,18 +322,27 @@ begin
         return jsonb_build_object(
           'allowed', false,
           'error_code', 'INSUFFICIENT_CREDITS',
+          'code', 'INSUFFICIENT_CREDITS',
+          'error', 'INSUFFICIENT_CREDITS',
+          'remaining', 0,
           'message', '체험 크레딧이 모두 소진되었습니다. 설정에서 개인 API 키를 등록해 주세요.'
         );
       end if;
 
-      select call_count into v_daily_count
-      from public.operator_ai_daily_usage
-      where usage_date = current_date;
+      insert into public.operator_ai_daily_usage (usage_date, call_count)
+      values (current_date, 1)
+      on conflict (usage_date) do update set
+        call_count = operator_ai_daily_usage.call_count + 1
+      returning call_count into v_daily_count;
 
-      if coalesce(v_daily_count, 0) >= v_cap then
+      if v_daily_count > v_cap then
+        update public.operator_ai_daily_usage set call_count = call_count - 1 where usage_date = current_date;
         return jsonb_build_object(
           'allowed', false,
           'error_code', 'OPERATOR_DAILY_CAP_EXCEEDED',
+          'code', 'OPERATOR_DAILY_CAP_EXCEEDED',
+          'error', 'OPERATOR_DAILY_CAP_EXCEEDED',
+          'remaining', coalesce(v_balance, 0),
           'message', '오늘의 운영자 AI 체험 전체 한도가 마감되었습니다. 설정에서 개인 API 키를 등록해 주세요.'
         );
       end if;
@@ -306,9 +353,24 @@ begin
       where user_id = v_uid
       returning balance into v_balance;
     else
-      select balance into v_balance
-      from public.ai_trial_credits
-      where user_id = v_uid;
+      -- Expired lease without refund: balance was already held, but check and count operator daily call
+      insert into public.operator_ai_daily_usage (usage_date, call_count)
+      values (current_date, 1)
+      on conflict (usage_date) do update set
+        call_count = operator_ai_daily_usage.call_count + 1
+      returning call_count into v_daily_count;
+
+      if v_daily_count > v_cap then
+        update public.operator_ai_daily_usage set call_count = call_count - 1 where usage_date = current_date;
+        return jsonb_build_object(
+          'allowed', false,
+          'error_code', 'OPERATOR_DAILY_CAP_EXCEEDED',
+          'code', 'OPERATOR_DAILY_CAP_EXCEEDED',
+          'error', 'OPERATOR_DAILY_CAP_EXCEEDED',
+          'remaining', coalesce(v_balance, 0),
+          'message', '오늘의 운영자 AI 체험 전체 한도가 마감되었습니다. 설정에서 개인 API 키를 등록해 주세요.'
+        );
+      end if;
     end if;
 
     v_lease_token := 'lt_' || replace(gen_random_uuid()::text, '-', '');
@@ -357,18 +419,27 @@ begin
     return jsonb_build_object(
       'allowed', false,
       'error_code', 'INSUFFICIENT_CREDITS',
+      'code', 'INSUFFICIENT_CREDITS',
+      'error', 'INSUFFICIENT_CREDITS',
+      'remaining', 0,
       'message', '체험 크레딧이 모두 소진되었습니다. 설정에서 개인 API 키를 등록해 주세요.'
     );
   end if;
 
-  select call_count into v_daily_count
-  from public.operator_ai_daily_usage
-  where usage_date = current_date;
+  insert into public.operator_ai_daily_usage (usage_date, call_count)
+  values (current_date, 1)
+  on conflict (usage_date) do update set
+    call_count = operator_ai_daily_usage.call_count + 1
+  returning call_count into v_daily_count;
 
-  if coalesce(v_daily_count, 0) >= v_cap then
+  if v_daily_count > v_cap then
+    update public.operator_ai_daily_usage set call_count = call_count - 1 where usage_date = current_date;
     return jsonb_build_object(
       'allowed', false,
       'error_code', 'OPERATOR_DAILY_CAP_EXCEEDED',
+      'code', 'OPERATOR_DAILY_CAP_EXCEEDED',
+      'error', 'OPERATOR_DAILY_CAP_EXCEEDED',
+      'remaining', coalesce(v_balance, 0),
       'message', '오늘의 운영자 AI 체험 전체 한도가 마감되었습니다. 설정에서 개인 API 키를 등록해 주세요.'
     );
   end if;
@@ -404,9 +475,8 @@ $$;
 -- ----------------------------------------------------------------------------
 create or replace function public.settle_trial_credit(
   p_task_id text,
-  p_user_id uuid,
-  p_lease_token text,
-  p_cached_result jsonb default null
+  p_user_id uuid default null,
+  p_lease_token text default null
 )
 returns jsonb
 language plpgsql
@@ -414,10 +484,20 @@ security definer
 set search_path = public
 as $$
 declare
+  v_uid uuid := coalesce(p_user_id, auth.uid());
   v_res public.ai_trial_reservations%rowtype;
+  v_token text := trim(coalesce(p_lease_token, ''));
 begin
   if auth.role() <> 'service_role' then
-    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED', 'message', 'service_role 권한이 필요합니다.');
+    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED', 'error_code', 'UNAUTHORIZED', 'message', 'service_role 권한이 필요합니다.');
+  end if;
+
+  if coalesce(p_task_id, '') = '' then
+    return jsonb_build_object('success', false, 'error', 'INVALID_PARAMETERS', 'error_code', 'INVALID_PARAMETERS', 'message', '작업 식별자가 필요합니다.');
+  end if;
+
+  if v_token = '' then
+    return jsonb_build_object('success', false, 'error', 'LEASE_TOKEN_REQUIRED', 'error_code', 'LEASE_TOKEN_REQUIRED', 'message', '유효한 실행 토큰(lease_token)이 필요합니다.');
   end if;
 
   select * into v_res
@@ -426,34 +506,43 @@ begin
   for update;
 
   if not found then
-    return jsonb_build_object('success', false, 'error', 'RESERVATION_NOT_FOUND', 'message', '예약 내역을 찾을 수 없습니다.');
+    return jsonb_build_object('success', false, 'error', 'RESERVATION_NOT_FOUND', 'error_code', 'RESERVATION_NOT_FOUND', 'message', '예약 내역을 찾을 수 없습니다.');
   end if;
 
-  if v_res.user_id <> p_user_id then
-    return jsonb_build_object('success', false, 'error', 'USER_MISMATCH', 'message', '예약 소유자가 일치하지 않습니다.');
+  if v_res.user_id <> v_uid then
+    return jsonb_build_object('success', false, 'error', 'TASK_OWNERSHIP_MISMATCH', 'error_code', 'TASK_OWNERSHIP_MISMATCH', 'message', '예약 소유자가 일치하지 않습니다.');
   end if;
 
+  -- Fencing lease token verification
+  if v_res.lease_token is null or v_res.lease_token <> v_token then
+    return jsonb_build_object('success', false, 'error', 'STALE_LEASE_TOKEN', 'error_code', 'STALE_LEASE_TOKEN', 'message', '유효하지 않거나 만료된 실행 토큰입니다.');
+  end if;
+
+  -- Idempotency: already settled
   if v_res.status = 'settled' then
-    return jsonb_build_object('success', true, 'status', 'already_settled', 'message', '이미 확정된 작업입니다.');
+    return jsonb_build_object('success', true, 'status', 'settled', 'message', '이미 확정된 작업입니다.');
   end if;
 
-  if v_res.lease_token is distinct from p_lease_token then
-    return jsonb_build_object('success', false, 'error', 'STALE_LEASE_TOKEN', 'message', '유효하지 않거나 만료된 실행 토큰입니다.');
+  -- Refunded task guard
+  if v_res.status in ('released', 'failed_refunded') then
+    return jsonb_build_object('success', false, 'error', 'ALREADY_REFUNDED', 'error_code', 'ALREADY_REFUNDED', 'message', '이미 환급된 작업은 재차감 없이 확정할 수 없습니다.');
+  end if;
+
+  -- Cached result guard: cannot settle without preserved AI output
+  if v_res.cached_result is null then
+    return jsonb_build_object('success', false, 'error', 'MISSING_CACHED_RESULT', 'error_code', 'MISSING_CACHED_RESULT', 'message', '보존된 AI 결과가 없어 크레딧을 확정할 수 없습니다.');
   end if;
 
   update public.ai_trial_reservations
   set status = 'settled',
-      settled_at = now(),
-      cached_result = coalesce(p_cached_result, cached_result),
+      settled_at = coalesce(settled_at, now()),
       lease_token = null,
       lease_expires_at = null
   where task_id = p_task_id
-    and lease_token = p_lease_token;
+    and lease_token = v_token;
 
-  insert into public.operator_ai_daily_usage (usage_date, call_count)
-  values (current_date, 1)
-  on conflict (usage_date) do update
-  set call_count = public.operator_ai_daily_usage.call_count + 1;
+  -- NOTE: Do NOT duplicate operator_ai_daily_usage increment here.
+  -- Daily usage is already counted during reserve_trial_credit.
 
   return jsonb_build_object('success', true, 'status', 'settled');
 end;
@@ -461,9 +550,9 @@ $$;
 
 create or replace function public.release_trial_credit(
   p_task_id text,
-  p_reason text,
-  p_user_id uuid,
-  p_lease_token text
+  p_reason text default null,
+  p_user_id uuid default null,
+  p_lease_token text default null
 )
 returns jsonb
 language plpgsql
@@ -471,10 +560,21 @@ security definer
 set search_path = public
 as $$
 declare
+  v_uid uuid := coalesce(p_user_id, auth.uid());
   v_res public.ai_trial_reservations%rowtype;
+  v_token text := trim(coalesce(p_lease_token, ''));
+  v_new_balance integer;
 begin
   if auth.role() <> 'service_role' then
-    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED', 'message', 'service_role 권한이 필요합니다.');
+    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED', 'error_code', 'UNAUTHORIZED', 'message', 'service_role 권한이 필요합니다.');
+  end if;
+
+  if coalesce(p_task_id, '') = '' then
+    return jsonb_build_object('success', false, 'error', 'INVALID_PARAMETERS', 'error_code', 'INVALID_PARAMETERS', 'message', '작업 식별자가 필요합니다.');
+  end if;
+
+  if v_token = '' then
+    return jsonb_build_object('success', false, 'error', 'LEASE_TOKEN_REQUIRED', 'error_code', 'LEASE_TOKEN_REQUIRED', 'message', '유효한 실행 토큰(lease_token)이 필요합니다.');
   end if;
 
   select * into v_res
@@ -483,44 +583,78 @@ begin
   for update;
 
   if not found then
-    return jsonb_build_object('success', false, 'error', 'RESERVATION_NOT_FOUND', 'message', '예약 내역을 찾을 수 없습니다.');
+    return jsonb_build_object('success', false, 'error', 'RESERVATION_NOT_FOUND', 'error_code', 'RESERVATION_NOT_FOUND', 'message', '예약 내역을 찾을 수 없습니다.');
   end if;
 
-  if v_res.user_id <> p_user_id then
-    return jsonb_build_object('success', false, 'error', 'USER_MISMATCH', 'message', '예약 소유자가 일치하지 않습니다.');
+  if v_res.user_id <> v_uid then
+    return jsonb_build_object('success', false, 'error', 'TASK_OWNERSHIP_MISMATCH', 'error_code', 'TASK_OWNERSHIP_MISMATCH', 'message', '예약 소유자가 일치하지 않습니다.');
   end if;
 
-  if v_res.status in ('settled', 'released', 'failed_refunded') then
-    return jsonb_build_object('success', true, 'status', 'already_finalized', 'message', '이미 완료되었거나 환급된 작업입니다.');
+  -- Fencing token verification
+  if v_res.lease_token is null or v_res.lease_token <> v_token then
+    return jsonb_build_object('success', false, 'error', 'STALE_LEASE_TOKEN', 'error_code', 'STALE_LEASE_TOKEN', 'message', '유효하지 않거나 만료된 실행 토큰입니다.');
   end if;
 
-  if v_res.lease_token is distinct from p_lease_token then
-    return jsonb_build_object('success', false, 'error', 'STALE_LEASE_TOKEN', 'message', '유효하지 않거나 만료된 실행 토큰입니다.');
+  -- Settled task cannot be refunded
+  if v_res.status = 'settled' then
+    return jsonb_build_object('success', false, 'error', 'ALREADY_SETTLED', 'error_code', 'ALREADY_SETTLED', 'message', '이미 확정된 작업은 환급할 수 없습니다.');
   end if;
 
+  -- Idempotency: already released
+  if v_res.status in ('released', 'failed_refunded') then
+    select balance into v_new_balance from public.ai_trial_credits where user_id = v_uid;
+    return jsonb_build_object(
+      'success', true,
+      'status', v_res.status,
+      'refunded', false,
+      'balance', coalesce(v_new_balance, 0),
+      'remaining', coalesce(v_new_balance, 0),
+      'message', '이미 완료되었거나 환급된 작업입니다.'
+    );
+  end if;
+
+  -- Guard: Tasks with preserved AI results (result_ready or cached_result exists) MUST NOT be refunded.
+  -- Downstream DB persistence failure should retry storage/settlement, NOT refund consumed AI tokens.
+  if v_res.status = 'result_ready' or v_res.cached_result is not null then
+    return jsonb_build_object(
+      'success', false,
+      'error', 'CANNOT_REFUND_RESULT_READY',
+      'error_code', 'CANNOT_REFUND_RESULT_READY',
+      'message', '이미 AI 결과가 생성 및 보존된 작업은 환급할 수 없습니다. 결과 저장 및 정산을 재시도해 주세요.'
+    );
+  end if;
+
+  -- Refund credit to user balance
   update public.ai_trial_reservations
   set status = 'failed_refunded',
       released_at = now(),
-      release_reason = p_reason,
+      release_reason = coalesce(p_reason, 'cancelled_or_failed'),
       lease_token = null,
       lease_expires_at = null
   where task_id = p_task_id
-    and lease_token = p_lease_token;
+    and lease_token = v_token;
 
   update public.ai_trial_credits
   set balance = least(balance + 1, granted_credits),
       updated_at = now()
-  where user_id = p_user_id;
+  where user_id = v_uid
+  returning balance into v_new_balance;
 
-  return jsonb_build_object('success', true, 'status', 'refunded');
+  return jsonb_build_object(
+    'success', true,
+    'status', 'refunded',
+    'refunded', true,
+    'balance', v_new_balance,
+    'remaining', v_new_balance
+  );
 end;
 $$;
 
 create or replace function public.record_trial_result_ready(
   p_task_id text,
-  p_cached_result jsonb,
-  p_user_id uuid,
-  p_lease_token text
+  p_result jsonb,
+  p_user_id uuid default null,
+  p_lease_token text default null
 )
 returns jsonb
 language plpgsql
@@ -528,10 +662,20 @@ security definer
 set search_path = public
 as $$
 declare
+  v_uid uuid := coalesce(p_user_id, auth.uid());
   v_res public.ai_trial_reservations%rowtype;
+  v_token text := trim(coalesce(p_lease_token, ''));
 begin
   if auth.role() <> 'service_role' then
-    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED', 'message', 'service_role 권한이 필요합니다.');
+    return jsonb_build_object('success', false, 'error', 'UNAUTHORIZED', 'error_code', 'UNAUTHORIZED', 'message', 'service_role 권한이 필요합니다.');
+  end if;
+
+  if coalesce(p_task_id, '') = '' then
+    return jsonb_build_object('success', false, 'error', 'INVALID_PARAMETERS', 'error_code', 'INVALID_PARAMETERS', 'message', '작업 식별자가 필요합니다.');
+  end if;
+
+  if v_token = '' then
+    return jsonb_build_object('success', false, 'error', 'LEASE_TOKEN_REQUIRED', 'error_code', 'LEASE_TOKEN_REQUIRED', 'message', '유효한 실행 토큰(lease_token)이 필요합니다.');
   end if;
 
   select * into v_res
@@ -540,24 +684,38 @@ begin
   for update;
 
   if not found then
-    return jsonb_build_object('success', false, 'error', 'RESERVATION_NOT_FOUND');
+    return jsonb_build_object('success', false, 'error', 'RESERVATION_NOT_FOUND', 'error_code', 'RESERVATION_NOT_FOUND', 'message', '예약 내역을 찾을 수 없습니다.');
   end if;
 
-  if v_res.user_id <> p_user_id then
-    return jsonb_build_object('success', false, 'error', 'USER_MISMATCH');
+  if v_res.user_id <> v_uid then
+    return jsonb_build_object('success', false, 'error', 'TASK_OWNERSHIP_MISMATCH', 'error_code', 'TASK_OWNERSHIP_MISMATCH', 'message', '예약 소유자가 일치하지 않습니다.');
   end if;
 
-  if v_res.lease_token is distinct from p_lease_token then
-    return jsonb_build_object('success', false, 'error', 'STALE_LEASE_TOKEN');
+  -- Fencing token verification
+  if v_res.lease_token is null or v_res.lease_token <> v_token then
+    return jsonb_build_object('success', false, 'error', 'STALE_LEASE_TOKEN', 'error_code', 'STALE_LEASE_TOKEN', 'message', '만료되었거나 유효하지 않은 실행 토큰(fencing token)입니다.');
   end if;
 
+  -- Settled task cannot have result overwritten
+  if v_res.status = 'settled' then
+    return jsonb_build_object('success', false, 'error', 'ALREADY_SETTLED', 'error_code', 'ALREADY_SETTLED', 'message', '이미 최종 확정된 작업의 결과는 덮어쓸 수 없습니다.');
+  end if;
+
+  -- Refunded task cannot record results
+  if v_res.status in ('released', 'failed_refunded') then
+    return jsonb_build_object('success', false, 'error', 'ALREADY_REFUNDED', 'error_code', 'ALREADY_REFUNDED', 'message', '이미 환급된 작업의 결과를 기록할 수 없습니다.');
+  end if;
+
+  -- Atomically preserve cached result AND transition status to 'result_ready'
   update public.ai_trial_reservations
-  set cached_result = p_cached_result,
-      lease_expires_at = now() + interval '120 seconds'
+  set cached_result = p_result,
+      status = 'result_ready',
+      lease_expires_at = now() + interval '300 seconds',
+      error_code = null
   where task_id = p_task_id
-    and lease_token = p_lease_token;
+    and lease_token = v_token;
 
-  return jsonb_build_object('success', true);
+  return jsonb_build_object('success', true, 'status', 'result_ready');
 end;
 $$;
 
@@ -850,8 +1008,8 @@ grant execute on function public.get_or_create_trial_credits(uuid) to authentica
 revoke all on function public.reserve_trial_credit(text, text, text, uuid, integer) from public, anon, authenticated;
 grant execute on function public.reserve_trial_credit(text, text, text, uuid, integer) to service_role;
 
-revoke all on function public.settle_trial_credit(text, uuid, text, jsonb) from public, anon, authenticated;
-grant execute on function public.settle_trial_credit(text, uuid, text, jsonb) to service_role;
+revoke all on function public.settle_trial_credit(text, uuid, text) from public, anon, authenticated;
+grant execute on function public.settle_trial_credit(text, uuid, text) to service_role;
 
 revoke all on function public.release_trial_credit(text, text, uuid, text) from public, anon, authenticated;
 grant execute on function public.release_trial_credit(text, text, uuid, text) to service_role;
