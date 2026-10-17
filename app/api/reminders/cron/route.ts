@@ -14,8 +14,9 @@ import {
  *
  * Security: Authenticated via Authorization: Bearer <CRON_SECRET> or x-cron-secret header.
  * Uses authoritative Server Admin Client (no user cookie dependency).
+ * Supports both GET (Vercel Cron standard) and POST (custom webhook runners).
  */
-export async function POST(req: NextRequest) {
+async function handleCron(req: NextRequest) {
   const cronSecret = process.env.CRON_SECRET;
   if (!cronSecret) {
     return NextResponse.json(
@@ -216,4 +217,12 @@ export async function POST(req: NextRequest) {
       { status: 500 }
     );
   }
+}
+
+export async function GET(req: NextRequest) {
+  return handleCron(req);
+}
+
+export async function POST(req: NextRequest) {
+  return handleCron(req);
 }

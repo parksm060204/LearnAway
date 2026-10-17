@@ -3,7 +3,13 @@ import { createAdminClient, hasAdminClientConfig } from './supabase/admin';
 
 export type TrialTaskType = 'analyze_concepts' | 'generate_problems' | 'evaluate_answer';
 
-export const DEFAULT_TRIAL_GRANTED_CREDITS = 1;
+export const DEFAULT_TRIAL_GRANTED_CREDITS = 3; // General account default
+export const DEFAULT_GUEST_TRIAL_GRANTED_CREDITS = 1; // Guest account default
+
+export function getInitialGrantedCreditsForAccount(isGuest?: boolean): number {
+  return isGuest ? DEFAULT_GUEST_TRIAL_GRANTED_CREDITS : DEFAULT_TRIAL_GRANTED_CREDITS;
+}
+
 export const MAX_TRIAL_ANALYZE_CHARS = 12000;
 export const MAX_TRIAL_ANALYZE_CHUNKS = 2;
 export const MAX_TRIAL_PROBLEMS_COUNT = 2;
@@ -17,6 +23,7 @@ export interface TrialCreditStatus {
   granted: number;
   balance: number;
   hasPersonalKey: boolean;
+  isGuest?: boolean;
 }
 
 export interface TrialReservationResult {
@@ -107,26 +114,28 @@ export function validateTrialEvaluateAnswerInput(
 }
 
 /**
- * Retrieves the user's trial credits status or initializes 1 credit atomically if new.
+ * Retrieves the user's trial credits status or initializes tiered credits (guest = 1, general = 3) atomically if new.
  */
-export async function getTrialCreditStatus(userId?: string): Promise<TrialCreditStatus> {
+export async function getTrialCreditStatus(userId?: string, isGuest?: boolean): Promise<TrialCreditStatus> {
+  const defaultGranted = getInitialGrantedCreditsForAccount(isGuest);
   if (!userId) {
-    return { granted: DEFAULT_TRIAL_GRANTED_CREDITS, balance: 0, hasPersonalKey: false };
+    return { granted: defaultGranted, balance: 0, hasPersonalKey: false, isGuest };
   }
   try {
     const supabase = await createClient();
     const { data, error } = await supabase.rpc('get_or_create_trial_credits');
     if (error || !data || typeof data !== 'object') {
-      return { granted: DEFAULT_TRIAL_GRANTED_CREDITS, balance: 0, hasPersonalKey: false };
+      return { granted: defaultGranted, balance: 0, hasPersonalKey: false, isGuest };
     }
-    const record = data as { granted?: number; balance?: number; hasPersonalKey?: boolean };
+    const record = data as { granted?: number; balance?: number; hasPersonalKey?: boolean; isGuest?: boolean };
     return {
-      granted: typeof record.granted === 'number' ? record.granted : DEFAULT_TRIAL_GRANTED_CREDITS,
+      granted: typeof record.granted === 'number' ? record.granted : defaultGranted,
       balance: typeof record.balance === 'number' ? record.balance : 0,
       hasPersonalKey: Boolean(record.hasPersonalKey),
+      isGuest: record.isGuest !== undefined ? Boolean(record.isGuest) : isGuest,
     };
   } catch {
-    return { granted: DEFAULT_TRIAL_GRANTED_CREDITS, balance: 0, hasPersonalKey: false };
+    return { granted: defaultGranted, balance: 0, hasPersonalKey: false, isGuest };
   }
 }
 
@@ -229,22 +238,45 @@ export async function recordTrialResultReady(
   taskId: string,
   result: unknown,
   leaseToken?: string
-): Promise<{ success: boolean; status?: string; error?: string }> {
+): Promise<{ success: boolean; status?: string; error?: string; errorCode?: string }> {
+  const token = typeof leaseToken === 'string' ? leaseToken.trim() : '';
+  if (!token) {
+    return {
+      success: false,
+      errorCode: 'LEASE_TOKEN_REQUIRED',
+      error: '유효한 실행 토큰(lease_token)이 필요합니다.',
+    };
+  }
+
   try {
     const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
     const { data, error } = await client.rpc('record_trial_result_ready', {
       p_task_id: taskId,
       p_result: result,
       p_user_id: userId,
-      p_lease_token: leaseToken ?? null,
+      p_lease_token: token,
     });
     if (error || !data || typeof data !== 'object') {
-      return { success: false, error: '결과 보존 처리 중 오류가 발생했습니다.' };
+      return {
+        success: false,
+        errorCode: 'RECORD_RESULT_RPC_ERROR',
+        error: error?.message || '결과 보존 처리 중 오류가 발생했습니다.',
+      };
     }
-    const res = data as { success?: boolean; status?: string; error?: string };
-    return { success: Boolean(res.success), status: res.status, error: res.error };
+    const res = data as { success?: boolean; status?: string; error?: string; error_code?: string; errorCode?: string };
+    const errCode = res.error_code || res.errorCode || (!res.success ? 'RECORD_RESULT_FAILED' : undefined);
+    return {
+      success: Boolean(res.success),
+      status: res.status,
+      error: res.error,
+      errorCode: errCode,
+    };
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : '결과 보존 통신 오류' };
+    return {
+      success: false,
+      errorCode: 'RECORD_RESULT_NETWORK_ERROR',
+      error: err instanceof Error ? err.message : '결과 보존 통신 오류',
+    };
   }
 }
 
@@ -257,21 +289,44 @@ export async function settleTrialCredit(
   userId: string,
   taskId: string,
   leaseToken?: string
-): Promise<{ success: boolean; status?: string; error?: string }> {
+): Promise<{ success: boolean; status?: string; error?: string; errorCode?: string }> {
+  const token = typeof leaseToken === 'string' ? leaseToken.trim() : '';
+  if (!token) {
+    return {
+      success: false,
+      errorCode: 'LEASE_TOKEN_REQUIRED',
+      error: '유효한 실행 토큰(lease_token)이 필요합니다.',
+    };
+  }
+
   try {
     const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
     const { data, error } = await client.rpc('settle_trial_credit', {
       p_task_id: taskId,
       p_user_id: userId,
-      p_lease_token: leaseToken ?? null,
+      p_lease_token: token,
     });
     if (error || !data || typeof data !== 'object') {
-      return { success: false, error: '체험 크레딧 확정 중 오류가 발생했습니다.' };
+      return {
+        success: false,
+        errorCode: 'SETTLE_RPC_ERROR',
+        error: error?.message || '체험 크레딧 확정 중 오류가 발생했습니다.',
+      };
     }
-    const res = data as { success?: boolean; status?: string; message?: string };
-    return { success: Boolean(res.success), status: res.status, error: res.message };
+    const res = data as { success?: boolean; status?: string; message?: string; error?: string; error_code?: string; errorCode?: string };
+    const errCode = res.error_code || res.errorCode || (!res.success ? 'SETTLE_FAILED' : undefined);
+    return {
+      success: Boolean(res.success),
+      status: res.status,
+      error: res.message || res.error,
+      errorCode: errCode,
+    };
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : '체험 크레딧 확정 통신 오류' };
+    return {
+      success: false,
+      errorCode: 'SETTLE_NETWORK_ERROR',
+      error: err instanceof Error ? err.message : '체험 크레딧 확정 통신 오류',
+    };
   }
 }
 
@@ -285,21 +340,45 @@ export async function releaseTrialCredit(
   taskId: string,
   reason?: string,
   leaseToken?: string
-): Promise<{ success: boolean; status?: string; remaining?: number; error?: string }> {
+): Promise<{ success: boolean; status?: string; remaining?: number; error?: string; errorCode?: string }> {
+  const token = typeof leaseToken === 'string' ? leaseToken.trim() : '';
+  if (!token) {
+    return {
+      success: false,
+      errorCode: 'LEASE_TOKEN_REQUIRED',
+      error: '유효한 실행 토큰(lease_token)이 필요합니다.',
+    };
+  }
+
   try {
     const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
     const { data, error } = await client.rpc('release_trial_credit', {
       p_task_id: taskId,
       p_reason: reason || 'cancelled_or_failed',
       p_user_id: userId,
-      p_lease_token: leaseToken ?? null,
+      p_lease_token: token,
     });
     if (error || !data || typeof data !== 'object') {
-      return { success: false, error: '체험 크레딧 환급 중 오류가 발생했습니다.' };
+      return {
+        success: false,
+        errorCode: 'RELEASE_RPC_ERROR',
+        error: error?.message || '체험 크레딧 환급 중 오류가 발생했습니다.',
+      };
     }
-    const res = data as { success?: boolean; status?: string; remaining?: number; message?: string };
-    return { success: Boolean(res.success), status: res.status, remaining: res.remaining, error: res.message };
+    const res = data as { success?: boolean; status?: string; remaining?: number; message?: string; error?: string; error_code?: string; errorCode?: string };
+    const errCode = res.error_code || res.errorCode || (!res.success ? 'RELEASE_FAILED' : undefined);
+    return {
+      success: Boolean(res.success),
+      status: res.status,
+      remaining: res.remaining,
+      error: res.message || res.error,
+      errorCode: errCode,
+    };
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : '체험 크레딧 환급 통신 오류' };
+    return {
+      success: false,
+      errorCode: 'RELEASE_NETWORK_ERROR',
+      error: err instanceof Error ? err.message : '체험 크레딧 환급 통신 오류',
+    };
   }
 }
