@@ -10,6 +10,7 @@ import {
   DailyStudyPlan,
   StudyPlanSummary,
   STUDY_PLAN_ITEM_KIND_LABELS,
+  RECOMMENDED_PRACTICE_KIND_LABELS,
   WeekdayStudyTime,
 } from '../lib/types';
 import {
@@ -454,6 +455,12 @@ export function StudyPlanModal({
                                       {STUDY_PLAN_ITEM_KIND_LABELS[item.kind]}
                                     </span>
 
+                                    {item.recommendedPracticeKind && (
+                                      <span className="text-[10px] font-academic-mono font-bold px-1.5 py-0.2 rounded-2xs bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                        {RECOMMENDED_PRACTICE_KIND_LABELS[item.recommendedPracticeKind].label}
+                                      </span>
+                                    )}
+
                                     <span className="font-academic-mono text-[10px] text-[#827d73]">
                                       {item.subjectName}
                                     </span>
@@ -497,6 +504,12 @@ export function StudyPlanModal({
                                     <div className="text-[10.5px] text-amber-900 bg-amber-50 p-1 border border-amber-200 rounded-2xs flex items-center gap-1">
                                       <AlertTriangle className="w-3 h-3 text-amber-700" />
                                       <span>{item.warningNote}</span>
+                                    </div>
+                                  )}
+                                  {item.explanationDetails && (
+                                    <div className="text-[10px] text-[#57544e] bg-[#fbf9f5] border border-[#ede8de] p-1.5 rounded-2xs mt-1 space-y-0.5">
+                                      <div><strong>일정 근거:</strong> {item.explanationDetails.whyDateMoved}</div>
+                                      <div><strong>추천 유형:</strong> {item.explanationDetails.whyProblemType}</div>
                                     </div>
                                   )}
                                 </div>

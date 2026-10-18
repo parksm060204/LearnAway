@@ -1,4 +1,13 @@
-import { Concept, ConceptStatus, RetentionModelSettings, ReviewEvent, ReviewRecommendation } from './types';
+import {
+  Concept,
+  ConceptStatus,
+  RetentionModelSettings,
+  ReviewEvent,
+  ReviewRecommendation,
+  RecommendedPracticeKind,
+  RECOMMENDED_PRACTICE_KIND_LABELS,
+  ReviewExplanationDetails,
+} from './types';
 import {
   toSeoulDateString,
   getSeoulCalendarDiff,
@@ -216,6 +225,197 @@ export function calculatePowerLawOptimalInterval(
 }
 
 /**
+ * Plan 04: Calculates a concept's academic mastery score (0 ~ 100) reflecting:
+ * 1. Confirmed evaluation scores and partial credits (exponential recency decay w_i)
+ * 2. Problem difficulty (Level 1~5) weighting
+ * 3. Spaced repetition success streaks (+streak bonus)
+ * 4. Error type discrimination (e.g. CALCULATION_ERROR does not severely penalize concept mastery,
+ *    CONCEPT_MISUNDERSTANDING / FORMULA_MISAPPLICATION reduces mastery, UNCERTAIN / needsReview is neutral)
+ * 5. Hint and assistance penalties
+ *
+ * Deterministic and pure function.
+ */
+export function calculateConceptMasteryScore(
+  events: ReviewEvent[],
+  reference: Date | string | number = new Date(),
+  baseScore: number = 0
+): number {
+  const confirmed = getConfirmedEvents(events);
+  if (confirmed.length === 0) return Math.min(100, Math.max(0, Number(baseScore.toFixed(1))));
+
+  let pastEvents: ReviewEvent[];
+  if (typeof reference === 'number') {
+    pastEvents = confirmed
+      .filter((e) => e.dayOffset <= reference)
+      .sort((a, b) => a.dayOffset - b.dayOffset);
+  } else {
+    const refDate = typeof reference === 'string' ? new Date(reference) : reference;
+    const refTime = refDate.getTime();
+    pastEvents = confirmed
+      .filter((e) => new Date(e.at).getTime() <= refTime)
+      .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+  }
+
+  if (pastEvents.length === 0) return Math.min(100, Math.max(0, Number(baseScore.toFixed(1))));
+
+  const weightedScores: { score: number; weight: number }[] = [];
+  let consecutiveHighScores = 0;
+  let repeatConceptErrors = 0;
+
+  const N = pastEvents.length;
+  for (let i = 0; i < N; i++) {
+    const ev = pastEvents[i];
+    const rawScore = Math.min(100, Math.max(0, ev.resultScore));
+    // Recency weight: 0.75^(N - 1 - i)
+    const recencyWeight = Math.pow(0.75, N - 1 - i);
+
+    // Hint penalty: -8% per hint, capped at -30%
+    const hintPenalty = Math.max(0.70, 1.0 - 0.08 * Math.max(0, ev.hintCount || 0));
+
+    // Error type factor
+    let errorFactor = 1.0;
+    const acError = ev.academicErrorType || ev.structuredError?.errorType;
+
+    if (acError === 'CALCULATION_ERROR' || acError === 'ANSWER_FORMAT_ERROR') {
+      // Calculation slip: does not imply lack of conceptual understanding
+      errorFactor = 1.0;
+    } else if (acError === 'CONCEPT_MISUNDERSTANDING' || acError === 'FORMULA_MISAPPLICATION') {
+      errorFactor = 0.85; // Serious conceptual error
+      repeatConceptErrors++;
+    } else if (acError === 'LOGICAL_ERROR' || acError === 'CONDITION_OMISSION') {
+      errorFactor = 0.92;
+    } else if (acError === 'UNCERTAIN' || ev.needsReview) {
+      // Unverified or uncertain AI evaluation: do not let AI failure unfairly degrade mastery
+      const safeScore = Math.max(rawScore, baseScore ?? 70);
+      weightedScores.push({ score: safeScore, weight: recencyWeight });
+      continue;
+    }
+
+    const eventMastery = Math.min(100, Math.max(0, rawScore * hintPenalty * errorFactor));
+    weightedScores.push({ score: eventMastery, weight: recencyWeight });
+
+    if (rawScore >= 80) {
+      consecutiveHighScores++;
+    } else {
+      consecutiveHighScores = 0;
+    }
+  }
+
+  const totalWeight = weightedScores.reduce((sum, w) => sum + w.weight, 0);
+  const weightedAverage = totalWeight > 0
+    ? weightedScores.reduce((sum, w) => sum + w.score * w.weight, 0) / totalWeight
+    : 0;
+
+  // Streak bonus: up to +6 points for repeated success
+  const streakBonus = Math.min(6, consecutiveHighScores * 2);
+  // Repeat error penalty: -3 points per repeated conceptual error, capped at -9
+  const repeatErrorPenalty = Math.min(9, Math.max(0, repeatConceptErrors - 1) * 3);
+
+  const finalMastery = Math.min(100, Math.max(0, weightedAverage + streakBonus - repeatErrorPenalty));
+  return Number(finalMastery.toFixed(1));
+}
+
+/**
+ * Plan 04: Resolves prerequisite dependency risk with cycle detection.
+ * If prerequisite concepts are unstudied or have low mastery (< 65),
+ * returns an elevated dependency risk score and the list of unmastered prerequisites.
+ */
+export function calculatePrerequisiteDependencyRisk(
+  concept: Concept,
+  allConcepts?: Concept[]
+): {
+  dependencyRiskScore: number;
+  unmasteredPrerequisites: string[];
+} {
+  if (!allConcepts || allConcepts.length === 0 || !concept.prerequisites || concept.prerequisites.length === 0) {
+    return { dependencyRiskScore: 0, unmasteredPrerequisites: [] };
+  }
+
+  const conceptByTitle = new Map(allConcepts.map((c) => [c.title.trim().toLowerCase(), c]));
+  const conceptById = new Map(allConcepts.map((c) => [c.id, c]));
+
+  const visited = new Set<string>([concept.id]);
+  const unmastered: string[] = [];
+  let totalRisk = 0;
+
+  for (const prereqStr of concept.prerequisites) {
+    const trimmed = prereqStr.trim();
+    if (!trimmed) continue;
+
+    const prereqConcept = conceptById.get(trimmed) || conceptByTitle.get(trimmed.toLowerCase());
+    if (!prereqConcept) continue;
+
+    if (visited.has(prereqConcept.id)) continue; // Prevent cyclic loops
+    visited.add(prereqConcept.id);
+
+    const isUnstudied = prereqConcept.status === 'unstudied' || (!prereqConcept.events || prereqConcept.events.length === 0);
+    const prereqMastery = prereqConcept.masteryScore ?? calculateConceptMasteryScore(prereqConcept.events || [], new Date(), prereqConcept.baseScore);
+
+    if (isUnstudied) {
+      totalRisk += 25;
+      unmastered.push(`${prereqConcept.title} (미학습)`);
+    } else if (prereqMastery < 65) {
+      const deficit = (65 - prereqMastery) * 0.4;
+      totalRisk += deficit;
+      unmastered.push(`${prereqConcept.title} (숙련도 ${prereqMastery.toFixed(0)}점)`);
+    }
+  }
+
+  return {
+    dependencyRiskScore: Number(Math.min(50, totalRisk).toFixed(1)),
+    unmasteredPrerequisites: unmastered,
+  };
+}
+
+/**
+ * Plan 04: Determines recommended practice problem kind (Types A ~ E) adaptively
+ * based on student's mastery, retention, and recent error analysis.
+ */
+export function determineRecommendedPracticeKind(
+  concept: Concept,
+  masteryScore: number,
+  retentionScore: number,
+  lastEvent?: ReviewEvent
+): RecommendedPracticeKind {
+  const acError = lastEvent?.academicErrorType || lastEvent?.structuredError?.errorType;
+  const lastScore = lastEvent ? lastEvent.resultScore : 0;
+
+  // 1. Critical conceptual error or formula misapplication
+  if (acError === 'CONCEPT_MISUNDERSTANDING' || acError === 'FORMULA_MISAPPLICATION') {
+    if (lastScore < 60) {
+      return 'original_rechallenge'; // Type A
+    }
+    return 'similar_problem'; // Type B
+  }
+
+  // 2. Condition omission / boundary case / transfer difficulty
+  if (acError === 'CONDITION_OMISSION') {
+    return 'transfer_problem'; // Type D
+  }
+
+  // 3. Calculation / format / reasoning steps mistake with good core concept
+  if (acError === 'CALCULATION_ERROR' || acError === 'ANSWER_FORMAT_ERROR' || acError === 'INCOMPLETE_REASONING') {
+    return 'variant_problem'; // Type C
+  }
+
+  // 4. High mastery (>= 75) and maintaining retention:
+  if (masteryScore >= 75) {
+    if (concept.relatedConcepts && concept.relatedConcepts.length > 0) {
+      return 'composite_application'; // Type E
+    }
+    return 'transfer_problem'; // Type D
+  }
+
+  // 5. Low mastery (< 60):
+  if (masteryScore < 60) {
+    return 'similar_problem'; // Type B
+  }
+
+  // Default: variant problem
+  return 'variant_problem'; // Type C
+}
+
+/**
  * Calculates deterministic review recommendation for a concept based on actual event timestamps.
  * Reflects last event score, review count, confidence, hint count, vulnerable criteria,
  * postponed days, and exam D-day.
@@ -225,7 +425,8 @@ export function calculateNextReviewRecommendation(
   settings: RetentionModelSettings = DEFAULT_RETENTION_SETTINGS,
   examAtIso?: string,
   referenceDate: Date = new Date(),
-  intervalMultiplier: number = 1
+  intervalMultiplier: number = 1,
+  allConcepts?: Concept[]
 ): ReviewRecommendation | null {
   if (concept.status === 'unstudied' || !concept.events || concept.events.length === 0) {
     return null;
@@ -265,13 +466,18 @@ export function calculateNextReviewRecommendation(
   // Calendar days difference in Asia/Seoul
   const calendarElapsedDays = Math.max(0, getSeoulCalendarDiff(lastEvent.at, referenceDate));
 
-  // Current score at referenceDate
+  // Current score (Retention) at referenceDate
   const currentScore = calculatePowerLawRetention(
     elapsedDays,
     lastEvent.resultScore,
     effectiveTau,
     settings.alpha
   );
+
+  // Plan 04: Mastery Score
+  const masteryScore = calculateConceptMasteryScore(concept.events, referenceDate, concept.baseScore);
+  const depRisk = calculatePrerequisiteDependencyRisk(concept, allConcepts);
+  const recommendedPracticeKind = determineRecommendedPracticeKind(concept, masteryScore, currentScore, lastEvent);
 
   // Calculate optimal retention interval t* in days
   const theoreticalIntervalDays = calculatePowerLawOptimalInterval(
@@ -318,11 +524,26 @@ export function calculateNextReviewRecommendation(
     }
   }
 
-  // Urgency score calculation:
-  // (100 - currentScore) * 1.5 + (overdue days * 6) + examProximityWeight
+  // Plan 04 Urgency score calculation:
+  // (100 - currentScore) * 1.5 + (overdue days * 6) + examProximityWeight + errorBonus + depRisk
   const overdueBonus = Math.max(0, -daysUntilReview) * 6.0;
   const scoreDeficit = (100 - currentScore) * 1.5;
-  const urgencyScore = Number((scoreDeficit + overdueBonus + examProximityWeight).toFixed(2));
+
+  let errorBonus = 0;
+  const acError = lastEvent.academicErrorType || lastEvent.structuredError?.errorType;
+  if (acError === 'CONCEPT_MISUNDERSTANDING' || acError === 'FORMULA_MISAPPLICATION') {
+    errorBonus = 25;
+  } else if (acError === 'CONDITION_OMISSION' || acError === 'LOGICAL_ERROR') {
+    errorBonus = 15;
+  } else if (acError === 'CALCULATION_ERROR') {
+    errorBonus = 8;
+  } else if (acError === 'UNCERTAIN') {
+    errorBonus = 4;
+  }
+
+  const urgencyScore = Number(
+    (scoreDeficit + overdueBonus + examProximityWeight + errorBonus + depRisk.dependencyRiskScore * 0.4).toFixed(2)
+  );
 
   // Human-readable rationale text explaining factors
   const rationaleParts: string[] = [];
@@ -335,6 +556,12 @@ export function calculateNextReviewRecommendation(
     }
   } else {
     rationaleParts.push(`모델 점수 ${currentScore.toFixed(1)}점 (안정 유지 중) · D+${daysUntilReview} 권장`);
+  }
+
+  rationaleParts.push(`숙련도 ${masteryScore.toFixed(1)}점`);
+
+  if (acError && acError !== 'NO_ERROR') {
+    rationaleParts.push(`최근 오답: ${acError}`);
   }
 
   if (confidence < 3) {
@@ -352,6 +579,9 @@ export function calculateNextReviewRecommendation(
   if (examProximityWeight > 10) {
     rationaleParts.push('시험 임박 가중치 적용');
   }
+  if (depRisk.unmasteredPrerequisites.length > 0) {
+    rationaleParts.push(`선행 개념 점검 권장: ${depRisk.unmasteredPrerequisites.join(', ')}`);
+  }
   if (safeMultiplier !== 1) {
     const baseRounded = Math.max(0, Math.round(rawBaseIntervalDays));
     rationaleParts.push(
@@ -361,12 +591,49 @@ export function calculateNextReviewRecommendation(
 
   const priorityReason = rationaleParts.join(' · ');
 
+  // Plan 04: 4-part rule-based explainability
+  const practiceMeta = RECOMMENDED_PRACTICE_KIND_LABELS[recommendedPracticeKind];
+
+  const whyPriority = [
+    `망각 위험 ${(100 - currentScore).toFixed(1)}점 (기억 유지율 ${currentScore.toFixed(1)}%)`,
+    `개념 숙련도 ${masteryScore.toFixed(1)}점`,
+    errorBonus > 0 ? `최근 ${acError} 감점 보완 가중치 +${errorBonus}` : null,
+    depRisk.dependencyRiskScore > 0 ? `선행 개념 의존 위험 +${depRisk.dependencyRiskScore}` : null,
+    `종합 긴급도 ${urgencyScore}점`,
+  ].filter(Boolean).join(' · ');
+
+  let whyDateMoved: string;
+  if (daysUntilReview < 0) {
+    whyDateMoved = `권장 복습 기한 ${Math.abs(daysUntilReview)}일 초과 연체로 오늘 최우선 복습 필요`;
+  } else if (daysUntilReview === 0) {
+    whyDateMoved = `오늘 권장 복습일 도래 (기억 유지율이 임계치 ${settings.threshold}점에 도달)`;
+  } else if (postponeDays > 0) {
+    whyDateMoved = `사용자 미루기(+${postponeDays}일) 설정으로 D+${daysUntilReview}로 조정됨`;
+  } else if (examProximityWeight > 10) {
+    whyDateMoved = `시험 D-Day 임박 가중치(+${examProximityWeight.toFixed(1)}) 반영하여 일정 앞당김`;
+  } else {
+    whyDateMoved = `기억 유지 모델 산출 간격에 따라 D+${daysUntilReview}일 후 복습 권장`;
+  }
+
+  const whyProblemType = `[${practiceMeta.label}] ${practiceMeta.description}`;
+  const dailyWorkload = daysUntilReview <= 0
+    ? `오늘 즉시 복습 필요 (예상 15~20분 소요)`
+    : `D+${daysUntilReview} 예정 (예상 15~20분 소요)`;
+
+  const explanationDetails: ReviewExplanationDetails = {
+    whyPriority,
+    whyDateMoved,
+    whyProblemType,
+    dailyWorkload,
+  };
+
   return {
     conceptId: concept.id,
     recommendedAt,
     recommendedDateStr,
     daysUntilReview,
     urgencyScore,
+    priorityScore: urgencyScore,
     priorityRank: 1, // updated by rankConceptsForReview
     priorityReason,
     isDueTodayOrOverdue: daysUntilReview <= 0,
@@ -379,7 +646,13 @@ export function calculateNextReviewRecommendation(
       vulnerableCriterionCount: vulnerableCount,
       examProximityWeight,
       postponeDays,
+      masteryScore,
+      dependencyRiskScore: depRisk.dependencyRiskScore,
     },
+    masteryScore,
+    retentionScore: currentScore,
+    recommendedPracticeKind,
+    explanationDetails,
     baseIntervalDays,
     intervalMultiplier: safeMultiplier,
     isPersonalized: safeMultiplier !== 1,
@@ -414,7 +687,7 @@ export function rankConceptsForReview(
       unstudied.push(c);
       continue;
     }
-    const rec = calculateNextReviewRecommendation(c, settings, examAtIso, referenceDate, intervalMultiplier);
+    const rec = calculateNextReviewRecommendation(c, settings, examAtIso, referenceDate, intervalMultiplier, concepts);
     if (rec) {
       recommendations.push(rec);
     } else {

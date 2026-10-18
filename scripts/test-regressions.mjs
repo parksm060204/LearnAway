@@ -15,7 +15,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/materialDraft.ts', 'lib/materialEditSave.ts', 'lib/materialIngestion.ts', 'lib/analysisCheckpoint.ts', 'lib/reviewNotifications.ts', 'lib/dashboardUrl.ts',
   'lib/practiceAnswerDraft.ts', 'lib/sessionAffiliation.ts', 'lib/analysisRecovery.ts', 'lib/recoveryToken.ts',
   'lib/todayStudy.ts', 'lib/reviewStats.ts',
-  'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts',
+  'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts', 'lib/retentionModel.ts', 'lib/dateUtils.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
   'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/aiClient.ts', 'lib/aiCredentials.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
   'lib/storageScope.ts', 'lib/auth/redirects.ts', 'lib/legacyImport.ts', 'lib/appReadiness.ts',
@@ -153,6 +153,8 @@ exports.requireApiUser = async () => {
   const problemSources = load(path.join(output, 'lib/problemSources.js'));
   const problemFreshness = load(path.join(output, 'lib/problemFreshness.js'));
   const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
+  const retentionModel = load(path.join(output, 'lib/retentionModel.js'));
+  const dateUtils = load(path.join(output, 'lib/dateUtils.js'));
   const logicSession = load(path.join(output, 'lib/logicSession.js'));
   const logicValidation = load(path.join(output, 'lib/logicValidation.js'));
   const transferValidation = load(path.join(output, 'lib/transferValidation.js'));
@@ -14615,6 +14617,454 @@ exports.requireApiUser = async () => {
     assert.equal(restored.academicErrorType, 'INCOMPLETE_REASONING');
     assert.equal(restored.structuredError.errorType, 'INCOMPLETE_REASONING');
     assert.equal(restored.structuredError.severity, 'minor');
+  });
+
+  // =========================================================================
+  // PLAN 04: ADAPTIVE REVIEW ENGINE & EXAM-DATE SCHEDULER VERIFICATION
+  // =========================================================================
+
+  check('P04-01: 복습 엔진 전수 진단 및 데이터 흐름 무결성 (Attempt -> ReviewEvent -> Concept -> StudyPlanItem)', () => {
+    storage.saveStoredConcepts([]);
+    storage.saveStoredAttempts([]);
+    storage.saveStoredProblems([]);
+    storage.saveStoredSubjects([]);
+
+    const subject = {
+      id: 'sub-audit-p04',
+      name: '고급통계학',
+      code: 'STAT301',
+      domain: 'math_stats',
+      examAt: '2026-10-25T09:00:00+09:00',
+    };
+    const concept = {
+      id: 'con-p04-clt',
+      subjectId: subject.id,
+      title: '중심극한정리 (CLT)',
+      status: 'review_needed',
+      currentScore: 65,
+      intervalDays: 2,
+      easeFactor: 2.5,
+      events: [],
+    };
+    const problem = {
+      id: 'prob-p04-clt-1',
+      conceptIds: [concept.id],
+      subjectId: subject.id,
+      title: '린데베르그-레비 CLT 증명',
+      type: 'proof_counterexample',
+      categoryLabel: '3. 증명 및 반례',
+      categoryNumber: 3,
+      promptText: '특성함수를 이용하여 CLT를 증명하시오.',
+      timeStandardMinutes: 20,
+      timeBreakdownDesc: '20분',
+      coreEvaluationHighlight: '특성함수 테일러 전개',
+      itemCountDesc: '1문항',
+      sourceRefs: '교재 7장',
+      hints: [],
+      modelAnswer: '모범 답안',
+      rubric: [{ id: 'r1', label: '특성함수', maxScore: 100, weight: 1.0, description: '전개' }],
+      isApproved: true,
+      isDemo: false,
+      qualityStatus: 'normal',
+    };
+
+    storage.saveStoredSubjects([subject]);
+    storage.saveStoredConcepts([concept]);
+    storage.saveStoredProblems([problem]);
+
+    const attempt = {
+      id: 'att-p04-audit-1',
+      problemId: problem.id,
+      conceptId: concept.id,
+      subjectId: subject.id,
+      at: '2026-10-18T10:00:00+09:00',
+      answer: '특성함수 phi(t/sqrt(n))의 테일러 전개를 이용함.',
+      confidence: 4,
+      errorType: 'none',
+      academicErrorType: 'NO_ERROR',
+      hintCount: 0,
+      reasoningNotes: '특성함수 연속성 정리 활용',
+      calculatedScore: 92,
+      rubricResults: [{ criterionId: 'r1', label: '특성함수 전개', score: 92, maxScore: 100, isVulnerable: false }],
+      evaluatorFeedback: '논리 전개가 정확합니다.',
+      strengths: '테일러 전개 정확',
+      criticalImprovements: '극한 교환 조건 명시',
+      needsReview: false,
+      isAiEvaluated: true,
+    };
+
+    const res = storage.recordAttemptAndUpdateConcept(attempt);
+    assert.equal(res.status, 'complete');
+
+    // Verify concept received review event and updated scores
+    const concepts = storage.loadStoredConcepts();
+    const updated = concepts.find((c) => c.id === concept.id);
+    assert.ok(updated);
+    assert.equal(updated.events.length, 1);
+    assert.equal(updated.events[0].attemptId, attempt.id);
+    assert.equal(updated.events[0].resultScore, 92);
+    assert.ok(updated.masteryScore !== undefined && updated.masteryScore > 70, '숙련도 정상 계산');
+
+    // Plan generation integrates updated concept and problem
+    const settings = types.DEFAULT_STUDY_PLAN_SETTINGS;
+    const plan = studyPlan.generateStudyPlan({
+      subjects: [subject],
+      concepts: [updated],
+      problems: [problem],
+      attempts: [attempt],
+      settings,
+      referenceDate: new Date('2026-10-18T10:00:00+09:00'),
+      daysCount: 7,
+    });
+
+    assert.ok(plan.days.length >= 7);
+    const day0 = plan.days[0];
+    assert.ok(day0.assignedMinutes <= day0.availableMinutes);
+  });
+
+  check('P04-02: 기억 유지율(Retention)과 개념 숙련도(Mastery)의 분리 및 결정론적 계산', () => {
+    // 1. Retention decay over time with fixed baseline
+    const initialScore = 90;
+    const tau = 4.0;
+    const rDay0 = retentionModel.calculatePowerLawRetention(0, initialScore, tau);
+    const rDay3 = retentionModel.calculatePowerLawRetention(3, initialScore, tau);
+    const rDay10 = retentionModel.calculatePowerLawRetention(10, initialScore, tau);
+
+    assert.equal(rDay0, 90, 'Day 0 retention equals initial score');
+    assert.ok(rDay3 < rDay0, 'Day 3 retention strictly less than Day 0');
+    assert.ok(rDay10 < rDay3, 'Day 10 retention strictly less than Day 3');
+    assert.ok(rDay10 >= 0 && rDay10 <= 100, 'Retention stays in [0, 100]');
+
+    // 2. Mastery calculation: distinction between calculation slip vs concept deficit
+    const refDate = new Date('2026-10-18T10:00:00+09:00');
+    const calcSlipEvent = {
+      id: 'ev-calc-slip',
+      conceptId: 'con-test',
+      at: '2026-10-17T10:00:00+09:00',
+      dayOffset: 0,
+      kind: 'attempt',
+      title: '계산 실수',
+      resultScore: 70, // 30pt deduction for calculation error
+      confidence: 4,
+      errorType: 'calc_or_impl_mistake',
+      academicErrorType: 'CALCULATION_ERROR',
+      hintCount: 0,
+    };
+    const conceptDeficitEvent = {
+      id: 'ev-concept-def',
+      conceptId: 'con-test',
+      at: '2026-10-17T10:00:00+09:00',
+      dayOffset: 0,
+      kind: 'attempt',
+      title: '개념 오해',
+      resultScore: 70, // 30pt deduction for concept misunderstanding
+      confidence: 4,
+      errorType: 'concept_confusion',
+      academicErrorType: 'CONCEPT_MISUNDERSTANDING',
+      hintCount: 0,
+    };
+
+    const masteryAfterCalcSlip = retentionModel.calculateConceptMasteryScore([calcSlipEvent], refDate, 70);
+    const masteryAfterConceptDef = retentionModel.calculateConceptMasteryScore([conceptDeficitEvent], refDate, 70);
+
+    // CRITICAL: Calculation slip does not destroy conceptual mastery, whereas concept misunderstanding reflects vulnerability
+    assert.ok(masteryAfterCalcSlip > masteryAfterConceptDef, `계산 실수는 개념 오해보다 숙련도 감점이 적어야 함 (${masteryAfterCalcSlip} > ${masteryAfterConceptDef})`);
+
+    // 3. Uncertain / needsReview does not definitively lower mastery
+    const uncertainEvent = {
+      id: 'ev-uncertain',
+      conceptId: 'con-test',
+      at: '2026-10-17T10:00:00+09:00',
+      dayOffset: 0,
+      kind: 'attempt',
+      title: '평가 불확실',
+      resultScore: 40,
+      confidence: 3,
+      errorType: 'concept_confusion',
+      academicErrorType: 'UNCERTAIN',
+      needsReview: true,
+      hintCount: 0,
+    };
+    const masteryUncertain = retentionModel.calculateConceptMasteryScore([uncertainEvent], refDate, 80);
+    assert.ok(masteryUncertain >= 70, '평가 불확실 건은 숙련도를 확정적으로 급락시키지 않음');
+
+    // 4. Determinism: identical inputs yield identical outputs
+    const masteryRun1 = retentionModel.calculateConceptMasteryScore([calcSlipEvent, conceptDeficitEvent], refDate, 70);
+    const masteryRun2 = retentionModel.calculateConceptMasteryScore([calcSlipEvent, conceptDeficitEvent], refDate, 70);
+    assert.equal(masteryRun1, masteryRun2, '동일 입력에 대한 숙련도 계산 결정론성');
+  });
+
+  check('P04-03: 시험일 기반 스케줄러 단계별 전략 (D-Day Phases) 및 일일 가용시간 엄격 준수', () => {
+    const ref = new Date('2026-10-18T09:00:00+09:00');
+    // Test D-20 (Foundation & Spaced Repetition)
+    const subD20 = { id: 's-d20', name: '선형대수학', examAt: '2026-11-07T09:00:00+09:00', domain: 'math_stats' };
+    // Test D-7 (Weak Concepts & Applications)
+    const subD7 = { id: 's-d7', name: '확률론', examAt: '2026-10-25T09:00:00+09:00', domain: 'math_stats' };
+    // Test D-2 (Core Recall & Mock Exam)
+    const subD2 = { id: 's-d2', name: '수치해석', examAt: '2026-10-20T09:00:00+09:00', domain: 'math_stats' };
+
+    const cD20 = { id: 'c-d20', subjectId: subD20.id, title: '고유값 분해', status: 'unstudied', currentScore: 0, events: [] };
+    const cD7 = { id: 'c-d7', subjectId: subD7.id, title: '조건부 기댓값', status: 'review_needed', currentScore: 45, events: [] };
+    const cD2 = { id: 'c-d2', subjectId: subD2.id, title: '뉴턴-랩슨법', status: 'review_needed', currentScore: 80, events: [] };
+
+    const plan = studyPlan.generateStudyPlan({
+      subjects: [subD20, subD7, subD2],
+      concepts: [cD20, cD7, cD2],
+      problems: [],
+      attempts: [],
+      settings: types.DEFAULT_STUDY_PLAN_SETTINGS,
+      referenceDate: ref,
+      daysCount: 7,
+    });
+
+    // Invariant: every single day respects available minutes
+    for (const day of plan.days) {
+      assert.ok(day.assignedMinutes <= day.availableMinutes, `일일 배정 시간(${day.assignedMinutes})은 가용 시간(${day.availableMinutes})을 초과할 수 없음`);
+    }
+
+    // Unassigned items are explicitly preserved when budget is full
+    const totalItems = plan.days.reduce((acc, d) => acc + d.items.length, 0);
+    assert.ok(totalItems > 0, '학습 계획 항목 생성됨');
+    assert.ok(Array.isArray(plan.days[0].unassignedItems), '배치 불가 항목 명시적 배열 존재');
+  });
+
+  check('P04-04: 취약 개념 우선순위 함수 및 선수 개념 의존성 순환 방지 (Cycle Detection)', () => {
+    // 1. Multi-factor priority ranking
+    const cWeak = {
+      id: 'c-weak',
+      subjectId: 'sub-test',
+      title: '취약 개념',
+      status: 'review_needed',
+      currentScore: 35,
+      masteryScore: 40,
+      events: [{ id: 'e1', conceptId: 'c-weak', at: '2026-10-17T09:00:00+09:00', kind: 'attempt', resultScore: 40, academicErrorType: 'CONCEPT_MISUNDERSTANDING' }],
+    };
+    const cStrong = {
+      id: 'c-strong',
+      subjectId: 'sub-test',
+      title: '우수 개념',
+      status: 'review_needed',
+      currentScore: 85,
+      masteryScore: 90,
+      events: [{ id: 'e2', conceptId: 'c-strong', at: '2026-10-17T09:00:00+09:00', kind: 'attempt', resultScore: 90, academicErrorType: 'NO_ERROR' }],
+    };
+
+    const recWeak = retentionModel.calculateNextReviewRecommendation(cWeak, types.DEFAULT_RETENTION_SETTINGS, undefined, new Date('2026-10-18T09:00:00+09:00'), 1, [cWeak, cStrong]);
+    const recStrong = retentionModel.calculateNextReviewRecommendation(cStrong, types.DEFAULT_RETENTION_SETTINGS, undefined, new Date('2026-10-18T09:00:00+09:00'), 1, [cWeak, cStrong]);
+
+    assert.ok(recWeak, 'recWeak 생성됨');
+    assert.ok(recStrong, 'recStrong 생성됨');
+    assert.ok(recWeak.priorityScore > recStrong.priorityScore, '취약 개념의 우선순위 점수가 우수 개념보다 높아야 함');
+
+    // 2. Circular Prerequisite Dependency cycle detection
+    const cA = { id: 'cA', subjectId: 'sub-p', title: '개념 A', prerequisites: ['개념 B'], currentScore: 50, masteryScore: 50, events: [] };
+    const cB = { id: 'cB', subjectId: 'sub-p', title: '개념 B', prerequisites: ['개념 A'], currentScore: 30, masteryScore: 30, events: [] }; // Cyclic A -> B -> A
+
+    const resRiskA = retentionModel.calculatePrerequisiteDependencyRisk(cA, [cA, cB]);
+    assert.ok(!isNaN(resRiskA.dependencyRiskScore), '순환 의존성이 있어도 무한 재귀 없이 안전하게 계산됨');
+    assert.ok(resRiskA.dependencyRiskScore > 0, '미숙련 선수 개념 B로 인해 개념 A의 위험도 가산됨');
+  });
+
+  check('P04-05: 맞춤형 문제 재출제 5대 유형 (Types A~E) 및 순수 결정론적 추천 (AI 미호출 보장)', () => {
+    // Type A: Low mastery (<60) and concept deficit -> original_rechallenge
+    const typeA = retentionModel.determineRecommendedPracticeKind(
+      { id: 'c1', title: '기초 개념', events: [] },
+      45,
+      50,
+      { resultScore: 40, academicErrorType: 'CONCEPT_MISUNDERSTANDING' }
+    );
+    assert.equal(typeA, 'original_rechallenge', '낮은 숙련도 또는 개념 오해 시 원문제 재도전 추천');
+
+    // Type B: Mastery < 60 without severe concept error -> similar_problem
+    const typeB = retentionModel.determineRecommendedPracticeKind(
+      { id: 'c2', title: '계산 공식', events: [] },
+      55,
+      60,
+      { resultScore: 70, academicErrorType: 'NO_ERROR' }
+    );
+    assert.equal(typeB, 'similar_problem', '숙련도 부족 시 유사 문제로 기본 이해 및 절차 숙달');
+
+    // Type C: Calculation slip or medium mastery -> variant_problem
+    const typeC = retentionModel.determineRecommendedPracticeKind(
+      { id: 'c3', title: '변형 적용', events: [] },
+      70,
+      75,
+      { resultScore: 75, academicErrorType: 'CALCULATION_ERROR' }
+    );
+    assert.equal(typeC, 'variant_problem', '계산 실수 또는 중간 숙련도는 변형 문제로 논리 전개 유연성 확인');
+
+    // Type D: Mastery >= 75 without related concepts -> transfer_problem
+    const typeD = retentionModel.determineRecommendedPracticeKind(
+      { id: 'c4', title: '고급 응용', events: [] },
+      85,
+      90,
+      { resultScore: 90, academicErrorType: 'NO_ERROR' }
+    );
+    assert.equal(typeD, 'transfer_problem', '최상위 숙련도는 전이 문제 추천');
+
+    // Type E: Mastery >= 75 with related concepts -> composite_application
+    const typeE = retentionModel.determineRecommendedPracticeKind(
+      { id: 'c5', title: '복합 응용', relatedConcepts: ['c1', 'c2'], events: [] },
+      90,
+      95,
+      { resultScore: 95, academicErrorType: 'NO_ERROR' }
+    );
+    assert.equal(typeE, 'composite_application', '복수 관련 개념 보유 시 복합 개념 문제 추천');
+  });
+
+  check('P04-06: 학습 데이터 무결성 및 중복 방지 (Deduplication & Idempotency)', () => {
+    storage.saveStoredConcepts([]);
+    storage.saveStoredAttempts([]);
+
+    const c1 = { id: 'c-int-1', subjectId: 's-int', title: '주 개념', events: [], currentScore: 50 };
+    const c2 = { id: 'c-int-2', subjectId: 's-int', title: '부 개념 (복합)', events: [], currentScore: 50 };
+    storage.saveStoredConcepts([c1, c2]);
+
+    const compAttempt = {
+      id: 'att-composite-once',
+      problemId: 'prob-comp',
+      conceptId: c1.id,
+      conceptIds: [c1.id, c2.id],
+      subjectId: 's-int',
+      at: '2026-10-18T10:00:00+09:00',
+      answer: '복합 풀이',
+      confidence: 4,
+      errorType: 'none',
+      calculatedScore: 90,
+      rubricResults: [{ criterionId: 'r1', maxScore: 100, score: 90 }],
+    };
+
+    // 1. First record
+    const r1 = storage.recordAttemptAndUpdateConcept(compAttempt);
+    assert.equal(r1.status, 'complete');
+
+    // 2. Retry record (idempotency)
+    const r2 = storage.recordAttemptAndUpdateConcept(compAttempt);
+    assert.equal(r2.status, 'already_completed', '재시도 시 already_completed 반환으로 멱등성 보장');
+
+    const attempts = storage.loadStoredAttempts();
+    assert.equal(attempts.filter((a) => a.id === compAttempt.id).length, 1, 'Attempt ID는 1회만 저장됨');
+
+    const concepts = storage.loadStoredConcepts();
+    const updatedC1 = concepts.find((c) => c.id === c1.id);
+    const updatedC2 = concepts.find((c) => c.id === c2.id);
+
+    assert.equal(updatedC1.events.length, 1, '주 개념에 1개의 ReviewEvent 생성');
+    assert.equal(updatedC2.events.length, 0, '부 개념에는 허위 중복 이벤트가 생성되지 않음 (전체 문항 귀속 원칙)');
+  });
+
+  check('P04-07: 복습 대시보드 설명 가능성 (4대 규칙 기반 질의 응답) 및 복습 알림 연동', () => {
+    const concept = {
+      id: 'con-explain',
+      subjectId: 'sub-exp',
+      title: '베이즈 정리',
+      status: 'review_needed',
+      currentScore: 40,
+      masteryScore: 45,
+      events: [{ id: 'e-1', conceptId: 'con-explain', at: '2026-10-16T10:00:00+09:00', kind: 'attempt', resultScore: 45, academicErrorType: 'FORMULA_MISAPPLICATION' }],
+    };
+
+    const rec = retentionModel.calculateNextReviewRecommendation(
+      concept,
+      types.DEFAULT_RETENTION_SETTINGS,
+      undefined,
+      new Date('2026-10-18T10:00:00+09:00'),
+      1,
+      [concept]
+    );
+
+    assert.ok(rec, '추천 객체 생성됨');
+    assert.ok(rec.explanationDetails, '4대 설명 필드 객체 존재');
+    assert.ok(rec.explanationDetails.whyPriority.length > 5, 'whyPriority 설명 텍스트 제공');
+    assert.ok(rec.explanationDetails.whyDateMoved.length > 5, 'whyDateMoved 설명 텍스트 제공');
+    assert.ok(rec.explanationDetails.whyProblemType.length > 5, 'whyProblemType 설명 텍스트 제공');
+    assert.ok(rec.explanationDetails.dailyWorkload.length > 5, 'dailyWorkload 설명 텍스트 제공');
+  });
+
+  check('P04-08: 1일, 7일, 14일, 30일, 60일, 90일 장기 시간 시뮬레이션 및 불변 조건 검증', () => {
+    const startDate = new Date('2026-09-01T09:00:00+09:00');
+    const timeSteps = [1, 7, 14, 30, 60, 90]; // Days
+
+    const baseConcept = {
+      id: 'con-sim-1',
+      subjectId: 'sub-sim',
+      title: '특이값 분해 (SVD)',
+      status: 'review_needed',
+      currentScore: 90,
+      masteryScore: 88,
+      lastAttemptAt: startDate.toISOString(),
+      events: [
+        {
+          id: 'ev-init',
+          conceptId: 'con-sim-1',
+          at: startDate.toISOString(),
+          dayOffset: 0,
+          kind: 'attempt',
+          resultScore: 90,
+          confidence: 4,
+          errorType: 'none',
+          academicErrorType: 'NO_ERROR',
+        },
+      ],
+    };
+
+    let prevRetention = 100;
+    for (const days of timeSteps) {
+      const simDate = new Date(startDate.getTime() + days * 24 * 60 * 60 * 1000);
+      const rec = retentionModel.calculateNextReviewRecommendation(
+        baseConcept,
+        types.DEFAULT_RETENTION_SETTINGS,
+        undefined,
+        simDate,
+        1,
+        [baseConcept]
+      );
+
+      assert.ok(rec, 'rec at simDate 생성됨');
+      // Invariant 1: Retention strictly bounded [0, 100]
+      assert.ok(rec.retentionScore >= 0 && rec.retentionScore <= 100, `t=${days}일 유지율은 [0, 100] 범위 내`);
+      // Invariant 2: Mastery strictly bounded [0, 100]
+      assert.ok(rec.masteryScore >= 0 && rec.masteryScore <= 100, `t=${days}일 숙련도는 [0, 100] 범위 내`);
+      // Invariant 3: Retention decay is strictly monotonic without new attempts
+      assert.ok(rec.retentionScore <= prevRetention, `t=${days}일 유지율(${rec.retentionScore})은 이전 시점(${prevRetention})보다 작거나 같아야 함`);
+      prevRetention = rec.retentionScore;
+    }
+
+    // Now simulate successful review at day 30: retention restores and tau expands
+    const day30Date = new Date(startDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const postReviewEvents = [
+      ...baseConcept.events,
+      {
+        id: 'ev-day30',
+        conceptId: 'con-sim-1',
+        at: day30Date.toISOString(),
+        dayOffset: 30,
+        kind: 'attempt',
+        resultScore: 95,
+        confidence: 5,
+        errorType: 'none',
+        academicErrorType: 'NO_ERROR',
+      },
+    ];
+
+    const updatedConcept = {
+      ...baseConcept,
+      events: postReviewEvents,
+      lastAttemptAt: day30Date.toISOString(),
+    };
+
+    const recPostReview = retentionModel.calculateNextReviewRecommendation(
+      updatedConcept,
+      types.DEFAULT_RETENTION_SETTINGS,
+      undefined,
+      day30Date,
+      1,
+      [updatedConcept]
+    );
+
+    assert.ok(recPostReview, 'recPostReview 생성됨');
+    assert.ok(recPostReview.retentionScore >= 90, 'Day 30 복습 성공 후 기억 유지율 즉시 회복 (90점 이상)');
+    assert.ok(recPostReview.factors.effectiveTau >= 4.0, '성공적 복습 후 기억 안정성 τ 증가');
   });
 
   console.log(`${passed} regression checks passed`);

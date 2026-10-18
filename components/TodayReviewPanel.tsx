@@ -7,6 +7,7 @@ import {
   ProblemType,
   Subject,
   ReviewRecommendation,
+  RECOMMENDED_PRACTICE_KIND_LABELS,
   isProblemAvailableForPractice,
 } from '../lib/types';
 import { AcademicMathView } from './AcademicMathView';
@@ -142,6 +143,48 @@ export function TodayReviewPanel({
           <p className="text-[11.5px] text-[#57544e] leading-relaxed">
             {recommendation.priorityReason}
           </p>
+
+                    {/* Recommended Practice Kind Badge & Scores */}
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            {recommendation.recommendedPracticeKind && (
+              <span className="bg-indigo-50 text-indigo-700 border border-indigo-200 px-2 py-0.5 rounded-2xs font-academic-mono font-bold text-[11px]">
+                {RECOMMENDED_PRACTICE_KIND_LABELS[recommendation.recommendedPracticeKind].label}
+              </span>
+            )}
+            {recommendation.masteryScore !== undefined && (
+              <span className="bg-emerald-50 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded-2xs font-academic-mono text-[10.5px]">
+                개념 숙련도: {Math.round(recommendation.masteryScore)}점
+              </span>
+            )}
+            {recommendation.retentionScore !== undefined && (
+              <span className="bg-blue-50 text-blue-800 border border-blue-200 px-1.5 py-0.5 rounded-2xs font-academic-mono text-[10.5px]">
+                예상 유지율: {Math.round(recommendation.retentionScore)}%
+              </span>
+            )}
+          </div>
+
+          {/* 4 Rule-Based Explanations */}
+          {recommendation.explanationDetails && (
+            <div className="mt-2 p-2.5 bg-white border border-[#e2ded6] rounded-xs space-y-1.5 text-[11px]">
+              <div className="font-bold text-[#191817] text-[11px] pb-1 border-b border-[#f1ede4]">
+                학습 스케줄러 추천 판단 근거 (설명 가능성)
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[#57544e]">
+                <div>
+                  <span className="font-semibold text-[#191817]">1. 우선순위 판정:</span> {recommendation.explanationDetails.whyPriority}
+                </div>
+                <div>
+                  <span className="font-semibold text-[#191817]">2. 복습 일정 근거:</span> {recommendation.explanationDetails.whyDateMoved}
+                </div>
+                <div>
+                  <span className="font-semibold text-[#191817]">3. 문제 유형 추천:</span> {recommendation.explanationDetails.whyProblemType}
+                </div>
+                <div>
+                  <span className="font-semibold text-[#191817]">4. 오늘 학습 분량:</span> {recommendation.explanationDetails.dailyWorkload}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Model Factors Micro-strip */}
           <div className="pt-1 flex flex-wrap items-center gap-1.5 text-[10.5px] font-academic-mono text-[#827d73]">

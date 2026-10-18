@@ -279,6 +279,13 @@ export function generateStudyPlan({
         status: existing?.status || 'pending',
         snapshotTitle: `[최초 학습] ${c.title}`,
         snapshotDetail: `출처: ${c.chapterRef || '교재'} · 핵심 개념 및 수식/불변식 정독`,
+        recommendedPracticeKind: 'similar_problem',
+        explanationDetails: {
+          whyPriority: `미학습 개념 1회독 권장 (우선순위 ${priorityScore}점)`,
+          whyDateMoved: examDiff > 7 ? '시험 D-Day 여유 구간 조기 1회독' : '시험 임박 핵심 개념 파악',
+          whyProblemType: '[유형 B: 유사 개념 문제] 핵심 정의 및 기본 예제 학습 권장',
+          dailyWorkload: '예상 20분 소요 (기본 개념 독해 및 정리)',
+        },
       };
 
       candidateItems.push({
@@ -296,7 +303,8 @@ export function generateStudyPlan({
         retentionSettings,
         subject.examAt,
         referenceDate,
-        personalizationMultiplier
+        personalizationMultiplier,
+        subjectConcepts
       );
 
       // Check recent attempts for vulnerabilities & Stage 8 diagnosis
@@ -305,15 +313,19 @@ export function generateStudyPlan({
         .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
       const lastAttempt = conceptAttempts[0];
 
-      const hasMethodError = lastAttempt?.errorType === 'method_selection_error';
-      const hasCalcError = lastAttempt?.errorType === 'calc_or_impl_mistake';
+      const acError = lastAttempt?.academicErrorType || lastAttempt?.structuredError?.errorType;
+      const hasConceptDeficit = acError === 'CONCEPT_MISUNDERSTANDING' || acError === 'FORMULA_MISAPPLICATION';
+      const hasConditionOmission = acError === 'CONDITION_OMISSION';
+      const hasLogicError = acError === 'LOGICAL_ERROR';
+      const hasMethodError = acError === 'FORMULA_MISAPPLICATION' || lastAttempt?.errorType === 'method_selection_error';
+      const hasCalcError = acError === 'CALCULATION_ERROR' || lastAttempt?.errorType === 'calc_or_impl_mistake';
       const hasNeedsImprovementDiagnosis =
         lastAttempt?.methodSelectionDiagnosis?.criteria.some((cr) => cr.rating === 'needs_improvement');
       const hasVulnerableRubric =
         lastAttempt?.rubricResults?.some((r) => r.isVulnerable || r.score < r.maxScore * 0.6);
 
       const isVulnerabilityTarget =
-        hasMethodError || hasCalcError || hasNeedsImprovementDiagnosis || hasVulnerableRubric;
+        hasConceptDeficit || hasConditionOmission || hasLogicError || hasMethodError || hasCalcError || hasNeedsImprovementDiagnosis || hasVulnerableRubric;
 
       // Review rounds: the pending item targets the NEXT review (reviewCount + 1).
       // Completion is only linked to the attempt that actually belongs to a round.
@@ -333,7 +345,15 @@ export function generateStudyPlan({
         subConfig.selectedProblemTypes
       );
 
-      const targetProblem = eligibleProblems[0] || null;
+      const preferredKind = rec?.recommendedPracticeKind;
+      const targetProblem =
+        (preferredKind === 'transfer_problem'
+          ? eligibleProblems.find((p) => p.isTransfer === true)
+          : preferredKind === 'composite_application'
+          ? eligibleProblems.find((p) => p.conceptIds && p.conceptIds.length > 1)
+          : null) ||
+        eligibleProblems[0] ||
+        null;
       const isOutdated = targetProblem?.isOutdated === true;
       const needsGeneration = !targetProblem;
 
@@ -360,12 +380,21 @@ export function generateStudyPlan({
         }
       }
 
-      if (hasMethodError || hasNeedsImprovementDiagnosis) {
+      if (hasConceptDeficit) {
+        priorityScore += 35;
+        reasonParts.push('최근 개념 이해 부족/공식 오적용 보완');
+      } else if (hasConditionOmission) {
+        priorityScore += 20;
+        reasonParts.push('최근 문제 필수 조건 누락 보완');
+      } else if (hasLogicError) {
+        priorityScore += 20;
+        reasonParts.push('최근 논리 전개 비약 보완');
+      } else if (hasMethodError || hasNeedsImprovementDiagnosis) {
         priorityScore += 30;
         reasonParts.push('최근 방법 선택 이유 보완 필요');
       } else if (hasCalcError) {
-        priorityScore += 20;
-        reasonParts.push('최근 계산/구현 오답 보완');
+        priorityScore += 10;
+        reasonParts.push('최근 계산 실수 확인');
       } else if (hasVulnerableRubric) {
         priorityScore += 15;
         reasonParts.push('취약 루브릭 감점 보완');
@@ -427,6 +456,8 @@ export function generateStudyPlan({
         completedAttemptId: completedAttId,
         needsProblemGeneration: needsGeneration,
         isOutdatedProblem: isOutdated,
+        recommendedPracticeKind: rec?.recommendedPracticeKind || (isVulnerabilityTarget ? 'similar_problem' : 'variant_problem'),
+        explanationDetails: rec?.explanationDetails,
       };
 
       candidateItems.push({
@@ -566,6 +597,13 @@ export function generateStudyPlan({
       snapshotTitle: `[지연 재도전] ${reservation.problemTitle || '문제'}`,
       snapshotDetail: `예약일 ${reservation.scheduledDate} · 원답안/보완 답안을 가리고 새로 풀기`,
       rechallengeId: reservation.id,
+      recommendedPracticeKind: 'original_rechallenge',
+      explanationDetails: {
+        whyPriority: '지연 재도전 예약 (보완 후 독립 재해결)',
+        whyDateMoved: `예약일 ${reservation.scheduledDate} 도래`,
+        whyProblemType: '[유형 A: 원문제 재도전] 원문제를 가리고 독립적으로 다시 풀기',
+        dailyWorkload: `예상 ${reservation.estimatedMinutes}분 소요`,
+      },
     };
 
     candidateItems.push({

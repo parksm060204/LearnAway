@@ -350,6 +350,72 @@ export interface Concept {
   postponedUntil?: string;       // 미루기 적용 목표 일자 (ISO 또는 YYYY-MM-DD)
   recommendedReviewAt?: string;  // 계산된 다음 권장 복습 시각 (ISO)
   lastCalculatedAt?: string;     // 최근 스케줄 계산 시각
+  // Plan 04: Mastery vs Retention separation
+  masteryScore?: number;         // 개념 이해 및 적용 숙련도 (0~100)
+  retentionScore?: number;       // 현재 기억 회상 유지율 (0~100, currentScore와 동등)
+}
+
+// =========================================================================
+// Plan 04: Adaptive Review Problem Kinds (Types A ~ E) & Explainability
+// =========================================================================
+export type RecommendedPracticeKind =
+  | 'original_rechallenge'   // 유형 A: 원문제 재도전
+  | 'similar_problem'        // 유형 B: 유사 개념 문제 (기본/표준)
+  | 'variant_problem'        // 유형 C: 조건 변형 문제 (조건/수치 변경)
+  | 'transfer_problem'       // 유형 D: 전이 이해 문제 (상황 전이)
+  | 'composite_application'; // 유형 E: 복합 개념 응용
+
+export interface RecommendedPracticeKindInfo {
+  kind: RecommendedPracticeKind;
+  label: string;
+  shortLabel: string;
+  typeCode: string;
+  description: string;
+}
+
+export const RECOMMENDED_PRACTICE_KIND_LABELS: Record<RecommendedPracticeKind, RecommendedPracticeKindInfo> = {
+  original_rechallenge: {
+    kind: 'original_rechallenge',
+    label: '유형 A: 원문제 재도전',
+    shortLabel: '원문제 재도전',
+    typeCode: 'Type A',
+    description: '오답 원인 분석 후 원문제를 가리고 독립적으로 재해결',
+  },
+  similar_problem: {
+    kind: 'similar_problem',
+    label: '유형 B: 유사 개념 문제',
+    shortLabel: '유사 문제',
+    typeCode: 'Type B',
+    description: '동일 개념의 표준 난이도 문제로 기본 이해 및 풀이 절차 강화',
+  },
+  variant_problem: {
+    kind: 'variant_problem',
+    label: '유형 C: 조건 변형 문제',
+    shortLabel: '변형 문제',
+    typeCode: 'Type C',
+    description: '문제 조건이나 풀이 경로를 일부 변형하여 논리 전개 유연성 확인',
+  },
+  transfer_problem: {
+    kind: 'transfer_problem',
+    label: '유형 D: 전이 이해 문제',
+    shortLabel: '전이 문제',
+    typeCode: 'Type D',
+    description: '기존 개념을 새로운 맥락이나 제약에 적용하여 전이 능력 검증',
+  },
+  composite_application: {
+    kind: 'composite_application',
+    label: '유형 E: 복합 개념 응용',
+    shortLabel: '복합 응용',
+    typeCode: 'Type E',
+    description: '복수 개념을 결합해 다단계 추론을 요구하는 대학 시험 실전 문제',
+  },
+};
+
+export interface ReviewExplanationDetails {
+  whyPriority: string;       // 왜 이 개념이 우선순위인가?
+  whyDateMoved: string;      // 왜 복습 날짜가 앞당겨졌는가? (또는 조정되었는가?)
+  whyProblemType: string;    // 왜 특정 문제 유형이 추천되었는가?
+  dailyWorkload: string;     // 오늘의 학습량이 얼마나 되는가?
 }
 
 export interface ReviewRecommendation {
@@ -358,6 +424,7 @@ export interface ReviewRecommendation {
   recommendedDateStr: string;     // YYYY-MM-DD in Asia/Seoul
   daysUntilReview: number;        // negative = overdue, 0 = today, positive = future days
   urgencyScore: number;           // Higher score = higher priority
+  priorityScore?: number;         // Higher score = higher priority (alias to urgencyScore)
   priorityRank: number;           // Deterministic rank 1, 2, 3...
   priorityReason: string;         // Human-readable rationale
   isDueTodayOrOverdue: boolean;   // true if daysUntilReview <= 0
@@ -370,7 +437,14 @@ export interface ReviewRecommendation {
     vulnerableCriterionCount: number;
     examProximityWeight: number;
     postponeDays: number;
+    masteryScore?: number;
+    dependencyRiskScore?: number;
   };
+  // Plan 04 fields:
+  masteryScore?: number;          // 개념 숙련도 (0~100)
+  retentionScore?: number;        // 기억 유지율 (0~100)
+  recommendedPracticeKind?: RecommendedPracticeKind; // 추천 문제 유형 (유형 A~E)
+  explanationDetails?: ReviewExplanationDetails;     // 4대 핵심 질문 규칙 기반 설명
   // Stage 10 fields: personal review-interval adjustment layer
   baseIntervalDays?: number;        // 모델이 산출한 기본 권장 간격(일)
   intervalMultiplier?: number;      // 개인별 보정 배율 (1.0 = 기본)
@@ -1068,6 +1142,10 @@ export interface StudyPlanItem {
 
   // Rechallenge reservation linkage (rechallenge items):
   rechallengeId?: string;
+
+  // Plan 04: Adaptive review problem kind & explainability
+  recommendedPracticeKind?: RecommendedPracticeKind;
+  explanationDetails?: ReviewExplanationDetails;
 
   /** Server-authoritative last-modified time (from the cloud row). */
   serverUpdatedAt?: string;

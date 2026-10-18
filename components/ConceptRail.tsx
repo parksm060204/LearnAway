@@ -164,19 +164,26 @@ export function ConceptRail({
                       </span>
                     </div>
 
-                    <span
-                      className={`font-bold text-xs ${
-                        concept.status === 'unstudied'
-                          ? 'text-[#827d73]'
-                          : concept.currentScore < 50
-                          ? 'text-[#c52828]'
-                          : concept.currentScore < 70
-                          ? 'text-amber-700'
-                          : 'text-[#191817]'
-                      }`}
-                    >
-                      {concept.status === 'unstudied' ? 'SCORE --' : `SCORE ${Math.round(concept.currentScore)}`}
-                    </span>
+                    <div className="flex flex-col items-end">
+                      <span
+                        className={`font-bold text-xs ${
+                          concept.status === 'unstudied'
+                            ? 'text-[#827d73]'
+                            : concept.currentScore < 50
+                            ? 'text-[#c52828]'
+                            : concept.currentScore < 70
+                            ? 'text-amber-700'
+                            : 'text-[#191817]'
+                        }`}
+                      >
+                        {concept.status === 'unstudied' ? 'SCORE --' : `유지 ${Math.round(concept.currentScore)}%`}
+                      </span>
+                      {concept.status !== 'unstudied' && concept.masteryScore !== undefined && (
+                        <span className="text-[10px] text-[#57544e] font-academic-mono">
+                          숙련 {Math.round(concept.masteryScore)}점
+                        </span>
+                      )}
+                    </div>
                   </div>
 
                   {/* Origin Badge */}

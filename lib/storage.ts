@@ -35,6 +35,7 @@ import {
 import {
   DEFAULT_RETENTION_SETTINGS,
   calculateCurrentConceptScore,
+  calculateConceptMasteryScore,
   getConceptStatusFromScore,
 } from './retentionModel';
 import { addDaysToDate } from './dateUtils';
@@ -2328,12 +2329,13 @@ export function recordAttemptAndUpdateConcept(
     saveStoredAttempts(newAttempts);
   }
 
-  // 2. Persist the Concept ReviewEvent.
+  // 2. Persist the Concept ReviewEvent (strictly attributed to primary concept).
   const updatedConcepts = currentConcepts.map((c) => {
-    // Only update the primary concept connected to this attempt
     if (c.id !== effectiveAttempt.conceptId || c.subjectId !== effectiveAttempt.subjectId) return c;
-    // Never append a duplicate event for the same Attempt.
-    if (alreadyEventStored) return c;
+    const conceptAlreadyHasEvent = c.events.some((e) => e.attemptId === effectiveAttempt.id);
+    if (conceptAlreadyHasEvent) return c;
+
+
 
     const newEvent: ReviewEvent = {
       id: `ev-${Date.now()}-${Math.random().toString(36).substring(7)}`,
@@ -2361,6 +2363,7 @@ export function recordAttemptAndUpdateConcept(
 
     const updatedEvents = [...c.events, newEvent];
     const newCurrentScore = calculateCurrentConceptScore(updatedEvents, settings, new Date(effectiveAttempt.at));
+    const newMasteryScore = calculateConceptMasteryScore(updatedEvents, new Date(effectiveAttempt.at), c.baseScore);
     const newStatus = getConceptStatusFromScore(newCurrentScore);
 
     return {
@@ -2373,6 +2376,8 @@ export function recordAttemptAndUpdateConcept(
       isLearned: true,
       baseScore: c.baseScore > 0 ? c.baseScore : effectiveAttempt.calculatedScore,
       currentScore: newCurrentScore,
+      retentionScore: newCurrentScore,
+      masteryScore: newMasteryScore,
       status: newStatus,
       exerciseCount: c.exerciseCount + 1,
       postponeDays: 0, // Reset postponement upon active confirmed review
