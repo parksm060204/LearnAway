@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 import { RubricCriterion } from '../../../lib/types';
 import { LOGIC_QUESTION_MAX, LOGIC_QUESTION_MIN, validateLogicQuestionsOutput } from '../../../lib/logicValidation';
 
@@ -146,6 +147,7 @@ ${diagnosisSummary || '(요약 없음)'}
 
 위 학생 답안의 논리를 스스로 보완하도록 이끄는 핵심 질문 ${LOGIC_QUESTION_MIN}~${LOGIC_QUESTION_MAX}개를 지정된 JSON으로 반환하십시오.`;
 
+    const aiStartTime = Date.now();
     const aiCall = await callAiChat({
       system: systemPrompt,
       user: userPrompt,
@@ -155,13 +157,41 @@ ${diagnosisSummary || '(요약 없음)'}
       timeoutMs: 45000,
       label: 'logic-questions',
     }, cred.config);
+    const aiExecutionTimeMs = Date.now() - aiStartTime;
+
     if (!aiCall.ok) {
+      await recordAiUsageTelemetry({
+        userId: auth.user.id,
+        taskType: 'logic_questions',
+        provider: cred.config.provider,
+        model: cred.config.model,
+        executionTimeMs: aiExecutionTimeMs,
+        status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
+        errorCode: aiCall.error.code,
+        creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+        inputText: userPrompt,
+      });
+
       return NextResponse.json(
         { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
         { status: httpStatusForAiError(aiCall.error.code) }
       );
     }
     const content = aiCall.content;
+
+    await recordAiUsageTelemetry({
+      userId: auth.user.id,
+      taskType: 'logic_questions',
+      provider: cred.config.provider,
+      model: aiCall.model || cred.config.model,
+      inputTokens: aiCall.usage?.promptTokens,
+      outputTokens: aiCall.usage?.completionTokens,
+      inputText: userPrompt,
+      outputText: content,
+      executionTimeMs: aiExecutionTimeMs,
+      status: 'success',
+      creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+    });
 
     let questions;
     try {

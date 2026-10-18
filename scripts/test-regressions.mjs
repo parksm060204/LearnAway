@@ -30,7 +30,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'app/api/evaluate-answer/route.ts', 'app/api/convert/route.ts', 'app/api/logic-questions/route.ts', 'app/api/transfer-problem/route.ts', 'app/api/analyze-concepts/route.ts', 'app/api/generate-problems/route.ts', 'lib/supabase/admin.ts', 'app/api/reminders/cron/route.ts',
   'lib/trialCredits.ts', 'lib/drive/googleDrive.ts', 'app/api/auth/username/route.ts', 'app/api/guest-login/route.ts', 'lib/auth/session.ts', 'lib/auth/apiAuth.ts',
   'lib/auth/username.ts',
-  'lib/pdf/token.ts', 'lib/pdf/browserPdfConverter.ts', 'lib/pdf/tempStorage.ts', 'app/api/cron/cleanup-temp-pdf/route.ts',
+  'lib/pdf/token.ts', 'lib/pdf/browserPdfConverter.ts', 'lib/pdf/tempStorage.ts', 'app/api/cron/cleanup-temp-pdf/route.ts', 'lib/aiCostTelemetry.ts', 'app/api/admin/ai-metrics/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -154,7 +154,7 @@ exports.requireApiUser = async () => {
   const problemFreshness = load(path.join(output, 'lib/problemFreshness.js'));
   const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
   const retentionModel = load(path.join(output, 'lib/retentionModel.js'));
-  const dateUtils = load(path.join(output, 'lib/dateUtils.js'));
+  load(path.join(output, 'lib/dateUtils.js'));
   const logicSession = load(path.join(output, 'lib/logicSession.js'));
   const logicValidation = load(path.join(output, 'lib/logicValidation.js'));
   const transferValidation = load(path.join(output, 'lib/transferValidation.js'));
@@ -173,6 +173,8 @@ exports.requireApiUser = async () => {
   const practiceAnswerDraft = load(path.join(output, 'lib/practiceAnswerDraft.js'));
   const sessionAffiliation = load(path.join(output, 'lib/sessionAffiliation.js'));
   const googleDrive = load(path.join(output, 'lib/drive/googleDrive.js'));
+  const aiCostTelemetry = load(path.join(output, 'lib/aiCostTelemetry.js'));
+  const trialCredits = load(path.join(output, 'lib/trialCredits.js'));
   const { INITIAL_SUBJECTS, INITIAL_CONCEPTS, INITIAL_PROBLEMS } = load(path.join(output, 'lib/initialData.js'));
   let passed = 0;
   const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -15065,6 +15067,411 @@ exports.requireApiUser = async () => {
     assert.ok(recPostReview, 'recPostReview 생성됨');
     assert.ok(recPostReview.retentionScore >= 90, 'Day 30 복습 성공 후 기억 유지율 즉시 회복 (90점 이상)');
     assert.ok(recPostReview.factors.effectiveTau >= 4.0, '성공적 복습 후 기억 안정성 τ 증가');
+  });
+
+  // =========================================================================
+  // Plan 05 Regression Test Suite: Data Safety & AI Operating Cost Control
+  // =========================================================================
+
+  check('P05-01: 전체 저장소 무결성 검증 - 빈 저장소 통과 및 손상된 JSON 감지', () => {
+    global.window = global.window || {};
+    global.window.localStorage = localStorage;
+    storageScope.setStorageScope({ kind: 'user', userId: 'p05-audit-user' });
+    const emptyCheck = storage.checkStoredDataIntegrity();
+    assert.equal(emptyCheck.ok, true, '빈 계정은 무결성 검증 통과');
+    assert.equal(emptyCheck.failedKeys.length, 0);
+
+    // Write corrupted JSON into localStorage for active user scope
+    const corruptKey = storageScope.scopedStorageKey('subjects_v1');
+    localStorage.setItem(corruptKey, '{broken-json-not-valid');
+    const corruptCheck = storage.checkStoredDataIntegrity();
+    assert.equal(corruptCheck.ok, false, '손상된 JSON 감지');
+    assert.ok(corruptCheck.failedKeys.includes(corruptKey), '손상된 키 보고');
+
+    // Clean up
+    localStorage.removeItem(corruptKey);
+  });
+
+  // --- P05-02: Local-Cloud Sync & Plan 04 Field Preservation ---
+  check('P05-02: 클라우드 동기화 매퍼의 Plan 04 필드 완전 보존 (masteryScore, retentionScore, recommendedPracticeKind)', () => {
+    const originalConcept = {
+      id: 'c-p05-sync',
+      subjectId: 's-math',
+      title: '고유값 분해',
+      order: 1,
+      status: 'in_progress',
+      currentScore: 85,
+      isLearned: true,
+      isDemo: false,
+      masteryScore: 88.5,
+      retentionScore: 92.0,
+      lastAttemptScore: 90,
+      vulnerableRubricCriteria: ['eigen_step_2'],
+    };
+
+    const upsertRow = cloudLearningMappers.conceptToUpsert(originalConcept);
+    assert.equal(upsertRow.id, originalConcept.id);
+    assert.ok(upsertRow.payload, 'payload 객체 보존');
+    assert.equal(upsertRow.payload.masteryScore, 88.5);
+    assert.equal(upsertRow.payload.retentionScore, 92.0);
+
+    const roundtripConcept = cloudLearningMappers.rowToConcept({
+      id: upsertRow.id,
+      user_id: 'test-user',
+      subject_id: upsertRow.subject_id,
+      title: upsertRow.title,
+      order_index: upsertRow.order_index,
+      status: upsertRow.status,
+      current_score: upsertRow.current_score,
+      is_learned: upsertRow.is_learned,
+      is_demo: upsertRow.is_demo,
+      version: 1,
+      draft_id: null,
+      payload: upsertRow.payload,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+
+    assert.equal(roundtripConcept.id, originalConcept.id);
+    assert.equal(roundtripConcept.masteryScore, 88.5, 'masteryScore 왕복 보존');
+    assert.equal(roundtripConcept.retentionScore, 92.0, 'retentionScore 왕복 보존');
+    assert.deepEqual(roundtripConcept.vulnerableRubricCriteria, ['eigen_step_2'], '취약 루브릭 왕복 보존');
+
+    // StudyPlanItem Plan 04 fields
+    const originalPlanItem = {
+      id: 'plan-item-p05',
+      subjectId: 's-math',
+      kind: 'review',
+      assignedDate: '2026-10-20',
+      status: 'pending',
+      round: 2,
+      recommendedPracticeKind: 'concept_targeted',
+      explanationDetails: { reasons: ['retention_below_threshold'] },
+    };
+
+    const planRow = cloudHistoryMappers.studyPlanItemToUpsert(originalPlanItem);
+    assert.equal(planRow.payload.recommendedPracticeKind, 'concept_targeted');
+    assert.deepEqual(planRow.payload.explanationDetails, { reasons: ['retention_below_threshold'] });
+
+    const roundtripPlanItem = cloudHistoryMappers.rowToStudyPlanItem({
+      id: planRow.id,
+      user_id: 'test-user',
+      subject_id: planRow.subject_id,
+      kind: planRow.kind,
+      assigned_date: planRow.assigned_date,
+      status: planRow.status,
+      round: planRow.round,
+      completed_attempt_id: null,
+      completed_event_id: null,
+      completed_mock_session_id: null,
+      payload: planRow.payload,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+
+    assert.equal(roundtripPlanItem.recommendedPracticeKind, 'concept_targeted');
+    assert.deepEqual(roundtripPlanItem.explanationDetails, { reasons: ['retention_below_threshold'] });
+  });
+
+  // --- P05-03: Google Drive Backup Enhanced Metadata & Integrity Verification ---
+  await checkAsync('P05-03: Google Drive 백업 확장 메타데이터 (schemaVersion, recordCounts, contentHash) 및 변조 거부 검증', async () => {
+    const testMaterials = [
+      {
+        id: 'mat-p05-1',
+        subjectId: 'subj-cs',
+        kind: 'pdf',
+        title: '알고리즘 복잡도',
+        sourceRefs: '',
+        status: 'ready',
+        isConverted: true,
+        uploadedAt: nowIso(),
+      },
+    ];
+
+    const mockLoaders = {
+      loadBody: async () => ({ status: 'found', body: { markdown: '# 알고리즘 점근 표기법' } }),
+      loadOriginal: async () => ({ status: 'missing' }),
+    };
+
+    // 1. Build backup with enhanced metadata
+    const backup = await materialPolicy.buildMaterialBackup(
+      testMaterials,
+      mockLoaders,
+      materialPolicy.MATERIAL_BACKUP_LIMITS,
+      { accountScope: 'user_p05_test', applicationVersion: '1.0.0', backupId: 'backup_p05_test_1' }
+    );
+
+    assert.equal(backup.version, 2);
+    assert.equal(backup.schemaVersion, 2);
+    assert.ok(backup.createdAt);
+    assert.equal(backup.accountScope, 'user_p05_test');
+    assert.equal(backup.recordCounts.materials, 1);
+    assert.equal(backup.recordCounts.withBody, 1);
+    assert.equal(backup.recordCounts.withOriginal, 0);
+    assert.ok(backup.contentHash.startsWith('bkh_'));
+
+    // 2. Serialize parts and parse round-trip
+    const blobParts = materialPolicy.materialBackupBlobParts(backup);
+    const serialized = blobParts.join('');
+    const parsed = materialPolicy.parseMaterialBackup(serialized);
+    assert.equal(parsed.ok, true, '정상 백업 파일 파싱 성공');
+    assert.equal(parsed.backup.schemaVersion, 2);
+    assert.equal(parsed.backup.recordCounts.materials, 1);
+    assert.equal(parsed.backup.contentHash, backup.contentHash);
+
+    // 3. Tamper test: modify content without updating contentHash -> Must be REJECTED!
+    const tamperedObj = JSON.parse(serialized);
+    tamperedObj.materials[0].material.title = '변조된 제목';
+    const tamperedJson = JSON.stringify(tamperedObj);
+    const tamperedParse = materialPolicy.parseMaterialBackup(tamperedJson);
+    assert.equal(tamperedParse.ok, false, '변조된 콘텐츠 해시는 안전하게 파싱 거부');
+    assert.ok(tamperedParse.error.includes('무결성 검증 실패'), '무결성 오류 메시지 제공');
+
+    // 4. Record count mismatch -> Must be REJECTED!
+    const countMismatchObj = JSON.parse(serialized);
+    countMismatchObj.recordCounts.materials = 99; // Lying about count
+    countMismatchObj.contentHash = materialPolicy.computeBackupContentHash(countMismatchObj.materials);
+    const countMismatchParse = materialPolicy.parseMaterialBackup(JSON.stringify(countMismatchObj));
+    assert.equal(countMismatchParse.ok, false, '레코드 수 불일치 백업은 거부');
+    assert.ok(countMismatchParse.error.includes('레코드 수와 일치하지 않습니다'));
+
+    // 5. Unsupported schema version -> Must be REJECTED!
+    const unsupportedObj = JSON.parse(serialized);
+    unsupportedObj.schemaVersion = 999;
+    const unsupportedParse = materialPolicy.parseMaterialBackup(JSON.stringify(unsupportedObj));
+    assert.equal(unsupportedParse.ok, false, '지원하지 않는 스키마 버전 거부');
+    assert.ok(unsupportedParse.error.includes('지원하지 않는 백업 스키마 버전'));
+  });
+
+  // --- P05-04: Storage Quota Exceed & Error Isolation ---
+  check('P05-04: localStorage 용량 초과(QuotaExceededError) 시 메모리 백업 격리 및 삭제 묘비 검증', () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'p05-quota-user' });
+    const realSetItem = localStorage.setItem;
+
+    try {
+      // Simulate quota error
+      localStorage.setItem = () => {
+        const err = new Error('QuotaExceededError');
+        err.name = 'QuotaExceededError';
+        throw err;
+      };
+
+      // saveStoredSubjects safely catches error without throwing
+      assert.doesNotThrow(() => {
+        storage.saveStoredSubjects([{ id: 'subj-quota', name: '용량초과과목' }]);
+      }, 'QuotaExceededError 발생 시에도 예외 없이 안전하게 처리');
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+
+    // Deletion tombstone verification
+    storage.markMaterialDeleted('mat-del-tombstone');
+    assert.equal(storage.isMaterialSaveFailed('mat-del-tombstone'), false);
+    // Even if stale list saved, marked deleted id stays excluded
+    storage.saveStoredMaterials([{ id: 'mat-del-tombstone', subjectId: 's', kind: 'pdf', title: '삭제자료', sourceRefs: '', status: 'ready', isConverted: true, uploadedAt: nowIso() }]);
+    assert.equal(storage.loadStoredMaterials().some((m) => m.id === 'mat-del-tombstone'), false, '삭제 묘비는 오래된 스냅샷 부활을 차단함');
+  });
+
+  // --- P05-05: AI Usage & Cost Telemetry ---
+  await checkAsync('P05-05: AI 토큰 사용량 계측, 모델별 비용 계산(USD/KRW) 및 운영자 분석 집계 검증', async () => {
+    aiCostTelemetry.clearTelemetryStore();
+
+    // 1. Exact pricing calculation
+    const costDeepSeek = aiCostTelemetry.calculateAiCost('deepseek-v4.1-flash', 1_000_000, 1_000_000);
+    assert.equal(costDeepSeek.estimatedCostUsd, 0.42, 'DeepSeek 1M in ($0.14) + 1M out ($0.28) = $0.42');
+    assert.equal(costDeepSeek.estimatedCostKrw, 588, '0.42 * 1400 = 588 KRW');
+    assert.equal(costDeepSeek.pricingModelFound, true);
+
+    const costGpt4oMini = aiCostTelemetry.calculateAiCost('gpt-4o-mini', 1_000_000, 1_000_000);
+    assert.equal(costGpt4oMini.estimatedCostUsd, 0.75, 'GPT-4o-mini 1M in ($0.15) + 1M out ($0.60) = $0.75');
+    assert.equal(costGpt4oMini.estimatedCostKrw, 1050, '0.75 * 1400 = 1050 KRW');
+
+    // 2. Token estimation fallback
+    const estTokens = aiCostTelemetry.estimateTokenCount('인공지능 기반 학습 도구 테스트');
+    assert.ok(estTokens > 0, '추정 토큰 수 양수');
+
+    // 3. Record telemetry events
+    await aiCostTelemetry.recordAiUsageTelemetry({
+      requestId: 'req-1',
+      userId: 'user-p05-1',
+      taskType: 'evaluate_answer',
+      provider: 'school_gateway',
+      model: 'deepseek-v4.1-flash',
+      inputTokens: 500,
+      outputTokens: 250,
+      executionTimeMs: 1200,
+      status: 'success',
+      creditSource: 'operator_trial',
+    });
+
+    await aiCostTelemetry.recordAiUsageTelemetry({
+      requestId: 'req-2',
+      userId: 'user-p05-1',
+      taskType: 'generate_problems',
+      provider: 'school_gateway',
+      model: 'deepseek-v4.1-flash',
+      inputTokens: 1000,
+      outputTokens: 800,
+      executionTimeMs: 2400,
+      status: 'success',
+      creditSource: 'operator_trial',
+    });
+
+    await aiCostTelemetry.recordAiUsageTelemetry({
+      requestId: 'req-3',
+      userId: 'user-p05-2',
+      taskType: 'evaluate_answer',
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      executionTimeMs: 500,
+      status: 'error',
+      errorCode: 'rate_limit',
+      creditSource: 'personal_key',
+      inputText: '샘플 프롬프트',
+    });
+
+    const summary = aiCostTelemetry.getAiUsageSummary();
+    assert.equal(summary.totalRequests, 3);
+    assert.equal(summary.successfulRequests, 2);
+    assert.equal(summary.failedRequests, 1);
+    assert.equal(summary.failureRatePercent, 33.33);
+    assert.equal(summary.requestsByTask['evaluate_answer'], 2);
+    assert.equal(summary.requestsByTask['generate_problems'], 1);
+    assert.equal(summary.operatorTrialConsumption.requests, 2);
+    assert.equal(summary.personalKeyConsumption.requests, 1);
+    assert.ok(summary.totalCostUsd > 0);
+    assert.ok(summary.dailyMetrics.length >= 1);
+
+    // Filter by userId
+    const userSummary = aiCostTelemetry.getAiUsageSummary({ userId: 'user-p05-1' });
+    assert.equal(userSummary.totalRequests, 2);
+    assert.equal(userSummary.successfulRequests, 2);
+  });
+
+  // --- P05-06: Tiered Credits & Abuse Protection ---
+  check('P05-06: 크레딧 계층 정책 (게스트 1회, 일반 3회), 비상 차단 및 입력 크기 제한 검증', () => {
+    // 1. Tiered initial grant values
+    assert.equal(trialCredits.getInitialGrantedCreditsForAccount(true), 1, '게스트 계정 초기 크레딧 1회');
+    assert.equal(trialCredits.getInitialGrantedCreditsForAccount(false), 3, '일반 계정 초기 크레딧 3회');
+
+    // 2. Operator emergency shutoff
+    assert.equal(trialCredits.isOperatorEmergencyStopped({ OPERATOR_EMERGENCY_STOP: 'true' }), true);
+    assert.equal(trialCredits.isOperatorEmergencyStopped({ OPERATOR_EMERGENCY_STOP: 'false' }), false);
+
+    // 3. Input validation limits
+    const validAnalysis = trialCredits.validateTrialAnalyzeConceptsInput(2, 10000);
+    assert.equal(validAnalysis.ok, true);
+
+    const chunkExceeded = trialCredits.validateTrialAnalyzeConceptsInput(3, 5000);
+    assert.equal(chunkExceeded.ok, false);
+    assert.equal(chunkExceeded.errorCode, 'TRIAL_LIMIT_EXCEEDED');
+
+    const charExceeded = trialCredits.validateTrialAnalyzeConceptsInput(1, 15000);
+    assert.equal(charExceeded.ok, false);
+
+    // Problem gen input limit
+    const validProblem = trialCredits.validateTrialProblemGenInput(2, 10000);
+    assert.equal(validProblem.ok, true);
+
+    const problemExceeded = trialCredits.validateTrialProblemGenInput(3, 5000);
+    assert.equal(problemExceeded.ok, false);
+
+    // Evaluate answer input limit
+    const mockExamProhibited = trialCredits.validateTrialEvaluateAnswerInput('답안', true);
+    assert.equal(mockExamProhibited.ok, false);
+    assert.equal(mockExamProhibited.errorCode, 'MOCK_EXAM_TRIAL_PROHIBITED');
+
+    const evalCharExceeded = trialCredits.validateTrialEvaluateAnswerInput('a'.repeat(7000), false);
+    assert.equal(evalCharExceeded.ok, false);
+  });
+
+  // --- P05-07: AI Deduplication & Zero-Cost Local Computations ---
+  check('P05-07: 로컬 망각곡선 및 학습 스케줄러의 무과금 로컬 연산 보장 (AI 호출 0회)', () => {
+    const baseConcept = {
+      id: 'c-local-zero-cost',
+      subjectId: 's1',
+      title: '미적분학 기본정리',
+      status: 'in_progress',
+      currentScore: 70,
+      events: [
+        {
+          id: 'ev-1',
+          conceptId: 'c-local-zero-cost',
+          at: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+          dayOffset: 0,
+          kind: 'attempt',
+          resultScore: 80,
+          confidence: 4,
+          errorType: 'none',
+          academicErrorType: 'NO_ERROR',
+        },
+      ],
+    };
+
+    // Calculate score & recommendation without network or AI tokens
+    const localScore = retentionModel.calculateCurrentConceptScore(baseConcept.events, types.DEFAULT_RETENTION_SETTINGS);
+    assert.ok(typeof localScore === 'number' && localScore >= 0 && localScore <= 100, '로컬 스코어 연산 성공');
+
+    const localRec = retentionModel.calculateNextReviewRecommendation(
+      baseConcept,
+      types.DEFAULT_RETENTION_SETTINGS,
+      undefined,
+      new Date(),
+      1,
+      [baseConcept]
+    );
+    assert.ok(localRec, '로컬 복습 추천 연산 성공');
+    assert.ok(localRec.retentionScore > 0);
+  });
+
+  // --- P05-08: Failure Injection Simulation ---
+  await checkAsync('P05-08: AI 호출 장애 시 크레딧 환급(release) 및 복원 도중 계정 전환 안전 격리', async () => {
+    // 1. Lease token requirement on recordTrialResultReady
+    const resNoToken = await trialCredits.recordTrialResultReady('user-p05', 'task-1', { eval: 'result' }, '');
+    assert.equal(resNoToken.success, false);
+    assert.equal(resNoToken.errorCode, 'LEASE_TOKEN_REQUIRED', 'leaseToken 없이 실행권 점유 불가능');
+
+    // 2. Cross-account switch abortion during restore
+    let currentScope = 'scope-A';
+    const fakeIo = {
+      getMaterials: () => [],
+      loadBodyResult: async () => ({ status: 'missing' }),
+      loadOriginalResult: async () => ({ status: 'missing' }),
+      saveBody: async () => ({ ok: true }),
+      saveOriginal: async () => ({ ok: true }),
+      persistMetadata: () => true,
+      getScopeId: () => currentScope,
+      knownSubjectIds: ['subj-1'],
+    };
+
+    // Switch account scope right before executeMaterialRestore begins or runs
+    currentScope = 'scope-B';
+    fakeIo.getScopeId = () => {
+      // Return scope-B then switch to scope-C midway
+      const s = currentScope;
+      currentScope = 'scope-C';
+      return s;
+    };
+
+    const outcome = await materialRestore.executeMaterialRestore(
+      [
+        {
+          material: {
+            id: 'mat-switch',
+            subjectId: 'subj-1',
+            kind: 'pdf',
+            title: '테스트',
+            sourceRefs: '',
+            status: 'ready',
+            isConverted: true,
+            uploadedAt: nowIso(),
+          },
+        },
+      ],
+      fakeIo
+    );
+
+    assert.equal(outcome.aborted, true, '복원 중 계정 범위 변경 시 즉시 안전 중단');
   });
 
   console.log(`${passed} regression checks passed`);

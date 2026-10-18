@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -1347,6 +1348,7 @@ ${chunk.text}
 
 위 텍스트에서 학술적으로 독립적인 핵심 개념들을 추출하여 지정된 JSON 스키마로 반환해 주세요.`;
 
+      const aiStartTime = Date.now();
       const aiCall = await callAiChat(
         {
           system: systemPrompt,
@@ -1359,8 +1361,22 @@ ${chunk.text}
         },
         aiConfig
       );
+      const aiExecutionTimeMs = Date.now() - aiStartTime;
 
       if (!aiCall.ok) {
+        await recordAiUsageTelemetry({
+          requestId: jobKey,
+          userId: auth.user.id,
+          taskType: 'analyze_concepts',
+          provider: aiConfig.provider,
+          model: aiConfig.model,
+          executionTimeMs: aiExecutionTimeMs,
+          status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
+          errorCode: aiCall.error.code,
+          creditSource: cred.ok && cred.isTrial ? 'operator_trial' : 'personal_key',
+          inputText: userPrompt,
+        });
+
         if (cred.ok && cred.isTrial) {
           await releaseTrialCredit(auth.user.id, jobKey, 'ai_call_failed', cred.leaseToken);
         }
@@ -1403,6 +1419,21 @@ ${chunk.text}
 
       const content = aiCall.content;
       responseModel = aiCall.model;
+
+      await recordAiUsageTelemetry({
+        requestId: jobKey,
+        userId: auth.user.id,
+        taskType: 'analyze_concepts',
+        provider: aiConfig.provider,
+        model: aiCall.model || aiConfig.model,
+        inputTokens: aiCall.usage?.promptTokens,
+        outputTokens: aiCall.usage?.completionTokens,
+        inputText: userPrompt,
+        outputText: content,
+        executionTimeMs: aiExecutionTimeMs,
+        status: 'success',
+        creditSource: cred.ok && cred.isTrial ? 'operator_trial' : 'personal_key',
+      });
 
       const cleanedJson = content.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
       let parsedResult: unknown;

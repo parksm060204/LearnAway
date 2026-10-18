@@ -1,7 +1,7 @@
 import type { Material, MaterialPage, MaterialStoragePolicy } from './types';
 import type { MaterialSyncStateRecord } from './storage';
 import { scopedStorageKey } from './storageScope';
-import { materialContentHash } from './cloud/hash';
+import { materialContentHash, stableStringify } from './cloud/hash';
 import { hashBlob } from './materialStorage';
 
 /**
@@ -387,10 +387,40 @@ export interface MaterialBackupEntry {
   fileError?: { body?: string; original?: string };
 }
 
+export interface MaterialBackupRecordCounts {
+  materials: number;
+  withBody: number;
+  withOriginal: number;
+}
+
 export interface MaterialBackupFile {
   version: number;
+  schemaVersion?: number;
+  createdAt?: string;
+  applicationVersion?: string;
+  accountScope?: string;
+  contentHash?: string;
+  recordCounts?: MaterialBackupRecordCounts;
+  backupId?: string;
   exportedAt?: string;
   materials: MaterialBackupEntry[];
+}
+
+export function computeBackupContentHash(entries: MaterialBackupEntry[]): string {
+  const summary = entries.map((e) => ({
+    id: e.material.id,
+    subjectId: e.material.subjectId,
+    title: e.material.title,
+    bodyHash: e.material.bodyHash || (e.body ? materialContentHash(e.body) : null),
+    origHash: e.material.originalHash || e.original?.hash || null,
+  }));
+  const canonical = stableStringify(summary);
+  let hash = 2166136261;
+  for (let i = 0; i < canonical.length; i += 1) {
+    hash ^= canonical.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `bkh_${(hash >>> 0).toString(16).padStart(8, '0')}_m${entries.length}`;
 }
 
 /**
@@ -537,10 +567,17 @@ function normalizeOriginalResult(value: unknown): BackupOriginalLoadResult {
  * while building (failing fast before more memory is committed); the caller
  * must still run findBackupLimitViolations() on the result BEFORE serializing.
  */
+export interface BuildMaterialBackupOptions {
+  accountScope?: string;
+  applicationVersion?: string;
+  backupId?: string;
+}
+
 export async function buildMaterialBackup(
   materials: Material[],
   loaders: MaterialBackupLoaders,
-  limits: MaterialBackupLimits = MATERIAL_BACKUP_LIMITS
+  limits: MaterialBackupLimits = MATERIAL_BACKUP_LIMITS,
+  options?: BuildMaterialBackupOptions
 ): Promise<MaterialBackupFile> {
   const entries: MaterialBackupEntry[] = [];
   for (const material of materials) {
@@ -605,7 +642,29 @@ export async function buildMaterialBackup(
     if (fileError.body || fileError.original) entry.fileError = fileError;
     entries.push(entry);
   }
-  return { version: MATERIAL_BACKUP_VERSION, exportedAt: new Date().toISOString(), materials: entries };
+
+  const withBody = entries.filter((e) => e.body !== undefined).length;
+  const withOriginal = entries.filter((e) => e.original !== undefined).length;
+  const recordCounts: MaterialBackupRecordCounts = {
+    materials: entries.length,
+    withBody,
+    withOriginal,
+  };
+  const contentHash = computeBackupContentHash(entries);
+  const now = new Date().toISOString();
+
+  return {
+    version: MATERIAL_BACKUP_VERSION,
+    schemaVersion: MATERIAL_BACKUP_VERSION,
+    createdAt: now,
+    exportedAt: now,
+    applicationVersion: options?.applicationVersion || '1.0.0',
+    accountScope: options?.accountScope,
+    contentHash,
+    recordCounts,
+    backupId: options?.backupId,
+    materials: entries,
+  };
 }
 
 /**
@@ -621,6 +680,27 @@ export function materialBackupBlobParts(backup: MaterialBackupFile): string[] {
     throw new Error('백업 버전 기록이 올바르지 않습니다.');
   }
   const parts: string[] = ['{"version":', JSON.stringify(backup.version)];
+  if (backup.schemaVersion !== undefined) {
+    parts.push(',"schemaVersion":', JSON.stringify(backup.schemaVersion));
+  }
+  if (backup.createdAt !== undefined) {
+    parts.push(',"createdAt":', JSON.stringify(backup.createdAt));
+  }
+  if (backup.applicationVersion !== undefined) {
+    parts.push(',"applicationVersion":', JSON.stringify(backup.applicationVersion));
+  }
+  if (backup.accountScope !== undefined) {
+    parts.push(',"accountScope":', JSON.stringify(backup.accountScope));
+  }
+  if (backup.contentHash !== undefined) {
+    parts.push(',"contentHash":', JSON.stringify(backup.contentHash));
+  }
+  if (backup.recordCounts !== undefined) {
+    parts.push(',"recordCounts":', JSON.stringify(backup.recordCounts));
+  }
+  if (backup.backupId !== undefined) {
+    parts.push(',"backupId":', JSON.stringify(backup.backupId));
+  }
   if (backup.exportedAt !== undefined) {
     parts.push(',"exportedAt":', JSON.stringify(backup.exportedAt));
   }
@@ -874,6 +954,18 @@ export function parseMaterialBackup(
       error: `지원하지 않는 백업 버전입니다 (지원: v${SUPPORTED_MATERIAL_BACKUP_VERSIONS.join(', v')}, 파일: ${String(version)}).`,
     };
   }
+  if (record.schemaVersion !== undefined) {
+    if (
+      typeof record.schemaVersion !== 'number' ||
+      !Number.isFinite(record.schemaVersion) ||
+      !SUPPORTED_MATERIAL_BACKUP_VERSIONS.includes(record.schemaVersion as (typeof SUPPORTED_MATERIAL_BACKUP_VERSIONS)[number])
+    ) {
+      return {
+        ok: false,
+        error: `지원하지 않는 백업 스키마 버전입니다 (지원: v${SUPPORTED_MATERIAL_BACKUP_VERSIONS.join(', v')}, 파일: ${String(record.schemaVersion)}).`,
+      };
+    }
+  }
   if (record.exportedAt !== undefined && (typeof record.exportedAt !== 'string' || !record.exportedAt.trim())) {
     return { ok: false, error: '백업 내보낸 시각 형식이 올바르지 않습니다.' };
   }
@@ -927,10 +1019,46 @@ export function parseMaterialBackup(
     entries.push(entry);
   }
 
+  let recordCounts: MaterialBackupRecordCounts | undefined;
+  if (record.recordCounts !== undefined) {
+    const rc = asRecord(record.recordCounts);
+    if (!rc || typeof rc.materials !== 'number' || rc.materials !== record.materials.length) {
+      return {
+        ok: false,
+        error: '백업 무결성 검증 실패: 백업 항목 수가 선언된 레코드 수와 일치하지 않습니다.',
+      };
+    }
+    recordCounts = {
+      materials: rc.materials,
+      withBody: typeof rc.withBody === 'number' ? rc.withBody : 0,
+      withOriginal: typeof rc.withOriginal === 'number' ? rc.withOriginal : 0,
+    };
+  }
+
+  if (record.contentHash !== undefined) {
+    if (typeof record.contentHash !== 'string' || !record.contentHash.trim()) {
+      return { ok: false, error: '백업 콘텐츠 해시 형식이 올바르지 않습니다.' };
+    }
+    const computedHash = computeBackupContentHash(entries);
+    if (record.contentHash !== computedHash) {
+      return {
+        ok: false,
+        error: '백업 무결성 검증 실패: 백업 내용이 훼손되었거나 변조되었습니다 (콘텐츠 해시 불일치).',
+      };
+    }
+  }
+
   return {
     ok: true,
     backup: {
       version,
+      ...(record.schemaVersion !== undefined ? { schemaVersion: record.schemaVersion as number } : {}),
+      ...(typeof record.createdAt === 'string' ? { createdAt: record.createdAt } : {}),
+      ...(typeof record.applicationVersion === 'string' ? { applicationVersion: record.applicationVersion } : {}),
+      ...(typeof record.accountScope === 'string' ? { accountScope: record.accountScope } : {}),
+      ...(typeof record.contentHash === 'string' ? { contentHash: record.contentHash } : {}),
+      ...(recordCounts ? { recordCounts } : {}),
+      ...(typeof record.backupId === 'string' ? { backupId: record.backupId } : {}),
       ...(typeof record.exportedAt === 'string' ? { exportedAt: record.exportedAt } : {}),
       materials: entries,
     },

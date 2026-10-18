@@ -3,6 +3,7 @@ import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { createClient } from '../../../lib/supabase/server';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser, lookupConnectionSecret, operatorFallbackAllowed, type TrialContext } from '../../../lib/aiCredentials';
+import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -758,6 +759,7 @@ ${
 위 학생의 답안과 방법 선택 이유를 [필수 평가 원칙]에 따라 면밀히 검토하고, 각 루브릭 기준별 점수, 확인된 근거 인용, 감점 이유, 개선 방법, 종합 피드백, 그리고 독립된 방법 선택 이유 진단 결과를 지정된 JSON 형식으로 산출해 주십시오.`;
 
     // 6. Call AI Model through the shared server client
+    const aiStartTime = Date.now();
     const aiCall = await callAiChat({
       system: systemPrompt,
       user: userPrompt,
@@ -767,7 +769,22 @@ ${
       timeoutMs: cred.isTrial ? MAX_TRIAL_EXECUTION_TIMEOUT_MS : 45000,
       label: 'evaluate-answer',
     }, cred.config);
+    const aiExecutionTimeMs = Date.now() - aiStartTime;
+
     if (!aiCall.ok) {
+      await recordAiUsageTelemetry({
+        requestId: taskId || undefined,
+        userId: auth.user.id,
+        taskType: 'evaluate_answer',
+        provider: cred.config.provider,
+        model: cred.config.model,
+        executionTimeMs: aiExecutionTimeMs,
+        status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
+        errorCode: aiCall.error.code,
+        creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+        inputText: userPrompt,
+      });
+
       if (cred.isTrial && taskId) {
         await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
       }
@@ -777,6 +794,21 @@ ${
       );
     }
     const content = aiCall.content;
+
+    await recordAiUsageTelemetry({
+      requestId: taskId || undefined,
+      userId: auth.user.id,
+      taskType: 'evaluate_answer',
+      provider: cred.config.provider,
+      model: aiCall.model || cred.config.model,
+      inputTokens: aiCall.usage?.promptTokens,
+      outputTokens: aiCall.usage?.completionTokens,
+      inputText: userPrompt,
+      outputText: content,
+      executionTimeMs: aiExecutionTimeMs,
+      status: 'success',
+      creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+    });
 
     // 7. Parse and Validate AI Evaluation Output
     let parsed: Record<string, unknown>;

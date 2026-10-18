@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser, lookupConnectionSecret } from '../../../lib/aiCredentials';
+import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -450,6 +451,7 @@ ${combinedSource}
 5. sourceRefs에는 인용한 자료의 제목을 명시하십시오.
 6. 반드시 지정된 JSON 포맷으로 응답하십시오.`;
 
+    const aiStartTime = Date.now();
     const aiCall = await callAiChat({
       system: systemPrompt,
       user: userPrompt,
@@ -459,7 +461,22 @@ ${combinedSource}
       outputTokenCeiling: cred.isTrial ? MAX_TRIAL_OUTPUT_TOKENS : undefined,
       label: 'generate-problems',
     }, cred.config);
+    const aiExecutionTimeMs = Date.now() - aiStartTime;
+
     if (!aiCall.ok) {
+      await recordAiUsageTelemetry({
+        requestId: taskId || undefined,
+        userId: auth.user.id,
+        taskType: 'generate_problems',
+        provider: cred.config.provider,
+        model: cred.config.model,
+        executionTimeMs: aiExecutionTimeMs,
+        status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
+        errorCode: aiCall.error.code,
+        creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+        inputText: userPrompt,
+      });
+
       if (cred.isTrial) {
         await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
       }
@@ -469,6 +486,21 @@ ${combinedSource}
       );
     }
     const content = aiCall.content;
+
+    await recordAiUsageTelemetry({
+      requestId: taskId || undefined,
+      userId: auth.user.id,
+      taskType: 'generate_problems',
+      provider: cred.config.provider,
+      model: aiCall.model || cred.config.model,
+      inputTokens: aiCall.usage?.promptTokens,
+      outputTokens: aiCall.usage?.completionTokens,
+      inputText: userPrompt,
+      outputText: content,
+      executionTimeMs: aiExecutionTimeMs,
+      status: 'success',
+      creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+    });
 
       const cleanedJson = content.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
       let parsedResult: unknown;

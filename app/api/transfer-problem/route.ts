@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 import { ProblemDifficulty, ProblemType, RubricCriterion } from '../../../lib/types';
 import { validateTransferProblemOutput } from '../../../lib/transferValidation';
 
@@ -175,6 +176,7 @@ ${conceptText}
 
 위 원문에서 조건을 실제로 바꾼 전이 문제 1개를 지정된 JSON으로 반환하십시오.`;
 
+    const aiStartTime = Date.now();
     const aiCall = await callAiChat({
       system: systemPrompt,
       user: userPrompt,
@@ -184,13 +186,41 @@ ${conceptText}
       timeoutMs: 60000,
       label: 'transfer-problem',
     }, cred.config);
+    const aiExecutionTimeMs = Date.now() - aiStartTime;
+
     if (!aiCall.ok) {
+      await recordAiUsageTelemetry({
+        userId: auth.user.id,
+        taskType: 'transfer_problem',
+        provider: cred.config.provider,
+        model: cred.config.model,
+        executionTimeMs: aiExecutionTimeMs,
+        status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
+        errorCode: aiCall.error.code,
+        creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+        inputText: userPrompt,
+      });
+
       return NextResponse.json(
         { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
         { status: httpStatusForAiError(aiCall.error.code) }
       );
     }
     const content = aiCall.content;
+
+    await recordAiUsageTelemetry({
+      userId: auth.user.id,
+      taskType: 'transfer_problem',
+      provider: cred.config.provider,
+      model: aiCall.model || cred.config.model,
+      inputTokens: aiCall.usage?.promptTokens,
+      outputTokens: aiCall.usage?.completionTokens,
+      inputText: userPrompt,
+      outputText: content,
+      executionTimeMs: aiExecutionTimeMs,
+      status: 'success',
+      creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+    });
 
     let draft;
     try {
