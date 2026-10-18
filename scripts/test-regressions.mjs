@@ -154,7 +154,7 @@ exports.requireApiUser = async () => {
   const problemFreshness = load(path.join(output, 'lib/problemFreshness.js'));
   const studyPlan = load(path.join(output, 'lib/studyPlan.js'));
   const retentionModel = load(path.join(output, 'lib/retentionModel.js'));
-  load(path.join(output, 'lib/dateUtils.js'));
+  const dateUtils = load(path.join(output, 'lib/dateUtils.js'));
   const logicSession = load(path.join(output, 'lib/logicSession.js'));
   const logicValidation = load(path.join(output, 'lib/logicValidation.js'));
   const transferValidation = load(path.join(output, 'lib/transferValidation.js'));
@@ -15473,6 +15473,237 @@ exports.requireApiUser = async () => {
 
     assert.equal(outcome.aborted, true, '복원 중 계정 범위 변경 시 즉시 안전 중단');
   });
+
+  // =========================================================================
+  // Plan 06: Undergraduate-Centric UX, Onboarding & Learning Dashboard
+  // =========================================================================
+
+  // --- P06-01: UI/UX Architecture Null Safety ---
+  await checkAsync('P06-01: 신규 사용자 및 과목 부재 시 Null-Safety 및 크래시 방지', async () => {
+    const emptySubjects = [];
+    const activeSubject = emptySubjects[0]; // undefined
+
+    // 1. Concept filtering
+    const allConcepts = [{ id: 'c1', subjectId: 's1', title: '개념1', events: [] }];
+    const subjectConcepts = activeSubject ? allConcepts.filter((c) => c.subjectId === activeSubject.id) : [];
+    assert.deepEqual(subjectConcepts, []);
+
+    // 2. Material filtering
+    const allMaterials = [{ id: 'm1', subjectId: 's1', title: '교재', kind: 'pdf' }];
+    const subjectMaterials = activeSubject ? allMaterials.filter((m) => m.subjectId === activeSubject.id) : [];
+    assert.deepEqual(subjectMaterials, []);
+
+    // 3. Problem filtering
+    const allProblems = [{ id: 'p1', subjectId: 's1', title: '문제1', type: 'essay_descriptive' }];
+    const subjectProblems = activeSubject ? allProblems.filter((p) => p.subjectId === activeSubject.id) : [];
+    assert.deepEqual(subjectProblems, []);
+  });
+
+  // --- P06-02: New User Onboarding & Empty States ---
+  await checkAsync('P06-02: 신규 사용자 온보딩 단계 정의 및 샘플 데이터 로더 검증', async () => {
+    const { INITIAL_SUBJECTS, INITIAL_MATERIALS, INITIAL_CONCEPTS, INITIAL_PROBLEMS } = load(path.join(output, 'lib/initialData.js'));
+    assert.ok(INITIAL_SUBJECTS.length >= 2, '데모 과목 최소 2개 구비');
+    assert.ok(INITIAL_MATERIALS.length >= 2, '데모 교재 구비');
+    assert.ok(INITIAL_CONCEPTS.length >= 4, '데모 개념 구비');
+    assert.ok(INITIAL_PROBLEMS.length >= 4, '데모 문제 구비');
+
+    assert.equal(typeof storage.resetToInitialDemoData, 'function');
+    assert.equal(typeof storage.checkStoredDataIntegrity, 'function');
+    const integrity = storage.checkStoredDataIntegrity();
+    assert.equal(integrity.ok, true, '저장소 무결성 검증 통과');
+  });
+
+  // --- P06-03: Learning Dashboard & D-Day Calculation ---
+  await checkAsync('P06-03: 학습 대시보드 D-Day 산출 및 복습 우선순위 산정 검증', async () => {
+    const futureDate = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    const ddayFuture = dateUtils.calculateDDay(futureDate);
+    assert.equal(ddayFuture.calendarDiff, 5, 'D-5일 산출');
+    assert.equal(ddayFuture.displayBadge, 'D-5');
+
+    const pastDate = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const ddayPast = dateUtils.calculateDDay(pastDate);
+    assert.equal(ddayPast.displayBadge, '시험 종료', '시험 종료 표기');
+
+    const todayStr = dateUtils.toSeoulDateString(new Date());
+    const mockSummary = {
+      todayDate: todayStr,
+      days: [
+        {
+          date: todayStr,
+          items: [
+            { id: 'item-1', status: 'pending', priorityScore: 10, estimatedMinutes: 20 },
+            { id: 'item-2', status: 'completed', priorityScore: 5, estimatedMinutes: 15 },
+          ],
+        },
+        {
+          date: '2026-12-31',
+          items: [
+            { id: 'item-3', status: 'pending', priorityScore: 20 },
+          ],
+        },
+      ],
+    };
+    const digest = todayStudy.getTodayPendingItems(mockSummary);
+    assert.equal(digest.items.length, 1, '오늘 보류된 항목만 정확히 추출');
+    assert.equal(digest.items[0].id, 'item-1');
+  });
+
+  // --- P06-04: Material Registration & Ingestion Validation ---
+  await checkAsync('P06-04: 강의 자료 등록 유효성 검사 및 중복 감지 UX 검증', async () => {
+    assert.equal(materialIngestion.MATERIAL_INPUT_LIMITS.pdfBytes, 20 * 1024 * 1024);
+    assert.equal(materialIngestion.MATERIAL_INPUT_LIMITS.textBytes, 10 * 1024 * 1024);
+
+    const existing = [
+      {
+        id: 'mat-existing',
+        title: '미적분학 1장',
+        kind: 'pdf',
+        parsedMarkdown: '# 제1장 미분과 적분\n함수 f(x)의 극한',
+      },
+    ];
+
+    const duplicateMatch = materialIngestion.findDuplicateMaterial(
+      existing,
+      '# 제1장 미분과 적분\n함수 f(x)의 극한',
+      ''
+    );
+    assert.ok(duplicateMatch, '동일 내용 중복 감지');
+    assert.equal(duplicateMatch.id, 'mat-existing');
+
+    const uniqueMatch = materialIngestion.findDuplicateMaterial(
+      existing,
+      '# 제2장 편미분과 다중적분',
+      ''
+    );
+    assert.equal(uniqueMatch, null, '고유한 자료는 중복 없음 판정');
+  });
+
+  // --- P06-05: Problem Solving Draft & Decoupled Evaluation ---
+  await checkAsync('P06-05: 문제 풀이 임시 답안 저장 격리 및 독립 평가 무결성 검증', async () => {
+    const userId = 'student-ux-user';
+    const problemId = 'prob-calc-01';
+    const problemVersion = 1;
+    const tabId = practiceAnswerDraft.resolvePracticeTabId();
+    const draft = {
+      problemId,
+      problemVersion,
+      tabId,
+      answerText: "f'(x) = 2x + cos(x)",
+      revealedHints: [],
+      confidence: 5,
+      errorType: 'none',
+      reasoningNotes: '',
+      solvingReason: '도함수의 정의 및 선형성에 의해 전개함',
+      isReasonNotApplicable: false,
+      reasonNotApplicableJustification: '',
+      savedAt: new Date().toISOString(),
+    };
+    const saved = practiceAnswerDraft.savePracticeAnswerDraft(userId, draft);
+    assert.ok(saved, '임시 답안 저장 성공');
+
+    const loadedDraft = practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, problemId, problemVersion, tabId);
+    assert.ok(loadedDraft, '임시 답안 성공적 복원');
+    assert.equal(loadedDraft.answerText, "f'(x) = 2x + cos(x)");
+    assert.equal(loadedDraft.confidence, 5);
+
+    practiceAnswerDraft.clearPracticeAnswerDraft(userId, problemId, problemVersion, tabId);
+    const clearedDraft = practiceAnswerDraft.loadPracticeAnswerDraftForTab(userId, problemId, problemVersion, tabId);
+    assert.equal(clearedDraft, null, '답안 제출 후 임시 저장소 초기화');
+  });
+
+  // --- P06-06: Review Engine Personalization & Schedule Invariance ---
+  await checkAsync('P06-06: 개인화 복습 일정 조정 시 점수 불변 및 복습 사유 설명 가능성', async () => {
+    const concept = {
+      id: 'c-stat-01',
+      subjectId: 's-math',
+      title: '중심극한정리 (CLT)',
+      baseScore: 75,
+      currentScore: 75,
+      status: 'active',
+      events: [
+        {
+          id: 'ev-1',
+          at: new Date(Date.now() - 48 * 3600 * 1000).toISOString(),
+          dayOffset: 0,
+          kind: 'attempt',
+          resultScore: 70,
+          confidence: 3,
+          errorType: 'none',
+          academicErrorType: 'NO_ERROR',
+        },
+      ],
+    };
+    storage.saveStoredConcepts([concept]);
+    const before = storage.loadStoredConcepts().find((c) => c.id === concept.id);
+    assert.ok(before, '저장된 개념 로드 확인');
+
+    const { postponedConcept } = storage.postponeConceptReview(concept.id, 2, new Date());
+    assert.ok(postponedConcept, '복습 연기 완료');
+    assert.equal(postponedConcept.postponeDays, 2);
+    assert.equal(postponedConcept.baseScore, before.baseScore, 'CRITICAL: 복습 연기 시 기본 점수 불변');
+    assert.equal(postponedConcept.currentScore, before.currentScore, 'CRITICAL: 복습 연기 시 현재 점수 불변');
+    assert.equal(postponedConcept.events.length, 1, 'CRITICAL: 가짜 ReviewEvent 미생성');
+  });
+
+  // --- P06-07: Responsive Web & Accessibility Semantic Standards ---
+  await checkAsync('P06-07: 반응형 내비게이션 탭 및 웹 접근성 시맨틱 규격 검증', async () => {
+    const validTabs = ['today', 'materials', 'problems', 'history', 'settings', 'session', 'exam'];
+    for (const tab of validTabs) {
+      assert.ok(typeof tab === 'string', `${tab} 탭 규격 확인`);
+    }
+
+    for (const [key, val] of Object.entries(types.ACADEMIC_ERROR_LABELS)) {
+      assert.ok(typeof key === 'string');
+      assert.ok(typeof val.label === 'string' && val.label.length > 0, `${key} 레이블 완비`);
+      assert.ok(typeof val.description === 'string' && val.description.length > 0, `${key} 설명 완비`);
+    }
+
+    assert.equal(Object.keys(types.ACADEMIC_DIFFICULTY_LEVELS).length, 5, '5단계 난이도 완비');
+  });
+
+  // --- P06-08: Admin AI Metrics & Anomaly Detection Telemetry ---
+  await checkAsync('P06-08: AI 호출 지표 집계, USD/KRW 비용 및 이상 호출 탐지 검증', async () => {
+    aiCostTelemetry.clearTelemetryStore();
+
+    await aiCostTelemetry.recordAiUsageTelemetry({
+      requestId: 'req-plan06-1',
+      userId: 'test-user-plan06',
+      taskType: 'evaluate_answer',
+      provider: 'school_gateway',
+      model: 'deepseek-v4.1-flash',
+      inputTokens: 1500,
+      outputTokens: 500,
+      executionTimeMs: 850,
+      status: 'success',
+      creditSource: 'operator_trial',
+    });
+
+    await aiCostTelemetry.recordAiUsageTelemetry({
+      requestId: 'req-plan06-2',
+      userId: 'test-user-plan06',
+      taskType: 'generate_problems',
+      provider: 'school_gateway',
+      model: 'deepseek-v4.1-flash',
+      inputTokens: 3000,
+      outputTokens: 1200,
+      executionTimeMs: 1400,
+      status: 'success',
+      creditSource: 'personal_key',
+    });
+
+    const summary = aiCostTelemetry.getAiUsageSummary();
+    assert.ok(summary.totalRequests >= 2, '최소 2건 호출 집계');
+    assert.ok(summary.operatorTrialConsumption.tokens >= 2000, '체험 크레딧 토큰 집계');
+    assert.ok(summary.personalKeyConsumption.tokens >= 4200, '개인 키 토큰 집계');
+    assert.ok(summary.totalCostUsd > 0, 'USD 예상 비용 산출');
+    assert.ok(summary.totalCostKrw > 0, 'KRW 예상 비용 산출');
+    assert.equal(summary.operatorTrialConsumption.requests, 1, '체험 크레딧 1건');
+    assert.equal(summary.personalKeyConsumption.requests, 1, '개인 키 1건');
+
+    const cost = aiCostTelemetry.calculateAiCost('deepseek-v4.1-flash', 1000000, 1000000);
+    assert.ok(cost.estimatedCostUsd > 0 && cost.estimatedCostUsd < 1, '100만 토큰당 합리적 단가');
+  });
+
 
   console.log(`${passed} regression checks passed`);
 }

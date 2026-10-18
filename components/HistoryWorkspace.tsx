@@ -20,13 +20,13 @@ import {
 import { formatSeoulDate } from '../lib/dateUtils';
 
 export interface HistoryWorkspaceProps {
-  activeSubject: Subject;
-  subjects: Subject[];
+  activeSubject?: Subject | null;
+  subjects?: Subject[];
   concepts: Concept[];
   problems: Problem[];
   attempts: Attempt[];
-  mockExams: MockExamSession[];
-  personalizationSettings: PersonalizationSettings;
+  mockExams?: MockExamSession[];
+  personalizationSettings?: PersonalizationSettings;
   correctionState?: PersonalizationCorrectionState;
   onUpdatePersonalizationSettings?: (settings: PersonalizationSettings) => void;
   onResetPersonalizationSettings?: () => void;
@@ -61,8 +61,9 @@ export function HistoryWorkspace({
 
   // Subject attempts
   const subjectAttempts = useMemo(() => {
+    if (!activeSubject) return [];
     return attempts.filter((a) => a.subjectId === activeSubject.id);
-  }, [attempts, activeSubject.id]);
+  }, [attempts, activeSubject]);
 
   // Filtered by period, concept, search
   const filteredAttempts = useMemo(() => {
@@ -148,6 +149,22 @@ export function HistoryWorkspace({
 
     return { total, avgScore, passRate, weakConcepts: weak };
   }, [subjectAttempts, concepts]);
+
+  if (!activeSubject) {
+    return (
+      <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-10 text-center shadow-2xs space-y-3">
+        <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto">
+          <BarChart3 className="w-6 h-6 stroke-1 text-[#827d73]" />
+        </div>
+        <h3 className="font-academic-serif font-bold text-base text-[#191817]">
+          선택된 과목이 없습니다.
+        </h3>
+        <p className="text-xs text-[#57544e] max-w-md mx-auto leading-relaxed">
+          과목을 추가하고 문제 풀이를 진행하면 이곳에 학습 기록 및 오답 분석 통계가 누적됩니다.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="w-full space-y-4">

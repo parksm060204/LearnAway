@@ -18,6 +18,7 @@ import {
   Info,
   LogOut,
   Bell,
+  BarChart3,
 } from 'lucide-react';
 
 export interface SettingsWorkspaceProps {
@@ -30,6 +31,7 @@ export interface SettingsWorkspaceProps {
   currentUserEmail?: string | null;
   onLogout?: () => void;
   isLoggingOut?: boolean;
+  onOpenAiMetrics?: () => void;
 }
 
 export function SettingsWorkspace({
@@ -42,6 +44,7 @@ export function SettingsWorkspace({
   currentUserEmail,
   onLogout,
   isLoggingOut = false,
+  onOpenAiMetrics,
 }: SettingsWorkspaceProps) {
   const [activeSubTab, setActiveSubTab] = useState<'api' | 'reminders' | 'policy' | 'data' | 'model' | 'account'>('api');
 
@@ -168,6 +171,22 @@ export function SettingsWorkspace({
             <User className="w-4 h-4 text-indigo-500" />
             <span>계정</span>
           </button>
+
+          {onOpenAiMetrics && (
+            <div className="pt-2 border-t border-[#f1ede4] mt-2">
+              <button
+                type="button"
+                onClick={onOpenAiMetrics}
+                className="w-full flex items-center justify-between px-3 py-2 text-xs rounded-xs font-semibold text-purple-900 bg-purple-50 hover:bg-purple-100 border border-purple-200 transition-colors text-left"
+              >
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="w-4 h-4 text-purple-600" />
+                  <span>AI 운영/비용 지표</span>
+                </div>
+                <span className="text-[10px] font-academic-mono bg-purple-200 text-purple-800 px-1 rounded-2xs">관리자</span>
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Content Pane (9 cols) */}
@@ -178,6 +197,24 @@ export function SettingsWorkspace({
                 AI API 연결 설정 (학교 BAZE Gateway / DeepSeek)
               </h3>
               <AiConnectionSection />
+
+              {onOpenAiMetrics && (
+                <div className="mt-4 p-3 bg-purple-50/70 border border-purple-200 rounded-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                  <div>
+                    <span className="text-xs font-bold text-purple-950 block">AI 운영 호출량 및 비용 지표 대시보드</span>
+                    <span className="text-[11px] text-purple-800">
+                      총 호출 수, 토큰 사용량, 성공률, USD/KRW 예상 비용 및 이상 호출 현황을 실시간 조회합니다.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onOpenAiMetrics}
+                    className="px-3 py-1.5 text-xs font-bold bg-purple-800 hover:bg-purple-900 text-white rounded-xs shadow-2xs shrink-0 transition-colors"
+                  >
+                    지표 보기
+                  </button>
+                </div>
+              )}
             </div>
           )}
 

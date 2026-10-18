@@ -22,10 +22,11 @@ import {
 } from 'lucide-react';
 
 export interface MaterialsWorkspaceProps {
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   materials: Material[];
   drafts?: ConceptDraft[];
   onOpenUpload: () => void;
+  onOpenAddSubject?: () => void;
   onSelectMaterial: (material: Material) => void;
   onDeleteMaterial?: (materialId: string) => Promise<void>;
   hasOriginal?: (materialId: string) => boolean;
@@ -41,6 +42,7 @@ export function MaterialsWorkspace({
   materials,
   drafts = [],
   onOpenUpload,
+  onOpenAddSubject,
   onSelectMaterial,
   onDeleteMaterial,
   hasOriginal,
@@ -97,6 +99,32 @@ export function MaterialsWorkspace({
     const ok = await onReconnectFile(mat, target.kind, file);
     if (ok) await refreshPresence();
   };
+
+  if (!activeSubject) {
+    return (
+      <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-10 text-center shadow-2xs space-y-3">
+        <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto">
+          <FolderOpen className="w-6 h-6 stroke-1 text-[#827d73]" />
+        </div>
+        <h3 className="font-academic-serif font-bold text-base text-[#191817]">
+          선택된 과목이 없습니다.
+        </h3>
+        <p className="text-xs text-[#57544e] max-w-md mx-auto leading-relaxed">
+          강의 자료를 등록하고 관리하려면 먼저 과목 폴더를 생성하거나 선택해 주세요.
+        </p>
+        {onOpenAddSubject && (
+          <button
+            type="button"
+            onClick={onOpenAddSubject}
+            className="px-4 py-2 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs inline-flex items-center gap-1.5 shadow-xs transition-colors"
+          >
+            <Plus className="w-3.5 h-3.5 text-[#c52828]" />
+            <span>+ 새 과목 폴더 추가</span>
+          </button>
+        )}
+      </div>
+    );
+  }
 
   const subjectMaterials = materials.filter((m) => m.subjectId === activeSubject.id);
 

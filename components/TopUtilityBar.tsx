@@ -25,7 +25,7 @@ export type DashboardTab = 'today' | 'materials' | 'problems' | 'history' | 'set
 
 interface TopUtilityBarProps {
   subjects: Subject[];
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   onSelectSubject: (subjectId: string) => void;
   onOpenAddSubject: () => void;
   onOpenUpload: () => void;
@@ -41,6 +41,7 @@ interface TopUtilityBarProps {
   onOpenProblemSession: () => void;
   onOpenMockExam: () => void;
   onOpenSettings: () => void;
+  onOpenAiMetrics?: () => void;
   onScrollToTodayReview: () => void;
   activeTab?: DashboardTab;
   onSelectTab?: (tab: DashboardTab) => void;
@@ -66,6 +67,7 @@ export function TopUtilityBar({
   onOpenProblemSession,
   onOpenMockExam,
   onOpenSettings,
+  onOpenAiMetrics,
   onScrollToTodayReview,
   activeTab = 'today',
   onSelectTab,
@@ -122,11 +124,17 @@ export function TopUtilityBar({
               aria-expanded={isDropdownOpen}
               aria-label="과목 선택 드롭다운"
             >
-              <span className="truncate max-w-[140px] sm:max-w-[220px]">{activeSubject.name}</span>
-              {activeSubject.isDemo && (
-                <span className="text-[10px] font-academic-mono bg-[#f4f1ea] text-[#827d73] px-1.5 py-0.5 rounded-xs border border-[#ded6c8]">
-                  데모
-                </span>
+              {activeSubject ? (
+                <>
+                  <span className="truncate max-w-[140px] sm:max-w-[220px]">{activeSubject.name}</span>
+                  {activeSubject.isDemo && (
+                    <span className="text-[10px] font-academic-mono bg-[#f4f1ea] text-[#827d73] px-1.5 py-0.5 rounded-xs border border-[#ded6c8]">
+                      데모
+                    </span>
+                  )}
+                </>
+              ) : (
+                <span className="text-[#c52828] font-bold">+ 과목 등록 필요</span>
               )}
               <ChevronDown className="w-3.5 h-3.5 text-[#827d73]" />
             </button>
@@ -138,36 +146,42 @@ export function TopUtilityBar({
                   <span>{subjects.length}개 보관</span>
                 </div>
                 <div className="max-h-60 overflow-y-auto">
-                  {subjects.map((sub) => (
-                    <button
-                      key={sub.id}
-                      onClick={() => {
-                        onSelectSubject(sub.id);
-                        setIsDropdownOpen(false);
-                      }}
-                      className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between hover:bg-[#faf8f4] transition-colors ${sub.id === activeSubject.id
-                        ? 'font-bold text-[#c52828] bg-[#fef2f2]'
-                        : 'text-[#191817]'
-                        }`}
-                    >
-                      <div>
-                        <div className="font-medium flex items-center gap-1.5">
-                          <span>{sub.name}</span>
-                          {sub.isDemo && (
-                            <span className="text-[9.5px] font-academic-mono text-[#827d73] border border-[#ded6c8] px-1 rounded-2xs">
-                              데모
-                            </span>
-                          )}
+                  {subjects.length === 0 ? (
+                    <div className="p-4 text-center text-xs text-[#827d73] leading-relaxed">
+                      등록된 과목이 없습니다.<br />아래 버튼을 눌러 새 과목을 추가하세요.
+                    </div>
+                  ) : (
+                    subjects.map((sub) => (
+                      <button
+                        key={sub.id}
+                        onClick={() => {
+                          onSelectSubject(sub.id);
+                          setIsDropdownOpen(false);
+                        }}
+                        className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between hover:bg-[#faf8f4] transition-colors ${sub.id === activeSubject?.id
+                          ? 'font-bold text-[#c52828] bg-[#fef2f2]'
+                          : 'text-[#191817]'
+                          }`}
+                      >
+                        <div>
+                          <div className="font-medium flex items-center gap-1.5">
+                            <span>{sub.name}</span>
+                            {sub.isDemo && (
+                              <span className="text-[9.5px] font-academic-mono text-[#827d73] border border-[#ded6c8] px-1 rounded-2xs">
+                                데모
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-[#827d73] font-academic-mono">
+                            {sub.domain === 'math_stats' ? '수학/수리통계' : '컴퓨터공학/코딩'}
+                          </div>
                         </div>
-                        <div className="text-[11px] text-[#827d73] font-academic-mono">
-                          {sub.domain === 'math_stats' ? '수학/수리통계' : '컴퓨터공학/코딩'}
-                        </div>
-                      </div>
-                      {sub.id === activeSubject.id && (
-                        <span className="w-1.5 h-1.5 rounded-full bg-[#c52828]" />
-                      )}
-                    </button>
-                  ))}
+                        {sub.id === activeSubject?.id && (
+                          <span className="w-1.5 h-1.5 rounded-full bg-[#c52828]" />
+                        )}
+                      </button>
+                    ))
+                  )}
                 </div>
 
                 {/* Create New Subject Button */}
@@ -428,7 +442,9 @@ export function TopUtilityBar({
               trialCredits.hasPersonalKey
                 ? '내 API 키 사용 중 · 체험 크레딧 차감 없음 (설정 열기)'
                 : trialCredits.balance > 0
-                ? `AI 체험 3회 제공 · 남은 체험: ${trialCredits.balance}회 (설정 열기)`
+                ? trialCredits.granted === 1
+                  ? `게스트 AI 체험 1회 제공 · 남은 체험: ${trialCredits.balance}회 (설정 열기)`
+                  : `AI 체험 ${trialCredits.granted}회 제공 · 남은 체험: ${trialCredits.balance}회 (설정 열기)`
                 : 'AI 체험 크레딧 소진 · 내 API 연결 필요 (설정 열기)'
             }
             aria-label="AI 연결 및 체험 크레딧 상태"
@@ -438,12 +454,29 @@ export function TopUtilityBar({
               {trialCredits.loading
                 ? 'AI...'
                 : trialCredits.hasPersonalKey
-                ? '내 API 사용 중 · 체험 크레딧 차감 없음'
+                ? '내 API 사용 중'
                 : trialCredits.balance > 0
-                ? `남은 체험: ${trialCredits.balance}회`
-                : '체험 소진 · 내 API 연결'}
+                ? trialCredits.granted === 1
+                  ? `게스트 체험 (${trialCredits.balance}/1회)`
+                  : `체험 (${trialCredits.balance}/${trialCredits.granted}회)`
+                : '체험 소진 · API 연결'}
             </span>
           </button>
+
+          {onOpenAiMetrics && (
+            <button
+              type="button"
+              onClick={() => {
+                closeMenus();
+                onOpenAiMetrics();
+              }}
+              className="hidden xl:flex items-center gap-1.5 px-2 py-1.5 rounded-xs text-[11px] font-academic-mono text-purple-700 hover:bg-purple-50 border border-purple-200 transition-colors"
+              title="운영자 AI 호출 지표 및 비용 대시보드"
+            >
+              <BarChart3 className="w-3.5 h-3.5 text-purple-600" />
+              <span>AI 지표</span>
+            </button>
+          )}
 
           <button
             onClick={() => {
@@ -587,12 +620,30 @@ export function TopUtilityBar({
                   : trialCredits.hasPersonalKey
                   ? '내 API 사용 중 · 체험 크레딧 차감 없음'
                   : trialCredits.balance > 0
-                  ? `AI 체험 3회 제공 (남은 체험: ${trialCredits.balance}회)`
+                  ? trialCredits.granted === 1
+                    ? `게스트 체험 1회 (남은 체험: ${trialCredits.balance}회)`
+                    : `AI 체험 ${trialCredits.granted}회 제공 (남은 체험: ${trialCredits.balance}회)`
                   : '체험 크레딧 소진 (내 API 연결 필요)'}
               </span>
             </div>
             <span className="text-[10px] underline font-academic-mono">설정</span>
           </div>
+
+          {onOpenAiMetrics && (
+            <button
+              onClick={() => {
+                onOpenAiMetrics();
+                setIsMobileMenuOpen(false);
+              }}
+              className="w-full flex items-center justify-between py-2 px-3 text-xs bg-purple-50 text-purple-900 border border-purple-200 rounded-xs font-semibold"
+            >
+              <div className="flex items-center gap-2">
+                <BarChart3 className="w-4 h-4 text-purple-600" />
+                <span>AI 운영/비용 지표 대시보드</span>
+              </div>
+              <span className="text-[10px] font-academic-mono text-purple-700">관리자</span>
+            </button>
+          )}
           <button
             onClick={() => {
               if (onSelectTab) onSelectTab('today');

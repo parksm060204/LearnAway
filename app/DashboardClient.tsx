@@ -68,7 +68,9 @@ import {
   checkStoredDataIntegrity,
   buildProblemFromDraft,
   AttemptSaveStatus,
+  resetToInitialDemoData,
 } from '../lib/storage';
+import { AdminAiMetricsModal } from '../components/AdminAiMetricsModal';
 import { loadLearningLibrary } from '../lib/cloud/learningLibrary';
 import { mergeConcepts, mergeDrafts, mergeProblems } from '../lib/cloud/mergeLearning';
 import {
@@ -298,6 +300,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   const [editingMaterial, setEditingMaterial] = useState<Material | null>(null);
   const [isMaterialEditorOpen, setIsMaterialEditorOpen] = useState(false);
   const [pdfViewerSourceRef, setPdfViewerSourceRef] = useState<string | null>(null);
+  const [isAdminAiMetricsOpen, setIsAdminAiMetricsOpen] = useState(false);
 
   // Stage 2: AI Concept Extraction & Review State
   const [conceptDrafts, setConceptDrafts] = useState<ConceptDraft[]>([]);
@@ -1840,6 +1843,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     saveStoredSubjects(updated);
     handleSelectSubject(result.data.id);
     showToast(`새 과목 폴더 [${result.data.name}]이 생성되었습니다.`);
+  };
+
+  // Demo Data Loader for Onboarding / Zero-State testing
+  const handleLoadDemoData = () => {
+    resetToInitialDemoData();
+    window.location.reload();
   };
 
   // Concept Selection Handler
@@ -3566,6 +3575,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         onOpenStudyPlan={() => setIsStudyPlanOpen(true)}
         onOpenLearningAnalytics={() => handleSelectTab('history')}
         onOpenSettings={() => handleSelectTab('settings')}
+        onOpenAiMetrics={() => setIsAdminAiMetricsOpen(true)}
         onScrollToTodayReview={() => handleSelectTab('today')}
         activeTab={activeTab}
         onSelectTab={handleSelectTab}
@@ -3699,6 +3709,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             activeSubject={activeSubject}
             onOpenScheduleModal={() => setIsScheduleModalOpen(true)}
             onOpenScopeModal={() => setIsScopeModalOpen(true)}
+            onOpenAddSubject={() => setIsAddSubjectModalOpen(true)}
+            onLoadDemoData={handleLoadDemoData}
             primaryCta={primaryCta}
             onPrimaryAction={primaryCta ? handleStartTodayPrimary : undefined}
             todayDigest={todayDigest}
@@ -3760,6 +3772,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             materials={materials}
             drafts={conceptDrafts}
             onOpenUpload={() => setIsUploadModalOpen(true)}
+            onOpenAddSubject={() => setIsAddSubjectModalOpen(true)}
             onSelectMaterial={(mat) => {
               setEditingMaterial(mat);
               setIsMaterialEditorOpen(true);
@@ -3813,6 +3826,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             materials={materials}
             concepts={subjectConcepts}
             onOpenGenerator={() => setIsProblemGeneratorOpen(true)}
+            onOpenAddSubject={() => setIsAddSubjectModalOpen(true)}
+            onOpenUpload={() => setIsUploadModalOpen(true)}
             onStartProblemSession={(problemId) => {
               openProblemSessionScreen(problemId || (availableSubjectProblems[0]?.id));
             }}
@@ -3872,6 +3887,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             currentUserEmail={currentUser.email}
             onLogout={handleLogout}
             isLoggingOut={isLoggingOut}
+            onOpenAiMetrics={() => setIsAdminAiMetricsOpen(true)}
           />
         )}
 
@@ -4695,6 +4711,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           onStartTransferProblem={handleStartTransferProblem}
         />
       )}
+
+      {/* 14. Admin AI Metrics & Cost Analytics Modal */}
+      <AdminAiMetricsModal
+        isOpen={isAdminAiMetricsOpen}
+        onClose={() => setIsAdminAiMetricsOpen(false)}
+      />
     </div>
   );
 }

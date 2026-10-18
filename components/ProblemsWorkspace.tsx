@@ -30,12 +30,14 @@ import {
 } from 'lucide-react';
 
 export interface ProblemsWorkspaceProps {
-  activeSubject: Subject;
+  activeSubject?: Subject | null;
   problems: Problem[];
   drafts: ProblemDraft[];
   materials?: Material[];
   concepts: Concept[];
   onOpenGenerator: () => void;
+  onOpenAddSubject?: () => void;
+  onOpenUpload?: () => void;
   onStartProblemSession: (problemId?: string) => void;
   onStartMockExam: () => void;
   hasActiveMockSession?: boolean;
@@ -58,6 +60,8 @@ export function ProblemsWorkspace({
   materials = [],
   concepts = [],
   onOpenGenerator,
+  onOpenAddSubject,
+  onOpenUpload,
   onStartProblemSession,
   onStartMockExam,
   hasActiveMockSession = false,
@@ -84,12 +88,14 @@ export function ProblemsWorkspace({
   const [draftFilterTab, setDraftFilterTab] = useState<'all' | 'pending' | 'needs_review'>('all');
 
   const subjectProblems = useMemo(() => {
+    if (!activeSubject) return [];
     return problems.filter((p) => p.subjectId === activeSubject.id);
-  }, [problems, activeSubject.id]);
+  }, [problems, activeSubject]);
 
   const subjectDrafts = useMemo(() => {
+    if (!activeSubject) return [];
     return drafts.filter((d) => d.subjectId === activeSubject.id);
-  }, [drafts, activeSubject.id]);
+  }, [drafts, activeSubject]);
 
   const subjectQualityCount = useMemo(() => {
     return subjectProblems.filter(
@@ -134,6 +140,32 @@ export function ProblemsWorkspace({
       return true;
     });
   }, [subjectDrafts, draftFilterTab]);
+
+  if (!activeSubject) {
+    return (
+      <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-10 text-center shadow-2xs space-y-3">
+        <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto">
+          <FileQuestion className="w-6 h-6 stroke-1 text-[#827d73]" />
+        </div>
+        <h3 className="font-academic-serif font-bold text-base text-[#191817]">
+          선택된 과목이 없습니다.
+        </h3>
+        <p className="text-xs text-[#57544e] max-w-md mx-auto leading-relaxed">
+          문제은행을 열고 문제를 풀거나 출제하려면 먼저 과목을 추가하거나 선택해 주세요.
+        </p>
+        {onOpenAddSubject && (
+          <button
+            type="button"
+            onClick={onOpenAddSubject}
+            className="px-4 py-2 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs inline-flex items-center gap-1.5 shadow-xs transition-colors"
+          >
+            <Plus className="w-3.5 h-3.5 text-[#c52828]" />
+            <span>+ 새 과목 추가하기</span>
+          </button>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="w-full space-y-4">
@@ -203,6 +235,27 @@ export function ProblemsWorkspace({
             >
               이어서 풀기
             </button>
+          </div>
+        )}
+
+        {/* No Concepts Prerequisite Warning Banner */}
+        {concepts.length === 0 && (
+          <div className="mt-4 p-3 bg-amber-50 border border-amber-300 rounded-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span className="text-xs text-amber-900 font-semibold">
+                과목에 등록된 학습 개념이 없습니다. 대학 시험 문제를 AI로 출제하려면 먼저 강의자료를 등록하고 개념을 추출해 주세요.
+              </span>
+            </div>
+            {onOpenUpload && (
+              <button
+                type="button"
+                onClick={onOpenUpload}
+                className="px-3 py-1 text-xs font-bold text-white bg-[#191817] hover:bg-[#33302b] rounded-xs shadow-2xs shrink-0 transition-colors"
+              >
+                자료 등록하기
+              </button>
+            )}
           </div>
         )}
       </div>
