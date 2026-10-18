@@ -8,7 +8,8 @@ import {
   Concept,
   Material,
   ProblemQualityStatus,
-  PROBLEM_DIFFICULTY_LABELS,
+  ACADEMIC_DIFFICULTY_LEVELS,
+  toAcademicDifficultyLevel,
 } from '../lib/types';
 import { AcademicMathView } from './AcademicMathView';
 import { ProblemQualityReviewTab } from './ProblemQualityReviewTab';
@@ -359,9 +360,23 @@ export function ProblemsWorkspace({
                           <span className="text-[10px] font-academic-mono bg-[#ded6c8]/60 text-[#57544e] px-1.5 py-0.5 rounded-2xs">
                             v{prob.version || 1}
                           </span>
-                          <span className="text-[10px] font-academic-mono bg-blue-50 text-blue-800 border border-blue-200 px-1.5 py-0.5 rounded-2xs">
-                            {prob.difficulty ? PROBLEM_DIFFICULTY_LABELS[prob.difficulty] || prob.difficulty : '기본 난이도'}
-                          </span>
+                          {(() => {
+                            const diffLevel = toAcademicDifficultyLevel(prob.difficultyLevel ?? prob.difficulty);
+                            const diffInfo = ACADEMIC_DIFFICULTY_LEVELS[diffLevel];
+                            return (
+                              <span
+                                className="text-[10px] font-academic-mono bg-purple-50 text-purple-800 border border-purple-200 px-1.5 py-0.5 rounded-2xs font-semibold"
+                                title={diffInfo.description}
+                              >
+                                Level {diffInfo.level} ({diffInfo.label})
+                              </span>
+                            );
+                          })()}
+                          {prob.sourceVerificationStatus === 'verified' && (
+                            <span className="text-[10px] font-academic-mono bg-emerald-50 border border-emerald-300 text-emerald-800 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">
+                              출처 검증 완료
+                            </span>
+                          )}
 
                           {prob.isOutdated && (
                             <span className="text-[10px] font-academic-mono bg-amber-50 border border-amber-300 text-amber-800 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">

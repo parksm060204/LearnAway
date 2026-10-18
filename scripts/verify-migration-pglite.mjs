@@ -161,6 +161,14 @@ async function testUpgradePath() {
   await runSqlFile(db, path.join(MIGRATIONS_DIR, migration28File));
   console.log('✓ Migration 28 executed cleanly without 42P13 or 42725 errors!');
 
+  // 4. Apply Migration 29
+  const migration29File = files.find(f => f.includes('000029_'));
+  if (migration29File) {
+    console.log(`Applying Migration 29: ${migration29File}...`);
+    await runSqlFile(db, path.join(MIGRATIONS_DIR, migration29File));
+    console.log('✓ Migration 29 executed cleanly!');
+  }
+
   // Now execute Scenarios A through F
   await setAuthContext(db, { uid: userIdA, role: 'service_role' });
 
@@ -354,16 +362,79 @@ async function testUpgradePath() {
   await db.query(`
     select public.record_trial_result_ready($1, '{"eval":"valid"}'::jsonb, $2, $3);
   `, [taskIdD, userIdA, tokenD2]);
-  await db.query(`
-    select public.settle_trial_credit($1, $2, $3);
-  `, [taskIdD, userIdA, tokenD2]);
-
-  // Repeated settle
-  await db.query(`
+  const settle1 = await db.query(`
     select public.settle_trial_credit($1, $2, $3) as r;
   `, [taskIdD, userIdA, tokenD2]);
-  // Note: after settle, lease_token is null in DB, or it can be called with same token
-  // Let's test repeated reserve
+  if (!settle1.rows[0].r.success || settle1.rows[0].r.status !== 'settled') {
+    throw new Error(`First settle failed: ${JSON.stringify(settle1.rows[0].r)}`);
+  }
+
+  // 1. Double Settle Retry with same token (Simulating network response loss): MUST SUCCEED READ-ONLY!
+  const settleRetry = await db.query(`
+    select public.settle_trial_credit($1, $2, $3) as r;
+  `, [taskIdD, userIdA, tokenD2]);
+  if (settleRetry.rows[0].r.success !== true || settleRetry.rows[0].r.status !== 'settled') {
+    throw new Error(`Double settle retry failed (expected success:true, got: ${JSON.stringify(settleRetry.rows[0].r)})`);
+  }
+  console.log('✓ Idempotent settle retry succeeded read-only with same token after response loss');
+
+  // 2. Cross-user settle attempt: MUST BE REJECTED
+  const crossUserSettle = await db.query(`
+    select public.settle_trial_credit($1, $2, $3) as r;
+  `, [taskIdD, userIdB, tokenD2]);
+  if (crossUserSettle.rows[0].r.success !== false || crossUserSettle.rows[0].r.error_code !== 'TASK_OWNERSHIP_MISMATCH') {
+    throw new Error(`Cross-user settle should fail with TASK_OWNERSHIP_MISMATCH: ${JSON.stringify(crossUserSettle.rows[0].r)}`);
+  }
+  console.log('✓ Cross-user settle attempt strictly rejected with TASK_OWNERSHIP_MISMATCH');
+
+  // 3. Settled task refund attempt: MUST BE BLOCKED
+  const refundSettled = await db.query(`
+    select public.release_trial_credit($1, 'should_fail', $2, $3) as r;
+  `, [taskIdD, userIdA, tokenD2]);
+  if (refundSettled.rows[0].r.success !== false || refundSettled.rows[0].r.error_code !== 'ALREADY_SETTLED') {
+    throw new Error(`Refunding a settled task must fail with ALREADY_SETTLED: ${JSON.stringify(refundSettled.rows[0].r)}`);
+  }
+  console.log('✓ Attempt to refund a settled task properly blocked with ALREADY_SETTLED');
+
+  // 4. Double Release / Refund Retry (Simulating network response loss):
+  await db.query(`update public.ai_trial_credits set balance = 1 where user_id = $1;`, [userIdA]);
+  const taskIdE = 'task_e_' + Date.now();
+  const resE1 = await db.query(`
+    select public.reserve_trial_credit($1, 'generate_problems', 'input_e', $2, 500) as r;
+  `, [taskIdE, userIdA]);
+  if (!resE1.rows[0].r.allowed) {
+    throw new Error(`Reservation for task E failed: ${JSON.stringify(resE1.rows[0].r)}`);
+  }
+  const tokenE = resE1.rows[0].r.lease_token;
+
+  // First release
+  const rel1 = await db.query(`
+    select public.release_trial_credit($1, 'cancelled', $2, $3) as r;
+  `, [taskIdE, userIdA, tokenE]);
+  if (!rel1.rows[0].r.success || rel1.rows[0].r.refunded !== true) {
+    throw new Error(`First release failed: ${JSON.stringify(rel1.rows[0].r)}`);
+  }
+  const balAfterE = rel1.rows[0].r.balance;
+
+  // Retry release with same token
+  const relRetry = await db.query(`
+    select public.release_trial_credit($1, 'cancelled', $2, $3) as r;
+  `, [taskIdE, userIdA, tokenE]);
+  if (relRetry.rows[0].r.success !== true || relRetry.rows[0].r.refunded !== false || relRetry.rows[0].r.balance !== balAfterE) {
+    throw new Error(`Release retry failed: ${JSON.stringify(relRetry.rows[0].r)}`);
+  }
+  console.log('✓ Idempotent release retry succeeded read-only with same token (refunded=false, balance unmutated)');
+
+  // 5. Attempting to settle a refunded task: MUST BE BLOCKED
+  const settleRefunded = await db.query(`
+    select public.settle_trial_credit($1, $2, $3) as r;
+  `, [taskIdE, userIdA, tokenE]);
+  if (settleRefunded.rows[0].r.success !== false || settleRefunded.rows[0].r.error_code !== 'ALREADY_REFUNDED') {
+    throw new Error(`Settling a refunded task must fail with ALREADY_REFUNDED: ${JSON.stringify(settleRefunded.rows[0].r)}`);
+  }
+  console.log('✓ Attempt to settle a refunded task properly blocked with ALREADY_REFUNDED');
+
+  // 6. Repeated reserve
   const repReserve = await db.query(`
     select public.reserve_trial_credit($1, 'evaluate_answer', 'input_d', $2, 500) as r;
   `, [taskIdD, userIdA]);
@@ -397,7 +468,7 @@ async function testUpgradePath() {
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~28) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~29) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -405,7 +476,7 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 28 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 29 on clean database`);
 }
 
 async function main() {

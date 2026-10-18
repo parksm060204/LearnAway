@@ -6,7 +6,8 @@ import {
   Problem,
   ProblemDraft,
   RubricCriterion,
-  PROBLEM_DIFFICULTY_LABELS,
+  ACADEMIC_DIFFICULTY_LEVELS,
+  toAcademicDifficultyLevel,
   Material,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
@@ -564,9 +565,28 @@ export function ProblemReviewModal({
                       <span className="text-xs font-bold font-academic-mono text-[#c52828] bg-[#fef2f2] border border-[#fecaca] px-2 py-0.5 rounded-xs">
                         {activeDraft.categoryLabel}
                       </span>
-                      <span className="text-xs font-academic-mono text-[#827d73]">
-                        난이도: {PROBLEM_DIFFICULTY_LABELS[activeDraft.difficulty] || activeDraft.difficulty}
-                      </span>
+                      {(() => {
+                        const diffLevel = toAcademicDifficultyLevel(activeDraft.difficultyLevel ?? activeDraft.difficulty);
+                        const diffInfo = ACADEMIC_DIFFICULTY_LEVELS[diffLevel];
+                        return (
+                          <span
+                            className="text-xs font-academic-mono bg-purple-50 text-purple-800 border border-purple-200 px-2 py-0.5 rounded-xs font-semibold"
+                            title={diffInfo.description}
+                          >
+                            Level {diffInfo.level} ({diffInfo.label})
+                          </span>
+                        );
+                      })()}
+                      {activeDraft.sourceVerificationStatus === 'verified' && (
+                        <span className="text-xs font-academic-mono bg-emerald-50 border border-emerald-300 text-emerald-800 px-2 py-0.5 rounded-xs font-semibold">
+                          출처 검증 완료
+                        </span>
+                      )}
+                      {(activeDraft.needsSourceReview || activeDraft.sourceVerificationStatus === 'needs_review') && (
+                        <span className="text-xs font-academic-mono bg-amber-50 border border-amber-300 text-amber-800 px-2 py-0.5 rounded-xs font-semibold">
+                          출처 검토 필요
+                        </span>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-2">

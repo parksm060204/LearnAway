@@ -276,6 +276,7 @@ export interface ReviewEvent {
   // Plan 03 fields:
   academicErrorType?: AcademicErrorType;
   structuredError?: StructuredErrorRecord;
+  sourceProvenance?: ProblemSourceProvenance;
 }
 
 export interface ConceptEvidence {
@@ -541,6 +542,7 @@ export interface ProblemDraft {
   sourceExcerpt?: string;
   sourceContentVersion?: string;
   sourceVerificationStatus?: SourceVerificationStatus;
+  needsSourceReview?: boolean;
 }
 
 export interface Problem {
@@ -640,6 +642,13 @@ export interface ProblemVersionSnapshot {
   rubric: RubricCriterion[];
   editedAt: string;
   editReason?: string;
+  difficultyLevel?: AcademicDifficultyLevel;
+  sourceMaterialId?: string;
+  sourceConceptIds?: string[];
+  sourceExcerpt?: string;
+  sourcePage?: string;
+  sourceContentVersion?: string;
+  sourceVerificationStatus?: SourceVerificationStatus;
 }
 
 export type AttemptSaveStatus =

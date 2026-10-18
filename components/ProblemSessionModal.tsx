@@ -460,6 +460,7 @@ export function ProblemSessionModal({
       isAiEvaluated: evaluationResult.isAiEvaluated,
       academicErrorType: evaluationResult.academicErrorType,
       structuredError: evaluationResult.structuredError,
+      sourceProvenance: evaluationResult.sourceProvenance,
       modelAnswerSnapshot: problem.modelAnswer,
       problemTitleSnapshot: problem.title,
       problemPromptSnapshot: problem.promptText,
@@ -567,7 +568,7 @@ export function ProblemSessionModal({
                   {problem.categoryLabel} · 표준 소요: {problem.timeStandardMinutes}분
                 </span>
                 {(() => {
-                  const diffLevel = toAcademicDifficultyLevel(problem.difficultyLevel);
+                  const diffLevel = toAcademicDifficultyLevel(problem.difficultyLevel ?? problem.difficulty);
                   const diffInfo = ACADEMIC_DIFFICULTY_LEVELS[diffLevel];
                   return (
                     <span

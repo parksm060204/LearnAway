@@ -22,6 +22,7 @@ import {
   AttemptSaveStatus,
   ProblemType,
   RubricCriterion,
+  toAcademicDifficultyLevel,
 } from './types';
 
 export type { AttemptSaveStatus } from './types';
@@ -1492,6 +1493,13 @@ export function buildProblemFromDraft(
     transferKind: draft.transferKind,
     originalCondition: draft.originalCondition,
     newCondition: draft.newCondition,
+    difficultyLevel: draft.difficultyLevel ?? (draft.difficulty ? toAcademicDifficultyLevel(draft.difficulty) : undefined),
+    sourceMaterialId: draft.sourceMaterialId,
+    sourceConceptIds: draft.sourceConceptIds ? [...draft.sourceConceptIds] : undefined,
+    sourceExcerpt: draft.sourceExcerpt,
+    sourcePage: draft.sourcePage,
+    sourceContentVersion: draft.sourceContentVersion,
+    sourceVerificationStatus: draft.sourceVerificationStatus,
   };
 
   if (existing) {
@@ -1517,6 +1525,13 @@ export function buildProblemFromDraft(
         rubric: [...(existing.rubric || [])],
         editedAt: now,
         editReason: '재승인 시 내용 변경',
+        difficultyLevel: existing.difficultyLevel ?? (existing.difficulty ? toAcademicDifficultyLevel(existing.difficulty) : undefined),
+        sourceMaterialId: existing.sourceMaterialId,
+        sourceConceptIds: existing.sourceConceptIds ? [...existing.sourceConceptIds] : undefined,
+        sourceExcerpt: existing.sourceExcerpt,
+        sourcePage: existing.sourcePage,
+        sourceContentVersion: existing.sourceContentVersion,
+        sourceVerificationStatus: existing.sourceVerificationStatus,
       };
       return {
         ...existing,
@@ -2039,6 +2054,19 @@ export function reapproveProblem(
     reports: updatedReports,
     qualityStatus: 'reapproved',
     sourceMaterials: refreshedSourceMaterials,
+    sourceContentVersion: (currentMaterials && target.sourceMaterialId)
+      ? (() => {
+          const m = currentMaterials.find((mat) => mat.id === target.sourceMaterialId);
+          return m ? computeMarkdownHash(m.parsedMarkdown || '') : target.sourceContentVersion;
+        })()
+      : target.sourceContentVersion,
+    sourceVerificationStatus: (currentMaterials && target.sourceMaterialId)
+      ? (() => {
+          const m = currentMaterials.find((mat) => mat.id === target.sourceMaterialId);
+          return m ? ('verified' as const) : ('needs_review' as const);
+        })()
+      : target.sourceVerificationStatus,
+    difficultyLevel: target.difficultyLevel ?? (target.difficulty ? toAcademicDifficultyLevel(target.difficulty) : undefined),
     // Explicit user re-approval clears the outdated/review flags so the problem
     // is not permanently excluded from circulation.
     isOutdated: false,
@@ -2319,6 +2347,7 @@ export function recordAttemptAndUpdateConcept(
       errorType: effectiveAttempt.errorType,
       academicErrorType: effectiveAttempt.academicErrorType,
       structuredError: effectiveAttempt.structuredError,
+      sourceProvenance: effectiveAttempt.sourceProvenance,
       hintCount: effectiveAttempt.hintCount,
       notes: effectiveAttempt.reasoningNotes,
       sourceRef: c.chapterRef,
@@ -2584,6 +2613,9 @@ export function recordAssistedRevisionAttempt(
       strengths: effectiveAttempt.strengths,
       criticalImprovements: effectiveAttempt.criticalImprovements,
       needsReview: effectiveAttempt.needsReview,
+      academicErrorType: effectiveAttempt.academicErrorType,
+      structuredError: effectiveAttempt.structuredError,
+      sourceProvenance: effectiveAttempt.sourceProvenance,
     };
 
     // Deliberately do NOT recalculate currentScore/exerciseCount/status: an

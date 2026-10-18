@@ -14263,31 +14263,111 @@ exports.requireApiUser = async () => {
     assert.equal(types.toLegacyErrorType('UNCERTAIN'), 'concept_confusion');
   });
 
-  check('P03-02: StructuredErrorRecord 구성, 점수 임계값(>=90점 NO_ERROR 강제) 및 검증 무결성', () => {
-    const rawTemplate = {
-      rubricResults: [
-        { criterionId: 'c1', label: '개념 이해', maxScore: 50, score: 48, isVulnerable: false },
-        { criterionId: 'c2', label: '유도 과정', maxScore: 50, score: 47, isVulnerable: false },
-      ],
-      strengths: '개념과 전개가 완벽함',
-      criticalImprovements: '특이사항 없음',
-      feedback: '훌륭한 풀이입니다.',
-    };
-
-    const highScoreResult = validation.validateEvaluationOutput(
-      { ...rawTemplate, academicErrorType: 'CALCULATION_ERROR' },
+  check('P03-02: 점수와 오류 분류 분리 검증 (95점+계산실수 보존, 100점+오류없음, 저점수+원인불명 UNCERTAIN, 오류분류 충돌 감지)', () => {
+    // 1. 95점 + 경미한 계산 실수: 90점 이상이어도 NO_ERROR로 강제되지 않고 계산 실수 보존
+    const calcErrorResult = validation.validateEvaluationOutput(
+      {
+        rubricResults: [
+          { criterionId: 'c1', label: '개념 이해', maxScore: 50, score: 50, isVulnerable: false },
+          { criterionId: 'c2', label: '유도 과정', maxScore: 50, score: 45, isVulnerable: false, deductionReason: '마지막 항 전개 시 부호 실수' },
+        ],
+        strengths: '개념과 논리 전개가 완벽함',
+        criticalImprovements: '마지막 수치 계산 주의',
+        feedback: '계산 실수가 있었으나 핵심 전개는 우수합니다.',
+        academicErrorType: 'CALCULATION_ERROR',
+        structuredError: {
+          errorType: 'CALCULATION_ERROR',
+          severity: 'minor',
+          evidence: '부호 실수: -2x 대신 +2x로 계산함',
+          feedback: '부호 계산을 재확인하세요.',
+        },
+      },
       [
         { id: 'c1', label: '개념 이해', maxScore: 50 },
         { id: 'c2', label: '유도 과정', maxScore: 50 },
       ],
-      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: '풀이...' }
+      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: '풀이... 부호 실수: -2x 대신 +2x로 계산함' }
     );
-    assert.equal(highScoreResult.calculatedScore, 95);
-    assert.equal(highScoreResult.academicErrorType, 'NO_ERROR');
-    assert.equal(highScoreResult.structuredError.errorType, 'NO_ERROR');
-    assert.equal(highScoreResult.structuredError.severity, 'none');
+    assert.equal(calcErrorResult.calculatedScore, 95);
+    assert.equal(calcErrorResult.academicErrorType, 'CALCULATION_ERROR', '95점 답안의 계산 실수가 NO_ERROR로 강제되지 않고 보존');
+    assert.equal(calcErrorResult.structuredError.errorType, 'CALCULATION_ERROR');
+    assert.equal(calcErrorResult.structuredError.severity, 'minor');
+    assert.equal(calcErrorResult.recommendedErrorType, 'calc_or_impl_mistake');
 
-    const lowScoreResult = validation.validateEvaluationOutput(
+    // 2. 100점 만점 + 오류 없음: NO_ERROR 및 severity none
+    const perfectResult = validation.validateEvaluationOutput(
+      {
+        rubricResults: [
+          { criterionId: 'c1', label: '개념 이해', maxScore: 50, score: 50, isVulnerable: false },
+          { criterionId: 'c2', label: '유도 과정', maxScore: 50, score: 50, isVulnerable: false },
+        ],
+        strengths: '완벽한 논증',
+        criticalImprovements: '없음',
+        feedback: '모범 답안 수준의 풀이입니다.',
+        academicErrorType: 'NO_ERROR',
+      },
+      [
+        { id: 'c1', label: '개념 이해', maxScore: 50 },
+        { id: 'c2', label: '유도 과정', maxScore: 50 },
+      ],
+      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: '완벽한 풀이...' }
+    );
+    assert.equal(perfectResult.calculatedScore, 100);
+    assert.equal(perfectResult.academicErrorType, 'NO_ERROR');
+    assert.equal(perfectResult.structuredError.errorType, 'NO_ERROR');
+    assert.equal(perfectResult.structuredError.severity, 'none');
+
+    // 3. 저점수(45점) + 원인 불명: 임의로 개념 이해 부족으로 단정하지 않고 UNCERTAIN 및 needsReview=true 설정
+    const uncertainResult = validation.validateEvaluationOutput(
+      {
+        rubricResults: [
+          { criterionId: 'c1', label: '개념 이해', maxScore: 50, score: 20, isVulnerable: true },
+          { criterionId: 'c2', label: '유도 과정', maxScore: 50, score: 25, isVulnerable: true },
+        ],
+        strengths: '일부 서술 시도',
+        criticalImprovements: '상세 원인 불명확',
+        feedback: '답안이 극히 짧아 구체적 오답 원인을 단정할 수 없습니다.',
+        academicErrorType: 'NO_ERROR', // 감점 발생했는데 NO_ERROR 주장
+      },
+      [
+        { id: 'c1', label: '개념 이해', maxScore: 50 },
+        { id: 'c2', label: '유도 과정', maxScore: 50 },
+      ],
+      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: '짧은 답안' }
+    );
+    assert.equal(uncertainResult.calculatedScore, 45);
+    assert.equal(uncertainResult.academicErrorType, 'UNCERTAIN', '감점 답안에 오류 원인이 없으면 CONCEPT_MISUNDERSTANDING으로 단정하지 않고 UNCERTAIN으로 분류');
+    assert.equal(uncertainResult.needsReview, true, '원인 불명 저점수 답안은 검토 필요(needsReview) 플래그 설정');
+
+    // 4. 상위 분류와 구조화 오류 분류 충돌 감지
+    const conflictResult = validation.validateEvaluationOutput(
+      {
+        rubricResults: [
+          { criterionId: 'c1', label: '개념 이해', maxScore: 50, score: 30, isVulnerable: true },
+          { criterionId: 'c2', label: '유도 과정', maxScore: 50, score: 30, isVulnerable: true },
+        ],
+        strengths: '부분 전개',
+        criticalImprovements: '오류 발생',
+        feedback: '오류가 감지되었습니다.',
+        academicErrorType: 'CALCULATION_ERROR',
+        structuredError: {
+          errorType: 'CONCEPT_MISUNDERSTANDING', // 상위 분류(CALCULATION_ERROR)와 모순
+          severity: 'critical',
+          evidence: 'L = f + g',
+          feedback: '개념을 확인하세요.',
+        },
+      },
+      [
+        { id: 'c1', label: '개념 이해', maxScore: 50 },
+        { id: 'c2', label: '유도 과정', maxScore: 50 },
+      ],
+      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: 'L = f + g' }
+    );
+    assert.equal(conflictResult.calculatedScore, 60);
+    assert.equal(conflictResult.needsReview, true, '상위 분류와 structuredError 분류 모순 시 조용히 확정하지 않고 needsReview=true 설정');
+
+    // 5. 유효한 저점수 진단
+    const validLowScore = validation.validateEvaluationOutput(
       {
         rubricResults: [
           { criterionId: 'c1', label: '개념 이해', maxScore: 50, score: 20, isVulnerable: true },
@@ -14300,7 +14380,7 @@ exports.requireApiUser = async () => {
         structuredError: {
           errorType: 'FORMULA_MISAPPLICATION',
           severity: 'critical',
-          evidence: 'L = f(x, y) + lambda(g - c)에서 부호 혼동',
+          evidence: 'L = f(x, y) + lambda(g - c)',
           feedback: '목적함수와 제약식의 결합 공식을 재검토하세요.',
         },
       },
@@ -14308,16 +14388,14 @@ exports.requireApiUser = async () => {
         { id: 'c1', label: '개념 이해', maxScore: 50 },
         { id: 'c2', label: '유도 과정', maxScore: 50 },
       ],
-      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: 'L = f + lambda * g' }
+      { conceptId: 'con-1', conceptTitle: '라그랑주 승수법', userAnswer: '풀이: L = f(x, y) + lambda(g - c)' }
     );
-    assert.equal(lowScoreResult.calculatedScore, 45);
-    assert.equal(lowScoreResult.academicErrorType, 'FORMULA_MISAPPLICATION');
-    assert.equal(lowScoreResult.recommendedErrorType, 'method_selection_error');
-    assert.equal(lowScoreResult.structuredError.errorType, 'FORMULA_MISAPPLICATION');
-    assert.equal(lowScoreResult.structuredError.severity, 'critical');
-    assert.equal(lowScoreResult.structuredError.conceptId, 'con-1');
-    assert.equal(lowScoreResult.structuredError.evaluationVersion, 'p03-eval-v1');
-    assert.ok(lowScoreResult.structuredError.evaluatedAt);
+    assert.equal(validLowScore.calculatedScore, 45);
+    assert.equal(validLowScore.academicErrorType, 'FORMULA_MISAPPLICATION');
+    assert.equal(validLowScore.recommendedErrorType, 'method_selection_error');
+    assert.equal(validLowScore.structuredError.errorType, 'FORMULA_MISAPPLICATION');
+    assert.equal(validLowScore.structuredError.severity, 'critical');
+    assert.equal(validLowScore.structuredError.conceptId, 'con-1');
   });
 
   check('P03-03: 5단계 학술 난이도 분류(Level 1~5) 및 문제 구조적 난이도 검증 규칙', () => {

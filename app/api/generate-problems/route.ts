@@ -327,12 +327,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const verifyQuoteInSources = (quote: string): boolean => {
-      const trimmed = quote.trim();
-      if (!trimmed) return false;
-      const normalize = (value: string) => value.replace(/\s+/g, ' ');
-      return normalize(combinedSource).includes(normalize(trimmed));
-    };
 
     // Build concepts contextual description
     const conceptsSummary = concepts
@@ -557,21 +551,84 @@ ${combinedSource}
         const hasConceptLink = conceptIds.length > 0;
 
         const quote = (asString(raw.sourceExcerpt) || asString(raw.sourceEvidenceQuote)).trim();
-        // A quote only counts as verified when it actually appears in the supplied sources.
-        const isSourceVerified = quote ? verifyQuoteInSources(quote) : false;
+        const normalize = (value: string) => value.replace(/\s+/g, ' ').trim();
+        const normalizedQuote = normalize(quote);
+
+        // Identify which supplied sources actually contain this quote
+        const matchingSources = normalizedQuote.length > 0
+          ? sources.filter((s) => normalize(s.markdown).includes(normalizedQuote))
+          : [];
+
+        let isSourceVerified = false;
+        let sourceVerificationStatus: SourceVerificationStatus = 'unverified';
+        let sourceMaterialId: string | undefined = undefined;
+        let sourceContentVersion: string | undefined = undefined;
+        let sourcePage: string | undefined = undefined;
+        const verificationNotes: string[] = [];
+
+        if (normalizedQuote.length === 0) {
+          isSourceVerified = false;
+          sourceVerificationStatus = 'unverified';
+          verificationNotes.push('원문 인용 근거 없음');
+        } else if (matchingSources.length === 1) {
+          // Exactly one source material confirmed!
+          isSourceVerified = true;
+          sourceVerificationStatus = 'verified';
+          const matchedSource = matchingSources[0];
+          sourceMaterialId = matchedSource.materialId;
+          sourceContentVersion = computeMarkdownHash(matchedSource.markdown);
+
+          // Verify page grounding if provided: do NOT fill arbitrary page without evidence
+          const rawPage = asString(raw.sourcePage).trim();
+          if (rawPage) {
+            const normalizedSource = normalize(matchedSource.markdown);
+            const normalizedRefs = matchedSource.sourceRefs ? normalize(matchedSource.sourceRefs) : '';
+            if (normalizedSource.includes(normalize(rawPage)) || normalizedRefs.includes(normalize(rawPage))) {
+              sourcePage = rawPage;
+            } else if (matchedSource.sourceRefs) {
+              sourcePage = matchedSource.sourceRefs;
+            }
+          } else if (matchedSource.sourceRefs) {
+            sourcePage = matchedSource.sourceRefs;
+          }
+        } else if (matchingSources.length > 1) {
+          // Quote exists in multiple sources: ambiguity / multi-source
+          isSourceVerified = false;
+          sourceVerificationStatus = 'needs_review';
+          verificationNotes.push('인용문이 복수의 자료에서 동시에 확인되어 출처가 모호함 (다중 출처 검토 필요)');
+          const candidateId = asString(raw.sourceMaterialId).trim();
+          const matchedCandidate = matchingSources.find((s) => s.materialId === candidateId);
+          if (matchedCandidate) {
+            sourceMaterialId = matchedCandidate.materialId;
+            sourceContentVersion = computeMarkdownHash(matchedCandidate.markdown);
+          } else {
+            sourceContentVersion = markdownHash;
+          }
+        } else {
+          // Quote not found in ANY provided source
+          isSourceVerified = false;
+          sourceVerificationStatus = 'needs_review';
+          verificationNotes.push('원문 인용 근거가 제공된 자료에서 확인되지 않음');
+        }
 
         // Plan 03: Difficulty and Structural consistency check (P03-03)
         const rawDifficultyLevel = toAcademicDifficultyLevel(raw.difficultyLevel ?? difficultyLevel);
-        const verificationNotes: string[] = [];
+        let isDifficultyStructureConsistent = true;
+
+        if (raw.difficultyLevel !== undefined && toAcademicDifficultyLevel(raw.difficultyLevel) !== difficultyLevel) {
+          isDifficultyStructureConsistent = false;
+          verificationNotes.push(`요청 난이도(Level ${difficultyLevel})와 AI 생성 난이도(Level ${toAcademicDifficultyLevel(raw.difficultyLevel)}) 불일치`);
+        }
+        if (raw.type && raw.type !== problemType) {
+          isDifficultyStructureConsistent = false;
+          verificationNotes.push(`요청 문제 유형(${problemType})과 AI 생성 유형(${raw.type}) 불일치`);
+        }
 
         if (!hasRequiredFields) verificationNotes.push('필수 항목(제목/지문/모범답안/힌트/루브릭) 누락');
         if (finalRubric.length === 0) verificationNotes.push('채점 루브릭 항목 누락 (배점 없음)');
         else if (!isScore100) verificationNotes.push(`루브릭 배점 합계 ${scoreSum}점 (100점 아님)`);
         if (!hasConceptLink) verificationNotes.push('선택 개념과 연결되지 않음');
-        if (!quote) verificationNotes.push('원문 인용 근거 없음');
-        else if (!isSourceVerified) verificationNotes.push('원문 인용 근거가 제공된 자료에서 확인되지 않음');
 
-        let isDifficultyStructureConsistent = true;
         if (rawDifficultyLevel >= 4) {
           if (finalRubric.length < 3 || (typeof raw.timeStandardMinutes === 'number' && raw.timeStandardMinutes < 15)) {
             isDifficultyStructureConsistent = false;
@@ -593,11 +650,7 @@ ${combinedSource}
         }
 
         const isVerified = hasRequiredFields && isScore100 && hasConceptLink && isSourceVerified && isDifficultyStructureConsistent && !isDuplicate;
-
         const conceptTitles = asStringArray(raw.conceptTitles);
-        const sourceMaterialId = asString(raw.sourceMaterialId) || sources[0]?.materialId || undefined;
-        const sourcePage = asString(raw.sourcePage) || sources[0]?.sourceRefs || undefined;
-        const sourceVerificationStatus: SourceVerificationStatus = isSourceVerified ? 'verified' : (quote ? 'needs_review' : 'unverified');
 
         const draft: ProblemDraft = {
           id: `draft-prob-${Date.now()}-${i}-${Math.random().toString(36).substring(7)}`,
@@ -627,7 +680,7 @@ ${combinedSource}
           sourceConceptIds: conceptIds.length > 0 ? conceptIds : concepts.map((c) => c.id),
           sourcePage,
           sourceExcerpt: quote || undefined,
-          sourceContentVersion: sourceMaterials[0]?.markdownHash || markdownHash,
+          sourceContentVersion: sourceContentVersion || (isSourceVerified ? sourceMaterials[0]?.markdownHash : undefined),
           sourceVerificationStatus,
           timeStandardMinutes:
             typeof raw.timeStandardMinutes === 'number' ? raw.timeStandardMinutes : 20,

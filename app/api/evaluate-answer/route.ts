@@ -24,11 +24,13 @@ import {
   MethodSelectionDiagnosis,
   METHOD_REASON_CRITERION_LABELS,
   EvaluationResult,
+  SourceVerificationStatus,
 } from '../../../lib/types';
 
 export interface EvaluateAnswerRequest {
   problemId?: string;
   problemVersion?: number;
+  problemType?: string;
   mockExamSessionId?: string;
   isProvisionalLocal?: boolean;
   conceptId: string;
@@ -194,6 +196,13 @@ export async function POST(req: NextRequest) {
     let verifiedAppliedCondition = appliedConditionNote;
     let qualityStatusNotice: string | undefined = undefined;
     let isProvisional = false;
+    let resolvedProblemType: string = typeof body.problemType === 'string' ? body.problemType : '';
+    let authoritativeConceptIds: string[] = conceptIds.length > 0 ? conceptIds : (conceptId ? [conceptId] : []);
+    let resolvedMaterialId: string | undefined = undefined;
+    let resolvedExcerpt: string | undefined = undefined;
+    let resolvedPage: string | undefined = undefined;
+    let resolvedContentVersion: string | undefined = undefined;
+    let resolvedSourceStatus: SourceVerificationStatus = 'unverified';
 
     const hasDb = Boolean(supabase && typeof supabase.from === 'function');
 
@@ -317,6 +326,19 @@ export async function POST(req: NextRequest) {
       verifiedMathFormula = typeof frozenProb.mathFormula === 'string' ? frozenProb.mathFormula : undefined;
       verifiedCodeSnippet = typeof frozenProb.codeSnippet === 'string' ? frozenProb.codeSnippet : undefined;
       verifiedAppliedCondition = typeof frozenProb.appliedConditionNote === 'string' ? frozenProb.appliedConditionNote : undefined;
+      if (typeof frozenProb.type === 'string') resolvedProblemType = frozenProb.type;
+      resolvedMaterialId = typeof frozenProb.sourceMaterialId === 'string' ? frozenProb.sourceMaterialId : undefined;
+      if (Array.isArray(frozenProb.sourceConceptIds) && frozenProb.sourceConceptIds.length > 0) {
+        authoritativeConceptIds = frozenProb.sourceConceptIds.filter((id): id is string => typeof id === 'string');
+      } else if (Array.isArray(frozenProb.conceptIds) && frozenProb.conceptIds.length > 0) {
+        authoritativeConceptIds = frozenProb.conceptIds.filter((id): id is string => typeof id === 'string');
+      }
+      resolvedExcerpt = typeof frozenProb.sourceExcerpt === 'string' ? frozenProb.sourceExcerpt : undefined;
+      resolvedPage = frozenProb.sourcePage !== undefined ? String(frozenProb.sourcePage) : undefined;
+      resolvedContentVersion = typeof frozenProb.sourceContentVersion === 'string' ? frozenProb.sourceContentVersion : undefined;
+      const frozenRawStatus = frozenProb.sourceVerificationStatus as SourceVerificationStatus | undefined;
+      const frozenNeedsReview = Boolean(frozenProb.needsSourceReview);
+      resolvedSourceStatus = frozenNeedsReview ? 'needs_review' : (frozenRawStatus || 'unverified');
     } else if (problemId) {
       // 2B. Problem Version Snapshot or Authoritative Problem Resolution
       if (hasDb) {
@@ -415,6 +437,19 @@ export async function POST(req: NextRequest) {
         verifiedMathFormula = typeof resolvedPayload.mathFormula === 'string' ? resolvedPayload.mathFormula : undefined;
         verifiedCodeSnippet = typeof resolvedPayload.codeSnippet === 'string' ? resolvedPayload.codeSnippet : undefined;
         verifiedAppliedCondition = typeof resolvedPayload.appliedConditionNote === 'string' ? resolvedPayload.appliedConditionNote : undefined;
+        if (typeof resolvedPayload.type === 'string') resolvedProblemType = resolvedPayload.type;
+        resolvedMaterialId = typeof resolvedPayload.sourceMaterialId === 'string' ? resolvedPayload.sourceMaterialId : undefined;
+        if (Array.isArray(resolvedPayload.sourceConceptIds) && resolvedPayload.sourceConceptIds.length > 0) {
+          authoritativeConceptIds = resolvedPayload.sourceConceptIds.filter((id): id is string => typeof id === 'string');
+        } else if (Array.isArray(resolvedPayload.conceptIds) && resolvedPayload.conceptIds.length > 0) {
+          authoritativeConceptIds = resolvedPayload.conceptIds.filter((id): id is string => typeof id === 'string');
+        }
+        resolvedExcerpt = typeof resolvedPayload.sourceExcerpt === 'string' ? resolvedPayload.sourceExcerpt : undefined;
+        resolvedPage = resolvedPayload.sourcePage !== undefined ? String(resolvedPayload.sourcePage) : undefined;
+        resolvedContentVersion = typeof resolvedPayload.sourceContentVersion === 'string' ? resolvedPayload.sourceContentVersion : undefined;
+        const payloadRawStatus = resolvedPayload.sourceVerificationStatus as SourceVerificationStatus | undefined;
+        const payloadNeedsReview = Boolean(resolvedPayload.needsSourceReview || serverProb?.needs_source_review);
+        resolvedSourceStatus = payloadNeedsReview ? 'needs_review' : (payloadRawStatus || 'unverified');
 
         if (qualityStatus !== 'verified') {
           qualityStatusNotice =
@@ -560,8 +595,9 @@ export async function POST(req: NextRequest) {
    - 논리적 뼈대와 증명 전개가 타당하나 단순 부호 착오나 사칙연산 실수가 발생한 경우, 개념 혼동과 엄격히 구별하여 해당 계산 유도 기준에서 70~90% 이상의 부분 점수를 부여하십시오. 절대 전체 0점 처리하지 마십시오.
    - 반면 정리의 필수 전제조건(예: 절대수렴성, 가측성, 미분가능성, 루프 불변식, RBT 블랙 높이)을 누락한 경우는 핵심 논증 결함으로 간주하여 해당 기준 배점에서 적절히 감점하십시오.
 
-3. **정답만 제시한 경우(Answer-Only) 감점 규칙**:
-   - 학생이 풀이 과정, 유도 식, 또는 논리적 근거 없이 최종 수치나 결론만 단답식으로 작성한 경우, 풀이 과정/접근법/논리 전개에 해당하는 루브릭 배점은 대폭 감점하고 최종 결론 배점만 인정하십시오.
+3. **정답만 제시한 경우(Answer-Only) 감점 규칙 및 유형별 예외**:
+   - 단, 단답형('short_answer') 또는 객관식('multiple_choice') 문제의 경우, 별도의 증명 과정이나 전개 유도식을 요구하지 않으므로 증명/유도 과정이 없다는 이유로 감점하지 마십시오.
+   - 단답형/객관식이 아닌 서술형·증명형·유도형 문제에서 학생이 풀이 과정, 유도 식, 또는 논리적 근거 없이 최종 수치나 결론만 단답식으로 작성한 경우, 풀이 과정/접근법/논리 전개에 해당하는 루브릭 배점은 대폭 감점하고 최종 결론 배점만 인정하십시오.
 
 4. **코딩 답안 정적 검토 한계 고지**:
    - 코딩 문제의 경우, 서버에서 코드를 직접 컴파일하거나 실행하지 않고 알고리즘의 정확성, 시간/공간 복잡도 증명, 경계 조건(Corner Cases), 루프 불변식의 정합성만을 정적으로 검토합니다.
@@ -676,6 +712,7 @@ export async function POST(req: NextRequest) {
     // 5. Build User Prompt using authoritative, verified content
     const userPrompt = `### [문제 정보]
 - 과목 분야: ${domain === 'math_stats' ? '수학·통계학' : '컴퓨터과학·알고리즘'}
+- 문제 유형: ${resolvedProblemType || '대학 시험형'}
 - 문제 제목: ${problemTitle}
 - 문제 본문:
 ${verifiedPrompt}
@@ -752,10 +789,15 @@ ${
         conceptId,
         conceptTitle: problemTitle,
         userAnswer,
+        allowedConceptIds: authoritativeConceptIds,
       });
       evaluationResult.sourceProvenance = {
-        sourceConceptIds: conceptIds.length > 0 ? conceptIds : [conceptId],
-        sourceVerificationStatus: 'verified',
+        sourceMaterialId: resolvedMaterialId,
+        sourceConceptIds: authoritativeConceptIds,
+        sourceExcerpt: resolvedExcerpt,
+        sourcePage: resolvedPage,
+        sourceContentVersion: resolvedContentVersion,
+        sourceVerificationStatus: resolvedSourceStatus,
       };
     } catch (cause) {
       if (cred.isTrial && taskId) {

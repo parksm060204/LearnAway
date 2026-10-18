@@ -1,7 +1,16 @@
 'use client';
 
 import React, { useState, useMemo } from 'react';
-import { Subject, Concept, Material, ProblemType, ProblemDifficulty, ProblemDraft } from '../lib/types';
+import {
+  Subject,
+  Concept,
+  Material,
+  ProblemType,
+  ProblemDifficulty,
+  ProblemDraft,
+  AcademicDifficultyLevel,
+  ACADEMIC_DIFFICULTY_LEVELS,
+} from '../lib/types';
 import { collectProblemSources } from '../lib/problemSources';
 import { getStorageScopeId } from '../lib/storageScope';
 import { X, Sparkles, AlertCircle, BrainCircuit, Loader2 } from 'lucide-react';
@@ -43,6 +52,30 @@ const MATH_PROBLEM_TYPES: { type: ProblemType; label: string; desc: string; estM
     desc: '제시된 잘못된 증명이나 풀이에서 논리적 비약과 오류 단계를 찾아 수정',
     estMin: 15,
   },
+  {
+    type: 'concept_explanation',
+    label: '5. 개념 설명형',
+    desc: '핵심 개념의 정의, 직관적 원리, 적용 범위 및 의의 상세 서술',
+    estMin: 15,
+  },
+  {
+    type: 'multiple_choice',
+    label: '6. 객관식',
+    desc: '개념 적용 및 명제 참/거짓 판별형 객관식 문항 (보기 분석)',
+    estMin: 10,
+  },
+  {
+    type: 'short_answer',
+    label: '7. 단답형',
+    desc: '정확한 수치, 공식, 또는 핵심 키워드를 요구하는 단답형 문항',
+    estMin: 10,
+  },
+  {
+    type: 'composite_application',
+    label: '8. 복합 개념 응용형',
+    desc: '복수의 개념을 유기적으로 결합하여 새로운 상황에 응용하는 고차원 복합 문제',
+    estMin: 25,
+  },
 ];
 
 const CS_PROBLEM_TYPES: { type: ProblemType; label: string; desc: string; estMin: number }[] = [
@@ -70,6 +103,30 @@ const CS_PROBLEM_TYPES: { type: ProblemType; label: string; desc: string; estMin
     desc: '경계 조건(Corner Case), 무한 루프, 메모리 누수 또는 실패 테스트케이스 제시',
     estMin: 15,
   },
+  {
+    type: 'concept_explanation',
+    label: '5. 개념 설명형',
+    desc: '자료구조·알고리즘의 핵심 개념 정의, 동작 메커니즘, 적용 한계 상세 설명',
+    estMin: 15,
+  },
+  {
+    type: 'multiple_choice',
+    label: '6. 객관식',
+    desc: '알고리즘 특성, 복잡도, 자료구조 불변식 판별형 객관식 문항',
+    estMin: 10,
+  },
+  {
+    type: 'short_answer',
+    label: '7. 단답형',
+    desc: '정확한 시간복잡도 표기, 반환값, 또는 핵심 키워드를 요구하는 단답형 문항',
+    estMin: 10,
+  },
+  {
+    type: 'composite_application',
+    label: '8. 복합 개념 응용형',
+    desc: '여러 자료구조와 최적화 기법을 융합하여 대규모 제약조건을 해결하는 고난도 복합 문제',
+    estMin: 25,
+  },
 ];
 
 export function ProblemGeneratorModal({
@@ -91,6 +148,9 @@ export function ProblemGeneratorModal({
     (c) => c.subjectId === activeSubject.id && c.status !== undefined
   );
 
+  // Subject switch protection: reset selection and options when subject changes
+  const [prevSubjectId, setPrevSubjectId] = useState(activeSubject.id);
+
   // Initial selected concepts: prefer selectedConceptId if valid, else first concept
   const [selectedConceptIds, setSelectedConceptIds] = useState<string[]>(() => {
     if (selectedConceptId && eligibleConcepts.some((c) => c.id === selectedConceptId)) {
@@ -103,10 +163,20 @@ export function ProblemGeneratorModal({
     return isMath ? 'essay_descriptive' : 'impl_descriptive';
   });
 
+  const [difficultyLevel, setDifficultyLevel] = useState<AcademicDifficultyLevel>(4);
   const [difficulty, setDifficulty] = useState<ProblemDifficulty>('advanced_college');
   const [problemCount, setProblemCount] = useState<number>(1);
   const [isGenerating, setIsGenerating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  if (activeSubject.id !== prevSubjectId) {
+    setPrevSubjectId(activeSubject.id);
+    setSelectedConceptIds(eligibleConcepts.length > 0 ? [eligibleConcepts[0].id] : []);
+    setSelectedType(isMath ? 'essay_descriptive' : 'impl_descriptive');
+    setDifficultyLevel(4);
+    setDifficulty('advanced_college');
+    setErrorMessage(null);
+  }
 
   // Materials actually linked to the currently selected concepts (same subject only).
   const selectedSourceMaterials = useMemo(() => {
@@ -174,6 +244,7 @@ export function ProblemGeneratorModal({
           concepts: targetConcepts,
           problemType: selectedType,
           difficulty,
+          difficultyLevel,
           problemCount,
           sources: collected.sources,
         }),
@@ -444,17 +515,19 @@ export function ProblemGeneratorModal({
             <label className="text-xs font-bold font-academic-mono text-[#57544e] uppercase flex items-center justify-between">
               <span>2. 문제 유형 선택 ({isMath ? '수학/수리통계' : '컴퓨터과학/코딩'})</span>
               <span className="text-[11px] text-[#827d73] font-normal">
-                과목 분야 전용 유형 4종
+                총 8개 전용 유형
               </span>
             </label>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <div role="group" aria-label="문제 유형 선택" className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {availableTypes.map((typeObj) => {
                 const isSelected = selectedType === typeObj.type;
                 return (
                   <button
                     key={typeObj.type}
                     type="button"
+                    aria-pressed={isSelected}
+                    aria-label={typeObj.label}
                     onClick={() => setSelectedType(typeObj.type)}
                     className={`text-left p-3 rounded-xs border transition-all ${
                       isSelected
@@ -488,24 +561,48 @@ export function ProblemGeneratorModal({
           {/* Section 3: Difficulty & Problem Count */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
             <div className="space-y-1.5">
-              <label className="text-xs font-bold font-academic-mono text-[#57544e] uppercase">
-                3. 출제 난이도
+              <label htmlFor="difficulty-level-select" className="text-xs font-bold font-academic-mono text-[#57544e] uppercase flex items-center justify-between">
+                <span>3. 학술 난이도 (Level 1~5)</span>
+                <span className="text-[#c52828] font-bold">Level {difficultyLevel}</span>
               </label>
               <select
-                value={difficulty}
-                onChange={(e) => setDifficulty(e.target.value as ProblemDifficulty)}
+                id="difficulty-level-select"
+                aria-label="출제 난이도 선택"
+                value={difficultyLevel}
+                onChange={(e) => {
+                  const lvl = Number(e.target.value) as AcademicDifficultyLevel;
+                  setDifficultyLevel(lvl);
+                  setDifficulty(ACADEMIC_DIFFICULTY_LEVELS[lvl].legacyDifficulty);
+                }}
                 className="w-full p-2 text-xs border border-[#ded6c8] rounded-xs bg-white text-[#191817] focus:outline-none focus:border-[#c52828]"
               >
-                <option value="advanced_college">
-                  고난도·대학 학부 시험 수준 (기본)
-                </option>
-                <option value="intermediate">
-                  중간고사 표준형 (응용 및 개념 통합)
-                </option>
-                <option value="graduate_challenging">
-                  대학원·심화 도전형 (일반화 및 엄밀 증명)
-                </option>
+                {(Object.keys(ACADEMIC_DIFFICULTY_LEVELS).map(Number) as AcademicDifficultyLevel[]).map((lvl) => (
+                  <option key={lvl} value={lvl}>
+                    {ACADEMIC_DIFFICULTY_LEVELS[lvl].label} {lvl === 4 ? '(대학 시험 기본)' : ''}
+                  </option>
+                ))}
               </select>
+              <div className="flex gap-1 pt-1" role="group" aria-label="난이도 레벨 빠른 선택">
+                {([1, 2, 3, 4, 5] as AcademicDifficultyLevel[]).map((lvl) => (
+                  <button
+                    key={lvl}
+                    type="button"
+                    aria-pressed={difficultyLevel === lvl}
+                    aria-label={`Level ${lvl} 선택`}
+                    onClick={() => {
+                      setDifficultyLevel(lvl);
+                      setDifficulty(ACADEMIC_DIFFICULTY_LEVELS[lvl].legacyDifficulty);
+                    }}
+                    className={`flex-1 py-1 text-[11px] font-academic-mono font-bold rounded-xs border transition-all ${
+                      difficultyLevel === lvl
+                        ? 'bg-[#191817] text-white border-[#191817]'
+                        : 'bg-white text-[#57544e] border-[#ded6c8] hover:bg-[#faf8f4]'
+                    }`}
+                  >
+                    L{lvl}
+                  </button>
+                ))}
+              </div>
             </div>
 
             <div className="space-y-1.5">
