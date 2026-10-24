@@ -148,7 +148,7 @@ begin
     end if;
 
     -- Check maximum retry attempt limits before external AI execution
-    if v_existing.attempt_count >= 5 then
+    if v_existing.attempt_count >= 5 and coalesce(v_existing.release_reason, '') <> 'intermediate_chunk' then
       return jsonb_build_object(
         'allowed', false,
         'error_code', 'MAX_RETRIES_EXCEEDED',
@@ -274,9 +274,13 @@ begin
       update public.ai_trial_reservations
       set
         status = 'processing',
-        attempt_count = attempt_count + 1,
+        attempt_count = case
+          when v_existing.release_reason = 'intermediate_chunk' then attempt_count
+          else attempt_count + 1
+        end,
         lease_token = v_lease_token,
         lease_expires_at = now() + interval '60 seconds',
+        release_reason = null,
         error_code = null
       where task_id = p_task_id;
 
@@ -561,7 +565,8 @@ begin
   update public.ai_trial_reservations
   set lease_expires_at = now(),
       lease_token = null,
-      last_lease_token = v_token
+      last_lease_token = v_token,
+      release_reason = 'intermediate_chunk'
   where task_id = p_task_id
     and lease_token = v_token;
 

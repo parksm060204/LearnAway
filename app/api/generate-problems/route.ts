@@ -624,7 +624,7 @@ ${combinedSource}
           : [];
 
       if (rawProblems.length === 0) {
-        if (cred.isTrial) {
+        if (cred.leaseToken) {
           await releaseTrialCredit(auth.user.id, taskId, 'empty_problems', cred.leaseToken);
         }
         return NextResponse.json(
@@ -837,6 +837,20 @@ ${combinedSource}
         };
 
         generatedDrafts.push(draft);
+      }
+
+      // Every raw item was malformed: treat as empty output, never as a normal (empty) result.
+      if (generatedDrafts.length === 0) {
+        if (cred.leaseToken) {
+          await releaseTrialCredit(auth.user.id, taskId, 'empty_problems', cred.leaseToken);
+        }
+        return NextResponse.json(
+          {
+            success: false,
+            error: 'AI가 생성한 문제 형식이 올바르지 않아 사용할 수 있는 문제가 없습니다. 다시 시도해 주세요.',
+          },
+          { status: 502 }
+        );
       }
 
       // Persist drafts server-side (idempotent by generation job id) so they

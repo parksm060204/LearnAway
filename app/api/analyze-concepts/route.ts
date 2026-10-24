@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { resolveOperatorAiConfig } from '../../../lib/aiConfig';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
@@ -583,13 +584,26 @@ export async function POST(req: NextRequest) {
           subjectId
         );
 
-    // 2. Resolve AI credentials with trialContext
-    const cred = await resolveAiConfigForUser(auth.user.id, {
-      taskId: expectedJobKey,
-      taskType: 'analyze_concepts',
-      inputIdentifier: markdownHash,
-      isSaveRetry: action === 'retry_save',
-    });
+    // 2. Resolve AI credentials.
+    // Only actions that actually execute paid AI (process/resume) register the task:
+    // registration deducts trial credit, opens a 60s execution lease and counts an attempt.
+    // init/status/pause must stay side-effect free, otherwise init -> process is blocked
+    // by CONCURRENT_EXECUTION_BLOCKED and status polling burns retry attempts.
+    const executesAi = action === 'process' || action === 'resume';
+    const cred = action === 'retry_save'
+      ? await resolveAiConfigForUser(auth.user.id, {
+          taskId: expectedJobKey,
+          taskType: 'analyze_concepts',
+          inputIdentifier: markdownHash,
+          isSaveRetry: true,
+        })
+      : executesAi
+        ? await resolveAiConfigForUser(auth.user.id, {
+            taskId: expectedJobKey,
+            taskType: 'analyze_concepts',
+            inputIdentifier: markdownHash,
+          })
+        : await resolveAiConfigForUser(auth.user.id);
 
     if (!cred.ok && action === 'process') {
       if (cred.code === 'concurrent_in_progress') {
@@ -616,7 +630,8 @@ export async function POST(req: NextRequest) {
       }
     }
     const resolvedModelId =
-      (dbJobForIdentity?.model_id as string) || (cred.ok ? cred.config.model : 'deepseek-v4.1-flash');
+      (dbJobForIdentity?.model_id as string) ||
+      (cred.ok ? cred.config.model : resolveOperatorAiConfig()?.model || 'deepseek-v4.1-flash');
 
     if (dbJobForIdentity?.model_id && cred.ok && cred.config.model !== dbJobForIdentity.model_id) {
       if (payload.model && payload.model !== dbJobForIdentity.model_id) {
@@ -1441,6 +1456,9 @@ ${chunk.text}
       try {
         parsedResult = JSON.parse(cleanedJson);
       } catch {
+        if (cred.ok && cred.leaseToken) {
+          await releaseTrialCredit(auth.user.id, jobKey, 'invalid_json', cred.leaseToken);
+        }
         commitChunkResult(
           session,
           chunk.chunkIndex,
@@ -1450,6 +1468,22 @@ ${chunk.text}
           'AI 응답을 JSON으로 해석하지 못했습니다.',
           activeLeaseToken || undefined
         );
+        if (supabaseClient && activeLeaseToken) {
+          try {
+            const privilegedClient = getPrivilegedClient();
+            await privilegedClient.rpc('commit_analysis_chunk_result', {
+              p_job_id: jobKey,
+              p_chunk_index: chunk.chunkIndex,
+              p_worker_id: workerId,
+              p_lease_token: activeLeaseToken,
+              p_status: 'failed',
+              p_drafts: [],
+              p_error: 'AI 응답을 JSON으로 해석하지 못했습니다.',
+            });
+          } catch {
+            // ignore cleanup failure
+          }
+        }
         return NextResponse.json(
           {
             success: false,

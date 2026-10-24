@@ -1063,7 +1063,7 @@ exports.requireApiUser = async () => {
                 error: null,
               });
             }
-            if ((existing.attempt_count || 1) >= 5) {
+            if ((existing.attempt_count || 1) >= 5 && existing.release_reason !== 'intermediate_chunk') {
               return Promise.resolve({
                 data: { allowed: false, error_code: 'MAX_RETRIES_EXCEEDED', message: '최대 재시도 횟수를 초과했습니다.' },
                 error: null,
@@ -1105,8 +1105,10 @@ exports.requireApiUser = async () => {
             }
 
             const leaseToken = 'lease_' + Math.random().toString(36).slice(2);
+            const isIntermediate = existing.release_reason === 'intermediate_chunk';
             existing.status = 'processing';
-            existing.attempt_count = (existing.attempt_count || 1) + 1;
+            existing.attempt_count = isIntermediate ? (existing.attempt_count || 1) : (existing.attempt_count || 1) + 1;
+            existing.release_reason = null;
             existing.lease_token = leaseToken;
             existing.lease_expires_at = new Date(Date.now() + 60000).toISOString();
             return Promise.resolve({
@@ -1359,9 +1361,13 @@ exports.requireApiUser = async () => {
           if (res.lease_token !== token) return Promise.resolve({ data: { success: false, error_code: 'STALE_LEASE_TOKEN' }, error: null });
           res.lease_token = null;
           res.lease_expires_at = null;
+          res.release_reason = 'intermediate_chunk';
           return Promise.resolve({ data: { success: true }, error: null });
         }
         if (name === 'aggregate_ai_usage_telemetry') {
+          if (state.failAggregateRpc) {
+            return Promise.resolve({ data: null, error: { message: 'function aggregate_ai_usage_telemetry does not exist', code: '42883' } });
+          }
           const telemetry = state.ai_usage_telemetry || [];
           const userId = params && params.p_user_id;
           const taskType = params && params.p_task_type;
@@ -17054,6 +17060,75 @@ exports.requireApiUser = async () => {
       assert.equal(page50.summary.totalRequests, 60, 'limit 변경 후에도 전체 합계 60건 동일');
       assert.equal(page50.summary.operatorTrialConsumption.requests, 60);
       assert.equal(page50.summary.operatorTrialConsumption.tokens, 9000);
+    });
+  });
+
+  // --- 추가 안정화: 다중 청크(7개 청크) 분석 순차 진행 시 MAX_RETRIES_EXCEEDED 차단 없이 완결 검증 ---
+  await checkAsync('추가 안정화: 다중 청크(7개 청크) 분석 순차 진행 시 MAX_RETRIES_EXCEEDED 차단 없이 완결 검증', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-7chunks' },
+      ai_trial_credits: [{ user_id: 'user-7chunks', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async () => {
+      const { registerAiTask, clearAiTaskLease, recordTrialResultReady, settleTrialCredit } = load(path.join(output, 'lib/trialCredits.js'));
+
+      let currentToken = '';
+      for (let chunkIdx = 1; chunkIdx <= 7; chunkIdx++) {
+        const reg = await registerAiTask('user-7chunks', 'task-multi-7chunks', 'analyze_concepts', 'hash-7chunks', true);
+        assert.equal(reg.allowed, true, `청크 ${chunkIdx} 정상 진입 허용 (MAX_RETRIES_EXCEEDED 차단 없음)`);
+        currentToken = reg.leaseToken;
+
+        if (chunkIdx < 7) {
+          const clearRes = await clearAiTaskLease('user-7chunks', 'task-multi-7chunks', currentToken);
+          assert.equal(clearRes.success, true, `청크 ${chunkIdx} lease 해제 성공`);
+        } else {
+          const recRes = await recordTrialResultReady('user-7chunks', 'task-multi-7chunks', { done: true }, currentToken);
+          assert.equal(recRes.success, true, '최종 청크 완료 후 결과 보존');
+          const settleRes = await settleTrialCredit('user-7chunks', 'task-multi-7chunks', currentToken);
+          assert.equal(settleRes.success, true, '최종 정산 완료');
+        }
+      }
+    });
+  });
+
+  // --- 추가 안정화: 집계 RPC 장애 시 페이징 대체 경로(fetchAllFilteredRecords) 정상 동작 검증 ---
+  await checkAsync('추가 안정화: 집계 RPC 장애 시 페이징 대체 경로(fetchAllFilteredRecords) 정상 동작 검증', async () => {
+    const { queryAiUsageTelemetryFromDb } = load(path.join(output, 'lib/aiCostTelemetry.js'));
+
+    const telemetryRecords = [];
+    for (let i = 1; i <= 25; i++) {
+      telemetryRecords.push({
+        id: `tel-fb-${i}`,
+        request_id: `req-fb-${i}`,
+        user_id: 'user-fallback-test',
+        task_type: 'evaluate_answer',
+        credit_source: 'personal_key',
+        provider: 'school_gateway',
+        model: 'deepseek-v4.1-flash',
+        input_tokens: 200,
+        output_tokens: 100,
+        total_tokens: 300,
+        estimated_cost_usd: 0.002,
+        estimated_cost_krw: 2.8,
+        status: 'success',
+        execution_time_ms: 300,
+        created_at: new Date(Date.now() - i * 60000).toISOString(),
+      });
+    }
+
+    await withFakeSupabase({
+      user: { id: 'user-fallback-test' },
+      failAggregateRpc: true, // RPC 장애 시뮬레이션
+      ai_usage_telemetry: telemetryRecords,
+    }, async () => {
+      const res = await queryAiUsageTelemetryFromDb({
+        userId: 'user-fallback-test',
+        limit: 5,
+      });
+
+      assert.equal(res.records.length, 5, '목록은 limit=5 페이징 적용');
+      assert.equal(res.summary.totalRequests, 25, 'RPC 장애 시에도 대체 경로로 전체 25건 누락 없이 정확히 집계');
+      assert.equal(res.summary.personalKeyConsumption.tokens, 7500);
     });
   });
 

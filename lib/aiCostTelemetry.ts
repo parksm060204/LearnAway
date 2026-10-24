@@ -564,7 +564,40 @@ export async function queryAiUsageTelemetryFromDb(
 
     const dbRecords: AiUsageTelemetryRecord[] = (data || []).map(mapRowToRecord);
 
+    // Fallback when the aggregation RPC is unavailable (e.g. migration 32 not applied).
+    // PostgREST caps unranged selects (default max-rows 1000), so read in explicit pages
+    // and refuse to return a silently truncated summary.
+    const FALLBACK_PAGE_SIZE = 1000;
+    const FALLBACK_MAX_ROWS = 100_000;
+    const fetchAllFilteredRecords = async (): Promise<AiUsageTelemetryRecord[]> => {
+      const all: AiUsageTelemetryRecord[] = [];
+      for (let from = 0; from < FALLBACK_MAX_ROWS; from += FALLBACK_PAGE_SIZE) {
+        let pageQuery = admin
+          .from('ai_usage_telemetry')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
+          .range(from, from + FALLBACK_PAGE_SIZE - 1);
+        if (filter?.userId && filter.userId !== 'all') pageQuery = pageQuery.eq('user_id', filter.userId);
+        if (filter?.taskType) pageQuery = pageQuery.eq('task_type', filter.taskType);
+        if (filter?.creditSource) pageQuery = pageQuery.eq('credit_source', filter.creditSource);
+        if (filter?.model) pageQuery = pageQuery.eq('model', filter.model);
+        if (filter?.startDate) pageQuery = pageQuery.gte('created_at', filter.startDate);
+        if (filter?.endDate) pageQuery = pageQuery.lte('created_at', filter.endDate);
+        const { data: pageData, error: pageErr } = await pageQuery;
+        if (pageErr) throw new Error(`DB 계측 요약 조회 실패: ${pageErr.message}`);
+        const rows = (pageData || []) as Record<string, unknown>[];
+        all.push(...rows.map(mapRowToRecord));
+        if (rows.length < FALLBACK_PAGE_SIZE) return all;
+      }
+      throw new Error(
+        `집계 대상 기록이 ${FALLBACK_MAX_ROWS}건을 넘어 대체 집계를 중단했습니다. aggregate_ai_usage_telemetry 마이그레이션 적용 여부를 확인해 주세요.`
+      );
+    };
+
     let summary: AiUsageSummary;
+    let aggData: unknown = null;
+    let aggFailed = false;
     try {
       const rpcParams = {
         p_user_id: filter?.userId && filter.userId !== 'all' ? filter.userId : null,
@@ -574,34 +607,22 @@ export async function queryAiUsageTelemetryFromDb(
         p_start_date: filter?.startDate || null,
         p_end_date: filter?.endDate || null,
       };
-      const { data: aggData, error: aggErr } = await admin.rpc('aggregate_ai_usage_telemetry', rpcParams);
-      if (!aggErr && aggData && typeof aggData === 'object' && 'totalRequests' in aggData) {
-        summary = aggData as AiUsageSummary;
+      const rpcRes = await admin.rpc('aggregate_ai_usage_telemetry', rpcParams);
+      if (rpcRes.error) {
+        aggFailed = true;
+        console.warn('aggregate_ai_usage_telemetry RPC failed, using paginated fallback:', rpcRes.error.message);
       } else {
-        let allQuery = admin.from('ai_usage_telemetry').select('*');
-        if (filter?.userId && filter.userId !== 'all') allQuery = allQuery.eq('user_id', filter.userId);
-        if (filter?.taskType) allQuery = allQuery.eq('task_type', filter.taskType);
-        if (filter?.creditSource) allQuery = allQuery.eq('credit_source', filter.creditSource);
-        if (filter?.model) allQuery = allQuery.eq('model', filter.model);
-        if (filter?.startDate) allQuery = allQuery.gte('created_at', filter.startDate);
-        if (filter?.endDate) allQuery = allQuery.lte('created_at', filter.endDate);
-        const { data: allData, error: allErr } = await allQuery;
-        if (allErr) throw new Error(`DB 계측 요약 조회 실패: ${allErr.message}`);
-        const allRecords = (allData || []).map(mapRowToRecord);
-        summary = getAiUsageSummary(filter, allRecords);
+        aggData = rpcRes.data;
       }
-    } catch {
-      let allQuery = admin.from('ai_usage_telemetry').select('*');
-      if (filter?.userId && filter.userId !== 'all') allQuery = allQuery.eq('user_id', filter.userId);
-      if (filter?.taskType) allQuery = allQuery.eq('task_type', filter.taskType);
-      if (filter?.creditSource) allQuery = allQuery.eq('credit_source', filter.creditSource);
-      if (filter?.model) allQuery = allQuery.eq('model', filter.model);
-      if (filter?.startDate) allQuery = allQuery.gte('created_at', filter.startDate);
-      if (filter?.endDate) allQuery = allQuery.lte('created_at', filter.endDate);
-      const { data: allData, error: allErr } = await allQuery;
-      if (allErr) throw new Error(`DB 계측 요약 조회 실패: ${allErr.message}`);
-      const allRecords = (allData || []).map(mapRowToRecord);
-      summary = getAiUsageSummary(filter, allRecords);
+    } catch (rpcErr) {
+      aggFailed = true;
+      console.warn('aggregate_ai_usage_telemetry RPC threw, using paginated fallback:', rpcErr);
+    }
+
+    if (!aggFailed && aggData && typeof aggData === 'object' && 'totalRequests' in aggData) {
+      summary = aggData as AiUsageSummary;
+    } else {
+      summary = getAiUsageSummary(filter, await fetchAllFilteredRecords());
     }
 
     return {
