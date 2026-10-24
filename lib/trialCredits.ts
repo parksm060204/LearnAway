@@ -303,6 +303,7 @@ export async function registerAiTask(
         remaining: res.remaining ?? 0,
         cachedResult: res.cached_result,
         leaseToken: res.lease_token,
+        creditSource: res.credit_source,
         message: res.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
       };
     }
@@ -312,6 +313,7 @@ export async function registerAiTask(
         allowed: false,
         status: 'concurrent_in_progress',
         errorCode: errCode || 'CONCURRENT_EXECUTION_BLOCKED',
+        creditSource: res.credit_source,
         message: res.message || '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
       };
     }
@@ -321,6 +323,7 @@ export async function registerAiTask(
         allowed: false,
         errorCode: errCode || (isPersonalKey ? 'REGISTRATION_REJECTED' : 'INSUFFICIENT_CREDITS'),
         remaining: res.remaining ?? 0,
+        creditSource: res.credit_source,
         message: res.message || '작업을 실행할 수 없습니다.',
       };
     }
@@ -620,3 +623,53 @@ export async function releaseTrialCredit(
     };
   }
 }
+
+/**
+ * Clears active execution lease for intermediate chunk completion in multi-chunk tasks.
+ * Preserves processing state while unblocking normal sequential progression to next chunk.
+ */
+export async function clearAiTaskLease(
+  userId: string,
+  taskId: string,
+  leaseToken?: string
+): Promise<{ success: boolean; status?: string; error?: string; errorCode?: string }> {
+  const token = typeof leaseToken === 'string' ? leaseToken.trim() : '';
+  if (!token) {
+    return {
+      success: false,
+      errorCode: 'LEASE_TOKEN_REQUIRED',
+      error: '유효한 실행 토큰(lease_token)이 필요합니다.',
+    };
+  }
+
+  try {
+    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const { data, error } = await client.rpc('clear_ai_task_lease', {
+      p_task_id: taskId,
+      p_user_id: userId,
+      p_lease_token: token,
+    });
+    if (error || !data || typeof data !== 'object') {
+      return {
+        success: false,
+        errorCode: 'CLEAR_LEASE_RPC_ERROR',
+        error: error?.message || '실행 토큰 해제 중 오류가 발생했습니다.',
+      };
+    }
+    const res = data as { success?: boolean; status?: string; error?: string; error_code?: string; errorCode?: string };
+    const errCode = res.error_code || res.errorCode || (!res.success ? 'CLEAR_LEASE_FAILED' : undefined);
+    return {
+      success: Boolean(res.success),
+      status: res.status,
+      error: res.error,
+      errorCode: errCode,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      errorCode: 'CLEAR_LEASE_NETWORK_ERROR',
+      error: err instanceof Error ? err.message : '실행 토큰 해제 통신 오류',
+    };
+  }
+}
+

@@ -1032,6 +1032,14 @@ exports.requireApiUser = async () => {
                 error: null,
               });
             }
+            const existingSource = existing.credit_source || 'operator_trial';
+            const targetSource = isPersonalKey ? 'personal_key' : 'operator_trial';
+            if (existingSource !== targetSource) {
+              return Promise.resolve({
+                data: { allowed: false, error_code: 'TASK_CREDIT_SOURCE_MISMATCH', message: '작업의 결제 출처가 일치하지 않습니다.' },
+                error: null,
+              });
+            }
             if (existing.status === 'settled' || existing.status === 'result_ready') {
               return Promise.resolve({
                 data: {
@@ -1055,9 +1063,21 @@ exports.requireApiUser = async () => {
                 error: null,
               });
             }
-            if (existing.status === 'released') {
+            if ((existing.attempt_count || 1) >= 5) {
+              return Promise.resolve({
+                data: { allowed: false, error_code: 'MAX_RETRIES_EXCEEDED', message: '최대 재시도 횟수를 초과했습니다.' },
+                error: null,
+              });
+            }
+            if (existing.status === 'released' || existing.status === 'failed_refunded') {
               if (!isPersonalKey) {
-                if (userCredits.balance <= 0) {
+                if ((params && params.p_operator_daily_cap || 500) <= (state.operator_daily_usage || 0)) {
+                  return Promise.resolve({
+                    data: { allowed: false, error_code: 'OPERATOR_DAILY_CAP_EXCEEDED', remaining: userCredits ? userCredits.balance : 0, message: '일일 한도 초과' },
+                    error: null,
+                  });
+                }
+                if (!userCredits || userCredits.balance <= 0) {
                   return Promise.resolve({
                     data: {
                       allowed: false,
@@ -1070,6 +1090,17 @@ exports.requireApiUser = async () => {
                 }
                 userCredits.balance -= 1;
                 userCredits.updated_at = nowIso();
+                state.operator_daily_usage = (state.operator_daily_usage || 0) + 1;
+              }
+            } else if (existing.status === 'processing') {
+              if (!isPersonalKey) {
+                if ((params && params.p_operator_daily_cap || 500) <= (state.operator_daily_usage || 0)) {
+                  return Promise.resolve({
+                    data: { allowed: false, error_code: 'OPERATOR_DAILY_CAP_EXCEEDED', remaining: userCredits ? userCredits.balance : 0, message: '일일 한도 초과' },
+                    error: null,
+                  });
+                }
+                state.operator_daily_usage = (state.operator_daily_usage || 0) + 1;
               }
             }
 
@@ -1085,6 +1116,7 @@ exports.requireApiUser = async () => {
                 remaining: userCredits ? userCredits.balance : 0,
                 lease_token: leaseToken,
                 is_personal_key: isPersonalKey,
+                credit_source: targetSource,
               },
               error: null,
             });
@@ -1314,6 +1346,65 @@ exports.requireApiUser = async () => {
               refunded: true,
               balance: userCredits ? userCredits.balance : 0,
               remaining: userCredits ? userCredits.balance : 0,
+            },
+            error: null,
+          });
+        }
+        if (name === 'clear_ai_task_lease') {
+          const taskId = params && params.p_task_id;
+          const token = params && typeof params.p_lease_token === 'string' ? params.p_lease_token.trim() : '';
+          const resList = state.ai_trial_reservations || [];
+          const res = resList.find((r) => r.task_id === taskId);
+          if (!res) return Promise.resolve({ data: { success: false, error_code: 'TASK_NOT_FOUND' }, error: null });
+          if (res.lease_token !== token) return Promise.resolve({ data: { success: false, error_code: 'STALE_LEASE_TOKEN' }, error: null });
+          res.lease_token = null;
+          res.lease_expires_at = null;
+          return Promise.resolve({ data: { success: true }, error: null });
+        }
+        if (name === 'aggregate_ai_usage_telemetry') {
+          const telemetry = state.ai_usage_telemetry || [];
+          const userId = params && params.p_user_id;
+          const taskType = params && params.p_task_type;
+          const creditSource = params && params.p_credit_source;
+          const model = params && params.p_model;
+          let filtered = telemetry;
+          if (userId) filtered = filtered.filter((r) => r.user_id === userId);
+          if (taskType) filtered = filtered.filter((r) => r.task_type === taskType);
+          if (creditSource) filtered = filtered.filter((r) => r.credit_source === creditSource);
+          if (model) filtered = filtered.filter((r) => r.model === model);
+
+          const totalRequests = filtered.length;
+          const totalCostUsd = filtered.reduce((acc, r) => acc + (r.estimated_cost_usd || 0), 0);
+          const totalCostKrw = filtered.reduce((acc, r) => acc + (r.estimated_cost_krw || 0), 0);
+
+          const opRows = filtered.filter((r) => r.credit_source === 'operator_trial');
+          const pkRows = filtered.filter((r) => r.credit_source === 'personal_key');
+
+          return Promise.resolve({
+            data: {
+              totalRequests,
+              totalCostUsd: Math.round(totalCostUsd * 1e6) / 1e6,
+              totalCostKrw: Math.round(totalCostKrw * 100) / 100,
+              successfulRequests: filtered.filter((r) => r.status === 'success').length,
+              failedRequests: filtered.filter((r) => r.status !== 'success').length,
+              failureRatePercent: totalRequests > 0 ? Math.round((filtered.filter((r) => r.status !== 'success').length / totalRequests) * 100) : 0,
+              requestsByTask: {},
+              tokensByModel: {},
+              costByModel: {},
+              dailyMetrics: [],
+              anomalies: [],
+              operatorTrialConsumption: {
+                requests: opRows.length,
+                tokens: opRows.reduce((acc, r) => acc + (r.total_tokens || 0), 0),
+                estimatedCostUsd: Math.round(opRows.reduce((acc, r) => acc + (r.estimated_cost_usd || 0), 0) * 1e6) / 1e6,
+                estimatedCostKrw: Math.round(opRows.reduce((acc, r) => acc + (r.estimated_cost_krw || 0), 0) * 100) / 100,
+              },
+              personalKeyConsumption: {
+                requests: pkRows.length,
+                tokens: pkRows.reduce((acc, r) => acc + (r.total_tokens || 0), 0),
+                estimatedCostUsd: Math.round(pkRows.reduce((acc, r) => acc + (r.estimated_cost_usd || 0), 0) * 1e6) / 1e6,
+                estimatedCostKrw: Math.round(pkRows.reduce((acc, r) => acc + (r.estimated_cost_krw || 0), 0) * 100) / 100,
+              },
             },
             error: null,
           });
@@ -16762,6 +16853,207 @@ exports.requireApiUser = async () => {
         taskType: 'evaluate_answer',
       });
       assert.equal(queriedEmpty.records.length, 0, '필터 불일치 시 0건 반환');
+    });
+  });
+
+  // =========================================================================
+  // 후속 4대 문제 (작업 재시도 예산, 최초 크레딧 초기화, 개인키 결과 보존, 사용량 집계 분리)
+  // =========================================================================
+
+  // --- 문제 1 [P1]: 작업 재시도의 크레딧·호출 예산 검증 복원 ---
+  await checkAsync('문제 1 [P1]: 작업 재시도 시 원자적 잔액 차감, 일일 한도·재시도 횟수 초과 차단 및 결제 출처 불일치 거부', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-retry-test' },
+      ai_trial_credits: [{ user_id: 'user-retry-test', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+      operator_daily_usage: 0,
+    }, async (client) => {
+      const { registerAiTask, releaseTrialCredit } = load(path.join(output, 'lib/trialCredits.js'));
+
+      // 1. 최초 예약: 잔액 3 -> 2
+      const res1 = await registerAiTask('user-retry-test', 'task-retry-01', 'evaluate_answer', 'hash-1', false);
+      assert.equal(res1.allowed, true);
+      assert.equal(res1.remaining, 2);
+      const token1 = res1.leaseToken;
+
+      // 2. 실패 환급: 잔액 2 -> 3
+      const rel1 = await releaseTrialCredit('user-retry-test', 'task-retry-01', 'ai_failure', token1);
+      assert.equal(rel1.success, true);
+      assert.ok(rel1.status === 'released' || rel1.status === 'refunded');
+      assert.equal(rel1.remaining, 3);
+
+      // 3. 재요청 시 원자적 재차감: 잔액 3 -> 2
+      const retry1 = await registerAiTask('user-retry-test', 'task-retry-01', 'evaluate_answer', 'hash-1', false);
+      assert.equal(retry1.allowed, true);
+      assert.equal(retry1.remaining, 2, '환급 후 재시도 시 잔액이 다시 원자적으로 차감됨');
+      const cred = client.__state.ai_trial_credits.find(c => c.user_id === 'user-retry-test');
+      assert.equal(cred.balance, 2);
+
+      // 4. 잔액 0일 때 재예약 거부
+      await releaseTrialCredit('user-retry-test', 'task-retry-01', 'ai_failure', retry1.leaseToken);
+      cred.balance = 0; // 잔액 소진 시뮬레이션
+      const retryNoBal = await registerAiTask('user-retry-test', 'task-retry-01', 'evaluate_answer', 'hash-1', false);
+      assert.equal(retryNoBal.allowed, false);
+      assert.equal(retryNoBal.errorCode, 'INSUFFICIENT_CREDITS');
+
+      // 5. 일일 한도 초과 시 재시도 거부
+      cred.balance = 2;
+      client.__state.operator_daily_usage = 500;
+      const retryDailyCap = await registerAiTask('user-retry-test', 'task-retry-01', 'evaluate_answer', 'hash-1', false, 500);
+      assert.equal(retryDailyCap.allowed, false);
+      assert.equal(retryDailyCap.errorCode, 'OPERATOR_DAILY_CAP_EXCEEDED');
+
+      // 6. 최대 재시도 횟수 초과(5회 이상) 거부
+      client.__state.operator_daily_usage = 0;
+      const taskRow = client.__state.ai_trial_reservations.find(r => r.task_id === 'task-retry-01');
+      taskRow.attempt_count = 5;
+      const retryMax = await registerAiTask('user-retry-test', 'task-retry-01', 'evaluate_answer', 'hash-1', false);
+      assert.equal(retryMax.allowed, false);
+      assert.equal(retryMax.errorCode, 'MAX_RETRIES_EXCEEDED');
+
+      // 7. 결제 방식 전환 거부 (개인키 <-> 운영자 체험)
+      const resPk = await registerAiTask('user-retry-test', 'task-pk-01', 'evaluate_answer', 'hash-pk', true);
+      assert.equal(resPk.allowed, true);
+      const switchAttempt = await registerAiTask('user-retry-test', 'task-pk-01', 'evaluate_answer', 'hash-pk', false);
+      assert.equal(switchAttempt.allowed, false);
+      assert.equal(switchAttempt.errorCode, 'TASK_CREDIT_SOURCE_MISMATCH');
+
+      // 8. 개인 키 작업 환급 시 체험 잔액 미증가
+      const relPk = await releaseTrialCredit('user-retry-test', 'task-pk-01', 'cancel', resPk.leaseToken);
+      assert.equal(relPk.success, true);
+      assert.equal(relPk.status, 'released', '개인 키 작업은 환급 시 체험 잔액이 증가하지 않음');
+    });
+  });
+
+  // --- 문제 2 [P2]: 최초 크레딧 초기화를 조회 순서에서 독립시키기 ---
+  await checkAsync('문제 2 [P2]: 조회 선행 없이 최초 예약 호출 시 계정 유형별 자동 지급 및 차감 원자성 검증', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-new-normal', email: 'normal@example.com' },
+      ai_trial_credits: [], // 크레딧 행 부재
+      ai_trial_reservations: [],
+    }, async (client) => {
+      const { registerAiTask, getTrialCreditStatus } = load(path.join(output, 'lib/trialCredits.js'));
+
+      // 1. 일반 계정: 예약 먼저 호출 -> 3회 자동 생성 후 1회 차감 -> 2회 잔여
+      const normRes = await registerAiTask('user-new-normal', 'task-first-norm', 'generate_problems', 'hash-norm', false);
+      assert.equal(normRes.allowed, true);
+      assert.equal(normRes.remaining, 2, '일반 계정 3회 자동 부여 후 1회 예약되어 잔액 2');
+
+      const normRow = client.__state.ai_trial_credits.find(c => c.user_id === 'user-new-normal');
+      assert.equal(normRow.granted_credits, 3);
+      assert.equal(normRow.balance, 2);
+
+      // 이후 getTrialCreditStatus 조회 시 잔액 보존 (재지급 없음)
+      const normQuery = await getTrialCreditStatus('user-new-normal');
+      assert.equal(normQuery.balance, 2);
+      assert.equal(normQuery.granted, 3);
+    });
+
+    await withFakeSupabase({
+      user: { id: 'user-new-guest', email: 'guest@id.learnaway.local', user_metadata: { auth_type: 'username' } },
+      ai_trial_credits: [], // 크레딧 행 부재
+      ai_trial_reservations: [],
+    }, async (client) => {
+      const { registerAiTask, getTrialCreditStatus } = load(path.join(output, 'lib/trialCredits.js'));
+
+      // 2. 게스트/간편 계정: 예약 먼저 호출 -> 1회 자동 생성 후 1회 차감 -> 0회 잔여
+      const guestRes = await registerAiTask('user-new-guest', 'task-first-guest', 'generate_problems', 'hash-guest', false);
+      assert.equal(guestRes.allowed, true);
+      assert.equal(guestRes.remaining, 0, '게스트 계정 1회 자동 부여 후 1회 예약되어 잔액 0');
+
+      const guestRow = client.__state.ai_trial_credits.find(c => c.user_id === 'user-new-guest');
+      assert.equal(guestRow.granted_credits, 1);
+      assert.equal(guestRow.balance, 0);
+
+      const guestQuery = await getTrialCreditStatus('user-new-guest', true);
+      assert.equal(guestQuery.balance, 0);
+      assert.equal(guestQuery.granted, 1);
+    });
+  });
+
+  // --- 문제 3 [P2]: 개인 API 키 작업의 결과 보존·완료·실패 복구 연결 ---
+  await checkAsync('문제 3 [P2]: 개인 API 키 작업 결과 보존 및 다중 청크 분석 clearAiTaskLease 연속 진행 검증', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-pk-flow' },
+      ai_trial_credits: [{ user_id: 'user-pk-flow', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async () => {
+      const { registerAiTask, recordTrialResultReady, settleTrialCredit, clearAiTaskLease } = load(path.join(output, 'lib/trialCredits.js'));
+
+      // 1. 개인 키 작업 등록
+      const reg = await registerAiTask('user-pk-flow', 'task-pk-chunk-1', 'analyze_concepts', 'hash-chunk-1', true);
+      assert.equal(reg.allowed, true);
+      const token = reg.leaseToken;
+
+      // 2. 중간 청크 완료: clearAiTaskLease 호출로 실행 락 해제
+      const clearRes = await clearAiTaskLease('user-pk-flow', 'task-pk-chunk-1', token);
+      assert.equal(clearRes.success, true, '중간 청크 leaseToken 정상 해제');
+
+      // 3. 동일 taskId로 다음 청크 즉시 진입 시 CONCURRENT_EXECUTION_BLOCKED 없이 허용
+      const nextChunk = await registerAiTask('user-pk-flow', 'task-pk-chunk-1', 'analyze_concepts', 'hash-chunk-1', true);
+      assert.equal(nextChunk.allowed, true, '중간 청크 lease 해제 후 다음 청크 원활한 재진입');
+      const nextToken = nextChunk.leaseToken;
+
+      // 4. 최종 청크 완료: 결과 보존 및 확정
+      const recordRes = await recordTrialResultReady('user-pk-flow', 'task-pk-chunk-1', { concepts: ['Derivative'] }, nextToken);
+      assert.equal(recordRes.success, true);
+      const settleRes = await settleTrialCredit('user-pk-flow', 'task-pk-chunk-1', nextToken);
+      assert.equal(settleRes.success, true);
+
+      // 5. 이미 보존된 개인 키 작업 재전송 시 캐시 즉시 반환 (추가 AI 호출 차단)
+      const repeatRes = await registerAiTask('user-pk-flow', 'task-pk-chunk-1', 'analyze_concepts', 'hash-chunk-1', true);
+      assert.equal(repeatRes.allowed, false);
+      assert.equal(repeatRes.status, 'already_completed');
+      assert.deepEqual(repeatRes.cachedResult, { concepts: ['Derivative'] });
+    });
+  });
+
+  // --- 문제 4 [P2]: 사용량 목록과 기간 전체 집계 분리 ---
+  await checkAsync('문제 4 [P2]: 사용량 목록 limit 페이징과 기간 전체 summary 집계 분리 검증', async () => {
+    const { queryAiUsageTelemetryFromDb } = load(path.join(output, 'lib/aiCostTelemetry.js'));
+
+    const telemetryRecords = [];
+    for (let i = 1; i <= 60; i++) {
+      telemetryRecords.push({
+        id: `tel-${i}`,
+        request_id: `req-${i}`,
+        user_id: 'user-paging-test',
+        task_type: i % 2 === 0 ? 'evaluate_answer' : 'generate_problems',
+        credit_source: 'operator_trial',
+        provider: 'school_gateway',
+        model: 'deepseek-v4.1-flash',
+        input_tokens: 100,
+        output_tokens: 50,
+        total_tokens: 150,
+        estimated_cost_usd: 0.001,
+        estimated_cost_krw: 1.4,
+        status: 'success',
+        execution_time_ms: 250,
+        created_at: new Date(Date.now() - i * 60000).toISOString(),
+      });
+    }
+
+    await withFakeSupabase({
+      user: { id: 'user-paging-test' },
+      ai_usage_telemetry: telemetryRecords,
+    }, async () => {
+      // 1. limit=10으로 조회 시: 목록은 10건, 그러나 summary.totalRequests는 전체 60건
+      const page10 = await queryAiUsageTelemetryFromDb({
+        userId: 'user-paging-test',
+        limit: 10,
+      });
+      assert.equal(page10.records.length, 10, '목록은 지정된 limit=10에 맞게 페이징');
+      assert.equal(page10.summary.totalRequests, 60, '전체 집계는 페이징과 무관하게 60건 유지');
+
+      // 2. limit=50으로 변경해도 전체 집계 60건 불변
+      const page50 = await queryAiUsageTelemetryFromDb({
+        userId: 'user-paging-test',
+        limit: 50,
+      });
+      assert.equal(page50.records.length, 50, '목록은 limit=50 반영');
+      assert.equal(page50.summary.totalRequests, 60, 'limit 변경 후에도 전체 합계 60건 동일');
+      assert.equal(page50.summary.operatorTrialConsumption.requests, 60);
+      assert.equal(page50.summary.operatorTrialConsumption.tokens, 9000);
     });
   });
 

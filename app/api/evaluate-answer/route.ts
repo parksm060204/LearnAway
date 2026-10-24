@@ -559,10 +559,16 @@ export async function POST(req: NextRequest) {
 
     const { data: budgetData, error: budgetError } = await supabase.rpc('consume_ai_call_budget');
     if (budgetError || !budgetData || typeof budgetData !== 'object') {
+      if (taskId && cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'budget_check_error', cred.leaseToken);
+      }
       return NextResponse.json({ success: false, error: 'AI 호출 한도를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.' }, { status: 503 });
     }
     const budget = budgetData as { allowed?: boolean; retryAfterSeconds?: number };
     if (!budget.allowed) {
+      if (taskId && cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'rate_limited', cred.leaseToken);
+      }
       const retryAfter = Math.max(1, Math.min(60, Number(budget.retryAfterSeconds) || 60));
       return NextResponse.json(
         { success: false, error: '평가 요청이 잠시 많습니다. 잠시 후 다시 시도해 주세요.', retryAfterSeconds: retryAfter },
@@ -788,7 +794,7 @@ ${
         inputText: userPrompt,
       });
 
-      if (cred.isTrial && taskId) {
+      if (taskId && cred.leaseToken) {
         await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
       }
       return NextResponse.json(
@@ -840,7 +846,7 @@ ${
         sourceVerificationStatus: resolvedSourceStatus,
       };
     } catch (cause) {
-      if (cred.isTrial && taskId) {
+      if (taskId && cred.leaseToken) {
         await releaseTrialCredit(auth.user.id, taskId, 'validation_failed', cred.leaseToken);
       }
       return NextResponse.json({ success: false,
@@ -967,7 +973,7 @@ ${
     }
 
     let cacheSuccess = true;
-    if (cred.isTrial && taskId) {
+    if (taskId && cred.leaseToken) {
       const cacheRes = await recordTrialResultReady(
         auth.user.id,
         taskId,

@@ -198,6 +198,8 @@ export type AiConfigResolution =
         | 'trial_limit_exceeded'
         | 'task_input_mismatch'
         | 'task_ownership_mismatch'
+        | 'task_credit_source_mismatch'
+        | 'max_retries_exceeded'
         | 'already_completed'
         | 'already_completed_missing_result'
         | 'concurrent_in_progress'
@@ -336,6 +338,22 @@ export async function resolveAiConfigForUser(
             message: reg.message || '해당 작업에 대한 접근 권한이 없습니다.',
           };
         }
+        if (reg.errorCode === 'TASK_CREDIT_SOURCE_MISMATCH') {
+          return {
+            ok: false,
+            code: 'task_credit_source_mismatch',
+            errorCode: 'TASK_CREDIT_SOURCE_MISMATCH',
+            message: reg.message || '기존 작업의 결제 방식과 요청된 결제 방식이 일치하지 않습니다.',
+          };
+        }
+        if (reg.errorCode === 'MAX_RETRIES_EXCEEDED') {
+          return {
+            ok: false,
+            code: 'max_retries_exceeded',
+            errorCode: 'MAX_RETRIES_EXCEEDED',
+            message: reg.message || '동일 작업의 최대 재시도 한도를 초과했습니다.',
+          };
+        }
         return {
           ok: false,
           code: 'trial_limit_exceeded',
@@ -438,6 +456,24 @@ export async function resolveAiConfigForUser(
         code: 'task_ownership_mismatch',
         errorCode: 'TASK_OWNERSHIP_MISMATCH',
         message: reservation.message || '해당 작업에 대한 접근 권한이 없습니다.',
+      };
+    }
+
+    if (reservation.errorCode === 'TASK_CREDIT_SOURCE_MISMATCH') {
+      return {
+        ok: false,
+        code: 'task_credit_source_mismatch',
+        errorCode: 'TASK_CREDIT_SOURCE_MISMATCH',
+        message: reservation.message || '기존 작업의 결제 방식과 요청된 결제 방식이 일치하지 않습니다.',
+      };
+    }
+
+    if (reservation.errorCode === 'MAX_RETRIES_EXCEEDED') {
+      return {
+        ok: false,
+        code: 'max_retries_exceeded',
+        errorCode: 'MAX_RETRIES_EXCEEDED',
+        message: reservation.message || '동일 작업의 최대 재시도 한도를 초과했습니다.',
       };
     }
 

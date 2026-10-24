@@ -577,7 +577,7 @@ ${combinedSource}
         inputText: userPrompt,
       });
 
-      if (cred.isTrial) {
+      if (cred.leaseToken) {
         await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
       }
       return NextResponse.json(
@@ -607,7 +607,7 @@ ${combinedSource}
       try {
         parsedResult = JSON.parse(cleanedJson);
       } catch {
-        if (cred.isTrial) {
+        if (cred.leaseToken) {
           await releaseTrialCredit(auth.user.id, taskId, 'invalid_json', cred.leaseToken);
         }
         return NextResponse.json(
@@ -907,7 +907,7 @@ ${combinedSource}
       // Settle credit ONLY when result cache is verified AND database persistence succeeds
       let settlementError: string | undefined;
       let isSettled = false;
-      if (cred.isTrial && draftsWithIds.length > 0) {
+      if (cred.leaseToken && draftsWithIds.length > 0) {
         if (cacheSuccess && outcome.persisted) {
           const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
           if (!settleResult.success) {

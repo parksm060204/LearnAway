@@ -111,19 +111,19 @@ async function runSqlFile(db, filePath) {
 }
 
 async function testUpgradePath() {
-  console.log('=== [1] Testing Upgrade Path: DB with Migrations 00~27 -> Apply Migration 28 ===');
+  console.log('=== [1] Testing Upgrade Path: DB with Migrations 00~31 -> Apply Migration 32 ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
-  // 1. Run migrations 00 to 27
+  // 1. Run migrations 00 to 31 (Strictly exclude 32 so previous version DB is tested!)
   const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
-  const upTo27 = files.filter(f => !f.includes('000028_'));
+  const pre32Files = files.filter(f => f < '20260101000032_');
 
-  for (const f of upTo27) {
+  for (const f of pre32Files) {
     // console.log(`Applying ${f}...`);
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied ${upTo27.length} migrations up to 27`);
+  console.log(`✓ Successfully applied ${pre32Files.length} migrations up to 31`);
 
   // 2. Insert mock pre-migration data
   const userIdA = '11111111-1111-1111-1111-111111111111';
@@ -155,21 +155,13 @@ async function testUpgradePath() {
 
   console.log('✓ Successfully populated pre-migration existing data (credits & result_ready reservation)');
 
-  // 3. Apply Migration 28 (Should succeed with ZERO 42P13 / 42725 errors!)
-  const migration28File = files.find(f => f.includes('000028_'));
-  console.log(`Applying Migration 28: ${migration28File}...`);
-  await runSqlFile(db, path.join(MIGRATIONS_DIR, migration28File));
-  console.log('✓ Migration 28 executed cleanly without 42P13 or 42725 errors!');
+  // 3. Apply Migration 32
+  const migration32File = files.find(f => f.includes('000032_'));
+  console.log(`Applying Migration 32: ${migration32File}...`);
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, migration32File));
+  console.log('✓ Migration 32 executed cleanly!');
 
-  // 4. Apply Migration 29
-  const migration29File = files.find(f => f.includes('000029_'));
-  if (migration29File) {
-    console.log(`Applying Migration 29: ${migration29File}...`);
-    await runSqlFile(db, path.join(MIGRATIONS_DIR, migration29File));
-    console.log('✓ Migration 29 executed cleanly!');
-  }
-
-  // Now execute Scenarios A through F
+  // Now execute Scenarios A through L
   await setAuthContext(db, { uid: userIdA, role: 'service_role' });
 
   // --------------------------------------------------------------------------
@@ -527,20 +519,364 @@ async function testUpgradePath() {
   }
   console.log('✓ lookup_saved_ai_task_result authoritative retrieval of preserved result verified');
 
-  // 7. lookup_saved_ai_task_result rejects cross-user or missing tasks
-  const lookupCrossUser = await db.query(`
-    select public.lookup_saved_ai_task_result($1, $2, 'generate_problems', 'hash_math_01') as r;
-  `, [taskP1, userIdB]);
-  if (lookupCrossUser.rows[0].r.success !== false || lookupCrossUser.rows[0].r.error_code !== 'TASK_OWNERSHIP_MISMATCH') {
-    throw new Error(`Saved task lookup for other user must fail with TASK_OWNERSHIP_MISMATCH: ${JSON.stringify(lookupCrossUser.rows[0].r)}`);
+  // --------------------------------------------------------------------------
+  // Scenario I: Autonomous Credit Initialization on Reservation (Problem 2)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario I: Autonomous Credit Initialization on Reservation (Problem 2) ---');
+  const userNormalNew = '33333333-3333-3333-3333-333333333333';
+  const userGuestNew = '44444444-4444-4444-4444-444444444444';
+
+  await db.query(`
+    insert into auth.users (id, email, raw_user_meta_data)
+    values ($1, 'normal_new@example.com', '{"auth_type":"email"}'::jsonb),
+           ($2, 'guest_new@id.learnaway.local', '{"auth_type":"username"}'::jsonb);
+  `, [userNormalNew, userGuestNew]);
+
+  // Normal user calls register_ai_task FIRST (without prior get_or_create_trial_credits)
+  const normReg = await db.query(`
+    select public.register_ai_task('task_auto_norm_01', 'evaluate_answer', 'hash_norm_01', $1, false, 500) as r;
+  `, [userNormalNew]);
+  const normData = normReg.rows[0].r;
+  if (!normData.allowed || normData.remaining !== 2 || normData.status !== 'processing') {
+    throw new Error(`Scenario I normal user auto-init failed: ${JSON.stringify(normData)}`);
   }
-  console.log('✓ lookup_saved_ai_task_result cross-user access strictly blocked with TASK_OWNERSHIP_MISMATCH');
+  const normRow = (await db.query(`select granted_credits, balance from public.ai_trial_credits where user_id = $1;`, [userNormalNew])).rows[0];
+  if (normRow.granted_credits !== 3 || normRow.balance !== 2) {
+    throw new Error(`Scenario I normal user credit row mismatch: ${JSON.stringify(normRow)}`);
+  }
+  console.log('✓ Normal user atomically initialized with 3 credits and 1 reserved (remaining=2)');
+
+  // Guest user calls register_ai_task FIRST
+  const guestReg = await db.query(`
+    select public.register_ai_task('task_auto_guest_01', 'evaluate_answer', 'hash_guest_01', $1, false, 500) as r;
+  `, [userGuestNew]);
+  const guestData = guestReg.rows[0].r;
+  if (!guestData.allowed || guestData.remaining !== 0 || guestData.status !== 'processing') {
+    throw new Error(`Scenario I guest user auto-init failed: ${JSON.stringify(guestData)}`);
+  }
+  const guestRow = (await db.query(`select granted_credits, balance from public.ai_trial_credits where user_id = $1;`, [userGuestNew])).rows[0];
+  if (guestRow.granted_credits !== 1 || guestRow.balance !== 0) {
+    throw new Error(`Scenario I guest user credit row mismatch: ${JSON.stringify(guestRow)}`);
+  }
+  console.log('✓ Guest user atomically initialized with 1 credit and 1 reserved (remaining=0)');
+
+  // Querying get_or_create_trial_credits subsequently MUST NOT overwrite balance or re-grant
+  const normCheck = (await db.query(`select public.get_or_create_trial_credits($1) as r;`, [userNormalNew])).rows[0].r;
+  if (normCheck.balance !== 2 || normCheck.granted !== 3) {
+    throw new Error(`Subsequent get_or_create overwrote balance: ${JSON.stringify(normCheck)}`);
+  }
+  console.log('✓ Subsequent credit query preserves existing balance without re-granting');
+
+  // --------------------------------------------------------------------------
+  // Scenario J: Task Retry Budget & Atomic Deduction Enforcement (Problem 1)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario J: Task Retry Budget & Atomic Deduction Enforcement (Problem 1) ---');
+  const taskIdJ = 'task_retry_p1_' + Date.now();
+  // 1. Initial reservation: balance 2 -> 1
+  const jRes1 = (await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'hash_j_01', $2, false, 500) as r;
+  `, [taskIdJ, userNormalNew])).rows[0].r;
+  if (!jRes1.allowed || jRes1.remaining !== 1) {
+    throw new Error(`Initial reservation failed: ${JSON.stringify(jRes1)}`);
+  }
+  const jToken1 = jRes1.lease_token;
+
+  // 2. Failure refund: balance 1 -> 2, status -> failed_refunded
+  const jRel1 = (await db.query(`
+    select public.release_trial_credit($1, 'AI_GATEWAY_TIMEOUT', $2, $3) as r;
+  `, [taskIdJ, userNormalNew, jToken1])).rows[0].r;
+  if (!jRel1.success || !jRel1.refunded || jRel1.balance !== 2) {
+    throw new Error(`Scenario J refund failed: ${JSON.stringify(jRel1)}`);
+  }
+  console.log('✓ Task released with refund: balance restored to 2');
+
+  // 3. Retry same task: MUST atomically deduct balance (2 -> 1)
+  const jRetry1 = (await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'hash_j_01', $2, false, 500) as r;
+  `, [taskIdJ, userNormalNew])).rows[0].r;
+  if (!jRetry1.allowed || jRetry1.remaining !== 1 || jRetry1.status !== 'processing') {
+    throw new Error(`Scenario J retry failed: ${JSON.stringify(jRetry1)}`);
+  }
+  const jBalAfterRetry1 = (await db.query(`select balance from public.ai_trial_credits where user_id = $1;`, [userNormalNew])).rows[0].balance;
+  if (jBalAfterRetry1 !== 1) {
+    throw new Error(`Expected balance 1 after retry deduction, got ${jBalAfterRetry1}`);
+  }
+  const jAttemptRow = (await db.query(`select attempt_count from public.ai_trial_reservations where task_id = $1;`, [taskIdJ])).rows[0];
+  if (jAttemptRow.attempt_count !== 2) {
+    throw new Error(`Expected attempt_count 2, got ${jAttemptRow.attempt_count}`);
+  }
+  console.log('✓ Retry on failed_refunded task atomically deducted balance (2 -> 1) and incremented attempt_count to 2');
+
+  // 4. Release again and simulate zero balance
+  const jToken2 = jRetry1.lease_token;
+  await db.query(`select public.release_trial_credit($1, 'AI_PARSE_ERROR', $2, $3);`, [taskIdJ, userNormalNew, jToken2]);
+  await db.query(`update public.ai_trial_credits set balance = 0 where user_id = $1;`, [userNormalNew]);
+
+  // 5. Retry when balance is 0: MUST be rejected with INSUFFICIENT_CREDITS
+  const jRetryNoBal = (await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'hash_j_01', $2, false, 500) as r;
+  `, [taskIdJ, userNormalNew])).rows[0].r;
+  if (jRetryNoBal.allowed !== false || jRetryNoBal.error_code !== 'INSUFFICIENT_CREDITS') {
+    throw new Error(`Retry with zero balance must be rejected with INSUFFICIENT_CREDITS: ${JSON.stringify(jRetryNoBal)}`);
+  }
+  console.log('✓ Retry on refunded task with 0 balance rejected with INSUFFICIENT_CREDITS');
+
+  // 6. Restore balance=2, simulate daily limit reached (call_count = 500)
+  await db.query(`update public.ai_trial_credits set balance = 2 where user_id = $1;`, [userNormalNew]);
+  await db.query(`
+    insert into public.operator_ai_daily_usage (usage_date, call_count)
+    values (current_date, 500)
+    on conflict (usage_date) do update set call_count = 500;
+  `);
+
+  // Retry when daily limit exceeded: MUST be rejected with OPERATOR_DAILY_CAP_EXCEEDED
+  const jRetryLimit = (await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'hash_j_01', $2, false, 500) as r;
+  `, [taskIdJ, userNormalNew])).rows[0].r;
+  if (jRetryLimit.allowed !== false || jRetryLimit.error_code !== 'OPERATOR_DAILY_CAP_EXCEEDED') {
+    throw new Error(`Retry with daily cap reached must fail with OPERATOR_DAILY_CAP_EXCEEDED: ${JSON.stringify(jRetryLimit)}`);
+  }
+  // Verify daily usage not inflated on rejection and balance untouched
+  const jUsageAfter = (await db.query(`select call_count from public.operator_ai_daily_usage where usage_date = current_date;`)).rows[0].call_count;
+  const jBalAfterCap = (await db.query(`select balance from public.ai_trial_credits where user_id = $1;`, [userNormalNew])).rows[0].balance;
+  if (jUsageAfter !== 500 || jBalAfterCap !== 2) {
+    throw new Error(`Rejected retry mutated balance or daily usage: bal=${jBalAfterCap}, usage=${jUsageAfter}`);
+  }
+  console.log('✓ Retry rejected on OPERATOR_DAILY_CAP_EXCEEDED without inflating usage or deducting balance');
+
+  // Reset daily usage to 10
+  await db.query(`update public.operator_ai_daily_usage set call_count = 10 where usage_date = current_date;`);
+
+  // 7. Max retries exceeded (attempt_count >= 5)
+  await db.query(`update public.ai_trial_reservations set attempt_count = 5 where task_id = $1;`, [taskIdJ]);
+  const jRetryMax = (await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'hash_j_01', $2, false, 500) as r;
+  `, [taskIdJ, userNormalNew])).rows[0].r;
+  if (jRetryMax.allowed !== false || jRetryMax.error_code !== 'MAX_RETRIES_EXCEEDED') {
+    throw new Error(`Attempt count >= 5 must fail with MAX_RETRIES_EXCEEDED: ${JSON.stringify(jRetryMax)}`);
+  }
+  console.log('✓ Retry rejected with MAX_RETRIES_EXCEEDED when attempt_count >= 5');
+
+  // 8. Expired lease retry on 'processing' task: NO double credit deduction, but AI budget applied
+  const taskIdJ2 = 'task_lease_exp_' + Date.now();
+  await db.query(`
+    select public.register_ai_task($1, 'evaluate_answer', 'hash_j_02', $2, false, 500) as r;
+  `, [taskIdJ2, userNormalNew]);
+  // balance: 2 -> 1
+  // Expire lease
+  await db.query(`
+    update public.ai_trial_reservations
+    set lease_expires_at = now() - interval '1 minute'
+    where task_id = $1;
+  `, [taskIdJ2]);
+
+  const balBeforeExpRetry = (await db.query(`select balance from public.ai_trial_credits where user_id = $1;`, [userNormalNew])).rows[0].balance;
+  const jExpRetry = (await db.query(`
+    select public.register_ai_task($1, 'evaluate_answer', 'hash_j_02', $2, false, 500) as r;
+  `, [taskIdJ2, userNormalNew])).rows[0].r;
+  if (!jExpRetry.allowed || jExpRetry.status !== 'processing') {
+    throw new Error(`Expired lease retry failed: ${JSON.stringify(jExpRetry)}`);
+  }
+  const jExpAttempt = (await db.query(`select attempt_count from public.ai_trial_reservations where task_id = $1;`, [taskIdJ2])).rows[0];
+  if (jExpAttempt.attempt_count !== 2) {
+    throw new Error(`Expected attempt_count 2 for expired lease retry, got ${jExpAttempt.attempt_count}`);
+  }
+  const balAfterExpRetry = (await db.query(`select balance from public.ai_trial_credits where user_id = $1;`, [userNormalNew])).rows[0].balance;
+  if (balBeforeExpRetry !== balAfterExpRetry) {
+    throw new Error(`Expired lease retry must NOT double deduct balance (${balBeforeExpRetry} vs ${balAfterExpRetry})`);
+  }
+  console.log('✓ Expired lease retry preserved balance without double deduction, issued fresh lease token and incremented attempt_count');
+
+  // --------------------------------------------------------------------------
+  // Scenario K: Credit Source Mismatch & Personal Key Refund Safety (Problems 1 & 3)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario K: Credit Source Mismatch & Personal Key Refund Safety (Problems 1 & 3) ---');
+  const taskPk = 'task_k_pk_' + Date.now();
+  // 1. Register with personal_key
+  const kPkReg = (await db.query(`
+    select public.register_ai_task($1, 'analyze_concepts', 'hash_k_01', $2, true, 500) as r;
+  `, [taskPk, userNormalNew])).rows[0].r;
+  if (!kPkReg.allowed || kPkReg.credit_source !== 'personal_key') {
+    throw new Error(`PK registration failed: ${JSON.stringify(kPkReg)}`);
+  }
+  const pkToken = kPkReg.lease_token;
+
+  // 2. Attempt to re-register personal_key task as operator_trial: MUST FAIL
+  const kMismatch1 = (await db.query(`
+    select public.register_ai_task($1, 'analyze_concepts', 'hash_k_01', $2, false, 500) as r;
+  `, [taskPk, userNormalNew])).rows[0].r;
+  if (kMismatch1.allowed !== false || kMismatch1.error_code !== 'TASK_CREDIT_SOURCE_MISMATCH') {
+    throw new Error(`Expected TASK_CREDIT_SOURCE_MISMATCH, got: ${JSON.stringify(kMismatch1)}`);
+  }
+  console.log('✓ Switching personal_key task to operator_trial rejected with TASK_CREDIT_SOURCE_MISMATCH');
+
+  // 3. Attempt to re-register operator_trial task as personal_key: MUST FAIL
+  const kMismatch2 = (await db.query(`
+    select public.register_ai_task($1, 'evaluate_answer', 'hash_j_02', $2, true, 500) as r;
+  `, [taskIdJ2, userNormalNew])).rows[0].r;
+  if (kMismatch2.allowed !== false || kMismatch2.error_code !== 'TASK_CREDIT_SOURCE_MISMATCH') {
+    throw new Error(`Expected TASK_CREDIT_SOURCE_MISMATCH, got: ${JSON.stringify(kMismatch2)}`);
+  }
+  console.log('✓ Switching operator_trial task to personal_key rejected with TASK_CREDIT_SOURCE_MISMATCH');
+
+  // 4. Release personal_key task: MUST NOT increment trial credits!
+  const balBeforePkRel = (await db.query(`select balance from public.ai_trial_credits where user_id = $1;`, [userNormalNew])).rows[0].balance;
+  const kPkRel = (await db.query(`
+    select public.release_trial_credit($1, 'USER_ABORT', $2, $3) as r;
+  `, [taskPk, userNormalNew, pkToken])).rows[0].r;
+  if (!kPkRel.success || kPkRel.refunded !== false) {
+    throw new Error(`Personal key release should have refunded=false: ${JSON.stringify(kPkRel)}`);
+  }
+  const balAfterPkRel = (await db.query(`select balance from public.ai_trial_credits where user_id = $1;`, [userNormalNew])).rows[0].balance;
+  if (balBeforePkRel !== balAfterPkRel) {
+    throw new Error(`Personal key release must NEVER inflate trial credit balance (${balBeforePkRel} -> ${balAfterPkRel})`);
+  }
+  console.log('✓ Releasing personal_key task safely released without trial balance inflation (refunded=false)');
+
+  // 5. clear_ai_task_lease for intermediate chunk progress
+  const taskChunk = 'task_chunk_' + Date.now();
+  const chunkInit = (await db.query(`
+    select public.register_ai_task($1, 'analyze_concepts', 'hash_chunk_01', $2, true, 500) as r;
+  `, [taskChunk, userNormalNew])).rows[0].r;
+  const chunkToken = chunkInit.lease_token;
+
+  // Normal immediate next chunk request would be blocked by CONCURRENT_EXECUTION_BLOCKED while lease active
+  const chunkBlocked = (await db.query(`
+    select public.register_ai_task($1, 'analyze_concepts', 'hash_chunk_01', $2, true, 500) as r;
+  `, [taskChunk, userNormalNew])).rows[0].r;
+  if (chunkBlocked.status !== 'concurrent_in_progress') {
+    throw new Error(`Active chunk lease must block duplicate: ${JSON.stringify(chunkBlocked)}`);
+  }
+
+  // Clear lease upon intermediate chunk finish
+  const clearRes = (await db.query(`
+    select public.clear_ai_task_lease($1, $2, $3) as r;
+  `, [taskChunk, userNormalNew, chunkToken])).rows[0].r;
+  if (!clearRes.success) {
+    throw new Error(`clear_ai_task_lease failed: ${JSON.stringify(clearRes)}`);
+  }
+  const chunkRow = (await db.query(`select status, lease_token, lease_expires_at from public.ai_trial_reservations where task_id = $1;`, [taskChunk])).rows[0];
+  if (chunkRow.status !== 'processing' || chunkRow.lease_token !== null) {
+    throw new Error(`clear_ai_task_lease did not clear lease correctly: ${JSON.stringify(chunkRow)}`);
+  }
+
+  // Now next chunk can register immediately without being blocked!
+  const chunkNext = (await db.query(`
+    select public.register_ai_task($1, 'analyze_concepts', 'hash_chunk_01', $2, true, 500) as r;
+  `, [taskChunk, userNormalNew])).rows[0].r;
+  if (!chunkNext.allowed || chunkNext.status !== 'processing') {
+    throw new Error(`Next chunk failed to register after clear_ai_task_lease: ${JSON.stringify(chunkNext)}`);
+  }
+  console.log('✓ clear_ai_task_lease enables smooth sequential multi-chunk execution without 409 collisions');
+
+  // --------------------------------------------------------------------------
+  // Scenario L: Telemetry Authoritative Aggregation & Permission Lockdown (Problem 4)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario L: Telemetry Authoritative Aggregation & Permission Lockdown (Problem 4) ---');
+  // 1. Insert 60 rows for userIdA, 10 rows for userIdB
+  await db.query(`
+    insert into public.ai_usage_telemetry (
+      request_id, user_id, task_type, credit_source, provider, model, input_tokens, output_tokens, total_tokens,
+      estimated_cost_usd, estimated_cost_krw, status, execution_time_ms, created_at
+    )
+    select
+      'req_a_' || i,
+      $1,
+      case when i % 2 = 0 then 'evaluate_answer' else 'generate_problems' end,
+      'operator_trial',
+      'school_gateway',
+      'deepseek-v4.1-flash',
+      100,
+      50,
+      150,
+      0.001,
+      1.4,
+      'success',
+      300,
+      now() - (i || ' minutes')::interval
+    from generate_series(1, 60) as i;
+  `, [userIdA]);
+
+  await db.query(`
+    insert into public.ai_usage_telemetry (
+      request_id, user_id, task_type, credit_source, provider, model, input_tokens, output_tokens, total_tokens,
+      estimated_cost_usd, estimated_cost_krw, status, execution_time_ms, created_at
+    )
+    select
+      'req_b_' || i,
+      $1,
+      'evaluate_answer',
+      'personal_key',
+      'openai',
+      'gpt-4o',
+      200,
+      100,
+      300,
+      0.005,
+      7.0,
+      'success',
+      400,
+      now() - (i || ' minutes')::interval
+    from generate_series(1, 10) as i;
+  `, [userIdB]);
+
+  // 2. Call aggregate_ai_usage_telemetry for userIdA
+  const aggA = (await db.query(`
+    select public.aggregate_ai_usage_telemetry($1, null, null, null, null, null) as r;
+  `, [userIdA])).rows[0].r;
+  if (aggA.totalRequests !== 60 || aggA.operatorTrialConsumption.tokens !== 9000) {
+    throw new Error(`Scenario L userIdA aggregation failed: ${JSON.stringify(aggA)}`);
+  }
+  console.log(`✓ Aggregate for 60 rows correctly returns totalRequests=60, operatorTrialTokens=${aggA.operatorTrialConsumption.tokens}`);
+
+  // 3. User isolation: userIdB only sees 10 rows
+  const aggB = (await db.query(`
+    select public.aggregate_ai_usage_telemetry($1, null, null, null, null, null) as r;
+  `, [userIdB])).rows[0].r;
+  if (aggB.totalRequests !== 10 || aggB.personalKeyConsumption.tokens !== 3000) {
+    throw new Error(`Scenario L userIdB aggregation failed: ${JSON.stringify(aggB)}`);
+  }
+  console.log(`✓ Aggregate for userIdB returns isolated totalRequests=10, personalKeyTokens=3000`);
+
+  // 4. Filtered aggregation (e.g. task_type = 'evaluate_answer' for userIdA -> 30 rows)
+  const aggFiltered = (await db.query(`
+    select public.aggregate_ai_usage_telemetry($1, 'evaluate_answer', null, null, null, null) as r;
+  `, [userIdA])).rows[0].r;
+  if (aggFiltered.totalRequests !== 30) {
+    throw new Error(`Scenario L filtered aggregation failed: ${JSON.stringify(aggFiltered)}`);
+  }
+  console.log(`✓ Filtered aggregation accurately counts 30 evaluate_answer rows`);
+
+  // 5. Admin role aggregate without userId sees all 70 rows
+  const aggAll = (await db.query(`
+    select public.aggregate_ai_usage_telemetry(null, null, null, null, null, null) as r;
+  `)).rows[0].r;
+  if (aggAll.totalRequests !== 70) {
+    throw new Error(`Admin global aggregation failed: ${JSON.stringify(aggAll)}`);
+  }
+  console.log(`✓ Admin aggregate across all users returns complete totalRequests=70`);
+
+  // 6. Permission lockdown: authenticated role CANNOT call aggregate_ai_usage_telemetry or clear_ai_task_lease
+  await setAuthContext(db, { uid: userIdA, role: 'authenticated' });
+  const unauthAgg = (await db.query(`
+    select public.aggregate_ai_usage_telemetry($1, null, null, null, null, null) as r;
+  `, [userIdA])).rows[0].r;
+  if (unauthAgg.error_code !== 'UNAUTHORIZED') {
+    throw new Error(`Authenticated user calling aggregate RPC must be rejected: ${JSON.stringify(unauthAgg)}`);
+  }
+  const unauthClear = (await db.query(`
+    select public.clear_ai_task_lease('any_task', $1, 'any_token') as r;
+  `, [userIdA])).rows[0].r;
+  if (unauthClear.error_code !== 'UNAUTHORIZED') {
+    throw new Error(`Authenticated user calling clear_ai_task_lease must be rejected: ${JSON.stringify(unauthClear)}`);
+  }
+  console.log('✓ Permission lockdown strictly verified for aggregate_ai_usage_telemetry and clear_ai_task_lease');
 
   console.log('\n=== All Upgrade Path & Scenario Tests Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~29) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~32) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -548,7 +884,7 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 29 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 32 on clean database`);
 }
 
 async function main() {

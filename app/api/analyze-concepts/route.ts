@@ -11,6 +11,7 @@ import {
   settleTrialCredit,
   releaseTrialCredit,
   recordTrialResultReady,
+  clearAiTaskLease,
   MAX_TRIAL_EXECUTION_TIMEOUT_MS,
   MAX_TRIAL_OUTPUT_TOKENS,
 } from '../../../lib/trialCredits';
@@ -1377,7 +1378,7 @@ ${chunk.text}
           inputText: userPrompt,
         });
 
-        if (cred.ok && cred.isTrial) {
+        if (cred.ok && cred.leaseToken) {
           await releaseTrialCredit(auth.user.id, jobKey, 'ai_call_failed', cred.leaseToken);
         }
         commitChunkResult(
@@ -1621,8 +1622,9 @@ ${chunk.text}
 
     // 8. Aggregate progress across the session ledger
     const progress = getSessionProgress(session);
+    const isCompleted = progress.status === 'completed' || progress.isAllComplete;
     let cacheSuccess = true;
-    if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial) {
+    if (isCompleted && cred.ok && cred.leaseToken) {
       const recRes = await recordTrialResultReady(auth.user.id, jobKey, { drafts: progress.allDrafts }, cred.leaseToken);
       if (!recRes.success) {
         cacheSuccess = false;
@@ -1644,6 +1646,9 @@ ${chunk.text}
         }
         console.warn('Record trial result warning in analyze-concepts:', recRes.error);
       }
+    } else if (!isCompleted && cred.ok && cred.leaseToken) {
+      // Intermediate chunk completion: clear execution lease so normal progression to next chunk is not blocked
+      await clearAiTaskLease(auth.user.id, jobKey, cred.leaseToken);
     }
 
     // 9. Persist drafts server-side
@@ -1671,7 +1676,7 @@ ${chunk.text}
       outcome = { persisted: true, drafts: progress.allDrafts };
     }
 
-    if ((progress.status === 'completed' || progress.isAllComplete) && cred.ok && cred.isTrial) {
+    if (isCompleted && cred.ok && cred.leaseToken) {
       if (cacheSuccess && outcome.persisted) {
         const settleResult = await settleTrialCredit(auth.user.id, jobKey, cred.leaseToken);
         if (!settleResult.success) {

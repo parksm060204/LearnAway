@@ -270,6 +270,7 @@ export interface TelemetryFilter {
   taskType?: string;
   creditSource?: AiCreditSource;
   model?: string;
+  limit?: number;
 }
 
 export interface DailyAiMetric {
@@ -509,11 +510,13 @@ export async function queryAiUsageTelemetryFromDb(
 }> {
   if (hasAdminClientConfig()) {
     const admin = createAdminClient();
+    const effectiveLimit = Math.min(1000, Math.max(1, filter?.limit ?? limit));
     let query = admin
       .from('ai_usage_telemetry')
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(Math.min(1000, Math.max(1, limit)));
+      .order('id', { ascending: false })
+      .limit(effectiveLimit);
 
     if (filter?.userId && filter.userId !== 'all') {
       query = query.eq('user_id', filter.userId);
@@ -539,7 +542,7 @@ export async function queryAiUsageTelemetryFromDb(
       throw new Error(`DB 계측 지표 조회 실패: ${error.message}`);
     }
 
-    const dbRecords: AiUsageTelemetryRecord[] = (data || []).map((row: Record<string, unknown>) => ({
+    const mapRowToRecord = (row: Record<string, unknown>): AiUsageTelemetryRecord => ({
       id: String(row.id || ''),
       requestId: String(row.request_id || row.id || ''),
       userId: String(row.user_id || ''),
@@ -557,9 +560,50 @@ export async function queryAiUsageTelemetryFromDb(
       errorCode: row.error_code ? String(row.error_code) : undefined,
       creditSource: (row.credit_source as AiCreditSource) || 'operator_trial',
       createdAt: String(row.created_at || ''),
-    }));
+    });
 
-    const summary = getAiUsageSummary(filter, dbRecords);
+    const dbRecords: AiUsageTelemetryRecord[] = (data || []).map(mapRowToRecord);
+
+    let summary: AiUsageSummary;
+    try {
+      const rpcParams = {
+        p_user_id: filter?.userId && filter.userId !== 'all' ? filter.userId : null,
+        p_task_type: filter?.taskType || null,
+        p_credit_source: filter?.creditSource || null,
+        p_model: filter?.model || null,
+        p_start_date: filter?.startDate || null,
+        p_end_date: filter?.endDate || null,
+      };
+      const { data: aggData, error: aggErr } = await admin.rpc('aggregate_ai_usage_telemetry', rpcParams);
+      if (!aggErr && aggData && typeof aggData === 'object' && 'totalRequests' in aggData) {
+        summary = aggData as AiUsageSummary;
+      } else {
+        let allQuery = admin.from('ai_usage_telemetry').select('*');
+        if (filter?.userId && filter.userId !== 'all') allQuery = allQuery.eq('user_id', filter.userId);
+        if (filter?.taskType) allQuery = allQuery.eq('task_type', filter.taskType);
+        if (filter?.creditSource) allQuery = allQuery.eq('credit_source', filter.creditSource);
+        if (filter?.model) allQuery = allQuery.eq('model', filter.model);
+        if (filter?.startDate) allQuery = allQuery.gte('created_at', filter.startDate);
+        if (filter?.endDate) allQuery = allQuery.lte('created_at', filter.endDate);
+        const { data: allData, error: allErr } = await allQuery;
+        if (allErr) throw new Error(`DB 계측 요약 조회 실패: ${allErr.message}`);
+        const allRecords = (allData || []).map(mapRowToRecord);
+        summary = getAiUsageSummary(filter, allRecords);
+      }
+    } catch {
+      let allQuery = admin.from('ai_usage_telemetry').select('*');
+      if (filter?.userId && filter.userId !== 'all') allQuery = allQuery.eq('user_id', filter.userId);
+      if (filter?.taskType) allQuery = allQuery.eq('task_type', filter.taskType);
+      if (filter?.creditSource) allQuery = allQuery.eq('credit_source', filter.creditSource);
+      if (filter?.model) allQuery = allQuery.eq('model', filter.model);
+      if (filter?.startDate) allQuery = allQuery.gte('created_at', filter.startDate);
+      if (filter?.endDate) allQuery = allQuery.lte('created_at', filter.endDate);
+      const { data: allData, error: allErr } = await allQuery;
+      if (allErr) throw new Error(`DB 계측 요약 조회 실패: ${allErr.message}`);
+      const allRecords = (allData || []).map(mapRowToRecord);
+      summary = getAiUsageSummary(filter, allRecords);
+    }
+
     return {
       records: dbRecords,
       summary,
