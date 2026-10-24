@@ -196,10 +196,13 @@ export type AiConfigResolution =
         | 'insufficient_credits'
         | 'operator_disabled'
         | 'trial_limit_exceeded'
+        | 'task_input_mismatch'
+        | 'task_ownership_mismatch'
         | 'already_completed'
         | 'already_completed_missing_result'
         | 'concurrent_in_progress';
       message: string;
+      errorCode?: string;
       cachedResult?: unknown;
       needsAiConnection?: boolean;
     };
@@ -346,6 +349,24 @@ export async function resolveAiConfigForUser(
         code: 'insufficient_credits',
         needsAiConnection: true,
         message: reservation.message || 'AI 체험 크레딧이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+      };
+    }
+
+    if (reservation.errorCode === 'TASK_INPUT_MISMATCH') {
+      return {
+        ok: false,
+        code: 'task_input_mismatch',
+        errorCode: 'TASK_INPUT_MISMATCH',
+        message: reservation.message || '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.',
+      };
+    }
+
+    if (reservation.errorCode === 'TASK_OWNERSHIP_MISMATCH') {
+      return {
+        ok: false,
+        code: 'task_ownership_mismatch',
+        errorCode: 'TASK_OWNERSHIP_MISMATCH',
+        message: reservation.message || '해당 작업에 대한 접근 권한이 없습니다.',
       };
     }
 

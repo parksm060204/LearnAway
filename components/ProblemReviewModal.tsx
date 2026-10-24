@@ -577,7 +577,7 @@ export function ProblemReviewModal({
                           </span>
                         );
                       })()}
-                      {activeDraft.sourceVerificationStatus === 'verified' && (
+                      {activeDraft.sourceVerificationStatus === 'verified' && !activeDraft.needsSourceReview && !activeDraft.isOutdated && (
                         <span className="text-xs font-academic-mono bg-emerald-50 border border-emerald-300 text-emerald-800 px-2 py-0.5 rounded-xs font-semibold">
                           출처 검증 완료
                         </span>

@@ -616,7 +616,7 @@ export async function POST(req: NextRequest) {
 
 8. **[P03-05 핵심] 9대 학술 오류 원인 분류 (Academic Error Taxonomy)**:
    - 답안에서 감점이 발생한 경우 가장 본질적인 원인을 다음 9개 중 1개로 정확히 분류하십시오:
-     - "NO_ERROR": 정답 완제 (점수 90점 이상)
+     - "NO_ERROR": 오류 없음 (완전한 정답 완제 및 감점 요인이 전혀 없는 100점 만점인 경우)
      - "CONCEPT_MISUNDERSTANDING": 개념 이해 부족 (핵심 개념·정의 오해)
      - "FORMULA_MISAPPLICATION": 공식의 잘못된 적용 (부적합한 공식/정리 적용 또는 전제조건 위반)
      - "CALCULATION_ERROR": 계산 실수 (접근법은 옳으나 중간 산술/대수/부호 실수)
@@ -626,7 +626,10 @@ export async function POST(req: NextRequest) {
      - "INCOMPLETE_REASONING": 풀이 과정 부족 (정답만 작성, 핵심 증명/유도 생략)
      - "ANSWER_FORMAT_ERROR": 답안 형식 오류 (단위 누락, 제출 양식 미준수)
      - "UNCERTAIN": 원인 확정 불가 (답안이 극히 짧거나 모호하여 단정할 수 없음)
-   - 원인을 확정할 수 없는 경우 임의로 "개념 이해 부족"으로 단정하지 말고 "UNCERTAIN"으로 분류하십시오.
+   - [중요 원칙]:
+     - 학생 답안에 소폭의 감점(예: 95점)이 있더라도 계산 실수나 부호 착오가 있다면 "NO_ERROR"로 처리하지 말고 "CALCULATION_ERROR" 등 발생한 실제 오류로 정확히 분류하십시오. 점수가 높다는 이유만으로 기계적으로 NO_ERROR로 처리하지 마십시오.
+     - 100점 만점으로 감점 요인이 전혀 없는 경우에만 "NO_ERROR"로 분류하십시오.
+     - 원인을 확정할 수 없는 경우 임의로 "개념 이해 부족"으로 단정하지 말고 "UNCERTAIN"으로 분류하십시오.
 
 9. **[8단계 핵심] 방법 선택 이유(Method Selection Reason) 독립 진단 원칙**:
    - 학생이 작성한 [풀이 및 결론]과 [방법 선택 이유]를 분리하여 진단합니다.
@@ -817,11 +820,16 @@ ${
       if (typeof content !== 'string') throw new Error('AI 평가 응답이 텍스트가 아닙니다.');
       const cleanJson = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
       parsed = JSON.parse(cleanJson);
+      const primaryConceptId = authoritativeConceptIds.includes(conceptId)
+        ? conceptId
+        : (authoritativeConceptIds[0] || conceptId || '');
+
       evaluationResult = validateEvaluationOutput(parsed, checkedRubric, {
-        conceptId,
+        conceptId: primaryConceptId,
         conceptTitle: problemTitle,
         userAnswer,
         allowedConceptIds: authoritativeConceptIds,
+        isProvisionalLocal: isProvisional,
       });
       evaluationResult.sourceProvenance = {
         sourceMaterialId: resolvedMaterialId,
@@ -1004,12 +1012,16 @@ ${
       }
     }
 
+    const finalReturnedConceptId = evaluationResult.conceptId || evaluationResult.structuredError?.conceptId ||
+      (authoritativeConceptIds.includes(conceptId) ? conceptId : (authoritativeConceptIds[0] || conceptId));
+    evaluationResult.conceptId = finalReturnedConceptId;
+
     return NextResponse.json({
       success: true,
       evaluation: evaluationResult,
       problemId,
-      conceptId,
-      conceptIds,
+      conceptId: finalReturnedConceptId,
+      conceptIds: authoritativeConceptIds,
       subjectId,
       isProvisionalLocal: isProvisional,
     });

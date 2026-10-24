@@ -52,6 +52,74 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 }
 
+// Explicit taskId registry to enforce that different inputs reusing the same explicit taskId are rejected
+const explicitTaskRegistry = new Map<string, { userId: string; inputIdentifier: string }>();
+
+export function verifyPageGrounding(params: {
+  markdown: string;
+  quote: string;
+  candidatePage?: string;
+  sourceRefs?: string;
+}): string | undefined {
+  const { markdown, quote, candidatePage, sourceRefs } = params;
+  const normQuote = quote.replace(/\s+/g, ' ').trim();
+  if (!normQuote) return undefined;
+
+  // 1. Scan for explicit page boundaries in markdown
+  // e.g. <!-- Page 3 -->, [Page 3], [p. 3], ## Page 3, [Page 3/40]
+  const PAGE_BOUNDARY_REGEX = /(?:<!--\s*page\s*(\d+)\s*-->|\[\s*(?:page|p\.?)\s*(\d+)(?:\/\d+)?\s*\]|^#+\s*(?:page|페이지)\s*(\d+)\b)/gim;
+  const pageMarkers: { offset: number; page: string }[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = PAGE_BOUNDARY_REGEX.exec(markdown)) !== null) {
+    const pageNum = match[1] || match[2] || match[3];
+    if (pageNum) {
+      pageMarkers.push({ offset: match.index, page: pageNum });
+    }
+  }
+
+  // Find position of quote in markdown
+  const normMarkdown = markdown.replace(/\s+/g, ' ');
+  const quotePos = normMarkdown.indexOf(normQuote);
+
+  if (pageMarkers.length > 0 && quotePos >= 0) {
+    let confirmedPage: string | undefined = undefined;
+    for (const marker of pageMarkers) {
+      const markerPos = markdown.slice(0, marker.offset).replace(/\s+/g, ' ').length;
+      if (markerPos <= quotePos) {
+        confirmedPage = marker.page;
+      } else {
+        break;
+      }
+    }
+
+    if (confirmedPage) {
+      const cleanCandidate = (candidatePage || '').replace(/\D/g, '');
+      if (!cleanCandidate || cleanCandidate === confirmedPage) {
+        return confirmedPage;
+      }
+      return confirmedPage;
+    }
+  }
+
+  // 2. If no page boundaries exist in markdown:
+  // Do NOT treat random digits in text as page evidence!
+  // Only accept if sourceRefs explicitly specifies an isolated page number (e.g. "p. 15", "15페이지")
+  if (sourceRefs && typeof sourceRefs === 'string') {
+    const pageRefMatch = /(?:^|[,\s])(?:p\.?|page|쪽|페이지)\s*([0-9]+)(?:[,\s]|$)/i.exec(sourceRefs.trim());
+    if (pageRefMatch && pageRefMatch[1]) {
+      const extractedPage = pageRefMatch[1];
+      const cleanCandidate = (candidatePage || '').replace(/\D/g, '');
+      if (!cleanCandidate || cleanCandidate === extractedPage) {
+        return extractedPage;
+      }
+    }
+  }
+
+  // Unverifiable page -> return undefined
+  return undefined;
+}
+
 const MATH_PROBLEM_TYPES: ProblemType[] = [
   'essay_descriptive',
   'calc_derivation',
@@ -264,8 +332,44 @@ export async function POST(req: NextRequest) {
       .join('\n\n===== 다음 자료 =====\n\n');
     const markdownHash = computeMarkdownHash(combinedSource);
     const conceptKey = concepts.map((c) => c.id).sort().join(',');
-    const inputIdentifier = computeMarkdownHash(`${subjectId}:${conceptKey}:${problemType}:${difficulty}:${markdownHash}`);
-    const taskId = asString(payload.taskId) || (`gen_${inputIdentifier}`);
+    const sourceVersions = sourceMaterials.map((s) => `${s.materialId}:${s.markdownHash}`).sort().join(';');
+
+    // Legacy inputIdentifier for backward compatibility and recovering older tasks
+    const legacyInputIdentifier = computeMarkdownHash(`${subjectId}:${conceptKey}:${problemType}:${difficulty}:${markdownHash}`);
+
+    // Authoritative normalized inputIdentifier: includes difficultyLevel, applied count, problemType, legacy difficulty, subject, concepts, and material versions
+    const inputIdentifier = computeMarkdownHash(
+      `${subjectId}:${conceptKey}:${problemType}:${difficulty}:${difficultyLevel}:${count}:${markdownHash}:${sourceVersions}`
+    );
+
+    const isExplicitTaskId = Boolean(payload.taskId && typeof payload.taskId === 'string' && payload.taskId.trim());
+    const explicitTaskId = isExplicitTaskId ? (payload.taskId as string).trim() : null;
+    const isLegacyDefaultTaskId = explicitTaskId === `gen_${legacyInputIdentifier}`;
+    const effectiveInputIdentifier = isLegacyDefaultTaskId ? legacyInputIdentifier : inputIdentifier;
+    const taskId = explicitTaskId || (`gen_${inputIdentifier}`);
+    const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+
+    // Reject mismatch if explicit taskId was already used with a different input
+    if (explicitTaskId) {
+      const existingTask = explicitTaskRegistry.get(explicitTaskId);
+      if (existingTask) {
+        if (existingTask.userId !== auth.user.id) {
+          return NextResponse.json(
+            { success: false, error: '해당 작업에 대한 접근 권한이 없습니다.', errorCode: 'TASK_OWNERSHIP_MISMATCH' },
+            { status: 403 }
+          );
+        }
+        if (
+          existingTask.inputIdentifier !== inputIdentifier &&
+          existingTask.inputIdentifier !== legacyInputIdentifier
+        ) {
+          return NextResponse.json(
+            { success: false, error: '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.', errorCode: 'TASK_INPUT_MISMATCH' },
+            { status: 400 }
+          );
+        }
+      }
+    }
 
     // Check trial limits if user has no personal API key
     const userLookup = await lookupConnectionSecret(auth.user.id);
@@ -283,9 +387,30 @@ export async function POST(req: NextRequest) {
     const cred = await resolveAiConfigForUser(auth.user.id, {
       taskId,
       taskType: 'generate_problems',
-      inputIdentifier,
+      inputIdentifier: effectiveInputIdentifier,
+      isSaveRetry,
     });
     if (!cred.ok) {
+      if (cred.code === 'task_input_mismatch' || cred.errorCode === 'TASK_INPUT_MISMATCH') {
+        return NextResponse.json(
+          {
+            success: false,
+            error: cred.message || '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.',
+            errorCode: 'TASK_INPUT_MISMATCH',
+          },
+          { status: 400 }
+        );
+      }
+      if (cred.code === 'task_ownership_mismatch' || cred.errorCode === 'TASK_OWNERSHIP_MISMATCH') {
+        return NextResponse.json(
+          {
+            success: false,
+            error: cred.message || '해당 작업에 대한 접근 권한이 없습니다.',
+            errorCode: 'TASK_OWNERSHIP_MISMATCH',
+          },
+          { status: 403 }
+        );
+      }
       if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
         const cached = cred.cachedResult as { drafts?: ProblemDraft[]; count?: number; generationJobId?: string };
         const generationJobId = cached.generationJobId || taskId || randomUUID();
@@ -610,19 +735,13 @@ ${combinedSource}
           sourceMaterialId = matchedSource.materialId;
           sourceContentVersion = computeMarkdownHash(matchedSource.markdown);
 
-          // Verify page grounding if provided: do NOT fill arbitrary page without evidence
-          const rawPage = asString(raw.sourcePage).trim();
-          if (rawPage) {
-            const normalizedSource = normalize(matchedSource.markdown);
-            const normalizedRefs = matchedSource.sourceRefs ? normalize(matchedSource.sourceRefs) : '';
-            if (normalizedSource.includes(normalize(rawPage)) || normalizedRefs.includes(normalize(rawPage))) {
-              sourcePage = rawPage;
-            } else if (matchedSource.sourceRefs) {
-              sourcePage = matchedSource.sourceRefs;
-            }
-          } else if (matchedSource.sourceRefs) {
-            sourcePage = matchedSource.sourceRefs;
-          }
+          // Verify page grounding if provided: do NOT fill arbitrary page without reliable evidence
+          sourcePage = verifyPageGrounding({
+            markdown: matchedSource.markdown,
+            quote,
+            candidatePage: asString(raw.sourcePage).trim() || undefined,
+            sourceRefs: matchedSource.sourceRefs || asString(raw.sourceRefs).trim() || undefined,
+          });
         } else if (matchingSources.length > 1) {
           // Quote exists in multiple sources: ambiguity / multi-source
           isSourceVerified = false;
@@ -827,6 +946,13 @@ ${combinedSource}
             ? '결과 캐시 보존이 완료되지 않아 크레딧 확정을 보류했습니다.'
             : '초안 DB 저장이 완료되지 않아 크레딧 확정을 보류했습니다.';
         }
+      }
+
+      if (explicitTaskId) {
+        explicitTaskRegistry.set(explicitTaskId, {
+          userId: auth.user.id,
+          inputIdentifier: effectiveInputIdentifier,
+        });
       }
 
       return NextResponse.json({

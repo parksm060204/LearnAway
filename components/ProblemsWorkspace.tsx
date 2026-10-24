@@ -425,13 +425,13 @@ export function ProblemsWorkspace({
                               </span>
                             );
                           })()}
-                          {prob.sourceVerificationStatus === 'verified' && (
+                          {prob.sourceVerificationStatus === 'verified' && !prob.needsSourceReview && !prob.isOutdated && (
                             <span className="text-[10px] font-academic-mono bg-emerald-50 border border-emerald-300 text-emerald-800 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">
                               출처 검증 완료
                             </span>
                           )}
 
-                          {prob.isOutdated && (
+                          {(prob.isOutdated || prob.needsSourceReview || prob.sourceVerificationStatus === 'needs_review') && (
                             <span className="text-[10px] font-academic-mono bg-amber-50 border border-amber-300 text-amber-800 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">
                               <AlertTriangle className="w-2.5 h-2.5 text-amber-600" />
                               출처 검토 필요

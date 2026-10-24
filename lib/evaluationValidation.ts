@@ -43,38 +43,74 @@ export interface ValidateEvaluationOutputOptions {
   conceptTitle?: string;
   sourceMaterialId?: string;
   userAnswer?: string;
+  isProvisionalLocal?: boolean;
 }
 
-function normalizeText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-const OMISSION_MARKERS = [
+export const CANONICAL_OMISSION_DIAGNOSES = new Set([
+  '답안에 해당 서술 없음',
   '해당 서술 없음',
+  '답안에 서술 없음',
   '서술 없음',
   '답안에 없음',
   '언급 없음',
-  '미작성',
-  '누락',
+  '답안에 언급 없음',
   '내용 없음',
+  '미작성',
+  '필요한 서술 누락',
+  '필요 서술 누락',
+  '조건 누락',
+  '누락',
   'no mention',
   'not mentioned',
   'not stated',
   'omitted',
-];
+  'omitted in answer',
+]);
 
-function isOmissionMarker(text: string): boolean {
-  const norm = text.toLowerCase();
-  return OMISSION_MARKERS.some((marker) => norm.includes(marker));
+export function isOmissionDiagnosis(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const cleaned = text
+    .trim()
+    .replace(/^["'“”‘’([{\s]+|["'“”‘’)}\].;\s]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  return CANONICAL_OMISSION_DIAGNOSES.has(cleaned);
 }
 
-function verifyQuoteInAnswer(quote: string, answer: string): boolean {
+export function normalizeWhitespacePreservingCase(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+export function isQuoteGroundingVerified(quote: string, answer: string): boolean {
+  const trimmedQuote = quote.trim();
+  const trimmedAnswer = answer.trim();
+  if (!trimmedQuote || !trimmedAnswer) return false;
+
+  // Strip wrapping markdown backticks or outer quotes from model quotation
+  const unwrappedQuote = trimmedQuote.replace(/^[`"'\s]+|[`"'\s]+$/g, '').trim();
+  if (!unwrappedQuote) return false;
+
+  const normQuote = normalizeWhitespacePreservingCase(unwrappedQuote);
+  const normAnswer = normalizeWhitespacePreservingCase(trimmedAnswer);
+
+  if (normAnswer.includes(normQuote)) return true;
+
+  // If quote has LaTeX math delimiters like $A = 1$ or $$A = 1$$
+  const mathUnwrapped = unwrappedQuote.replace(/^\$+|\$+$/g, '').trim();
+  if (mathUnwrapped) {
+    const normMath = normalizeWhitespacePreservingCase(mathUnwrapped);
+    if (normAnswer.includes(normMath)) return true;
+  }
+
+  return false;
+}
+
+export function verifyQuoteInAnswer(quote: string, answer: string): boolean {
   const trimmed = quote.trim();
   if (!trimmed) return false;
-  if (isOmissionMarker(trimmed)) return true; // Valid indication that answer omitted the required step
-  const normQuote = normalizeText(trimmed);
-  const normAnswer = normalizeText(answer);
-  return normAnswer.includes(normQuote);
+  if (isOmissionDiagnosis(trimmed)) return true; // Canonical omission diagnosis
+  return isQuoteGroundingVerified(trimmed, answer);
 }
 
 /** Missing or malformed model output is an API failure, never a student's zero. */
@@ -167,14 +203,20 @@ export function validateEvaluationOutput(
     if (rawTopError) {
       const resolved = toAcademicErrorType(rawTopError);
       if (resolved === 'NO_ERROR') {
-        // 감점되었는데 오류 없음으로 보고한 경우:
+        // 감점되었는데 오류 없음으로 보고한 경우: 점수와 무관하게 모순 감지 및 UNCERTAIN 처리
         needsReview = true;
-        academicErrorType = calculatedScore < 90 ? 'UNCERTAIN' : 'NO_ERROR';
+        academicErrorType = 'UNCERTAIN';
       } else {
         academicErrorType = resolved;
       }
     } else if (rawStructuredError) {
-      academicErrorType = toAcademicErrorType(rawStructuredError);
+      const structResolved = toAcademicErrorType(rawStructuredError);
+      if (structResolved === 'NO_ERROR') {
+        needsReview = true;
+        academicErrorType = 'UNCERTAIN';
+      } else {
+        academicErrorType = structResolved;
+      }
     } else {
       // 원인 정보가 전혀 없는 경우: 임의로 개념 이해 부족으로 단정하지 말고 UNCERTAIN 처리
       academicErrorType = 'UNCERTAIN';
@@ -185,27 +227,58 @@ export function validateEvaluationOutput(
   const legacyErrorType: ErrorType = toLegacyErrorType(academicErrorType);
 
   // Validate allowed concept IDs for structured error
+  const hasAuthoritativeSet = Array.isArray(options?.allowedConceptIds);
   const allowedConceptIds = new Set<string>();
-  if (options?.allowedConceptIds && Array.isArray(options.allowedConceptIds)) {
-    options.allowedConceptIds.forEach((id) => id && allowedConceptIds.add(id));
-  }
-  if (options?.conceptIds && Array.isArray(options.conceptIds)) {
-    options.conceptIds.forEach((id) => id && allowedConceptIds.add(id));
-  }
-  if (options?.conceptId) {
-    allowedConceptIds.add(options.conceptId);
+  if (hasAuthoritativeSet) {
+    // Registered problems: strictly use the concept set authorized by server!
+    options!.allowedConceptIds!.forEach((id) => id && allowedConceptIds.add(id));
+  } else if (options?.isProvisionalLocal) {
+    // Provisional local problems: allow client concept IDs
+    if (options.conceptIds && Array.isArray(options.conceptIds)) {
+      options.conceptIds.forEach((id) => id && allowedConceptIds.add(id));
+    }
+    if (options.conceptId) {
+      allowedConceptIds.add(options.conceptId);
+    }
   }
 
-  let finalConceptId = options?.conceptId || '';
-  if (rawStructured?.conceptId && typeof rawStructured.conceptId === 'string' && rawStructured.conceptId.trim()) {
-    const candidateId = rawStructured.conceptId.trim();
-    if (allowedConceptIds.size > 0 && !allowedConceptIds.has(candidateId)) {
-      // 임의/타 개념 ID -> 권위 있는 ID가 아니므로 검토 필요 및 기본 conceptId로 대체
-      needsReview = true;
-      finalConceptId = options?.conceptId || Array.from(allowedConceptIds)[0] || '';
+  // Pick default conceptId within authoritative set if available
+  let defaultConceptId = '';
+  if (options?.conceptId && allowedConceptIds.has(options.conceptId)) {
+    defaultConceptId = options.conceptId;
+  } else if (allowedConceptIds.size > 0) {
+    defaultConceptId = Array.from(allowedConceptIds)[0];
+  } else {
+    defaultConceptId = options?.conceptId || '';
+  }
+
+  let finalConceptId = defaultConceptId;
+  const candidateRaw =
+    (rawStructured?.conceptId && typeof rawStructured.conceptId === 'string' && rawStructured.conceptId.trim())
+      ? rawStructured.conceptId.trim()
+      : (parsed.conceptId && typeof parsed.conceptId === 'string' && parsed.conceptId.trim())
+        ? (parsed.conceptId as string).trim()
+        : '';
+
+  if (candidateRaw) {
+    const candidateId = candidateRaw;
+    if (allowedConceptIds.size > 0) {
+      if (!allowedConceptIds.has(candidateId)) {
+        // Not in server authoritative set! Flag for review and fall back to authorized ID
+        needsReview = true;
+        finalConceptId = defaultConceptId;
+      } else {
+        finalConceptId = candidateId;
+      }
     } else {
-      finalConceptId = candidateId;
+      // No authorized concepts in registered problem: flag review
+      if (!options?.isProvisionalLocal) {
+        needsReview = true;
+      }
+      finalConceptId = defaultConceptId || candidateId;
     }
+  } else if (allowedConceptIds.size === 0 && !options?.isProvisionalLocal) {
+    needsReview = true;
   }
 
   // Validate structured error evidence quote
@@ -264,6 +337,7 @@ export function validateEvaluationOutput(
     recommendedErrorType: legacyErrorType,
     academicErrorType,
     structuredError,
+    conceptId: finalConceptId,
     staticAnalysisNotice: '본 평가는 AI의 정적 분석 및 논증 검토이며, 코드를 실행하거나 동적 테스트하지 않았습니다.',
     needsReview,
     isAiEvaluated: true,

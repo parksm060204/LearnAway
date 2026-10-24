@@ -15704,6 +15704,638 @@ exports.requireApiUser = async () => {
     assert.ok(cost.estimatedCostUsd > 0 && cost.estimatedCostUsd < 1, '100만 토큰당 합리적 단가');
   });
 
+  // --- Plan-03 Academic Assessment Fixes Verification ---
+  const generateProblemsRoute = load(path.join(output, 'app/api/generate-problems/route.js'));
+  const generateProblemsPOST = generateProblemsRoute.POST;
+  const verifyPageGrounding = generateProblemsRoute.verifyPageGrounding;
+
+  const savedFallbackPlan03 = process.env.AI_ALLOW_OPERATOR_FALLBACK;
+  const savedApiKeyPlan03 = AI_CONFIG.apiKey;
+  const trialClientBackupPlan03 = globalThis.__fakeSupabaseClient;
+
+  process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
+  AI_CONFIG.apiKey = 'test-only-not-a-real-key';
+
+  const defaultFakeSupabase = {
+    rpc: async (name) => {
+      if (name === 'consume_ai_call_budget') {
+        return { data: { allowed: true, remaining: 9, retryAfterSeconds: 60 }, error: null };
+      }
+      if (name === 'get_or_create_trial_credits') {
+        return { data: { success: true, granted_credits: 3, remaining_credits: 3, is_first_grant: false }, error: null };
+      }
+      if (name === 'reserve_trial_credit') {
+        return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lease_mock_token_123' }, error: null };
+      }
+      if (name === 'settle_trial_credit') {
+        return { data: { success: true, status: 'settled', is_existing: false }, error: null };
+      }
+      if (name === 'release_trial_credit') {
+        return { data: { success: true, refunded: true, remaining_credits: 3 }, error: null };
+      }
+      return { data: null, error: null };
+    },
+    from: () => ({
+      insert: () => ({ error: null }),
+      select: () => {
+        const query = {
+          eq: (col, val) => ({
+            ...query,
+            maybeSingle: async () => ({
+              data: val === 'prob-authoritative-test'
+                ? {
+                    id: val,
+                    user_id: 'test-user',
+                    version: 1,
+                    quality_status: 'normal',
+                    concept_ids: ['c-authoritative-main', 'c-authoritative-sub'],
+                    payload: {
+                      promptText: '선형 변환의 고유값 문제 지문',
+                      modelAnswer: 'det(A - lambda I) = 0을 만족하는 스칼라 lambda',
+                      rubric: [{ id: 'r1', label: '채점', maxScore: 100, weight: 1, description: '평가' }],
+                      conceptIds: ['c-authoritative-main', 'c-authoritative-sub'],
+                    },
+                  }
+                : null,
+              error: null,
+            }),
+            single: async () => ({
+              data: val === 'prob-authoritative-test'
+                ? {
+                    id: val,
+                    user_id: 'test-user',
+                    version: 1,
+                    quality_status: 'normal',
+                    concept_ids: ['c-authoritative-main', 'c-authoritative-sub'],
+                    payload: {
+                      promptText: '선형 변환의 고유값 문제 지문',
+                      modelAnswer: 'det(A - lambda I) = 0을 만족하는 스칼라 lambda',
+                      rubric: [{ id: 'r1', label: '채점', maxScore: 100, weight: 1, description: '평가' }],
+                      conceptIds: ['c-authoritative-main', 'c-authoritative-sub'],
+                    },
+                  }
+                : null,
+              error: null,
+            }),
+          }),
+          maybeSingle: async () => ({ data: null, error: null }),
+          single: async () => ({ data: null, error: null }),
+        };
+        return query;
+      },
+    }),
+  };
+  globalThis.__fakeSupabaseClient = defaultFakeSupabase;
+
+  // ISSUE-01 [P1]: 문제 생성 입력 식별자 정규화, 난이도/문항수 충돌 방지 및 taskId 불일치 거부 검증
+  await checkAsync('ISSUE-01 [P1]: 문제 생성 입력 식별자 정규화, 난이도/문항수 충돌 방지 및 taskId 불일치 거부 검증', async () => {
+    const baseSource = [{
+      materialId: 'mat-p1-test',
+      title: '선형대수학 강의록',
+      markdown: '행렬식 det(A)는 정방행렬의 가역성을 판별하는 스칼라값이다. <!-- Page 1 --> 역행렬이 존재할 필요충분조건은 det(A) != 0 이다.',
+      sourceRefs: '1장',
+    }];
+    const baseConcept = { id: 'c-linalg-p1', subjectId: 'subj-math-p1', title: '행렬식과 가역성' };
+
+    let aiFetchCount = 0;
+    const originalFetch = global.fetch;
+
+    const aiClientPath = path.join(output, 'lib', 'aiClient.js');
+    const aiModule = load(aiClientPath);
+    const origCallAiChat = aiModule.callAiChat;
+
+    aiModule.callAiChat = async () => {
+      aiFetchCount++;
+      const sampleDraft = {
+        title: '가역행렬과 행렬식 증명',
+        promptText: 'nxn 정방행렬 A에 대해 역행렬이 존재할 필요충분조건이 det(A) != 0 임을 증명하시오.',
+        modelAnswer: 'det(A) != 0 이면 rank(A) = n 이므로 가역이다.',
+        rubric: [
+          { id: 'r1', label: '정의 서술', maxScore: 50, weight: 0.5, description: '가역성과 행렬식 정의' },
+          { id: 'r2', label: '논리 전개', maxScore: 50, weight: 0.5, description: '필요충분조건 양방향 증명' },
+        ],
+        hints: ['기약 행 사다리꼴(RREF)을 고려하시오.'],
+        sourceExcerpt: '역행렬이 존재할 필요충분조건은 det(A) != 0 이다.',
+        sourcePage: 1,
+      };
+      return {
+        ok: true,
+        content: JSON.stringify({ problems: [sampleDraft] }),
+        model: 'deepseek-v4.1-flash',
+        usage: { promptTokens: 100, completionTokens: 100 },
+      };
+    };
+
+    try {
+      // Level 1 call
+      const reqL1 = new NextRequest('http://localhost/api/generate-problems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'subj-math-p1',
+          subjectDomain: 'math_stats',
+          problemType: 'proof_counterexample',
+          difficultyLevel: 1,
+          difficulty: 'intermediate',
+          problemCount: 1,
+          concepts: [baseConcept],
+          sources: baseSource,
+        }),
+      });
+      const resL1 = await generateProblemsPOST(reqL1);
+      const jsonL1 = await resL1.json();
+      assert.equal(resL1.status, 200, 'Level 1 문제 생성 성공');
+      assert.equal(jsonL1.count, 1);
+      assert.equal(jsonL1.drafts[0].difficultyLevel, 1);
+
+      // Level 2 call (must not collide with Level 1 cache even though both map to intermediate)
+      const callsBeforeL2 = aiFetchCount;
+      const reqL2 = new NextRequest('http://localhost/api/generate-problems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'subj-math-p1',
+          subjectDomain: 'math_stats',
+          problemType: 'proof_counterexample',
+          difficultyLevel: 2,
+          difficulty: 'intermediate',
+          problemCount: 1,
+          concepts: [baseConcept],
+          sources: baseSource,
+        }),
+      });
+      const resL2 = await generateProblemsPOST(reqL2);
+      assert.equal(resL2.status, 200, 'Level 2 문제 생성 성공');
+      const jsonL2 = await resL2.json();
+      assert.equal(jsonL2.drafts[0].difficultyLevel, 2);
+      assert.ok(aiFetchCount > callsBeforeL2, 'Level 1 캐시를 오인하지 않고 별도 AI 호출 수행');
+
+      // Problem Count 2 call (must not collide with Count 1)
+      const callsBeforeC2 = aiFetchCount;
+      const reqC2 = new NextRequest('http://localhost/api/generate-problems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'subj-math-p1',
+          subjectDomain: 'math_stats',
+          problemType: 'proof_counterexample',
+          difficultyLevel: 2,
+          difficulty: 'intermediate',
+          problemCount: 2,
+          concepts: [baseConcept],
+          sources: baseSource,
+        }),
+      });
+      const resC2 = await generateProblemsPOST(reqC2);
+      assert.equal(resC2.status, 200, '문항수 2 문제 생성 성공');
+      assert.ok(aiFetchCount > callsBeforeC2, '1문항 캐시를 오인하지 않고 별도 작업 실행');
+
+      // Explicit taskId reuse with mismatched inputs -> Must reject with 400 TASK_INPUT_MISMATCH
+      const explicitTaskId = 'task-p1-unique-' + Date.now();
+      const reqTask1 = new NextRequest('http://localhost/api/generate-problems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          taskId: explicitTaskId,
+          subjectId: 'subj-math-p1',
+          subjectDomain: 'math_stats',
+          problemType: 'proof_counterexample',
+          difficultyLevel: 3,
+          difficulty: 'advanced_college',
+          problemCount: 1,
+          concepts: [baseConcept],
+          sources: baseSource,
+        }),
+      });
+      const resTask1 = await generateProblemsPOST(reqTask1);
+      assert.equal(resTask1.status, 200, '명시적 taskId 최초 생성 성공');
+
+      // Attempt to reuse same explicitTaskId with different difficultyLevel (Level 4)
+      const reqTaskMismatch = new NextRequest('http://localhost/api/generate-problems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          taskId: explicitTaskId,
+          subjectId: 'subj-math-p1',
+          subjectDomain: 'math_stats',
+          problemType: 'proof_counterexample',
+          difficultyLevel: 4,
+          difficulty: 'advanced_college',
+          problemCount: 1,
+          concepts: [baseConcept],
+          sources: baseSource,
+        }),
+      });
+      const resTaskMismatch = await generateProblemsPOST(reqTaskMismatch);
+      assert.equal(resTaskMismatch.status, 400, '동일 taskId에 다른 입력 재사용 시 400 거부');
+      const jsonMismatch = await resTaskMismatch.json();
+      assert.equal(jsonMismatch.errorCode, 'TASK_INPUT_MISMATCH', 'TASK_INPUT_MISMATCH 에러 코드 반환');
+
+      // Verify trial credit cache retry does not trigger extra AI call
+      globalThis.__fakeSupabaseClient = {
+        rpc: async (name) => {
+          if (name === 'reserve_trial_credit') {
+            return {
+              data: {
+                allowed: true,
+                status: 'already_completed',
+                remaining: 3,
+                lease_token: 'lease_mock_token_cached',
+                cached_result: {
+                  drafts: [jsonL1.drafts[0]],
+                  count: 1,
+                  generationJobId: 'job-cached-1',
+                },
+              },
+              error: null,
+            };
+          }
+          return { data: null, error: null };
+        },
+      };
+
+      const callsBeforeCachedRetry = aiFetchCount;
+      const reqRetry = new NextRequest('http://localhost/api/generate-problems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'subj-math-p1',
+          subjectDomain: 'math_stats',
+          problemType: 'proof_counterexample',
+          difficultyLevel: 1,
+          difficulty: 'intermediate',
+          problemCount: 1,
+          concepts: [baseConcept],
+          sources: baseSource,
+          creditSource: 'operator_trial',
+        }),
+      });
+      const resRetry = await generateProblemsPOST(reqRetry);
+      assert.equal(resRetry.status, 200, '동일 요청 캐시 복구 성공');
+      const jsonRetry = await resRetry.json();
+      assert.equal(jsonRetry.fromCache, true, 'fromCache 플래그 확인');
+      assert.equal(aiFetchCount, callsBeforeCachedRetry, '캐시 복구 시 추가 AI 호출 없음');
+    } finally {
+      globalThis.__fakeSupabaseClient = defaultFakeSupabase;
+      aiModule.callAiChat = origCallAiChat;
+      global.fetch = originalFetch;
+    }
+  });
+
+  // ISSUE-02 [P2]: 인용 검증의 누락 문구 우회 방지 및 정규 누락 진단 처리 검증
+  await checkAsync('ISSUE-02 [P2]: 인용 검증의 누락 문구 우회 방지 및 정규 누락 진단 처리 검증', async () => {
+    const rubric = [{ id: 'r1', label: '조건 확인', maxScore: 100, weight: 1, description: '조건 검토' }];
+    const studentAnswer = 'x = 1';
+
+    // 1. Fake quote containing "누락" keyword in arbitrary sentence -> MUST fail verification (needsReview: true)
+    const bypassResult = validation.validateEvaluationOutput({
+      rubricResults: [{
+        criterionId: 'r1',
+        score: 80,
+        evidenceQuote: '존재하지 않는 계산 결과 999; 조건 누락',
+      }],
+      academicErrorType: 'CALCULATION_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: studentAnswer });
+    assert.equal(bypassResult.needsReview, true, '누락 단어가 임의 문장에 포함된 가짜 인용은 needsReview: true');
+
+    // 2. English bypass phrase "omitted" in arbitrary sentence -> MUST fail verification
+    const englishBypassResult = validation.validateEvaluationOutput({
+      rubricResults: [{
+        criterionId: 'r1',
+        score: 80,
+        evidenceQuote: 'fabricated 999; omitted assumption',
+      }],
+      academicErrorType: 'CALCULATION_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: studentAnswer });
+    assert.equal(englishBypassResult.needsReview, true, '영문 omitted 포함 가짜 인용은 needsReview: true');
+
+    // 3. Empty evidence quote -> MUST fail verification
+    const emptyQuoteResult = validation.validateEvaluationOutput({
+      rubricResults: [{
+        criterionId: 'r1',
+        score: 80,
+        evidenceQuote: '',
+      }],
+      academicErrorType: 'CALCULATION_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: studentAnswer });
+    assert.equal(emptyQuoteResult.needsReview, true, '빈 근거는 needsReview: true');
+
+    // 4. Genuine exact canonical omission diagnosis -> Verified as omission diagnosis, not quote
+    assert.ok(validation.isOmissionDiagnosis('필요한 서술 누락'), '표준 누락 진단 식별');
+    assert.ok(validation.isOmissionDiagnosis('조건 누락'), '표준 누락 진단 식별');
+    assert.ok(!validation.isOmissionDiagnosis('존재하지 않는 계산 결과 999; 조건 누락'), '임의 문장은 누락 진단 아님');
+
+    const canonicalOmissionResult = validation.validateEvaluationOutput({
+      rubricResults: [{
+        criterionId: 'r1',
+        score: 60,
+        evidenceQuote: '필요한 서술 누락',
+      }],
+      academicErrorType: 'CALCULATION_ERROR',
+      structuredError: {
+        evidence: '필요한 서술 누락',
+        errorType: 'CALCULATION_ERROR',
+      },
+      needsReview: false,
+    }, rubric, { userAnswer: studentAnswer, isProvisionalLocal: true });
+    assert.equal(canonicalOmissionResult.needsReview, false, '정규 누락 진단은 정상 처리');
+
+    // 5. Genuine quote match -> Verified
+    const normalQuoteResult = validation.validateEvaluationOutput({
+      rubricResults: [{
+        criterionId: 'r1',
+        score: 100,
+        evidenceQuote: 'x = 1',
+      }],
+      academicErrorType: 'NO_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: studentAnswer, isProvisionalLocal: true });
+    assert.equal(normalQuoteResult.needsReview, false, '실제 답안 일치 인용은 정상 통과');
+  });
+
+  // ISSUE-03 [P2]: 수식·코드 인용의 대소문자 및 의미 보존 검증 (A/a, 변수명, 부호)
+  await checkAsync('ISSUE-03 [P2]: 수식·코드 인용의 대소문자 및 의미 보존 검증 (A/a, 변수명, 부호)', async () => {
+    const rubric = [{ id: 'r1', label: '수식 검토', maxScore: 100, weight: 1, description: '수식 전개' }];
+
+    // 1. Math Case distinction: A = 1 vs a = 1
+    const mathCaseResult = validation.validateEvaluationOutput({
+      rubricResults: [{ criterionId: 'r1', score: 90, evidenceQuote: 'a = 1' }],
+      academicErrorType: 'CALCULATION_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: 'A = 1' });
+    assert.equal(mathCaseResult.needsReview, true, 'A=1 과 a=1의 대소문자 차이는 불일치 처리 (needsReview: true)');
+
+    // 2. Variable name case: maxVal vs maxval
+    const varCaseResult = validation.validateEvaluationOutput({
+      rubricResults: [{ criterionId: 'r1', score: 90, evidenceQuote: 'maxval' }],
+      academicErrorType: 'CALCULATION_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: 'int maxVal = 100;' });
+    assert.equal(varCaseResult.needsReview, true, '변수명 대소문자 차이 보존 (maxVal vs maxval)');
+
+    // 3. Mathematical sign change: x + 1 vs x - 1
+    const signChangeResult = validation.validateEvaluationOutput({
+      rubricResults: [{ criterionId: 'r1', score: 90, evidenceQuote: 'x - 1' }],
+      academicErrorType: 'CALCULATION_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: 'f(x) = x + 1' });
+    assert.equal(signChangeResult.needsReview, true, '부호 변경 (x+1 vs x-1) 불일치 처리');
+
+    // 4. Code case sensitivity: HttpResponse vs Httpresponse
+    const codeCaseResult = validation.validateEvaluationOutput({
+      rubricResults: [{ criterionId: 'r1', score: 90, evidenceQuote: 'Httpresponse' }],
+      academicErrorType: 'CALCULATION_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: 'const res: HttpResponse = new HttpResponse();' });
+    assert.equal(codeCaseResult.needsReview, true, '코드 식별자 대소문자 구분 보존');
+
+    // 5. Legitimate newline and whitespace difference: preserved
+    const newlineResult = validation.validateEvaluationOutput({
+      rubricResults: [{ criterionId: 'r1', score: 90, evidenceQuote: 'def solve(x): return x * 2' }],
+      academicErrorType: 'CALCULATION_ERROR',
+      structuredError: {
+        evidence: 'def solve(x): return x * 2',
+        errorType: 'CALCULATION_ERROR',
+      },
+      needsReview: false,
+    }, rubric, { userAnswer: 'def solve(x):\n    return x * 2', isProvisionalLocal: true });
+    assert.equal(newlineResult.needsReview, false, '정상적인 줄바꿈 및 공백 차이는 정규화하여 일치 인정');
+  });
+
+  // ISSUE-04 [P2]: 평가 시 서버 권위 개념 ID 범위 유지 및 외부/임의 개념 우회 차단 검증
+  await checkAsync('ISSUE-04 [P2]: 평가 시 서버 권위 개념 ID 범위 유지 및 외부/임의 개념 우회 차단 검증', async () => {
+    const testProblem = {
+      ...base,
+      id: 'prob-authoritative-test',
+      conceptIds: ['c-authoritative-main', 'c-authoritative-sub'],
+      subjectId: subject.id,
+    };
+    storage.saveStoredProblems([testProblem]);
+
+    const rubric = [{ id: 'r1', label: '채점', maxScore: 100, weight: 1, description: '평가' }];
+    const aiClientPath = path.join(output, 'lib', 'aiClient.js');
+    const aiModule = load(aiClientPath);
+    const origCallAiChat = aiModule.callAiChat;
+
+    try {
+      // Model tries to assign a foreign concept ID not present in problem.conceptIds
+      aiModule.callAiChat = async () => ({
+        ok: true,
+        content: JSON.stringify({
+          calculatedScore: 90,
+          academicErrorType: 'CALCULATION_ERROR',
+          needsReview: false,
+          conceptId: 'foreign-concept-id-malicious',
+          rubricResults: [{ criterionId: 'r1', score: 90, evidenceQuote: 'answer' }],
+        }),
+        model: 'deepseek-v4.1-flash',
+        usage: { promptTokens: 100, completionTokens: 100 },
+      });
+
+      const reqForeign = new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          problemId: testProblem.id,
+          conceptId: 'foreign-concept-id-malicious',
+          subjectId: subject.id,
+          problemTitle: testProblem.title,
+          problemPrompt: '문제',
+          userAnswer: 'answer',
+          modelAnswer: 'answer',
+          rubric,
+        }),
+      });
+
+      const resForeign = await POST(reqForeign);
+      const jsonForeign = await resForeign.json();
+      if (resForeign.status !== 200) console.error('FOREIGN ERROR JSON:', jsonForeign);
+      assert.equal(resForeign.status, 200);
+      assert.equal(jsonForeign.evaluation.conceptId, 'c-authoritative-main', '서버 권위 개념 범위 밖의 foreign concept는 primary 개념으로 강제 정규화');
+
+      // Multi-concept composite problem: model chooses valid secondary concept
+      aiModule.callAiChat = async () => ({
+        ok: true,
+        content: JSON.stringify({
+          calculatedScore: 90,
+          academicErrorType: 'CALCULATION_ERROR',
+          needsReview: false,
+          conceptId: 'c-authoritative-sub',
+          rubricResults: [{ criterionId: 'r1', score: 90, evidenceQuote: 'answer' }],
+        }),
+        model: 'deepseek-v4.1-flash',
+        usage: { promptTokens: 100, completionTokens: 100 },
+      });
+
+      const reqComposite = new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          problemId: testProblem.id,
+          conceptId: 'c-authoritative-main',
+          subjectId: subject.id,
+          problemTitle: testProblem.title,
+          problemPrompt: '문제',
+          userAnswer: 'answer',
+          modelAnswer: 'answer',
+          rubric,
+        }),
+      });
+
+      const resComposite = await POST(reqComposite);
+      const jsonComposite = await resComposite.json();
+      assert.equal(jsonComposite.evaluation.conceptId, 'c-authoritative-sub', '복합 문제의 서버 권위 집합 내 개념은 인정');
+    } finally {
+      aiModule.callAiChat = origCallAiChat;
+    }
+  });
+
+  // ISSUE-05 [P2]: 재승인 시 실제 원문 인용 대조 및 페이지 출처 허위 검증 방지 검증
+  await checkAsync('ISSUE-05 [P2]: 재승인 시 실제 원문 인용 대조 및 페이지 출처 허위 검증 방지 검증', async () => {
+    const matId = 'mat-reapp-test';
+    const originalQuote = '정리 2.1: 모든 수렴하는 수열은 유계이다.';
+    const originalMarkdown = `# 해석학\n\n${originalQuote}\n\n<!-- Page 5 -->\n역은 일반적으로 성립하지 않는다.`;
+
+    const materialOriginal = {
+      id: matId,
+      subjectId: subject.id,
+      title: '실해석학 기초',
+      parsedMarkdown: originalMarkdown,
+      status: 'analyzed',
+      updatedAt: new Date().toISOString(),
+    };
+
+    const problemToReapprove = {
+      ...base,
+      id: 'prob-reapp-1',
+      rubric: [{ id: 'r1', label: '증명 논리', maxScore: 100, weight: 1, description: '전체 논리적 완결성' }],
+      subjectId: subject.id,
+      sourceMaterialId: matId,
+      sourceExcerpt: originalQuote,
+      sourceEvidenceQuote: originalQuote,
+      sourceVerificationStatus: 'needs_review',
+      needsSourceReview: true,
+      isOutdated: true,
+      qualityStatus: 'reported',
+      sourceMaterials: [{ materialId: matId, title: '실해석학 기초', markdownHash: markdownUtils.computeMarkdownHash(originalMarkdown) }],
+    };
+    storage.saveStoredProblems([problemToReapprove]);
+
+    // Case A: Material preserved with quote -> Promoted to verified
+    const reapprovedOk = storage.reapproveProblem(problemToReapprove.id, '사용자 검토 완료', [materialOriginal]);
+    assert.ok(reapprovedOk.success, '재승인 성공');
+    assert.equal(reapprovedOk.updatedProblem.qualityStatus, 'reapproved', 'qualityStatus reapproved 확인');
+    assert.equal(reapprovedOk.updatedProblem.sourceVerificationStatus, 'verified', '인용문 확인 시 verified 승격');
+    assert.equal(reapprovedOk.updatedProblem.needsSourceReview, false, 'needsSourceReview 해제');
+
+    // Case B: Material edited, quote deleted -> MUST NOT promote to verified
+    const editedMarkdown = `# 해석학\n\n수열의 유계성 개념 설명.\n\n역은 일반적으로 성립하지 않는다.`;
+    const materialEdited = { ...materialOriginal, parsedMarkdown: editedMarkdown };
+    const reapprovedDeletedQuote = storage.reapproveProblem(problemToReapprove.id, '인용문 누락 상태 재승인 시도', [materialEdited]);
+    assert.equal(reapprovedDeletedQuote.updatedProblem.qualityStatus, 'reapproved', '사용자 재승인 표시는 반영');
+    assert.equal(reapprovedDeletedQuote.updatedProblem.sourceVerificationStatus, 'needs_review', '인용문 불일치 시 needs_review 유지');
+    assert.equal(reapprovedDeletedQuote.updatedProblem.needsSourceReview, true, 'needsSourceReview 유지 (허위 검증 방지)');
+
+    // Case C: Material body empty / unloaded -> MUST NOT promote to verified
+    const materialUnloaded = { ...materialOriginal, parsedMarkdown: '' };
+    const reapprovedUnloaded = storage.reapproveProblem(problemToReapprove.id, '본문 미로딩 재승인', [materialUnloaded]);
+    assert.equal(reapprovedUnloaded.updatedProblem.sourceVerificationStatus, 'needs_review', '본문 미로딩 시 needs_review 유지');
+    assert.equal(reapprovedUnloaded.updatedProblem.needsSourceReview, true);
+
+    // Case D: Material deleted -> MUST NOT promote to verified
+    const reapprovedDeletedMat = storage.reapproveProblem(problemToReapprove.id, '자료 삭제 재승인', []);
+    assert.equal(reapprovedDeletedMat.updatedProblem.sourceVerificationStatus, 'needs_review', '자료 삭제 시 needs_review 유지');
+    assert.equal(reapprovedDeletedMat.updatedProblem.needsSourceReview, true);
+
+    // Page Grounding Verification:
+    // Digit 3 in body does not make it page 3
+    const pageGroundingNoMarker = verifyPageGrounding({
+      markdown: '해석학에는 3가지 공리가 존재한다. 공리 1, 공리 2, 공리 3.',
+      quote: '3가지 공리가 존재한다',
+      candidatePage: '3',
+      sourceRefs: '3단원',
+    });
+    assert.equal(pageGroundingNoMarker, undefined, '본문 숫자 3이나 3단원 문구는 페이지 번호로 오인하지 않음');
+
+    // Explicit page boundary <!-- Page 7 -->
+    const pageGroundingWithMarker = verifyPageGrounding({
+      markdown: '# 단원 시작\n<!-- Page 7 -->\n정리 5: 코시 수열은 수렴한다.',
+      quote: '정리 5: 코시 수열은 수렴한다',
+      candidatePage: '7',
+    });
+    assert.equal(pageGroundingWithMarker, '7', '명시적 페이지 경계 인식 성공');
+
+    // sourceRefs full title should not become page number
+    const pageGroundingTitle = verifyPageGrounding({
+      markdown: '정리 5: 코시 수열은 수렴한다.',
+      quote: '정리 5: 코시 수열은 수렴한다',
+      sourceRefs: 'Calculus 8th Edition Chapter 2',
+    });
+    assert.equal(pageGroundingTitle, undefined, '교재 제목 전체는 페이지 번호로 대입되지 않음');
+  });
+
+  // ISSUE-06 [P2]: 평가 프롬프트 100점 정책 통일 및 95점 계산 실수 오류 분류 보존 검증
+  await checkAsync('ISSUE-06 [P2]: 평가 프롬프트 100점 정책 통일 및 95점 계산 실수 오류 분류 보존 검증', async () => {
+    const rubric = [
+      { id: 'r1', label: '증명 논리', maxScore: 90, weight: 0.9, description: '논리 구성' },
+      { id: 'r2', label: '최종 계산', maxScore: 10, weight: 0.1, description: '부호 및 수치' },
+    ];
+    const studentAnswer = '따라서 결론은 x = -5 이다.';
+
+    // 1. 95점 + 경미한 계산 실수: Preserved as CALCULATION_ERROR, not forced to NO_ERROR
+    const calcErrorResult = validation.validateEvaluationOutput({
+      rubricResults: [
+        { criterionId: 'r1', score: 90, evidenceQuote: 'x = -5' },
+        { criterionId: 'r2', score: 5, evidenceQuote: 'x = -5' },
+      ],
+      academicErrorType: 'CALCULATION_ERROR',
+      structuredError: {
+        evidence: 'x = -5',
+        errorType: 'CALCULATION_ERROR',
+      },
+      needsReview: false,
+    }, rubric, { userAnswer: studentAnswer, isProvisionalLocal: true });
+    assert.equal(calcErrorResult.calculatedScore, 95, '95점 계산');
+    assert.equal(calcErrorResult.academicErrorType, 'CALCULATION_ERROR', '95점 답안의 경미한 계산 실수 분류 보존');
+    assert.equal(calcErrorResult.needsReview, false, '정상 진단 시 needsReview: false 유지');
+
+    // 2. 100점 만점 + 오류 없음: NO_ERROR
+    const perfectResult = validation.validateEvaluationOutput({
+      rubricResults: [
+        { criterionId: 'r1', score: 90, evidenceQuote: 'x = -5' },
+        { criterionId: 'r2', score: 10, evidenceQuote: 'x = -5' },
+      ],
+      academicErrorType: 'NO_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: studentAnswer, isProvisionalLocal: true });
+    assert.equal(perfectResult.calculatedScore, 100, '100점 만점');
+    assert.equal(perfectResult.academicErrorType, 'NO_ERROR', '만점 시 NO_ERROR 인정');
+    assert.equal(perfectResult.needsReview, false);
+
+    // 3. Contradiction: Score is 80 (deduction) but model claims NO_ERROR -> Flagged as UNCERTAIN & needsReview
+    const contradictoryResult = validation.validateEvaluationOutput({
+      rubricResults: [
+        { criterionId: 'r1', score: 70, evidenceQuote: 'x = -5' },
+        { criterionId: 'r2', score: 10, evidenceQuote: 'x = -5' },
+      ],
+      academicErrorType: 'NO_ERROR',
+      needsReview: false,
+    }, rubric, { userAnswer: studentAnswer, isProvisionalLocal: true });
+    assert.equal(contradictoryResult.needsReview, true, '감점 존재 시 NO_ERROR 주장은 모순 탐지하여 needsReview: true');
+    assert.equal(contradictoryResult.academicErrorType, 'UNCERTAIN', '모순 시 UNCERTAIN 처리 (임의 개념오류 단정 금지)');
+
+    // 4. Rubric score is strictly preserved and not arbitrarily deducted
+    assert.equal(calcErrorResult.calculatedScore, 95, '진단 보정이 루브릭 점수를 임의 변경하지 않음');
+  });
+
+  if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
+  else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
+  AI_CONFIG.apiKey = savedApiKeyPlan03;
+  globalThis.__fakeSupabaseClient = trialClientBackupPlan03;
+
 
   console.log(`${passed} regression checks passed`);
 }

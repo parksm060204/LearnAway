@@ -23,6 +23,7 @@ import {
   ProblemType,
   RubricCriterion,
   toAcademicDifficultyLevel,
+  SourceVerificationStatus,
 } from './types';
 
 export type { AttemptSaveStatus } from './types';
@@ -2050,30 +2051,66 @@ export function reapproveProblem(
       })
     : target.sourceMaterials;
 
+  // Re-verify actual quote against current material text
+  const quote = (target.sourceExcerpt || (target as { sourceEvidenceQuote?: string }).sourceEvidenceQuote || '').trim();
+  const normalize = (v: string) => v.replace(/\s+/g, ' ').trim();
+  const normalizedQuote = normalize(quote);
+
+  let newVerificationStatus: SourceVerificationStatus = target.sourceVerificationStatus || 'unverified';
+  let newContentVersion = target.sourceContentVersion;
+  let newNeedsSourceReview = Boolean(target.needsSourceReview);
+  let verificationNote = '';
+
+  if (currentMaterials && target.sourceMaterialId) {
+    const matchedMaterial = currentMaterials.find((m) => m.id === target.sourceMaterialId);
+    if (!matchedMaterial) {
+      // Source material has been deleted: cannot verify quote
+      newVerificationStatus = 'needs_review';
+      newNeedsSourceReview = true;
+      verificationNote = ' (연결된 원본 자료가 삭제되어 출처 검토 필요)';
+    } else if (!matchedMaterial.parsedMarkdown || !matchedMaterial.parsedMarkdown.trim()) {
+      // Material body could not be loaded / empty: cannot verify quote
+      newVerificationStatus = 'needs_review';
+      newNeedsSourceReview = true;
+      verificationNote = ' (원본 자료 본문이 미로딩되어 출처 검토 필요)';
+    } else {
+      const currentMarkdown = matchedMaterial.parsedMarkdown;
+      const currentHash = computeMarkdownHash(currentMarkdown);
+      newContentVersion = currentHash;
+
+      if (!normalizedQuote) {
+        // No quote provided in the problem originally
+        newVerificationStatus = 'unverified';
+        newNeedsSourceReview = false;
+      } else if (normalize(currentMarkdown).includes(normalizedQuote)) {
+        // Quote verified in current material!
+        newVerificationStatus = 'verified';
+        newNeedsSourceReview = false;
+      } else {
+        // Quote NO LONGER exists in the updated material text!
+        newVerificationStatus = 'needs_review';
+        newNeedsSourceReview = true; // MUST NOT promote to verified!
+        verificationNote = ' (인용문이 수정된 자료 본문에서 확인되지 않아 출처 검토 필요)';
+      }
+    }
+  } else if (!target.sourceMaterialId) {
+    newVerificationStatus = target.sourceVerificationStatus === 'verified' && !normalizedQuote ? 'unverified' : (target.sourceVerificationStatus || 'unverified');
+  }
+
   const updatedProblem: Problem = {
     ...target,
     reports: updatedReports,
     qualityStatus: 'reapproved',
     sourceMaterials: refreshedSourceMaterials,
-    sourceContentVersion: (currentMaterials && target.sourceMaterialId)
-      ? (() => {
-          const m = currentMaterials.find((mat) => mat.id === target.sourceMaterialId);
-          return m ? computeMarkdownHash(m.parsedMarkdown || '') : target.sourceContentVersion;
-        })()
-      : target.sourceContentVersion,
-    sourceVerificationStatus: (currentMaterials && target.sourceMaterialId)
-      ? (() => {
-          const m = currentMaterials.find((mat) => mat.id === target.sourceMaterialId);
-          return m ? ('verified' as const) : ('needs_review' as const);
-        })()
-      : target.sourceVerificationStatus,
+    sourceContentVersion: newContentVersion,
+    sourceVerificationStatus: newVerificationStatus,
     difficultyLevel: target.difficultyLevel ?? (target.difficulty ? toAcademicDifficultyLevel(target.difficulty) : undefined),
-    // Explicit user re-approval clears the outdated/review flags so the problem
-    // is not permanently excluded from circulation.
+    // Explicit user re-approval clears the outdated flag so problem returns to practice,
+    // but needsSourceReview strictly preserves quote grounding validity.
     isOutdated: false,
-    needsSourceReview: false,
+    needsSourceReview: newNeedsSourceReview,
     lastReviewedAt: now,
-    reviewNotes: reapprovalNote || '품질 검증 통과 및 재승인 완료 (출제 가능 복귀)',
+    reviewNotes: (reapprovalNote || '품질 검증 통과 및 재승인 완료 (출제 가능 복귀)') + verificationNote,
   };
 
   const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));

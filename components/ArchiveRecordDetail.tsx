@@ -12,6 +12,7 @@ import {
 } from '../lib/types';
 import { ProblemReportModal } from './ProblemReportModal';
 import { AcademicMathView } from './AcademicMathView';
+import { isOmissionDiagnosis } from '../lib/evaluationValidation';
 import {
   FileText,
   ExternalLink,
@@ -282,7 +283,11 @@ export function ArchiveRecordDetail({
                 {rubric.evidenceQuote && (
                   <div className="text-[10px] text-[#827d73] border-t border-[#f1ede4] pt-1">
                     <span className="font-mono">근거: </span>
-                    <span className="italic line-clamp-2">&ldquo;{rubric.evidenceQuote}&rdquo;</span>
+                    {isOmissionDiagnosis(rubric.evidenceQuote) ? (
+                      <span className="text-amber-800 font-medium">[미작성/서술 누락] {rubric.evidenceQuote}</span>
+                    ) : (
+                      <span className="italic line-clamp-2">&ldquo;{rubric.evidenceQuote}&rdquo;</span>
+                    )}
                   </div>
                 )}
               </div>

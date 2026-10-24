@@ -18,6 +18,7 @@ import { MathFormula } from './MathFormula';
 import { AcademicMathView } from './AcademicMathView';
 import { ProblemReportModal } from './ProblemReportModal';
 import { AttemptSaveStatus } from '../lib/storage';
+import { isOmissionDiagnosis } from '../lib/evaluationValidation';
 import {
   clearPracticeAnswerDraft,
   hasPracticeDraftContent,
@@ -591,7 +592,7 @@ export function ProblemSessionModal({
                 <span className="text-[10px] font-academic-mono bg-[#ded6c8]/60 text-[#57544e] px-1.5 py-0.5 rounded-2xs font-semibold">
                   v{problem.version || 1}
                 </span>
-                {problem.sourceVerificationStatus === 'verified' && (
+                {problem.sourceVerificationStatus === 'verified' && !problem.needsSourceReview && !problem.isOutdated && (
                   <span className="text-[10px] font-academic-mono bg-emerald-50 border border-emerald-300 text-emerald-800 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">
                     <ShieldCheck className="w-2.5 h-2.5 text-emerald-600" />
                     출처 검증 완료
@@ -1263,9 +1264,15 @@ export function ProblemSessionModal({
                       {rubric.evidenceQuote && (
                         <div className="text-[11px] text-[#57544e]">
                           <strong className="text-[#827d73] font-academic-mono">확인 근거: </strong>
-                          <span className="italic">
-                            &ldquo;<AcademicMathView inline content={rubric.evidenceQuote} />&rdquo;
-                          </span>
+                          {isOmissionDiagnosis(rubric.evidenceQuote) ? (
+                            <span className="text-amber-800 font-medium">
+                              [미작성/서술 누락] {rubric.evidenceQuote}
+                            </span>
+                          ) : (
+                            <span className="italic">
+                              &ldquo;<AcademicMathView inline content={rubric.evidenceQuote} />&rdquo;
+                            </span>
+                          )}
                         </div>
                       )}
 

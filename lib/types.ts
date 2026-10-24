@@ -617,6 +617,7 @@ export interface ProblemDraft {
   sourceContentVersion?: string;
   sourceVerificationStatus?: SourceVerificationStatus;
   needsSourceReview?: boolean;
+  isOutdated?: boolean;
 }
 
 export interface Problem {
@@ -875,6 +876,7 @@ export interface EvaluationResult {
   academicErrorType?: AcademicErrorType;
   structuredError?: StructuredErrorRecord;
   sourceProvenance?: ProblemSourceProvenance;
+  conceptId?: string;
 }
 
 export interface Attempt {
