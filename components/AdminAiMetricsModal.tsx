@@ -321,7 +321,7 @@ export function AdminAiMetricsModal({ isOpen, onClose }: AdminAiMetricsModalProp
         {/* Footer */}
         <div className="px-5 py-3 border-t border-[#ded6c8] bg-[#faf8f4] flex items-center justify-between shrink-0 text-xs">
           <span className="text-[#827d73] text-[11px]">
-            기본 모델: <strong>deepseek-v4.1-flash</strong> ($0.14/1M in, $0.28/1M out)
+            비용 추정 기준: 2026-01-01 공식 단가표 (deepseek-v4.1-flash: 입력 $0.14/1M, 출력 $0.28/1M, 환율 1 USD = 1,400 KRW 추정치 적용)
           </span>
           <button
             type="button"

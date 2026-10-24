@@ -40,7 +40,7 @@ import {
   getConceptStatusFromScore,
 } from './retentionModel';
 import { addDaysToDate } from './dateUtils';
-import { computeMarkdownHash } from './markdownUtils';
+import { computeMarkdownHash, verifyPageGrounding } from './markdownUtils';
 import { completeRechallengeReservation } from './logicSession';
 import {
   isMaterialBodyPersisted,
@@ -2059,6 +2059,7 @@ export function reapproveProblem(
   let newVerificationStatus: SourceVerificationStatus = target.sourceVerificationStatus || 'unverified';
   let newContentVersion = target.sourceContentVersion;
   let newNeedsSourceReview = Boolean(target.needsSourceReview);
+  let newSourcePage = target.sourcePage;
   let verificationNote = '';
 
   if (currentMaterials && target.sourceMaterialId) {
@@ -2086,6 +2087,12 @@ export function reapproveProblem(
         // Quote verified in current material!
         newVerificationStatus = 'verified';
         newNeedsSourceReview = false;
+        newSourcePage = verifyPageGrounding({
+          markdown: currentMarkdown,
+          quote: normalizedQuote,
+          candidatePage: target.sourcePage,
+          sourceRefs: matchedMaterial.sourceRefs,
+        });
       } else {
         // Quote NO LONGER exists in the updated material text!
         newVerificationStatus = 'needs_review';
@@ -2104,6 +2111,7 @@ export function reapproveProblem(
     sourceMaterials: refreshedSourceMaterials,
     sourceContentVersion: newContentVersion,
     sourceVerificationStatus: newVerificationStatus,
+    sourcePage: newSourcePage,
     difficultyLevel: target.difficultyLevel ?? (target.difficulty ? toAcademicDifficultyLevel(target.difficulty) : undefined),
     // Explicit user re-approval clears the outdated flag so problem returns to practice,
     // but needsSourceReview strictly preserves quote grounding validity.

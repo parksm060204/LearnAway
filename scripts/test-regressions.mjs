@@ -657,7 +657,12 @@ exports.requireApiUser = async () => {
     const clone = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
     const nowIso = () => new Date().toISOString();
     const matchFilters = (rows, filters) =>
-      rows.filter((row) => filters.every(([col, val, op]) => { if (op === "in") return Array.isArray(val) && val.includes(row[col]); return row[col] === val; }));
+      rows.filter((row) => filters.every(([col, val, op]) => {
+        if (op === "in") return Array.isArray(val) && val.includes(row[col]);
+        if (op === "gte") return row[col] >= val;
+        if (op === "lte") return row[col] <= val;
+        return row[col] === val;
+      }));
 
     function tableBuilder(table) {
       const ctx = { op: 'select', payload: null, onConflict: null, ignoreDuplicates: false, filters: [], order: [], range: null, limit: null };
@@ -668,6 +673,8 @@ exports.requireApiUser = async () => {
         limit(count) { ctx.limit = count; return builder; },
         eq(col, val) { ctx.filters.push([col, val]); return builder; },
         in(col, val) { ctx.filters.push([col, val, "in"]); return builder; },
+        gte(col, val) { ctx.filters.push([col, val, "gte"]); return builder; },
+        lte(col, val) { ctx.filters.push([col, val, "lte"]); return builder; },
         update(payload) { ctx.op = 'update'; ctx.payload = payload; return builder; },
         upsert(payload, opts) {
           ctx.op = 'upsert';
@@ -892,7 +899,10 @@ exports.requireApiUser = async () => {
         }
         state.rpcCalls.push({ name, params });
         if (state.rpcImpl) {
-          const custom = state.rpcImpl(name, params, state);
+          let custom = state.rpcImpl(name, params, state);
+          if ((!custom || (custom.data === null && custom.error === null)) && name === 'register_ai_task') {
+            custom = state.rpcImpl('reserve_trial_credit', params, state);
+          }
           if (custom && (custom.data !== null || custom.error !== null || name === 'get_ai_connection_secret')) {
             return Promise.resolve(custom);
           }
@@ -973,15 +983,16 @@ exports.requireApiUser = async () => {
             error: null,
           });
         }
-        if (name === 'reserve_trial_credit') {
+        if (name === 'reserve_trial_credit' || name === 'register_ai_task') {
           if (state.isAdmin === false) {
-            return Promise.resolve({ data: null, error: { message: 'permission denied for function reserve_trial_credit', code: '42501' } });
+            return Promise.resolve({ data: null, error: { message: `permission denied for function ${name}`, code: '42501' } });
           }
           const userId = (params && params.p_user_id) || (state.user ? state.user.id : 'test-user');
+          const isPersonalKey = Boolean(params && params.p_is_personal_key);
           const creditsList = (state.ai_trial_credits = state.ai_trial_credits || []);
           const resList = (state.ai_trial_reservations = state.ai_trial_reservations || []);
           let userCredits = creditsList.find((c) => c.user_id === userId);
-          if (!userCredits) {
+          if (!userCredits && !isPersonalKey) {
             const usernameAccounts = (state.username_accounts = state.username_accounts || []);
             const isGuest = userId === 'user-trial-1' ||
               usernameAccounts.some((u) => u.user_id === userId) ||
@@ -1027,7 +1038,8 @@ exports.requireApiUser = async () => {
                   allowed: false,
                   status: 'already_completed',
                   cached_result: existing.cached_result,
-                  remaining: userCredits.balance,
+                  remaining: userCredits ? userCredits.balance : 0,
+                  is_personal_key: isPersonalKey,
                 },
                 error: null,
               });
@@ -1044,19 +1056,21 @@ exports.requireApiUser = async () => {
               });
             }
             if (existing.status === 'released') {
-              if (userCredits.balance <= 0) {
-                return Promise.resolve({
-                  data: {
-                    allowed: false,
-                    error_code: 'INSUFFICIENT_CREDITS',
-                    remaining: 0,
-                    message: 'AI 체험 크레딧이 모두 소진되었습니다.',
-                  },
-                  error: null,
-                });
+              if (!isPersonalKey) {
+                if (userCredits.balance <= 0) {
+                  return Promise.resolve({
+                    data: {
+                      allowed: false,
+                      error_code: 'INSUFFICIENT_CREDITS',
+                      remaining: 0,
+                      message: 'AI 체험 크레딧이 모두 소진되었습니다.',
+                    },
+                    error: null,
+                  });
+                }
+                userCredits.balance -= 1;
+                userCredits.updated_at = nowIso();
               }
-              userCredits.balance -= 1;
-              userCredits.updated_at = nowIso();
             }
 
             const leaseToken = 'lease_' + Math.random().toString(36).slice(2);
@@ -1068,27 +1082,30 @@ exports.requireApiUser = async () => {
               data: {
                 allowed: true,
                 status: 'processing',
-                remaining: userCredits.balance,
+                remaining: userCredits ? userCredits.balance : 0,
                 lease_token: leaseToken,
+                is_personal_key: isPersonalKey,
               },
               error: null,
             });
           }
 
-          if (userCredits.balance <= 0) {
-            return Promise.resolve({
-              data: {
-                allowed: false,
-                error_code: 'INSUFFICIENT_CREDITS',
-                remaining: 0,
-                message: 'AI 체험 크레딧이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
-              },
-              error: null,
-            });
+          if (!isPersonalKey) {
+            if (userCredits.balance <= 0) {
+              return Promise.resolve({
+                data: {
+                  allowed: false,
+                  error_code: 'INSUFFICIENT_CREDITS',
+                  remaining: 0,
+                  message: 'AI 체험 크레딧이 모두 소진되었습니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+                },
+                error: null,
+              });
+            }
+            userCredits.balance -= 1;
+            userCredits.updated_at = nowIso();
           }
 
-          userCredits.balance -= 1;
-          userCredits.updated_at = nowIso();
           const leaseToken = 'lease_' + Math.random().toString(36).slice(2);
           const newRes = {
             id: `res_${Date.now()}_${Math.random().toString(36).slice(2)}`,
@@ -1096,6 +1113,7 @@ exports.requireApiUser = async () => {
             task_id: taskId,
             task_type: taskType,
             input_identifier: inputIdentifier,
+            credit_source: isPersonalKey ? 'personal_key' : 'operator_trial',
             status: 'processing',
             attempt_count: 1,
             lease_token: leaseToken,
@@ -1109,8 +1127,55 @@ exports.requireApiUser = async () => {
             data: {
               allowed: true,
               status: 'processing',
-              remaining: userCredits.balance,
+              remaining: userCredits ? userCredits.balance : 0,
               lease_token: leaseToken,
+              is_personal_key: isPersonalKey,
+            },
+            error: null,
+          });
+        }
+        if (name === 'lookup_saved_ai_task_result') {
+          if (state.isAdmin === false) {
+            return Promise.resolve({ data: null, error: { message: 'permission denied for function lookup_saved_ai_task_result', code: '42501' } });
+          }
+          const userId = params && params.p_user_id;
+          const taskId = params && params.p_task_id;
+          const taskType = params && params.p_task_type;
+          const inputIdentifier = params && params.p_input_identifier;
+          const resList = state.ai_trial_reservations || [];
+          const res = resList.find((r) => r.task_id === taskId);
+          if (!res) {
+            return Promise.resolve({
+              data: { success: false, error_code: 'TASK_NOT_FOUND', message: '보존된 작업 결과가 없습니다.' },
+              error: null,
+            });
+          }
+          if (res.user_id !== userId) {
+            return Promise.resolve({
+              data: { success: false, error_code: 'TASK_OWNERSHIP_MISMATCH', message: '다른 사용자의 작업 식별자입니다.' },
+              error: null,
+            });
+          }
+          if (res.task_type !== taskType) {
+            return Promise.resolve({
+              data: { success: false, error_code: 'TASK_TYPE_MISMATCH', message: '작업 종류가 일치하지 않습니다.' },
+              error: null,
+            });
+          }
+          if (inputIdentifier && res.input_identifier !== inputIdentifier) {
+            return Promise.resolve({
+              data: { success: false, error_code: 'TASK_INPUT_MISMATCH', message: '동일한 작업 식별자에 다른 입력이 전달되었습니다.' },
+              error: null,
+            });
+          }
+          return Promise.resolve({
+            data: {
+              success: true,
+              status: res.status,
+              credit_source: res.credit_source || 'operator_trial',
+              cached_result: res.cached_result || null,
+              created_at: res.created_at,
+              updated_at: res.updated_at,
             },
             error: null,
           });
@@ -1161,6 +1226,13 @@ exports.requireApiUser = async () => {
           if (res.lease_token !== token) {
             return Promise.resolve({ data: { success: false, message: '만료되었거나 유효하지 않은 실행 토큰입니다.', error_code: 'STALE_LEASE_TOKEN' }, error: null });
           }
+          if (res.credit_source === 'personal_key') {
+            res.status = 'settled';
+            res.settled_at = nowIso();
+            res.lease_expires_at = null;
+            res.updated_at = nowIso();
+            return Promise.resolve({ data: { success: true, status: 'settled', credit_source: 'personal_key' }, error: null });
+          }
           if (res.status === 'settled') {
             return Promise.resolve({ data: { success: true, status: 'settled' }, error: null });
           }
@@ -1199,6 +1271,14 @@ exports.requireApiUser = async () => {
           }
           if (res.lease_token !== token) {
             return Promise.resolve({ data: { success: false, message: '만료되었거나 유효하지 않은 실행 토큰입니다.', error_code: 'STALE_LEASE_TOKEN' }, error: null });
+          }
+          if (res.credit_source === 'personal_key') {
+            res.status = 'released';
+            res.released_at = nowIso();
+            res.release_reason = (params && params.p_reason) || 'failure';
+            res.lease_expires_at = null;
+            res.updated_at = nowIso();
+            return Promise.resolve({ data: { success: true, status: 'released', refunded: false, remaining: 0, credit_source: 'personal_key' }, error: null });
           }
           if (res.status === 'settled') {
             return Promise.resolve({ data: { success: false, message: '이미 확정된 작업은 환급할 수 없습니다.', error_code: 'ALREADY_SETTLED' }, error: null });
@@ -11677,7 +11757,9 @@ exports.requireApiUser = async () => {
       // Balance was NOT deducted
       const credRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-with-key');
       assert.equal(credRow.balance, 3, '개인 API 사용 시 체험 크레딧 차감 없음');
-      assert.equal(client.__state.ai_trial_reservations.length, 0);
+      // 개인 API 키 사용자도 작업 무결성·동시성 제어를 위해 ai_trial_reservations에 credit_source='personal_key'로 등록됨
+      assert.equal(client.__state.ai_trial_reservations.length, 1);
+      assert.equal(client.__state.ai_trial_reservations[0].credit_source, 'personal_key');
     });
   });
 
@@ -11706,7 +11788,7 @@ exports.requireApiUser = async () => {
     });
   });
 
-  await checkAsync('AI 체험 크레딧 7: 결과 생성 후 저장 실패 -> 추가 차감 없이 복구', async () => {
+  await checkAsync('AI 체험 크레딧 7: 결과 생성 후 저장 실패 -> 추가 차감 없이 복구 (P1 저장 재시도 AI 우회 차단)', async () => {
     await withFakeSupabase({
       user: { id: 'user-save-retry' },
       ai_trial_credits: [{ user_id: 'user-save-retry', granted_credits: 3, balance: 2, granted_at: nowIso(), updated_at: nowIso() }],
@@ -11717,12 +11799,15 @@ exports.requireApiUser = async () => {
         task_type: 'analyze_concepts',
         input_identifier: 'hash-concept-input',
         status: 'settled',
+        cached_result: { concepts: [{ id: 'c1', name: '테스트 개념' }] },
         created_at: nowIso(),
         updated_at: nowIso(),
       }],
     }, async (client) => {
       const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
-      // Save retry with isSaveRetry: true
+      const { lookupSavedTaskResult } = load(path.join(output, 'lib/trialCredits.js'));
+
+      // 1. isSaveRetry 플래그만으로 AI 실행 자격증명을 얻으려는 시도 원천 차단
       const res = await resolveAiConfigForUser('user-save-retry', {
         taskId: 'task-concept-1',
         taskType: 'analyze_concepts',
@@ -11730,9 +11815,19 @@ exports.requireApiUser = async () => {
         isSaveRetry: true,
       });
 
-      assert.equal(res.ok, true);
-      assert.equal(res.source, 'operator');
-      assert.equal(res.isTrial, true);
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'save_retry_cannot_execute_ai', '저장 재시도는 AI 실행 권한을 부여하지 않음');
+
+      // 2. 저장 재시도는 서버에 보존된 결과를 조회해 추가 AI 0회로 안전하게 복구
+      const saved = await lookupSavedTaskResult(
+        'user-save-retry',
+        'task-concept-1',
+        'analyze_concepts',
+        'hash-concept-input'
+      );
+      assert.equal(saved.success, true);
+      assert.equal(saved.status, 'settled');
+      assert.deepEqual(saved.cachedResult, { concepts: [{ id: 'c1', name: '테스트 개념' }] });
 
       // Balance remains 2 (no additional deduction)
       const credRow = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-save-retry');
@@ -15716,16 +15811,71 @@ exports.requireApiUser = async () => {
   process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
   AI_CONFIG.apiKey = 'test-only-not-a-real-key';
 
+  const taskRegistryMock = new Map();
   const defaultFakeSupabase = {
-    rpc: async (name) => {
+    rpc: async (name, params) => {
       if (name === 'consume_ai_call_budget') {
         return { data: { allowed: true, remaining: 9, retryAfterSeconds: 60 }, error: null };
       }
       if (name === 'get_or_create_trial_credits') {
         return { data: { success: true, granted_credits: 3, remaining_credits: 3, is_first_grant: false }, error: null };
       }
-      if (name === 'reserve_trial_credit') {
+      if (name === 'reserve_trial_credit' || name === 'register_ai_task') {
+        const taskId = params?.p_task_id;
+        const inputId = params?.p_input_identifier;
+        if (taskId && taskRegistryMock.has(taskId)) {
+          const entry = taskRegistryMock.get(taskId);
+          if (entry.input_identifier !== inputId) {
+            return {
+              data: {
+                allowed: false,
+                error_code: 'TASK_INPUT_MISMATCH',
+                message: '동일한 작업 식별자에 다른 입력이 전달되었습니다.',
+              },
+              error: null,
+            };
+          }
+          return {
+            data: {
+              allowed: true,
+              status: entry.status || 'processing',
+              remaining: 2,
+              lease_token: 'lease_mock_token_123',
+            },
+            error: null,
+          };
+        }
+        if (taskId) {
+          taskRegistryMock.set(taskId, { input_identifier: inputId, status: 'processing' });
+        }
         return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lease_mock_token_123' }, error: null };
+      }
+      if (name === 'record_trial_result_ready') {
+        const taskId = params?.p_task_id;
+        if (taskId && taskRegistryMock.has(taskId)) {
+          const entry = taskRegistryMock.get(taskId);
+          entry.status = 'result_ready';
+          entry.cached_result = params?.p_result;
+        }
+        return { data: { success: true, status: 'result_ready' }, error: null };
+      }
+      if (name === 'lookup_saved_ai_task_result') {
+        const taskId = params?.p_task_id;
+        const inputId = params?.p_input_identifier;
+        if (taskId && taskRegistryMock.has(taskId)) {
+          const entry = taskRegistryMock.get(taskId);
+          if (inputId && entry.input_identifier !== inputId) {
+            return {
+              data: { success: false, error_code: 'TASK_INPUT_MISMATCH', message: '동일한 작업 식별자에 다른 입력이 전달되었습니다.' },
+              error: null,
+            };
+          }
+          return {
+            data: { success: true, status: entry.status || 'result_ready', cached_result: entry.cached_result || null },
+            error: null,
+          };
+        }
+        return { data: { success: false, error_code: 'TASK_NOT_FOUND', message: '작업 없음' }, error: null };
       }
       if (name === 'settle_trial_credit') {
         return { data: { success: true, status: 'settled', is_existing: false }, error: null };
@@ -15934,7 +16084,21 @@ exports.requireApiUser = async () => {
       // Verify trial credit cache retry does not trigger extra AI call
       globalThis.__fakeSupabaseClient = {
         rpc: async (name) => {
-          if (name === 'reserve_trial_credit') {
+          if (name === 'lookup_saved_ai_task_result') {
+            return {
+              data: {
+                success: true,
+                status: 'already_completed',
+                cached_result: {
+                  drafts: [jsonL1.drafts[0]],
+                  count: 1,
+                  generationJobId: 'job-cached-1',
+                },
+              },
+              error: null,
+            };
+          }
+          if (name === 'reserve_trial_credit' || name === 'register_ai_task') {
             return {
               data: {
                 allowed: true,
@@ -16331,7 +16495,277 @@ exports.requireApiUser = async () => {
     assert.equal(calcErrorResult.calculatedScore, 95, '진단 보정이 루브릭 점수를 임의 변경하지 않음');
   });
 
-  if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
+  // =========================================================================
+  // 6대 핵심 문제 회귀 검증 (P1/P2)
+  // =========================================================================
+
+  // --- 문제 1 [P1]: 저장 재시도 플래그를 이용한 크레딧 제한 우회 차단 ---
+  await checkAsync('문제 1 [P1]: 잔액 0 사용자 isSaveRetry/action=retry_save 전송 시 외부 AI 호출 0회 및 차단', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-p1-zero-balance' },
+      ai_trial_credits: [{ user_id: 'user-p1-zero-balance', granted_credits: 3, balance: 0, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async () => {
+      const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+      const res = await resolveAiConfigForUser('user-p1-zero-balance', {
+        taskId: 'task-fake-retry',
+        taskType: 'generate_problems',
+        inputIdentifier: 'hash-fake',
+        isSaveRetry: true,
+      });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'save_retry_cannot_execute_ai', '저장 재시도 플래그로 AI 실행 권한 획득 불가');
+    });
+  });
+
+  await checkAsync('문제 1 [P1]: 존재하지 않거나 소유권 불일치 작업의 저장 재시도 -> AI 0회 및 거부', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-p1-attacker' },
+      ai_trial_reservations: [{
+        id: 'res-owner',
+        user_id: 'user-p1-victim',
+        task_id: 'task-victim-1',
+        task_type: 'generate_problems',
+        input_identifier: 'hash-victim',
+        status: 'result_ready',
+        cached_result: { problems: [] },
+      }],
+    }, async () => {
+      const { lookupSavedTaskResult } = load(path.join(output, 'lib/trialCredits.js'));
+      // 타인 작업 조회
+      const resOther = await lookupSavedTaskResult('user-p1-attacker', 'task-victim-1', 'generate_problems', 'hash-victim');
+      assert.equal(resOther.success, false);
+      assert.equal(resOther.errorCode, 'TASK_OWNERSHIP_MISMATCH');
+
+      // 존재하지 않는 작업 조회
+      const resNonExistent = await lookupSavedTaskResult('user-p1-attacker', 'task-non-existent', 'generate_problems');
+      assert.equal(resNonExistent.success, false);
+      assert.equal(resNonExistent.errorCode, 'TASK_NOT_FOUND');
+    });
+  });
+
+  // --- 문제 2 [P1]: AI 사용량 API의 다른 사용자 정보 조회 차단 ---
+  await checkAsync('문제 2 [P1]: AI 사용량 API 인증·권한 검증 (비로그인 401, 본인 200, 타인 403 격리, 관리자 허용)', async () => {
+    const adminMetricsRoute = load(path.join(output, 'app/api/admin/ai-metrics/route.js'));
+    const GET = adminMetricsRoute.GET;
+
+    // 1. 비로그인 요청 -> 401
+    auth.__setMode('anonymous');
+    try {
+      const req = new NextRequest('http://localhost/api/admin/ai-metrics?userId=user-target');
+      const res = await GET(req);
+      assert.equal(res.status, 401, '비로그인 사용자는 401 반환');
+    } finally {
+      auth.__setMode('authenticated');
+    }
+
+    // 2. 일반 사용자 본인 조회 -> 200
+    await withFakeSupabase({ user: { id: 'user-alice', email: 'alice@example.com' } }, async () => {
+      const req = new NextRequest('http://localhost/api/admin/ai-metrics?userId=user-alice');
+      const res = await GET(req);
+      assert.equal(res.status, 200, '본인 사용량 조회 성공');
+      const json = await res.json();
+      assert.equal(json.success, true);
+    });
+
+    // 3. 일반 사용자 A가 사용자 B 조회 -> 403 Forbidden 및 데이터/존재 비노출
+    await withFakeSupabase({ user: { id: 'user-alice', email: 'alice@example.com' } }, async () => {
+      const req = new NextRequest('http://localhost/api/admin/ai-metrics?userId=user-bob');
+      const res = await GET(req);
+      assert.equal(res.status, 403, '타인 사용량 조회 거부 (403)');
+      const json = await res.json();
+      assert.equal(json.errorCode || json.error_code, 'FORBIDDEN');
+      assert.equal(json.data, undefined, '기록 및 집계 데이터 비노출');
+    });
+
+    // 4. 검증된 관리자 조회 -> 200 (ADMIN_EMAILS 또는 ADMIN_USER_IDS 설정)
+    const prevAdminEmails = process.env.ADMIN_EMAILS;
+    process.env.ADMIN_EMAILS = 'admin@learnaway.local';
+    try {
+      await withFakeSupabase({ user: { id: 'user-admin', email: 'admin@learnaway.local' } }, async () => {
+        const req = new NextRequest('http://localhost/api/admin/ai-metrics?userId=user-bob');
+        const res = await GET(req);
+        assert.equal(res.status, 200, '검증된 관리자는 타 사용자 사용량 조회 허용');
+      });
+    } finally {
+      if (prevAdminEmails === undefined) delete process.env.ADMIN_EMAILS;
+      else process.env.ADMIN_EMAILS = prevAdminEmails;
+    }
+
+    // 5. 관리자 설정 누락 시 default-deny -> 403
+    const prevAdminIds = process.env.ADMIN_USER_IDS;
+    delete process.env.ADMIN_USER_IDS;
+    delete process.env.ADMIN_EMAILS;
+    try {
+      await withFakeSupabase({ user: { id: 'user-unconfigured', email: 'anyone@example.com' } }, async () => {
+        const req = new NextRequest('http://localhost/api/admin/ai-metrics?userId=user-target');
+        const res = await GET(req);
+        assert.equal(res.status, 403, '관리자 환경변수 누락 시 기본 거부');
+      });
+    } finally {
+      if (prevAdminIds !== undefined) process.env.ADMIN_USER_IDS = prevAdminIds;
+    }
+  });
+
+  // --- 문제 3 [P2]: 작업 입력 식별자의 서버 영속성·동시성 확보 ---
+  await checkAsync('문제 3 [P2]: 개인 키 및 체험 경로 원자적 DB 작업 등록, 입력 불일치 거부 및 동시 선점 방지', async () => {
+    await withFakeSupabase({
+      user: { id: 'user-p3' },
+      ai_trial_credits: [{ user_id: 'user-p3', granted_credits: 3, balance: 3, granted_at: nowIso(), updated_at: nowIso() }],
+      ai_trial_reservations: [],
+    }, async (client) => {
+      const { registerAiTask } = load(path.join(output, 'lib/trialCredits.js'));
+
+      // 1. 개인 키 작업 등록 시 balance 차감 없이 ai_trial_reservations에 credit_source='personal_key' 등록
+      const regPersonal = await registerAiTask(
+        'user-p3',
+        'task-p3-pers-1',
+        'evaluate_answer',
+        'hash-input-v1',
+        true
+      );
+      assert.equal(regPersonal.allowed, true);
+      assert.ok(regPersonal.leaseToken, '유효한 fencing leaseToken 발급');
+      const cred = client.__state.ai_trial_credits.find((c) => c.user_id === 'user-p3');
+      assert.equal(cred.balance, 3, '개인 키 작업은 잔액 차감 없음');
+      const resRow = client.__state.ai_trial_reservations.find((r) => r.task_id === 'task-p3-pers-1');
+      assert.equal(resRow.credit_source, 'personal_key');
+
+      // 2. 동일한 taskId에 다른 inputIdentifier 재사용 시 TASK_INPUT_MISMATCH 거부
+      const regMismatch = await registerAiTask(
+        'user-p3',
+        'task-p3-pers-1',
+        'evaluate_answer',
+        'hash-input-v2-DIFFERENT',
+        true
+      );
+      assert.equal(regMismatch.allowed, false);
+      assert.equal(regMismatch.errorCode, 'TASK_INPUT_MISMATCH');
+
+      // 3. 실행 중(lease 유효) 동시 요청 시 CONCURRENT_EXECUTION_BLOCKED 차단
+      const regConcurrent = await registerAiTask(
+        'user-p3',
+        'task-p3-pers-1',
+        'evaluate_answer',
+        'hash-input-v1',
+        true
+      );
+      assert.equal(regConcurrent.allowed, false);
+      assert.equal(regConcurrent.errorCode, 'CONCURRENT_EXECUTION_BLOCKED');
+    });
+  });
+
+  // --- 문제 4 [P2]: 미확정 평가가 숙련도·복습 계획을 왜곡하지 않도록 수정 ---
+  await checkAsync('문제 4 [P2]: 미확정 평가(needsReview:true, UNCERTAIN)가 숙련도 92점을 왜곡하거나 감점하지 않음', async () => {
+    const { calculateConceptMasteryScore, getConfirmedEvents, isConfirmedReviewEvent } = load(path.join(output, 'lib/retentionModel.js'));
+
+    const confirmedHistory = [
+      { kind: 'attempt', score: 90, resultScore: 90, at: new Date(Date.now() - 3600000).toISOString(), answeredAt: new Date(Date.now() - 3600000).toISOString(), status: 'CONFIRMED' },
+      { kind: 'attempt', score: 95, resultScore: 95, at: new Date(Date.now() - 1800000).toISOString(), answeredAt: new Date(Date.now() - 1800000).toISOString(), status: 'CONFIRMED' },
+    ];
+    const scoreBefore = calculateConceptMasteryScore(confirmedHistory);
+    assert.ok(scoreBefore >= 90, `기존 확정 평가 숙련도 고득점 확인 (현재: ${scoreBefore})`);
+
+    // 미확정(needsReview: true, UNCERTAIN) 평가 추가 시도
+    const unconfirmedEvaluation = {
+      kind: 'attempt',
+      score: 30,
+      resultScore: 30,
+      at: new Date().toISOString(),
+      answeredAt: new Date().toISOString(),
+      academicErrorType: 'UNCERTAIN',
+      needsReview: true,
+      status: 'UNCERTAIN',
+    };
+    assert.equal(isConfirmedReviewEvent(unconfirmedEvaluation), false, '미확정 평가는 확정 이벤트로 분류되지 않음');
+
+    const mixedHistory = [...confirmedHistory, unconfirmedEvaluation];
+    const confirmedOnly = getConfirmedEvents(mixedHistory);
+    assert.equal(confirmedOnly.length, 2, '미확정 평가는 계산 대상에서 제외');
+
+    const scoreAfter = calculateConceptMasteryScore(mixedHistory);
+    assert.equal(scoreAfter, scoreBefore, '미확정 평가로 인해 숙련도가 69.1점 등으로 급락하지 않고 완전 보존됨');
+
+    // 미확정 고득점 또한 부풀림 방지
+    const unconfirmedHighScore = {
+      kind: 'attempt',
+      score: 100,
+      resultScore: 100,
+      at: new Date().toISOString(),
+      answeredAt: new Date().toISOString(),
+      needsReview: true,
+      status: 'NEEDS_REVIEW',
+    };
+    const scoreWithHigh = calculateConceptMasteryScore([...confirmedHistory, unconfirmedHighScore]);
+    assert.equal(scoreWithHigh, scoreBefore, '미확정 고득점 또한 확정 전에는 숙련도에 반영되지 않음');
+  });
+
+  // --- 문제 5 [P2]: 모델이 만든 페이지 정보를 검증 근거로 사용하는 경로 제거 ---
+  await checkAsync('문제 5 [P2]: AI 환각 페이지(p. 999) 미승인 및 복수 페이지 중복 인용 보수적 처리', async () => {
+    const { verifyPageGrounding } = load(path.join(output, 'lib/markdownUtils.js'));
+
+    // 1. 페이지 경계가 없는 문서에서 AI가 임의로 p. 999를 주장하는 경우 -> undefined (미확인)
+    const unpagedDoc = '이 문서는 페이지 경계 주석이 전혀 없는 일반 마크다운 문서입니다. 내용 인용문구 포함.';
+    const p999 = verifyPageGrounding(unpagedDoc, '내용 인용문구', 'p. 999');
+    assert.equal(p999, undefined, '자료에 페이지 경계가 없으면 AI의 p. 999 주장을 채택하지 않고 undefined 처리');
+
+    // 2. 실제 페이지 경계가 있고 인용문이 단일 페이지에 고유한 경우 -> 정확한 페이지 반환
+    const pagedDoc = '첫 페이지 <!-- Page 1 --> 둘째 페이지 고유 인용문구 <!-- Page 2 --> 셋째 페이지';
+    const pUnique = verifyPageGrounding(pagedDoc, '고유 인용문구');
+    assert.equal(pUnique, '1', '단일 페이지에 일치하는 인용은 해당 페이지 확인');
+
+    // 3. 같은 인용문이 복수 페이지에 중복 출현하는 경우 -> 임의 첫 페이지로 단정하지 않고 보수적(undefined) 처리
+    const duplicateDoc = '<!-- Page 1 --> 반복되는 동일 수식 x = 5 <!-- Page 2 --> 기타 <!-- Page 3 --> 반복되는 동일 수식 x = 5';
+    const pAmbiguous = verifyPageGrounding(duplicateDoc, '반복되는 동일 수식 x = 5');
+    assert.equal(pAmbiguous, undefined, '복수 페이지 중복 인용 시 임의 확정 방지 (undefined)');
+
+    // 4. 출처 제목 또는 범위 설명을 페이지 번호로 대입하지 않음
+    const pChapter = verifyPageGrounding(pagedDoc, '고유 인용문구', 'Chapter 2: pp. 10-25');
+    assert.notEqual(pChapter, '10', '범위 설명의 숫자를 단일 페이지로 임의 대입하지 않음');
+  });
+
+  // --- 문제 6 [P2]: AI 사용량 조회를 영속 DB 기준으로 전환 ---
+  await checkAsync('문제 6 [P2]: AI 사용량 영속 DB 저장 및 필터링 조회 검증', async () => {
+    const { recordAiUsageTelemetry, queryAiUsageTelemetryFromDb } = load(path.join(output, 'lib/aiCostTelemetry.js'));
+
+    await withFakeSupabase({
+      user: { id: 'user-telemetry-test' },
+      ai_usage_telemetry: [],
+    }, async (client) => {
+      // 1. 레코드 저장
+      await recordAiUsageTelemetry({
+        userId: 'user-telemetry-test',
+        taskType: 'generate_problems',
+        creditSource: 'operator_trial',
+        provider: 'school_gateway',
+        model: 'deepseek-v4.1-flash',
+        inputTokens: 500,
+        outputTokens: 200,
+        status: 'success',
+      });
+
+      assert.equal(client.__state.ai_usage_telemetry.length, 1, 'DB 테이블에 사용량 기록 영속화');
+
+      // 2. DB 기준 조회 및 필터 검증
+      const queried = await queryAiUsageTelemetryFromDb({
+        userId: 'user-telemetry-test',
+        taskType: 'generate_problems',
+        creditSource: 'operator_trial',
+      });
+      assert.equal(queried.records.length, 1, 'DB에서 일치하는 레코드 조회 성공');
+      assert.equal(queried.records[0].model, 'deepseek-v4.1-flash');
+      assert.equal(queried.records[0].totalTokens, 700);
+
+      // 3. 다른 taskType 필터 시 빈 결과 반환
+      const queriedEmpty = await queryAiUsageTelemetryFromDb({
+        userId: 'user-telemetry-test',
+        taskType: 'evaluate_answer',
+      });
+      assert.equal(queriedEmpty.records.length, 0, '필터 불일치 시 0건 반환');
+    });
+  });
+
+    if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
   else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
   AI_CONFIG.apiKey = savedApiKeyPlan03;
   globalThis.__fakeSupabaseClient = trialClientBackupPlan03;

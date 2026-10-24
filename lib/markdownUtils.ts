@@ -323,3 +323,127 @@ export function verifySourceCitation(
     verificationNote: '원문에서 인용구를 명확히 확인하지 못함 (사용자 검토 필요)',
   };
 }
+
+/**
+ * Authoritative page grounding verification:
+ * Checks whether an excerpt/quote actually maps to a specific page in the source material.
+ *
+ * Rules:
+ * 1. AI model outputs (raw.sourceRefs / raw.sourcePage) are strictly rejected as grounding evidence.
+ * 2. Scans for real page boundaries in markdown (<!-- page 3 -->, [Page 3], # Page 3, etc.).
+ * 3. If a quote appears multiple times across DIFFERENT pages, returns undefined (ambiguous).
+ * 4. If no page boundaries exist in markdown, accepts ONLY an isolated, single-page specification
+ *    in the authoritative sourceRefs (e.g. "p. 15", "15쪽"). Ranges ("pp. 10-20", "10~15") and titles return undefined.
+ * 5. Candidate page (if provided) must match the grounded page; otherwise returns undefined.
+ */
+export function verifyPageGrounding(
+  paramsOrMarkdown: { markdown: string; quote: string; candidatePage?: string; sourceRefs?: string } | string,
+  maybeQuote?: string,
+  maybeCandidatePage?: string,
+  maybeSourceRefs?: string
+): string | undefined {
+  let markdown: string;
+  let quote: string;
+  let candidatePage: string | undefined;
+  let sourceRefs: string | undefined;
+
+  if (typeof paramsOrMarkdown === 'object' && paramsOrMarkdown !== null) {
+    markdown = paramsOrMarkdown.markdown || '';
+    quote = paramsOrMarkdown.quote || '';
+    candidatePage = paramsOrMarkdown.candidatePage;
+    sourceRefs = paramsOrMarkdown.sourceRefs;
+  } else {
+    markdown = typeof paramsOrMarkdown === 'string' ? paramsOrMarkdown : '';
+    quote = typeof maybeQuote === 'string' ? maybeQuote : '';
+    candidatePage = maybeCandidatePage;
+    sourceRefs = maybeSourceRefs;
+  }
+
+  const normQuote = quote.replace(/\s+/g, ' ').trim();
+  if (!normQuote) return undefined;
+
+  const PAGE_BOUNDARY_REGEX = /(?:<!--\s*page\s*(\d+)\s*-->|\[\s*(?:page|p\.?)\s*(\d+)(?:\/\d+)?\s*\]|^#+\s*(?:page|페이지)\s*(\d+)\b)/gim;
+  const pageMarkers: { offset: number; page: string }[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = PAGE_BOUNDARY_REGEX.exec(markdown)) !== null) {
+    const pageNum = match[1] || match[2] || match[3];
+    if (pageNum) {
+      pageMarkers.push({ offset: match.index, page: pageNum });
+    }
+  }
+
+  const normMarkdown = markdown.replace(/\s+/g, ' ');
+
+  // Find ALL positions of normQuote in normMarkdown to detect duplicate quotes across multiple pages
+  const quotePositions: number[] = [];
+  let searchPos = 0;
+  while (searchPos < normMarkdown.length) {
+    const foundIdx = normMarkdown.indexOf(normQuote, searchPos);
+    if (foundIdx === -1) break;
+    quotePositions.push(foundIdx);
+    searchPos = foundIdx + normQuote.length;
+  }
+
+  // Quote does not exist in markdown
+  if (quotePositions.length === 0) return undefined;
+
+  if (pageMarkers.length > 0) {
+    // For each occurrence of the quote, determine which page marker it falls under
+    const matchedPages = new Set<string>();
+
+    for (const qPos of quotePositions) {
+      let pageForThisOccurrence: string | undefined = undefined;
+      for (const marker of pageMarkers) {
+        const markerPos = markdown.slice(0, marker.offset).replace(/\s+/g, ' ').length;
+        if (markerPos <= qPos) {
+          pageForThisOccurrence = marker.page;
+        } else {
+          break;
+        }
+      }
+      if (pageForThisOccurrence) {
+        matchedPages.add(pageForThisOccurrence);
+      }
+    }
+
+    // If quote exists on MULTIPLE distinct pages, do not arbitrarily pick the first one: return undefined!
+    if (matchedPages.size > 1) {
+      return undefined;
+    }
+
+    if (matchedPages.size === 1) {
+      const confirmedPage = Array.from(matchedPages)[0];
+      const cleanCandidate = (candidatePage || '').replace(/\D/g, '');
+      if (cleanCandidate && cleanCandidate !== confirmedPage) {
+        // Candidate page contradicts confirmed page in markdown -> reject
+        return undefined;
+      }
+      return confirmedPage;
+    }
+    return undefined;
+  }
+
+  // 2. If no page boundaries exist in markdown:
+  // Only accept if authoritative sourceRefs explicitly specifies an ISOLATED single page number.
+  // Reject page ranges (e.g. "pp. 10-20", "10~15", "Chapter 3-4"), titles, or unverified claims.
+  if (sourceRefs && typeof sourceRefs === 'string') {
+    const trimmedRefs = sourceRefs.trim();
+    // Range indicators must be rejected
+    if (/[-~,]|to|pp\b|pp\./i.test(trimmedRefs)) {
+      return undefined;
+    }
+
+    // Strict single page match (e.g. "p. 15", "p 15", "page 15", "15쪽", "15페이지")
+    const singlePageMatch = /^(?:p\.?|page|쪽|페이지)?\s*([0-9]+)\s*(?:쪽|페이지)?$/i.exec(trimmedRefs);
+    if (singlePageMatch && singlePageMatch[1]) {
+      const extractedPage = singlePageMatch[1];
+      const cleanCandidate = (candidatePage || '').replace(/\D/g, '');
+      if (!cleanCandidate || cleanCandidate === extractedPage) {
+        return extractedPage;
+      }
+    }
+  }
+
+  return undefined;
+}

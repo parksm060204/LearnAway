@@ -159,7 +159,7 @@ export function operatorFallbackAllowed(env: Record<string, string | undefined> 
 }
 
 import {
-  reserveTrialCredit,
+  registerAiTask,
   isOperatorEmergencyStopped,
   type TrialTaskType,
 } from './trialCredits';
@@ -200,11 +200,13 @@ export type AiConfigResolution =
         | 'task_ownership_mismatch'
         | 'already_completed'
         | 'already_completed_missing_result'
-        | 'concurrent_in_progress';
+        | 'concurrent_in_progress'
+        | 'save_retry_cannot_execute_ai';
       message: string;
       errorCode?: string;
       cachedResult?: unknown;
       needsAiConnection?: boolean;
+      leaseToken?: string;
     };
 
 /** Reads the caller's stored secret and distinguishes the three states. */
@@ -230,9 +232,9 @@ export async function lookupConnectionSecret(userId?: string): Promise<Connectio
  * Resolves the AI config for a request.
  *
  * Order:
- *  1. the user's registered connection (decrypted server-side); trial credit is NOT deducted.
+ *  1. the user's registered connection (decrypted server-side); task registered atomically; trial credit is NOT deducted.
  *  2. the operator's key via trial credit, ONLY when the user is confirmed unregistered
- *     AND a trial credit is successfully reserved for this bounded task (or save retry).
+ *     AND a trial credit is successfully reserved for this bounded task.
  *  3. legacy explicit operator fallback (AI_ALLOW_OPERATOR_FALLBACK), used only when enabled.
  *
  * A lookup failure, malformed response or decryption failure aborts the call:
@@ -242,6 +244,15 @@ export async function resolveAiConfigForUser(
   userId?: string,
   trialContext?: TrialContext
 ): Promise<AiConfigResolution> {
+  // Save retries MUST NEVER execute AI directly: they must use server-preserved results!
+  if (trialContext?.isSaveRetry) {
+    return {
+      ok: false,
+      code: 'save_retry_cannot_execute_ai',
+      message: '저장 재시도 요청으로는 외부 AI를 직접 실행할 수 없으며 서버에 보존된 결과를 사용해야 합니다.',
+    };
+  }
+
   const lookup = await lookupConnectionSecret(userId);
 
   if (lookup.status === 'lookup_failed') {
@@ -261,12 +272,12 @@ export async function resolveAiConfigForUser(
         message: '서버 암호화 키(AI_CREDENTIAL_ENCRYPTION_KEY)가 설정되지 않아 저장된 API 연결을 사용할 수 없습니다.',
       };
     }
+    let apiKey: string;
     try {
-      const apiKey = decryptSecret(
+      apiKey = decryptSecret(
         { ciphertext: lookup.secret.ciphertext || '', iv: lookup.secret.iv || '', tag: lookup.secret.tag || '' },
         key
       );
-      return { ok: true, source: 'user', config: buildSchoolConfig(apiKey, lookup.secret.model) };
     } catch {
       return {
         ok: false,
@@ -274,6 +285,68 @@ export async function resolveAiConfigForUser(
         message: '저장된 API 키를 복호화하지 못했습니다. 설정에서 키를 다시 등록해 주세요.',
       };
     }
+
+    let leaseToken: string | undefined = undefined;
+    if (trialContext && userId) {
+      const reg = await registerAiTask(
+        userId,
+        trialContext.taskId,
+        trialContext.taskType,
+        trialContext.inputIdentifier,
+        true
+      );
+      if (!reg.allowed) {
+        if (reg.status === 'already_completed') {
+          if (!reg.cachedResult) {
+            return {
+              ok: false,
+              code: 'already_completed_missing_result',
+              message: '작업은 완료 상태이나 보존된 AI 결과가 비어 있습니다. 새로운 작업 식별자로 다시 시도해 주세요.',
+            };
+          }
+          return {
+            ok: false,
+            code: 'already_completed',
+            cachedResult: reg.cachedResult,
+            leaseToken: reg.leaseToken,
+            message: reg.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
+          };
+        }
+        if (reg.status === 'concurrent_in_progress') {
+          return {
+            ok: false,
+            code: 'concurrent_in_progress',
+            errorCode: 'CONCURRENT_EXECUTION_BLOCKED',
+            message: reg.message || '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
+          };
+        }
+        if (reg.errorCode === 'TASK_INPUT_MISMATCH') {
+          return {
+            ok: false,
+            code: 'task_input_mismatch',
+            errorCode: 'TASK_INPUT_MISMATCH',
+            message: reg.message || '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.',
+          };
+        }
+        if (reg.errorCode === 'TASK_OWNERSHIP_MISMATCH') {
+          return {
+            ok: false,
+            code: 'task_ownership_mismatch',
+            errorCode: 'TASK_OWNERSHIP_MISMATCH',
+            message: reg.message || '해당 작업에 대한 접근 권한이 없습니다.',
+          };
+        }
+        return {
+          ok: false,
+          code: 'trial_limit_exceeded',
+          errorCode: reg.errorCode,
+          message: reg.message || '작업 등록에 실패했습니다.',
+        };
+      }
+      leaseToken = reg.leaseToken;
+    }
+
+    return { ok: true, source: 'user', leaseToken, config: buildSchoolConfig(apiKey, lookup.secret.model) };
   }
 
   // Confirmed unregistered: check trial credit reservation or explicit fallback.
@@ -297,15 +370,12 @@ export async function resolveAiConfigForUser(
       };
     }
 
-    if (trialContext.isSaveRetry) {
-      return { ok: true, source: 'operator', isTrial: true, config: operatorConfig };
-    }
-
-    const reservation = await reserveTrialCredit(
+    const reservation = await registerAiTask(
       userId,
       trialContext.taskId,
       trialContext.taskType,
-      trialContext.inputIdentifier
+      trialContext.inputIdentifier,
+      false
     );
 
     if (reservation.status === 'already_completed') {
@@ -320,7 +390,8 @@ export async function resolveAiConfigForUser(
         ok: false,
         code: 'already_completed',
         cachedResult: reservation.cachedResult,
-        message: '이미 완료된 작업의 결과가 보존되어 있습니다.',
+        leaseToken: reservation.leaseToken,
+        message: reservation.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
       };
     }
 

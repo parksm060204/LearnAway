@@ -464,6 +464,78 @@ async function testUpgradePath() {
   }
   console.log('✓ Normal authenticated users blocked from direct execution of service_role RPCs');
 
+  // --------------------------------------------------------------------------
+  // Scenario H: Unified Task Registration & Save Retry Lookup (Migration 31)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario H: Unified Task Registration & Save Retry Lookup (Migration 31) ---');
+  await setAuthContext(db, { uid: userIdA, role: 'service_role' });
+
+  // 1. Personal key registration does not deduct trial credits
+  const beforeCredits = (await db.query(`select balance from public.ai_trial_credits where user_id = $1;`, [userIdA])).rows[0].balance;
+  const taskP1 = 'task_personal_001';
+  const regPersonal = await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'hash_math_01', $2, true, 500) as r;
+  `, [taskP1, userIdA]);
+  const resP1 = regPersonal.rows[0].r;
+  if (!resP1.allowed || resP1.credit_source !== 'personal_key') {
+    throw new Error(`Personal key registration failed: ${JSON.stringify(resP1)}`);
+  }
+  const afterCredits = (await db.query(`select balance from public.ai_trial_credits where user_id = $1;`, [userIdA])).rows[0].balance;
+  if (beforeCredits !== afterCredits) {
+    throw new Error(`Personal key registration must not mutate trial credit balance (${beforeCredits} -> ${afterCredits})`);
+  }
+  console.log('✓ Personal key registration succeeds without trial balance mutation');
+
+  // 2. Input mismatch rejection on same taskId
+  const regMismatch = await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'DIFFERENT_HASH', $2, true, 500) as r;
+  `, [taskP1, userIdA]);
+  if (regMismatch.rows[0].r.allowed !== false || regMismatch.rows[0].r.error_code !== 'TASK_INPUT_MISMATCH') {
+    throw new Error(`Different input on same taskId must be rejected with TASK_INPUT_MISMATCH: ${JSON.stringify(regMismatch.rows[0].r)}`);
+  }
+  console.log('✓ Same taskId with different input correctly rejected with TASK_INPUT_MISMATCH');
+
+  // 3. Ownership mismatch rejection
+  const regOwnerMismatch = await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'hash_math_01', $2, true, 500) as r;
+  `, [taskP1, userIdB]);
+  if (regOwnerMismatch.rows[0].r.allowed !== false || regOwnerMismatch.rows[0].r.error_code !== 'TASK_OWNERSHIP_MISMATCH') {
+    throw new Error(`Different user on same taskId must be rejected with TASK_OWNERSHIP_MISMATCH: ${JSON.stringify(regOwnerMismatch.rows[0].r)}`);
+  }
+  console.log('✓ Reusing another user taskId correctly rejected with TASK_OWNERSHIP_MISMATCH');
+
+  // 4. Concurrent execution blocked while lease is active
+  const regConcurrent = await db.query(`
+    select public.register_ai_task($1, 'generate_problems', 'hash_math_01', $2, true, 500) as r;
+  `, [taskP1, userIdA]);
+  if (regConcurrent.rows[0].r.status !== 'concurrent_in_progress') {
+    throw new Error(`Concurrent execution must return concurrent_in_progress: ${JSON.stringify(regConcurrent.rows[0].r)}`);
+  }
+  console.log('✓ Duplicate execution during active lease correctly blocked with concurrent_in_progress');
+
+  // 5. Record result ready
+  await db.query(`
+    select public.record_trial_result_ready($1, '{"problems":[{"id":"p1"}]}'::jsonb, $2, $3);
+  `, [taskP1, userIdA, resP1.lease_token]);
+
+  // 6. lookup_saved_ai_task_result succeeds with preserved result
+  const lookupSuccess = await db.query(`
+    select public.lookup_saved_ai_task_result($1, $2, 'generate_problems', 'hash_math_01') as r;
+  `, [taskP1, userIdA]);
+  if (!lookupSuccess.rows[0].r.success || !lookupSuccess.rows[0].r.cached_result) {
+    throw new Error(`Saved task lookup must return preserved result: ${JSON.stringify(lookupSuccess.rows[0].r)}`);
+  }
+  console.log('✓ lookup_saved_ai_task_result authoritative retrieval of preserved result verified');
+
+  // 7. lookup_saved_ai_task_result rejects cross-user or missing tasks
+  const lookupCrossUser = await db.query(`
+    select public.lookup_saved_ai_task_result($1, $2, 'generate_problems', 'hash_math_01') as r;
+  `, [taskP1, userIdB]);
+  if (lookupCrossUser.rows[0].r.success !== false || lookupCrossUser.rows[0].r.error_code !== 'TASK_OWNERSHIP_MISMATCH') {
+    throw new Error(`Saved task lookup for other user must fail with TASK_OWNERSHIP_MISMATCH: ${JSON.stringify(lookupCrossUser.rows[0].r)}`);
+  }
+  console.log('✓ lookup_saved_ai_task_result cross-user access strictly blocked with TASK_OWNERSHIP_MISMATCH');
+
   console.log('\n=== All Upgrade Path & Scenario Tests Passed Successfully! ===\n');
 }
 

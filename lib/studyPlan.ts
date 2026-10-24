@@ -33,6 +33,7 @@ import {
 import {
   DEFAULT_RETENTION_SETTINGS,
   calculateNextReviewRecommendation,
+  getConfirmedEvents,
 } from './retentionModel';
 
 export interface GenerateStudyPlanParams {
@@ -307,9 +308,16 @@ export function generateStudyPlan({
         subjectConcepts
       );
 
-      // Check recent attempts for vulnerabilities & Stage 8 diagnosis
+      // Check recent attempts for vulnerabilities & Stage 8 diagnosis (only confirmed attempts!)
       const conceptAttempts = attempts
-        .filter((a) => a.conceptId === c.id || a.conceptIds?.includes(c.id))
+        .filter(
+          (a) =>
+            (a.conceptId === c.id || a.conceptIds?.includes(c.id)) &&
+            !a.needsReview &&
+            (a as { status?: string }).status !== 'unconfirmed' &&
+            a.academicErrorType !== 'UNCERTAIN' &&
+            a.structuredError?.errorType !== 'UNCERTAIN'
+        )
         .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
       const lastAttempt = conceptAttempts[0];
 
@@ -329,7 +337,7 @@ export function generateStudyPlan({
 
       // Review rounds: the pending item targets the NEXT review (reviewCount + 1).
       // Completion is only linked to the attempt that actually belongs to a round.
-      const reviewEvents = (c.events || [])
+      const reviewEvents = getConfirmedEvents(c.events || [])
         .filter((e) => e.kind === 'attempt' || e.kind === 'review')
         .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
       const reviewCount = reviewEvents.length;

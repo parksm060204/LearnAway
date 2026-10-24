@@ -233,7 +233,7 @@ export async function recordAiUsageTelemetry(input: RecordTelemetryInput): Promi
   if (hasAdminClientConfig()) {
     try {
       const admin = createAdminClient();
-      await admin.from('ai_usage_telemetry').insert({
+      const { error } = await admin.from('ai_usage_telemetry').insert({
         id: record.id,
         request_id: record.requestId,
         user_id: record.userId,
@@ -252,8 +252,11 @@ export async function recordAiUsageTelemetry(input: RecordTelemetryInput): Promi
         credit_source: record.creditSource,
         created_at: record.createdAt,
       });
-    } catch {
-      // Telemetry persistence failure must never fail the underlying learning feature.
+      if (error) {
+        console.warn('AI usage telemetry DB persistence failed:', error.message);
+      }
+    } catch (err) {
+      console.warn('AI usage telemetry DB persistence exception:', err);
     }
   }
 
@@ -266,6 +269,7 @@ export interface TelemetryFilter {
   userId?: string;
   taskType?: string;
   creditSource?: AiCreditSource;
+  model?: string;
 }
 
 export interface DailyAiMetric {
@@ -489,4 +493,106 @@ export function clearTelemetryStore(): void {
 /** Returns read-only slice of in-memory telemetry records. */
 export function getInMemoryTelemetryRecords(): readonly AiUsageTelemetryRecord[] {
   return inMemoryTelemetryRecords;
+}
+
+/**
+ * Queries AI usage telemetry records and summary from persistent DB (or in-memory fallback).
+ * Throws or returns an error if DB query fails, preventing silent false 0 usage.
+ */
+export async function queryAiUsageTelemetryFromDb(
+  filter?: TelemetryFilter,
+  limit = 100
+): Promise<{
+  records: AiUsageTelemetryRecord[];
+  summary: AiUsageSummary;
+  fromDb: boolean;
+}> {
+  if (hasAdminClientConfig()) {
+    const admin = createAdminClient();
+    let query = admin
+      .from('ai_usage_telemetry')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(Math.min(1000, Math.max(1, limit)));
+
+    if (filter?.userId && filter.userId !== 'all') {
+      query = query.eq('user_id', filter.userId);
+    }
+    if (filter?.taskType) {
+      query = query.eq('task_type', filter.taskType);
+    }
+    if (filter?.creditSource) {
+      query = query.eq('credit_source', filter.creditSource);
+    }
+    if (filter?.model) {
+      query = query.eq('model', filter.model);
+    }
+    if (filter?.startDate) {
+      query = query.gte('created_at', filter.startDate);
+    }
+    if (filter?.endDate) {
+      query = query.lte('created_at', filter.endDate);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      throw new Error(`DB 계측 지표 조회 실패: ${error.message}`);
+    }
+
+    const dbRecords: AiUsageTelemetryRecord[] = (data || []).map((row: Record<string, unknown>) => ({
+      id: String(row.id || ''),
+      requestId: String(row.request_id || row.id || ''),
+      userId: String(row.user_id || ''),
+      taskType: String(row.task_type || ''),
+      provider: String(row.provider || ''),
+      model: String(row.model || ''),
+      inputTokens: typeof row.input_tokens === 'number' ? row.input_tokens : 0,
+      outputTokens: typeof row.output_tokens === 'number' ? row.output_tokens : 0,
+      totalTokens: typeof row.total_tokens === 'number' ? row.total_tokens : 0,
+      isEstimatedTokens: Boolean(row.is_estimated_tokens),
+      estimatedCostUsd: Number(row.estimated_cost_usd) || 0,
+      estimatedCostKrw: Number(row.estimated_cost_krw) || 0,
+      executionTimeMs: typeof row.execution_time_ms === 'number' ? row.execution_time_ms : 0,
+      status: (row.status as AiTelemetryStatus) || 'success',
+      errorCode: row.error_code ? String(row.error_code) : undefined,
+      creditSource: (row.credit_source as AiCreditSource) || 'operator_trial',
+      createdAt: String(row.created_at || ''),
+    }));
+
+    const summary = getAiUsageSummary(filter, dbRecords);
+    return {
+      records: dbRecords,
+      summary,
+      fromDb: true,
+    };
+  }
+
+  // Fallback to in-memory store in environments without admin Supabase credentials (e.g. mock test suite)
+  const inMemory = [...inMemoryTelemetryRecords];
+  let filteredInMemory = inMemory;
+  if (filter?.userId && filter.userId !== 'all') {
+    filteredInMemory = filteredInMemory.filter((r) => r.userId === filter.userId);
+  }
+  if (filter?.taskType) {
+    filteredInMemory = filteredInMemory.filter((r) => r.taskType === filter.taskType);
+  }
+  if (filter?.creditSource) {
+    filteredInMemory = filteredInMemory.filter((r) => r.creditSource === filter.creditSource);
+  }
+  if (filter?.model) {
+    filteredInMemory = filteredInMemory.filter((r) => r.model === filter.model);
+  }
+  if (filter?.startDate) {
+    filteredInMemory = filteredInMemory.filter((r) => new Date(r.createdAt).getTime() >= new Date(filter.startDate!).getTime());
+  }
+  if (filter?.endDate) {
+    filteredInMemory = filteredInMemory.filter((r) => new Date(r.createdAt).getTime() <= new Date(filter.endDate!).getTime());
+  }
+
+  const summary = getAiUsageSummary(filter, filteredInMemory);
+  return {
+    records: filteredInMemory.slice(-limit).reverse(),
+    summary,
+    fromDb: false,
+  };
 }

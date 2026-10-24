@@ -229,6 +229,244 @@ export async function reserveTrialCredit(
   }
 }
 
+export interface TaskRegistrationResult {
+  allowed: boolean;
+  status?: 'processing' | 'already_completed' | 'concurrent_in_progress' | 'reserved';
+  remaining?: number;
+  leaseToken?: string;
+  cachedResult?: unknown;
+  errorCode?: string;
+  message?: string;
+  creditSource?: 'operator_trial' | 'personal_key';
+}
+
+/**
+ * Atomically registers/verifies an AI task for both personal_key and operator_trial callers.
+ * Enforces task ownership and input_identifier idempotency, blocking mismatched reuse or concurrent duplicates.
+ */
+export async function registerAiTask(
+  userId: string,
+  taskId: string,
+  taskType: TrialTaskType,
+  inputIdentifier: string,
+  isPersonalKey = false,
+  dailyCap = getOperatorDailyCap()
+): Promise<TaskRegistrationResult> {
+  if (!isPersonalKey && isOperatorEmergencyStopped()) {
+    return {
+      allowed: false,
+      errorCode: 'OPERATOR_DISABLED',
+      message: '운영자 AI 체험 서비스가 일시 점검 중입니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+    };
+  }
+
+  try {
+    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const { data, error } = await client.rpc('register_ai_task', {
+      p_task_id: taskId,
+      p_task_type: taskType,
+      p_input_identifier: inputIdentifier,
+      p_user_id: userId,
+      p_is_personal_key: isPersonalKey,
+      p_daily_cap: dailyCap,
+    });
+
+    if (error || !data || typeof data !== 'object') {
+      if (!isPersonalKey) {
+        return reserveTrialCredit(userId, taskId, taskType, inputIdentifier, dailyCap);
+      }
+      return {
+        allowed: false,
+        errorCode: 'TASK_REGISTRATION_FAILED',
+        message: error?.message || '작업 등록 중 오류가 발생했습니다.',
+      };
+    }
+
+    const res = data as {
+      allowed?: boolean;
+      status?: 'processing' | 'already_completed' | 'concurrent_in_progress' | 'reserved';
+      remaining?: number;
+      lease_token?: string;
+      cached_result?: unknown;
+      error_code?: string;
+      code?: string;
+      message?: string;
+      credit_source?: 'operator_trial' | 'personal_key';
+    };
+
+    const errCode = res.error_code || res.code;
+
+    if (res.status === 'already_completed') {
+      return {
+        allowed: false,
+        status: 'already_completed',
+        remaining: res.remaining ?? 0,
+        cachedResult: res.cached_result,
+        leaseToken: res.lease_token,
+        message: res.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
+      };
+    }
+
+    if (res.status === 'concurrent_in_progress') {
+      return {
+        allowed: false,
+        status: 'concurrent_in_progress',
+        errorCode: errCode || 'CONCURRENT_EXECUTION_BLOCKED',
+        message: res.message || '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
+      };
+    }
+
+    if (!res.allowed) {
+      return {
+        allowed: false,
+        errorCode: errCode || (isPersonalKey ? 'REGISTRATION_REJECTED' : 'INSUFFICIENT_CREDITS'),
+        remaining: res.remaining ?? 0,
+        message: res.message || '작업을 실행할 수 없습니다.',
+      };
+    }
+
+    return {
+      allowed: true,
+      status: res.status || 'processing',
+      remaining: res.remaining,
+      leaseToken: res.lease_token,
+      creditSource: res.credit_source,
+    };
+  } catch (err) {
+    return {
+      allowed: false,
+      errorCode: 'TASK_REGISTRATION_NETWORK_ERROR',
+      message: err instanceof Error ? err.message : '작업 등록 통신 오류',
+    };
+  }
+}
+
+export interface SavedTaskLookupResult {
+  success: boolean;
+  status?: string;
+  cachedResult?: unknown;
+  leaseToken?: string;
+  creditSource?: string;
+  errorCode?: string;
+  message?: string;
+}
+
+/**
+ * Looks up server-preserved AI result for save retries (isSaveRetry: true / action: retry_save).
+ * Strictly verifies ownership and input identifier without calling external AI.
+ */
+export async function lookupSavedTaskResult(
+  userId: string,
+  taskId: string,
+  taskType?: TrialTaskType,
+  inputIdentifier?: string
+): Promise<SavedTaskLookupResult> {
+  if (!taskId || !userId) {
+    return {
+      success: false,
+      errorCode: 'INVALID_PARAMETERS',
+      message: '작업 식별자 또는 사용자 정보가 누락되었습니다.',
+    };
+  }
+
+  try {
+    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const { data, error } = await client.rpc('lookup_saved_ai_task_result', {
+      p_task_id: taskId,
+      p_user_id: userId,
+      p_task_type: taskType || null,
+      p_input_identifier: inputIdentifier || null,
+    });
+
+    if (!error && data && typeof data === 'object') {
+      const res = data as {
+        success?: boolean;
+        status?: string;
+        cached_result?: unknown;
+        lease_token?: string;
+        credit_source?: string;
+        error_code?: string;
+        message?: string;
+      };
+      if (res.success) {
+        return {
+          success: true,
+          status: res.status,
+          cachedResult: res.cached_result,
+          leaseToken: res.lease_token,
+          creditSource: res.credit_source,
+        };
+      }
+      return {
+        success: false,
+        errorCode: res.error_code || 'LOOKUP_FAILED',
+        message: res.message || '보존된 결과를 조회하지 못했습니다.',
+      };
+    }
+
+    // Direct table query fallback if lookup_saved_ai_task_result RPC is not present
+    const { data: row, error: rowErr } = await client
+      .from('ai_trial_reservations')
+      .select('*')
+      .eq('task_id', taskId)
+      .maybeSingle();
+
+    if (rowErr || !row) {
+      return {
+        success: false,
+        errorCode: 'TASK_NOT_FOUND',
+        message: '저장 재시도할 기존 작업 기록을 찾을 수 없습니다.',
+      };
+    }
+
+    if (row.user_id !== userId) {
+      return {
+        success: false,
+        errorCode: 'TASK_OWNERSHIP_MISMATCH',
+        message: '해당 작업에 대한 접근 권한이 없습니다.',
+      };
+    }
+
+    if (taskType && row.task_type !== taskType) {
+      return {
+        success: false,
+        errorCode: 'TASK_TYPE_MISMATCH',
+        message: '작업 종류가 일치하지 않습니다.',
+      };
+    }
+
+    if (inputIdentifier && row.input_identifier !== inputIdentifier) {
+      return {
+        success: false,
+        errorCode: 'TASK_INPUT_MISMATCH',
+        message: '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.',
+      };
+    }
+
+    if (!row.cached_result) {
+      return {
+        success: false,
+        errorCode: 'NO_SAVED_RESULT',
+        message: '서버에 보존된 AI 생성 결과가 없습니다. 새로운 작업으로 다시 요청해 주세요.',
+      };
+    }
+
+    return {
+      success: true,
+      status: row.status,
+      cachedResult: row.cached_result,
+      leaseToken: row.lease_token,
+      creditSource: row.credit_source,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      errorCode: 'LOOKUP_NETWORK_ERROR',
+      message: err instanceof Error ? err.message : '보존된 결과 조회 통신 오류',
+    };
+  }
+}
+
 /**
  * Records AI output as result_ready before attempting DB persistence.
  * Validates leaseToken to prevent stale executions from overwriting state.

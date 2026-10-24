@@ -86,14 +86,41 @@ export function calculateComprehensiveTau(
 }
 
 /**
+ * Evaluates whether an event represents an authoritative, confirmed evaluation.
+ * Unconfirmed AI evaluations (needsReview: true, UNCERTAIN academic error type,
+ * status: 'unconfirmed') are NOT confirmed and must not affect mastery, retention,
+ * or error-based recommendations until explicitly confirmed.
+ */
+export function isConfirmedReviewEvent(e: ReviewEvent): boolean {
+  if (!e) return false;
+  if (e.kind !== 'initial_study' && e.kind !== 'attempt' && e.kind !== 'review') {
+    return false;
+  }
+  if (e.needsReview === true) return false;
+  if ((e as { status?: string }).status === 'unconfirmed') return false;
+  if ((e as { isUnconfirmed?: boolean }).isUnconfirmed === true) return false;
+  const acError = e.academicErrorType || e.structuredError?.errorType;
+  if (acError === 'UNCERTAIN') return false;
+  return true;
+}
+
+/**
  * Filters only verified confirmed learning and evaluation events.
- * Crucial rule: 'scheduled', unconfirmed AI drafts, or postponed reminders
- * MUST NOT count as study accomplishments.
+ * Crucial rule: 'scheduled', unconfirmed AI drafts, needsReview evaluations,
+ * or postponed reminders MUST NOT count as study accomplishments or degrade mastery.
  */
 export function getConfirmedEvents(events?: ReviewEvent[]): ReviewEvent[] {
   if (!events || events.length === 0) return [];
+  return events.filter(isConfirmedReviewEvent);
+}
+
+/**
+ * Returns all unconfirmed learning/attempt events requiring review.
+ */
+export function getUnconfirmedEvents(events?: ReviewEvent[]): ReviewEvent[] {
+  if (!events || events.length === 0) return [];
   return events.filter(
-    (e) => e.kind === 'initial_study' || e.kind === 'attempt' || e.kind === 'review'
+    (e) => (e.kind === 'attempt' || e.kind === 'review') && !isConfirmedReviewEvent(e)
   );
 }
 
@@ -265,6 +292,10 @@ export function calculateConceptMasteryScore(
   const N = pastEvents.length;
   for (let i = 0; i < N; i++) {
     const ev = pastEvents[i];
+    if (!isConfirmedReviewEvent(ev)) {
+      continue;
+    }
+
     const rawScore = Math.min(100, Math.max(0, ev.resultScore));
     // Recency weight: 0.75^(N - 1 - i)
     const recencyWeight = Math.pow(0.75, N - 1 - i);
@@ -284,11 +315,6 @@ export function calculateConceptMasteryScore(
       repeatConceptErrors++;
     } else if (acError === 'LOGICAL_ERROR' || acError === 'CONDITION_OMISSION') {
       errorFactor = 0.92;
-    } else if (acError === 'UNCERTAIN' || ev.needsReview) {
-      // Unverified or uncertain AI evaluation: do not let AI failure unfairly degrade mastery
-      const safeScore = Math.max(rawScore, baseScore ?? 70);
-      weightedScores.push({ score: safeScore, weight: recencyWeight });
-      continue;
     }
 
     const eventMastery = Math.min(100, Math.max(0, rawScore * hintPenalty * errorFactor));

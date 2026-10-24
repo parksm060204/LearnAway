@@ -12,6 +12,7 @@ import {
   settleTrialCredit,
   releaseTrialCredit,
   recordTrialResultReady,
+  lookupSavedTaskResult,
   MAX_TRIAL_EXECUTION_TIMEOUT_MS,
   MAX_TRIAL_OUTPUT_TOKENS,
 } from '../../../lib/trialCredits';
@@ -29,7 +30,8 @@ import {
   toAcademicDifficultyLevel,
   SourceVerificationStatus,
 } from '../../../lib/types';
-import { computeMarkdownHash } from '../../../lib/markdownUtils';
+import { computeMarkdownHash, verifyPageGrounding } from '../../../lib/markdownUtils';
+export { verifyPageGrounding };
 
 interface SourceInput {
   materialId: string;
@@ -50,74 +52,6 @@ function asString(value: unknown, fallback = ''): string {
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
-}
-
-// Explicit taskId registry to enforce that different inputs reusing the same explicit taskId are rejected
-const explicitTaskRegistry = new Map<string, { userId: string; inputIdentifier: string }>();
-
-export function verifyPageGrounding(params: {
-  markdown: string;
-  quote: string;
-  candidatePage?: string;
-  sourceRefs?: string;
-}): string | undefined {
-  const { markdown, quote, candidatePage, sourceRefs } = params;
-  const normQuote = quote.replace(/\s+/g, ' ').trim();
-  if (!normQuote) return undefined;
-
-  // 1. Scan for explicit page boundaries in markdown
-  // e.g. <!-- Page 3 -->, [Page 3], [p. 3], ## Page 3, [Page 3/40]
-  const PAGE_BOUNDARY_REGEX = /(?:<!--\s*page\s*(\d+)\s*-->|\[\s*(?:page|p\.?)\s*(\d+)(?:\/\d+)?\s*\]|^#+\s*(?:page|페이지)\s*(\d+)\b)/gim;
-  const pageMarkers: { offset: number; page: string }[] = [];
-  let match: RegExpExecArray | null;
-
-  while ((match = PAGE_BOUNDARY_REGEX.exec(markdown)) !== null) {
-    const pageNum = match[1] || match[2] || match[3];
-    if (pageNum) {
-      pageMarkers.push({ offset: match.index, page: pageNum });
-    }
-  }
-
-  // Find position of quote in markdown
-  const normMarkdown = markdown.replace(/\s+/g, ' ');
-  const quotePos = normMarkdown.indexOf(normQuote);
-
-  if (pageMarkers.length > 0 && quotePos >= 0) {
-    let confirmedPage: string | undefined = undefined;
-    for (const marker of pageMarkers) {
-      const markerPos = markdown.slice(0, marker.offset).replace(/\s+/g, ' ').length;
-      if (markerPos <= quotePos) {
-        confirmedPage = marker.page;
-      } else {
-        break;
-      }
-    }
-
-    if (confirmedPage) {
-      const cleanCandidate = (candidatePage || '').replace(/\D/g, '');
-      if (!cleanCandidate || cleanCandidate === confirmedPage) {
-        return confirmedPage;
-      }
-      return confirmedPage;
-    }
-  }
-
-  // 2. If no page boundaries exist in markdown:
-  // Do NOT treat random digits in text as page evidence!
-  // Only accept if sourceRefs explicitly specifies an isolated page number (e.g. "p. 15", "15페이지")
-  if (sourceRefs && typeof sourceRefs === 'string') {
-    const pageRefMatch = /(?:^|[,\s])(?:p\.?|page|쪽|페이지)\s*([0-9]+)(?:[,\s]|$)/i.exec(sourceRefs.trim());
-    if (pageRefMatch && pageRefMatch[1]) {
-      const extractedPage = pageRefMatch[1];
-      const cleanCandidate = (candidatePage || '').replace(/\D/g, '');
-      if (!cleanCandidate || cleanCandidate === extractedPage) {
-        return extractedPage;
-      }
-    }
-  }
-
-  // Unverifiable page -> return undefined
-  return undefined;
 }
 
 const MATH_PROBLEM_TYPES: ProblemType[] = [
@@ -349,26 +283,68 @@ export async function POST(req: NextRequest) {
     const taskId = explicitTaskId || (`gen_${inputIdentifier}`);
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
 
-    // Reject mismatch if explicit taskId was already used with a different input
-    if (explicitTaskId) {
-      const existingTask = explicitTaskRegistry.get(explicitTaskId);
-      if (existingTask) {
-        if (existingTask.userId !== auth.user.id) {
-          return NextResponse.json(
-            { success: false, error: '해당 작업에 대한 접근 권한이 없습니다.', errorCode: 'TASK_OWNERSHIP_MISMATCH' },
-            { status: 403 }
-          );
-        }
-        if (
-          existingTask.inputIdentifier !== inputIdentifier &&
-          existingTask.inputIdentifier !== legacyInputIdentifier
-        ) {
-          return NextResponse.json(
-            { success: false, error: '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.', errorCode: 'TASK_INPUT_MISMATCH' },
-            { status: 400 }
-          );
-        }
+    // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved results only.
+    if (isSaveRetry) {
+      const saved = await lookupSavedTaskResult(
+        auth.user.id,
+        taskId,
+        'generate_problems',
+        effectiveInputIdentifier
+      );
+      if (!saved.success) {
+        const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
+        return NextResponse.json(
+          {
+            success: false,
+            error: saved.message || '저장 재시도할 기존 작업 결과를 찾을 수 없습니다.',
+            errorCode: saved.errorCode || 'SAVED_TASK_NOT_FOUND',
+          },
+          { status }
+        );
       }
+      const cached = saved.cachedResult as { drafts?: ProblemDraft[]; count?: number; generationJobId?: string } | null;
+      const generationJobId = cached?.generationJobId || taskId || randomUUID();
+      const drafts = Array.isArray(cached?.drafts) ? cached.drafts : [];
+      if (drafts.length === 0) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '서버에 보존된 문제 초안이 없습니다. 새로운 작업으로 다시 요청해 주세요.',
+            errorCode: 'NO_SAVED_DRAFTS',
+          },
+          { status: 400 }
+        );
+      }
+      let outcome: { persisted: boolean; drafts: ProblemDraft[]; persistError?: string } = {
+        persisted: false,
+        drafts,
+        persistError: undefined,
+      };
+      try {
+        const supabase = await createClient();
+        outcome = await persistProblemDraftsForResponse(supabase, drafts, generationJobId);
+      } catch (e) {
+        outcome = {
+          persisted: false,
+          drafts,
+          persistError: e instanceof Error ? e.message : '초안 저장에 실패했습니다.',
+        };
+      }
+      let isSettled = false;
+      if (outcome.persisted && saved.leaseToken && saved.creditSource === 'operator_trial') {
+        const settleResult = await settleTrialCredit(auth.user.id, taskId, saved.leaseToken);
+        isSettled = settleResult.success;
+      }
+      return NextResponse.json({
+        success: true,
+        drafts: outcome.drafts,
+        count: outcome.drafts.length,
+        generationJobId,
+        persisted: outcome.persisted,
+        settled: isSettled,
+        persistError: outcome.persistError,
+        fromCache: true,
+      });
     }
 
     // Check trial limits if user has no personal API key
@@ -383,12 +359,11 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 1. Resolve AI credentials with trialContext
+    // 1. Resolve AI credentials with trialContext (atomic DB task registration for both trial & personal key)
     const cred = await resolveAiConfigForUser(auth.user.id, {
       taskId,
       taskType: 'generate_problems',
       inputIdentifier: effectiveInputIdentifier,
-      isSaveRetry,
     });
     if (!cred.ok) {
       if (cred.code === 'task_input_mismatch' || cred.errorCode === 'TASK_INPUT_MISMATCH') {
@@ -740,7 +715,7 @@ ${combinedSource}
             markdown: matchedSource.markdown,
             quote,
             candidatePage: asString(raw.sourcePage).trim() || undefined,
-            sourceRefs: matchedSource.sourceRefs || asString(raw.sourceRefs).trim() || undefined,
+            sourceRefs: matchedSource.sourceRefs || undefined,
           });
         } else if (matchingSources.length > 1) {
           // Quote exists in multiple sources: ambiguity / multi-source
@@ -876,7 +851,7 @@ ${combinedSource}
       }));
 
       let cacheSuccess = true;
-      if (cred.isTrial && draftsWithIds.length > 0) {
+      if (cred.leaseToken && draftsWithIds.length > 0) {
         const cacheRes = await recordTrialResultReady(
           auth.user.id,
           taskId,
@@ -946,13 +921,6 @@ ${combinedSource}
             ? '결과 캐시 보존이 완료되지 않아 크레딧 확정을 보류했습니다.'
             : '초안 DB 저장이 완료되지 않아 크레딧 확정을 보류했습니다.';
         }
-      }
-
-      if (explicitTaskId) {
-        explicitTaskRegistry.set(explicitTaskId, {
-          userId: auth.user.id,
-          inputIdentifier: effectiveInputIdentifier,
-        });
       }
 
       return NextResponse.json({
