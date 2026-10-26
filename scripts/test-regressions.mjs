@@ -13,7 +13,7 @@ const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-'));
 const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
   'lib/types.ts', 'lib/storage.ts', 'lib/mockExam.ts', 'lib/evaluationValidation.ts', 'lib/materialStorage.ts', 'lib/materialPolicy.ts', 'lib/materialRestore.ts',
   'lib/materialDraft.ts', 'lib/materialEditSave.ts', 'lib/materialIngestion.ts', 'lib/analysisCheckpoint.ts', 'lib/reviewNotifications.ts', 'lib/dashboardUrl.ts',
-  'lib/practiceAnswerDraft.ts', 'lib/sessionAffiliation.ts', 'lib/analysisRecovery.ts', 'lib/recoveryToken.ts',
+  'lib/practiceAnswerDraft.ts', 'lib/sessionAffiliation.ts', 'lib/analysisRecovery.ts', 'lib/recoveryToken.ts', 'lib/taskRecoveryClient.ts',
   'lib/todayStudy.ts', 'lib/reviewStats.ts',
   'lib/problemSources.ts', 'lib/problemFreshness.ts', 'lib/studyPlan.ts', 'lib/retentionModel.ts', 'lib/dateUtils.ts',
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
@@ -18598,7 +18598,500 @@ exports.requireApiUser = async () => {
     });
   });
 
-    if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
+  // =========================================================================
+  // 복구 기능 버그 3건 회귀 테스트
+  // =========================================================================
+
+  await checkAsync('복구 버그 1: 늦은 복구 응답의 다른 세션/계정 적용 방지 및 복구 기록 보존', async () => {
+    const { shouldApplyResponse } = load(path.join(output, 'lib/logicAsync.js'));
+    const {
+      saveTaskRecovery,
+      getTaskRecovery,
+      clearTaskRecovery,
+    } = load(path.join(output, 'lib/taskRecoveryClient.js'));
+
+    const userA = 'user-test-a';
+    const userB = 'user-test-b';
+    const sessionA = 'session-101';
+    const sessionB = 'session-202';
+    const hashA = 'hash-question-input-v1';
+
+    // 1. 세션 전환 차단 검증: 세션 A에서 요청 후 응답 도착 시 세션 B가 활성화되어 있으면 차단
+    assert.equal(
+      shouldApplyResponse({
+        mounted: true,
+        requestId: 1,
+        latestRequestId: 1,
+        requestSessionId: sessionA,
+        activeSessionId: sessionB,
+        snapshotHash: hashA,
+        currentHash: hashA,
+      }),
+      false,
+      'A 세션 요청 응답이 B 활성 세션에 적용되지 않아야 함'
+    );
+
+    // 2. 같은 세션에서 새 요청 후 이전 응답 도착 시 차단
+    assert.equal(
+      shouldApplyResponse({
+        mounted: true,
+        requestId: 1,
+        latestRequestId: 2,
+        requestSessionId: sessionA,
+        activeSessionId: sessionA,
+        snapshotHash: hashA,
+        currentHash: hashA,
+      }),
+      false,
+      '구형 requestId 응답이 최신 요청 결과를 덮어쓰지 않아야 함'
+    );
+
+    // 3. 언마운트 시 차단
+    assert.equal(
+      shouldApplyResponse({
+        mounted: false,
+        requestId: 1,
+        latestRequestId: 1,
+        requestSessionId: sessionA,
+        activeSessionId: sessionA,
+        snapshotHash: hashA,
+        currentHash: hashA,
+      }),
+      false,
+      '언마운트 상태에서 응답 적용 차단'
+    );
+
+    // 4. 입력 변경 시 차단
+    assert.equal(
+      shouldApplyResponse({
+        mounted: true,
+        requestId: 1,
+        latestRequestId: 1,
+        requestSessionId: sessionA,
+        activeSessionId: sessionA,
+        snapshotHash: hashA,
+        currentHash: 'hash-question-input-modified',
+      }),
+      false,
+      '입력 내용이 변경되었을 때 이전 응답 적용 차단'
+    );
+
+    // 5. 정상 복구: 세션, ID, 해시 모두 일치 시 적용 허용
+    assert.equal(
+      shouldApplyResponse({
+        mounted: true,
+        requestId: 1,
+        latestRequestId: 1,
+        requestSessionId: sessionA,
+        activeSessionId: sessionA,
+        snapshotHash: hashA,
+        currentHash: hashA,
+      }),
+      true,
+      '원래 세션 및 최신 요청에만 정상 적용'
+    );
+
+    // 6. 복구 기록 보존 및 오래된 응답/다른 탭의 복구 기록 삭제 방지
+    saveTaskRecovery(userA, 'transfer_problem', sessionA, {
+      taskId: 'task-newer-2',
+      signedRecoveryToken: 'token-2',
+      recoveryData: { draft: { id: 'd2' } },
+    });
+
+    // 오래된 응답(task-older-1)이 clear 시도: 삭제 거부되어야 함
+    const clearedWrong = clearTaskRecovery(userA, 'transfer_problem', sessionA, 'task-older-1');
+    assert.equal(clearedWrong, false, '다른/이전 taskId를 가진 응답이 최신 복구 기록을 삭제하지 못해야 함');
+
+    const stillThere = getTaskRecovery(userA, 'transfer_problem', sessionA);
+    assert.ok(stillThere, '새로운 복구 기록이 보존되어 있어야 함');
+    assert.equal(stillThere.taskId, 'task-newer-2');
+
+    // 계정 격리 검증: userB는 userA의 복구 기록을 조회하거나 삭제할 수 없음
+    assert.equal(getTaskRecovery(userB, 'transfer_problem', sessionA), null, '다른 사용자의 복구 기록 조회 불가');
+    clearTaskRecovery(userB, 'transfer_problem', sessionA, 'task-newer-2');
+    assert.ok(getTaskRecovery(userA, 'transfer_problem', sessionA), '다른 사용자가 복구 기록을 삭제할 수 없음');
+
+    // 정상 일치하는 taskId로 삭제 성공
+    const clearedRight = clearTaskRecovery(userA, 'transfer_problem', sessionA, 'task-newer-2');
+    assert.equal(clearedRight, true);
+    assert.equal(getTaskRecovery(userA, 'transfer_problem', sessionA), null);
+  });
+
+  await checkAsync('복구 버그 2: 품질 검토 복구 토큰의 작업 유형 일치 및 레거시 토큰 호환성 검증', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: reviewPost } = load(path.join(output, 'app/api/review-problem-quality/route.js'));
+    const { signTaskRecoveryToken, verifyTaskRecoveryToken } = load(path.join(output, 'lib/recoveryToken.js'));
+    const { AI_CONFIG } = load(path.join(output, 'lib/aiConfig.js'));
+    const aiModule = load(path.join(output, 'lib/aiClient.js'));
+
+    const testUser = { id: 'user-qual-recovery' };
+    let aiCallCount = 0;
+    const recordedResults = [];
+    const settledTasks = [];
+    let persistenceShouldFail = true;
+
+    // AI Mock
+    const prevApiKey = AI_CONFIG.apiKey;
+    const prevProvider = AI_CONFIG.provider;
+    const prevCallAiChat = aiModule.callAiChat;
+    AI_CONFIG.apiKey = 'mock-key';
+    AI_CONFIG.provider = 'baze';
+
+    aiModule.callAiChat = async () => {
+      aiCallCount++;
+      return {
+        ok: true,
+        content: JSON.stringify({
+          isReportJustified: true,
+          severity: 'moderate',
+          recommendation: 'edit_required',
+          analysisSummary: '원문 대조 결과 조건 명확화가 필요합니다.',
+          suggestedFixes: '조건 범위를 x > 0으로 한정할 것',
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    const rpcSpy = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        return {
+          data: {
+            allowed: true,
+            status: 'processing',
+            task_id: args.p_task_id || 'task-qual-1',
+            lease_token: 'lease-qual-1',
+            credit_source: 'operator_trial',
+          },
+          error: null,
+        };
+      }
+      if (fn === 'consume_ai_call_budget') {
+        return { data: { allowed: true }, error: null };
+      }
+      if (fn === 'record_trial_result_ready') {
+        if (persistenceShouldFail) {
+          return { data: { success: false, error: 'Database network partition failure' }, error: null };
+        }
+        recordedResults.push({ ...args });
+        return { data: { success: true, task_id: args.p_task_id }, error: null };
+      }
+      if (fn === 'settle_trial_credit') {
+        settledTasks.push({ ...args });
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    try {
+      await withFakeSupabase({ user: testUser, rpcImpl: rpcSpy }, async () => {
+        const problemPayload = {
+          id: 'prob-qual-1',
+          version: 1,
+          title: '선형대수 고유값 문제',
+          promptText: '행렬 A의 특성다항식을 구하시오.',
+          modelAnswer: 'det(A - lambda I) = 0',
+          rubric: [{ id: 'r1', label: '행렬식 계산', maxScore: 100, description: '전개 과정' }],
+          categoryLabel: '선형대수',
+        };
+
+        const initialReq = new NextRequest('http://localhost/api/review-problem-quality', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            problem: problemPayload,
+            reports: [{ type: 'ambiguous_condition', details: '행렬 차수가 주어지지 않음' }],
+            sourceMarkdown: '제1장 고유값과 고유벡터',
+          }),
+        });
+
+        // 1. 최초 요청 시 DB 보존 실패 주입 -> 토큰 발급 및 canRetrySave: true 반환
+        const res1 = await reviewPost(initialReq);
+        assert.equal(res1.status, 500);
+        const data1 = await res1.json();
+        assert.equal(data1.canRetrySave, true, '저장 재시도 가능 플래그 반환');
+        assert.ok(data1.signedRecoveryToken, '서명된 복구 토큰 발급');
+        assert.ok(data1.recoveryData, '복구 데이터 반환');
+        assert.equal(aiCallCount, 1, 'AI는 1회 호출됨');
+
+        // 2. 발급된 토큰을 그대로 retry_save에 전달 -> AI 재호출 없이 저장 및 정산 성공
+        persistenceShouldFail = false; // DB 복구됨
+        const retryReq = new NextRequest('http://localhost/api/review-problem-quality', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            problem: problemPayload,
+            reports: [{ type: 'ambiguous_condition', details: '행렬 차수가 주어지지 않음' }],
+            sourceMarkdown: '제1장 고유값과 고유벡터',
+            isSaveRetry: true,
+            action: 'retry_save',
+            taskId: data1.taskId,
+            signedRecoveryToken: data1.signedRecoveryToken,
+            recoveryData: data1.recoveryData,
+          }),
+        });
+
+        const resRetry = await reviewPost(retryReq);
+        assert.equal(resRetry.status, 200, '재시도 저장 성공');
+        const dataRetry = await resRetry.json();
+        assert.equal(dataRetry.success, true);
+        assert.equal(dataRetry.settled, true);
+        assert.equal(dataRetry.review.isReportJustified, true);
+        assert.equal(aiCallCount, 1, '재시도 시 AI 재호출 0회');
+        assert.equal(recordedResults.length, 1, '결과가 DB에 성공적으로 저장됨');
+        assert.equal(settledTasks.length, 1, '크레딧이 정상 정산됨');
+
+        // 3. 구형 토큰 호환성 검증: problem_quality_review 로 서명된 구형 토큰 검증
+        const legacyToken = signTaskRecoveryToken({
+          userId: testUser.id,
+          taskId: 'task-legacy-qual',
+          taskType: 'problem_quality_review',
+          inputIdentifier: 'test-hash-input',
+          result: { foo: 'bar' },
+        });
+
+        const verifiedLegacy = verifyTaskRecoveryToken(legacyToken, {
+          userId: testUser.id,
+          taskId: 'task-legacy-qual',
+          taskType: 'review_problem_quality',
+          inputIdentifier: 'test-hash-input',
+          result: { foo: 'bar' },
+        });
+        assert.equal(verifiedLegacy.ok, true, '구형 별칭 problem_quality_review 토큰이 review_problem_quality 검증 시 허용되어야 함');
+
+        // 4. 무관한 작업 유형 또는 변조된 토큰 거부 검증
+        const rejectedWrongTask = verifyTaskRecoveryToken(legacyToken, {
+          userId: testUser.id,
+          taskId: 'task-legacy-qual',
+          taskType: 'evaluate_answer',
+          inputIdentifier: 'test-hash-input',
+          result: { foo: 'bar' },
+        });
+        assert.equal(rejectedWrongTask.ok, false);
+        assert.equal(rejectedWrongTask.code, 'MISMATCH', '다른 작업 유형은 엄격히 거부');
+
+        const parsedToken = JSON.parse(Buffer.from(legacyToken, 'base64url').toString('utf-8'));
+        parsedToken.s = (parsedToken.s[0] === '0' ? '1' : '0') + parsedToken.s.slice(1);
+        const tamperedToken = Buffer.from(JSON.stringify(parsedToken)).toString('base64url');
+        const verifiedTampered = verifyTaskRecoveryToken(tamperedToken, {
+          userId: testUser.id,
+          taskId: 'task-legacy-qual',
+          taskType: 'review_problem_quality',
+          inputIdentifier: 'test-hash-input',
+          result: { foo: 'bar' },
+        });
+        assert.equal(verifiedTampered.ok, false);
+        assert.equal(verifiedTampered.code, 'TAMPERED', '변조된 토큰 거부');
+      });
+    } finally {
+      AI_CONFIG.apiKey = prevApiKey;
+      AI_CONFIG.provider = prevProvider;
+      aiModule.callAiChat = prevCallAiChat;
+    }
+  });
+
+  await checkAsync('복구 버그 3: 생성 당시 입력 스냅샷 보존 복구 및 수정 답안 분리 보존', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
+    const { POST: evaluatePost } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+    const { saveTaskRecovery, getTaskRecovery } = load(path.join(output, 'lib/taskRecoveryClient.js'));
+    const { AI_CONFIG } = load(path.join(output, 'lib/aiConfig.js'));
+    const aiModule = load(path.join(output, 'lib/aiClient.js'));
+
+    const testUser = { id: 'user-snapshot-tester' };
+    let aiCallCount = 0;
+    let persistenceShouldFail = true;
+
+    const prevApiKey = AI_CONFIG.apiKey;
+    const prevProvider = AI_CONFIG.provider;
+    const prevCallAiChat = aiModule.callAiChat;
+    AI_CONFIG.apiKey = 'mock-key';
+    AI_CONFIG.provider = 'baze';
+
+    aiModule.callAiChat = async () => {
+      aiCallCount++;
+      return {
+        ok: true,
+        content: JSON.stringify({
+          calculatedScore: 88,
+          rubricResults: [{ criterionId: 'r1', score: 88, deductionReason: '계산 실수', improvementTip: '부호 주의', evidenceQuote: 'g(x)', isVulnerable: false }],
+          feedback: '잘 작성되었습니다.',
+          strengths: '논리 전개 우수',
+          criticalImprovements: '사소한 계산 오류',
+          needsReview: false,
+          academicErrorType: 'CALCULATION_ERROR',
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    const rpcSpy = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        return {
+          data: {
+            allowed: true,
+            status: 'processing',
+            task_id: args.p_task_id || 'task-eval-snap-1',
+            lease_token: 'lease-eval-snap-1',
+            credit_source: 'operator_trial',
+          },
+          error: null,
+        };
+      }
+      if (fn === 'consume_ai_call_budget') {
+        return { data: { allowed: true }, error: null };
+      }
+      if (fn === 'record_trial_result_ready') {
+        if (persistenceShouldFail) {
+          return { data: { success: false, error: 'Database commit failed' }, error: null };
+        }
+        return { data: { success: true, task_id: args.p_task_id }, error: null };
+      }
+      if (fn === 'settle_trial_credit') {
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    try {
+      await withFakeSupabase({
+        user: testUser,
+        problems: [{
+          id: 'prob-eval-snap',
+          user_id: testUser.id,
+          version: 1,
+          prompt_text: '롤의 정리를 이용하여 증명하라.',
+          model_answer: 'g(x) = f(x) - ...',
+          rubric: [{ id: 'r1', label: '정리 적용', maxScore: 100, description: '조건 충족' }],
+          payload: {
+            promptText: '롤의 정리를 이용하여 증명하라.',
+            modelAnswer: 'g(x) = f(x) - ...',
+            rubric: [{ id: 'r1', label: '정리 적용', maxScore: 100, description: '조건 충족' }],
+          },
+          concept_ids: ['c1'],
+          subject_id: 's1',
+          quality_status: 'normal',
+        }],
+        rpcImpl: rpcSpy,
+      }, async () => {
+        const originalInput = {
+          isProvisionalLocal: true,
+          problemId: 'prob-eval-snap',
+          problemVersion: 1,
+          conceptId: 'c1',
+          subjectId: 's1',
+          domain: 'math_stats',
+          problemTitle: '평균값 정리 증명',
+          problemPrompt: '롤의 정리를 이용하여 증명하라.',
+          modelAnswer: 'g(x) = f(x) - ...',
+          rubric: [{ id: 'r1', label: '정리 적용', maxScore: 100, description: '조건 충족' }],
+          userAnswer: '원래 작성한 답안: g(x) 정의 후 롤의 정리 적용',
+          revealedHintCount: 0,
+          hints: [],
+          solvingReason: '교재 3장 평균값 정리 증명 패턴 활용',
+        };
+
+        // 1. 원래 답안으로 채점 요청 -> DB 보존 실패 주입
+        const res1 = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(originalInput),
+        }));
+        assert.equal(res1.status, 500);
+        const data1 = await res1.json();
+        assert.equal(data1.canRetrySave, true);
+        assert.ok(data1.signedRecoveryToken);
+
+        // 2. 클라이언트에서 입력 스냅샷과 함께 복구 기록 저장 (새로고침 시뮬레이션)
+        const saveRes = saveTaskRecovery(testUser.id, 'evaluate_answer', originalInput.problemId, {
+          taskId: data1.taskId,
+          signedRecoveryToken: data1.signedRecoveryToken,
+          recoveryData: data1.recoveryData,
+          inputSnapshot: {
+            userAnswer: originalInput.userAnswer,
+            solvingReason: originalInput.solvingReason,
+            revealedHintCount: originalInput.revealedHintCount,
+            problemVersion: originalInput.problemVersion,
+          },
+          inputVersion: originalInput.problemVersion,
+        });
+        assert.equal(saveRes.ok, true, 'localStorage에 스냅샷과 함께 정상 저장');
+
+        // 새로고침 후 복구 기록 읽기
+        const reloaded = getTaskRecovery(testUser.id, 'evaluate_answer', originalInput.problemId);
+        assert.ok(reloaded);
+        assert.equal(reloaded.inputSnapshot.userAnswer, originalInput.userAnswer);
+
+        // 3. 사용자가 UI에서 답안을 수정함
+        const modifiedAnswer = '수정된 답안: 코시 평균값 정리로 확장 시도';
+        assert.notEqual(modifiedAnswer, reloaded.inputSnapshot.userAnswer);
+
+        // 수정된 답안으로 재시도 시 토큰 해시 불일치로 거부되어야 함 (토큰 검증 무력화 방지)
+        persistenceShouldFail = false; // DB 복구
+        const wrongPayloadReq = new NextRequest('http://localhost/api/evaluate-answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...originalInput,
+            userAnswer: modifiedAnswer, // 수정된 답안 전송
+            isSaveRetry: true,
+            action: 'retry_save',
+            taskId: reloaded.taskId,
+            signedRecoveryToken: reloaded.signedRecoveryToken,
+            recoveryData: reloaded.recoveryData,
+          }),
+        });
+        const resWrong = await evaluatePost(wrongPayloadReq);
+        assert.equal(resWrong.status, 400, '현재 수정 답안으로 재시도 시 입력 불일치로 거부');
+
+        // 4. 보존된 스냅샷 답안으로 재시도 -> 성공!
+        const correctPayloadReq = new NextRequest('http://localhost/api/evaluate-answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...originalInput,
+            userAnswer: reloaded.inputSnapshot.userAnswer, // 스냅샷 답안 사용
+            solvingReason: reloaded.inputSnapshot.solvingReason,
+            isSaveRetry: true,
+            action: 'retry_save',
+            taskId: reloaded.taskId,
+            signedRecoveryToken: reloaded.signedRecoveryToken,
+            recoveryData: reloaded.recoveryData,
+          }),
+        });
+        const resCorrect = await evaluatePost(correctPayloadReq);
+        assert.equal(resCorrect.status, 200, '원래 스냅샷 답안으로 재시도 저장 성공');
+        const dataCorrect = await resCorrect.json();
+        assert.equal(dataCorrect.success, true);
+        assert.equal(dataCorrect.evaluation.calculatedScore, 88);
+        assert.equal(aiCallCount, 1, '전체 복구 과정에서 추가 AI 호출 0회');
+
+        // 5. LocalStorage 용량 초과 감지 검증
+        const originalSetItem = window.localStorage.setItem;
+        try {
+          window.localStorage.setItem = () => {
+            const err = new Error('Quota exceeded');
+            err.name = 'QuotaExceededError';
+            throw err;
+          };
+          const quotaRes = saveTaskRecovery(testUser.id, 'evaluate_answer', 'test-key', {
+            taskId: 't1',
+            signedRecoveryToken: 's1',
+            recoveryData: {},
+          });
+          assert.equal(quotaRes.ok, false);
+          assert.equal(quotaRes.quotaExceeded, true);
+          assert.ok(quotaRes.error.includes('용량이 초과'));
+        } finally {
+          window.localStorage.setItem = originalSetItem;
+        }
+      });
+    } finally {
+      AI_CONFIG.apiKey = prevApiKey;
+      AI_CONFIG.provider = prevProvider;
+      aiModule.callAiChat = prevCallAiChat;
+    }
+  });
+
+  if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
   else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
   AI_CONFIG.apiKey = savedApiKeyPlan03;
   globalThis.__fakeSupabaseClient = trialClientBackupPlan03;

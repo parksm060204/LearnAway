@@ -13,6 +13,7 @@ import {
   ACADEMIC_DIFFICULTY_LEVELS,
   toAcademicDifficultyLevel,
   ACADEMIC_ERROR_LABELS,
+  RubricCriterion,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
 import { AcademicMathView } from './AcademicMathView';
@@ -58,6 +59,30 @@ import {
   type TaskRecoveryRecord,
 } from '../lib/taskRecoveryClient';
 
+export interface EvaluateAnswerInputSnapshot {
+  problemId: string;
+  problemVersion: number;
+  userAnswer: string;
+  solvingReason?: string;
+  isReasonNotApplicable?: boolean;
+  reasonNotApplicableJustification?: string;
+  revealedHintCount: number;
+  hints: string[];
+  problemTitle?: string;
+  problemPrompt?: string;
+  appliedConditionNote?: string;
+  mathFormula?: string;
+  codeSnippet?: string;
+  modelAnswer?: string;
+  rubric?: RubricCriterion[];
+  conceptId?: string;
+  conceptIds?: string[];
+  subjectId?: string;
+  domain?: string;
+  isProvisionalLocal?: boolean;
+}
+
+
 // Snapshot of every input that the AI evaluation depends on. Recording is only
 // allowed while the current inputs still match this snapshot.
 interface EvaluationInputSnapshot {
@@ -66,6 +91,7 @@ interface EvaluationInputSnapshot {
   isReasonNotApplicable: boolean;
   reasonNotApplicableJustification: string;
   hintCount: number;
+  problemVersion?: number;
 }
 
 interface ProblemSessionModalProps {
@@ -277,6 +303,16 @@ export function ProblemSessionModal({
   // Stage 4: AI Evaluation State
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [isRetryingSave, setIsRetryingSave] = useState(false);
+  const evalRequestIdRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const recoveryKey = userId ? `${userId}:${problem.id}` : '';
   const [prevRecoveryKey, setPrevRecoveryKey] = useState(recoveryKey);
   const [recoveryRecord, setRecoveryRecord] = useState<TaskRecoveryRecord | null>(() =>
@@ -314,10 +350,11 @@ export function ProblemSessionModal({
       ? reasonNotApplicableJustification.trim()
       : '',
     hintCount: revealedHints.length,
+    problemVersion: problem.version ?? 1,
   });
 
-  // Any change to an evaluation input invalidates the previous diagnosis so a
-  // stale diagnosis can never be attached to changed content.
+  // Stale evaluations are guarded by matchesSnapshot so they cannot be committed
+  // against modified inputs, while preserving the user's draft in textarea.
   const invalidateEvaluation = () => {
     setEvaluationResult(null);
     setEvaluatedSnapshot(null);
@@ -329,32 +366,32 @@ export function ProblemSessionModal({
     if (isEvaluating) return;
     if (!revealedHints.includes(index)) {
       setRevealedHints([...revealedHints, index]);
-      invalidateEvaluation();
+      setEvaluationError(null);
     }
   };
 
   const changeAnswer = (value: string) => {
     if (isEvaluating) return;
     setAnswerText(value);
-    invalidateEvaluation();
+    setEvaluationError(null);
   };
 
   const changeSolvingReason = (value: string) => {
     if (isEvaluating) return;
     setSolvingReason(value);
-    invalidateEvaluation();
+    setEvaluationError(null);
   };
 
   const changeReasonNotApplicable = (value: boolean) => {
     if (isEvaluating) return;
     setIsReasonNotApplicable(value);
-    invalidateEvaluation();
+    setEvaluationError(null);
   };
 
   const changeJustification = (value: string) => {
     if (isEvaluating) return;
     setReasonNotApplicableJustification(value);
-    invalidateEvaluation();
+    setEvaluationError(null);
   };
 
   const insertMathSnippet = (snippet: string) => {
@@ -375,6 +412,36 @@ export function ProblemSessionModal({
       return;
     }
 
+    const currentReqId = ++evalRequestIdRef.current;
+    const reqUserId = userId;
+    const reqProblemId = problem.id;
+    const reqProblemVersion = problem.version ?? 1;
+
+    const evalSnapshot: EvaluateAnswerInputSnapshot = {
+      problemId: problem.id,
+      problemVersion: reqProblemVersion,
+      conceptId: concept.id,
+      conceptIds: problem.conceptIds || [concept.id],
+      subjectId: subject.id,
+      domain: subject.domain || 'math_stats',
+      problemTitle: problem.title,
+      problemPrompt: problem.promptText,
+      appliedConditionNote: problem.appliedConditionNote,
+      mathFormula: problem.mathFormula,
+      codeSnippet: problem.codeSnippet,
+      modelAnswer: problem.modelAnswer,
+      rubric: problem.rubric,
+      userAnswer: trimmed,
+      revealedHintCount: revealedHints.length,
+      hints: revealedHints.map((index) => problem.hints[index]),
+      solvingReason: isReasonNotApplicable ? undefined : solvingReason.trim(),
+      isReasonNotApplicable,
+      reasonNotApplicableJustification: isReasonNotApplicable
+        ? reasonNotApplicableJustification.trim()
+        : undefined,
+      isProvisionalLocal: Boolean((problem as { isProvisionalLocal?: boolean }).isProvisionalLocal),
+    };
+
     setIsEvaluating(true);
     setEvaluationError(null);
 
@@ -384,7 +451,7 @@ export function ProblemSessionModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           problemId: problem.id,
-          problemVersion: problem.version ?? 1,
+          problemVersion: reqProblemVersion,
           conceptId: concept.id,
           conceptIds: problem.conceptIds || [concept.id],
           subjectId: subject.id,
@@ -409,15 +476,30 @@ export function ProblemSessionModal({
       });
 
       const data = await res.json();
+
+      if (
+        !mountedRef.current ||
+        currentReqId !== evalRequestIdRef.current ||
+        userId !== reqUserId ||
+        problem.id !== reqProblemId
+      ) {
+        return;
+      }
+
       if (!res.ok || !data.success) {
         if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && userId) {
           const rec = {
             taskId: data.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
+            inputSnapshot: evalSnapshot,
+            inputVersion: reqProblemVersion,
             error: data.error,
           };
-          saveTaskRecovery(userId, 'evaluate_answer', problem.id, rec);
+          const saveRes = saveTaskRecovery(userId, 'evaluate_answer', reqProblemId, rec);
+          if (!saveRes.ok) {
+            console.warn('LocalStorage save failed:', saveRes.error);
+          }
           setRecoveryRecord({
             ...rec,
             userId,
@@ -432,7 +514,7 @@ export function ProblemSessionModal({
       }
 
       if (userId) {
-        clearTaskRecovery(userId, 'evaluate_answer', problem.id);
+        clearTaskRecovery(userId, 'evaluate_answer', reqProblemId, data.taskId);
       }
       setRecoveryRecord(null);
       const evalData: EvaluationResult = data.evaluation;
@@ -446,6 +528,7 @@ export function ProblemSessionModal({
           ? reasonNotApplicableJustification.trim()
           : '',
         hintCount: revealedHints.length,
+        problemVersion: reqProblemVersion,
       });
       setCurrentAttemptId(`att-${Date.now()}-${Math.random().toString(36).substring(7)}`);
 
@@ -456,7 +539,7 @@ export function ProblemSessionModal({
     } catch (err) {
       setEvaluationError(`네트워크 연결 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
-      setIsEvaluating(false);
+      if (mountedRef.current) setIsEvaluating(false);
     }
   };
 
@@ -464,67 +547,123 @@ export function ProblemSessionModal({
     if (!recoveryRecord || isRetryingSave) return;
     setIsRetryingSave(true);
     setEvaluationError(null);
+    const currentReqId = ++evalRequestIdRef.current;
+    const reqUserId = userId;
+    const reqProblemId = problem.id;
+    const reqProblemVersion = problem.version ?? 1;
+    const reqTaskId = recoveryRecord.taskId;
+
+    const snap = recoveryRecord.inputSnapshot as EvaluateAnswerInputSnapshot | undefined;
+    const targetVersion = snap?.problemVersion ?? recoveryRecord.inputVersion ?? reqProblemVersion;
+
     try {
+      const payload = snap
+        ? {
+            problemId: snap.problemId || reqProblemId,
+            problemVersion: targetVersion,
+            conceptId: snap.conceptId || concept.id,
+            conceptIds: snap.conceptIds || (problem.conceptIds || [concept.id]),
+            subjectId: snap.subjectId || subject.id,
+            domain: snap.domain || (subject.domain || 'math_stats'),
+            problemTitle: snap.problemTitle || problem.title,
+            problemPrompt: snap.problemPrompt || problem.promptText,
+            appliedConditionNote: snap.appliedConditionNote ?? problem.appliedConditionNote,
+            mathFormula: snap.mathFormula ?? problem.mathFormula,
+            codeSnippet: snap.codeSnippet ?? problem.codeSnippet,
+            modelAnswer: snap.modelAnswer || problem.modelAnswer,
+            rubric: snap.rubric || problem.rubric,
+            userAnswer: snap.userAnswer,
+            revealedHintCount: snap.revealedHintCount,
+            hints: snap.hints || [],
+            solvingReason: snap.solvingReason,
+            isReasonNotApplicable: snap.isReasonNotApplicable,
+            reasonNotApplicableJustification: snap.reasonNotApplicableJustification,
+            isProvisionalLocal: snap.isProvisionalLocal ?? Boolean((problem as { isProvisionalLocal?: boolean }).isProvisionalLocal),
+            isSaveRetry: true,
+            action: 'retry_save',
+            taskId: recoveryRecord.taskId,
+            signedRecoveryToken: recoveryRecord.signedRecoveryToken,
+            recoveryData: recoveryRecord.recoveryData,
+          }
+        : {
+            problemId: problem.id,
+            problemVersion: reqProblemVersion,
+            conceptId: concept.id,
+            conceptIds: problem.conceptIds || [concept.id],
+            subjectId: subject.id,
+            domain: subject.domain || 'math_stats',
+            problemTitle: problem.title,
+            problemPrompt: problem.promptText,
+            appliedConditionNote: problem.appliedConditionNote,
+            mathFormula: problem.mathFormula,
+            codeSnippet: problem.codeSnippet,
+            modelAnswer: problem.modelAnswer,
+            rubric: problem.rubric,
+            userAnswer: answerText.trim(),
+            revealedHintCount: revealedHints.length,
+            hints: revealedHints.map((index) => problem.hints[index]),
+            solvingReason: isReasonNotApplicable ? undefined : solvingReason.trim(),
+            isReasonNotApplicable,
+            reasonNotApplicableJustification: isReasonNotApplicable
+              ? reasonNotApplicableJustification.trim()
+              : undefined,
+            isSaveRetry: true,
+            action: 'retry_save',
+            taskId: recoveryRecord.taskId,
+            signedRecoveryToken: recoveryRecord.signedRecoveryToken,
+            recoveryData: recoveryRecord.recoveryData,
+          };
+
       const res = await fetch('/api/evaluate-answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          problemId: problem.id,
-          problemVersion: problem.version ?? 1,
-          conceptId: concept.id,
-          conceptIds: problem.conceptIds || [concept.id],
-          subjectId: subject.id,
-          domain: subject.domain || 'math_stats',
-          problemTitle: problem.title,
-          problemPrompt: problem.promptText,
-          appliedConditionNote: problem.appliedConditionNote,
-          mathFormula: problem.mathFormula,
-          codeSnippet: problem.codeSnippet,
-          modelAnswer: problem.modelAnswer,
-          rubric: problem.rubric,
-          userAnswer: answerText.trim(),
-          revealedHintCount: revealedHints.length,
-          hints: revealedHints.map((index) => problem.hints[index]),
-          solvingReason: isReasonNotApplicable ? undefined : solvingReason.trim(),
-          isReasonNotApplicable,
-          reasonNotApplicableJustification: isReasonNotApplicable
-            ? reasonNotApplicableJustification.trim()
-            : undefined,
-          isSaveRetry: true,
-          action: 'retry_save',
-          taskId: recoveryRecord.taskId,
-          signedRecoveryToken: recoveryRecord.signedRecoveryToken,
-          recoveryData: recoveryRecord.recoveryData,
-        }),
+        body: JSON.stringify(payload),
       });
+
       const data = await res.json();
+
+      if (
+        !mountedRef.current ||
+        currentReqId !== evalRequestIdRef.current ||
+        userId !== reqUserId ||
+        problem.id !== reqProblemId
+      ) {
+        return;
+      }
+
       if (!res.ok || !data.success) {
         if (data.signedRecoveryToken && data.recoveryData && userId) {
-          saveTaskRecovery(userId, 'evaluate_answer', problem.id, {
+          saveTaskRecovery(userId, 'evaluate_answer', reqProblemId, {
             taskId: data.taskId || recoveryRecord.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
+            inputSnapshot: snap,
+            inputVersion: targetVersion,
             error: data.error,
           });
         }
         setEvaluationError(data.error || '저장 재시도에 실패했습니다.');
         return;
       }
+
       if (userId) {
-        clearTaskRecovery(userId, 'evaluate_answer', problem.id);
+        clearTaskRecovery(userId, 'evaluate_answer', reqProblemId, reqTaskId);
       }
       setRecoveryRecord(null);
       const evalData: EvaluationResult = data.evaluation;
       notifyTrialCreditsUpdated();
       setEvaluationResult(evalData);
       setEvaluatedSnapshot({
-        answer: answerText.trim(),
-        solvingReason: isReasonNotApplicable ? '' : solvingReason.trim(),
-        isReasonNotApplicable,
-        reasonNotApplicableJustification: isReasonNotApplicable
-          ? reasonNotApplicableJustification.trim()
-          : '',
-        hintCount: revealedHints.length,
+        answer: snap ? snap.userAnswer : answerText.trim(),
+        solvingReason: snap
+          ? (snap.isReasonNotApplicable ? '' : (snap.solvingReason || ''))
+          : (isReasonNotApplicable ? '' : solvingReason.trim()),
+        isReasonNotApplicable: snap ? Boolean(snap.isReasonNotApplicable) : isReasonNotApplicable,
+        reasonNotApplicableJustification: snap
+          ? (snap.reasonNotApplicableJustification || '')
+          : (isReasonNotApplicable ? reasonNotApplicableJustification.trim() : ''),
+        hintCount: snap ? snap.revealedHintCount : revealedHints.length,
+        problemVersion: targetVersion,
       });
       setCurrentAttemptId(`att-${Date.now()}-${Math.random().toString(36).substring(7)}`);
       if (evalData.recommendedErrorType) {
@@ -533,7 +672,7 @@ export function ProblemSessionModal({
     } catch (err) {
       setEvaluationError(`네트워크 연결 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
-      setIsRetryingSave(false);
+      if (mountedRef.current) setIsRetryingSave(false);
     }
   };
 
@@ -580,7 +719,7 @@ export function ProblemSessionModal({
       modelAnswerSnapshot: problem.modelAnswer,
       problemTitleSnapshot: problem.title,
       problemPromptSnapshot: problem.promptText,
-      problemVersion: problem.version || 1,
+      problemVersion: snapshot.problemVersion ?? problem.version ?? 1,
       rubricSnapshot: problem.rubric,
       // Stage 8 fields — record the exact inputs that were evaluated
       solvingReason: snapshot.isReasonNotApplicable ? undefined : snapshot.solvingReason,
@@ -636,6 +775,20 @@ export function ProblemSessionModal({
   };
 
   const isPage = variant === 'page';
+
+  const currentSnapshot = buildEvaluationSnapshot();
+  const isSnapshotMatching =
+    evaluatedSnapshot !== null &&
+    evaluatedSnapshot.answer === currentSnapshot.answer &&
+    evaluatedSnapshot.solvingReason === currentSnapshot.solvingReason &&
+    evaluatedSnapshot.isReasonNotApplicable === currentSnapshot.isReasonNotApplicable &&
+    evaluatedSnapshot.reasonNotApplicableJustification === currentSnapshot.reasonNotApplicableJustification &&
+    evaluatedSnapshot.hintCount === currentSnapshot.hintCount;
+
+  const isVersionMismatch =
+    evaluatedSnapshot?.problemVersion !== undefined &&
+    problem.version !== undefined &&
+    evaluatedSnapshot.problemVersion !== problem.version;
 
   const modalBody = (
     <div className={isPage ? "w-full max-w-5xl mx-auto my-3 bg-white border border-[#c8c2b5] rounded-xs shadow-sm overflow-hidden flex flex-col min-h-[calc(100vh-140px)]" : "w-full max-w-4xl bg-white border border-[#c8c2b5] rounded-xs shadow-xl my-auto overflow-hidden flex flex-col max-h-[92vh]"}>
@@ -1259,6 +1412,41 @@ export function ProblemSessionModal({
             </div>
           )}
 
+          {/* Unsaved recovery record prompt (e.g. after refresh or modal reopen) */}
+          {!evaluationResult && !evaluationError && recoveryRecord && (
+            <div className="p-3.5 border border-amber-300 bg-amber-50/90 rounded-xs space-y-2">
+              <div className="flex items-start gap-2 text-amber-900 text-xs">
+                <RotateCcw className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <strong className="block font-bold">이전에 저장되지 않은 채점 결과 복구 가능</strong>
+                  <p className="text-[11.5px] leading-relaxed text-amber-800">
+                    이 문제에 대해 AI 채점이 완료되었으나 저장되지 않은 결과가 있습니다. AI를 재호출하지 않고 저장할 수 있습니다.
+                    {recoveryRecord.inputSnapshot ? (
+                      <span className="block text-[11px] text-amber-700 mt-0.5">
+                        (생성 당시 답안 스냅샷이 보존되어 있어 현재 작성 중인 답안과 별개로 안전하게 복구할 수 있습니다.)
+                      </span>
+                    ) : (
+                      <span className="block text-[11px] text-amber-700 mt-0.5">
+                        (주의: 이전 버전 복구 기록으로 스냅샷이 누락되어, 현재 입력이 당시와 일치할 때만 복구됩니다.)
+                      </span>
+                    )}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleRetrySave}
+                  disabled={isRetryingSave}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xs transition-colors disabled:opacity-50"
+                >
+                  {isRetryingSave ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                  <span>미저장 결과 복구하기 (AI 재평가 없음)</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Evaluation Error State (Transparent Failure, No Fake Records) */}
           {evaluationError && (
             <div className="p-4 border border-red-300 bg-red-50/80 rounded-xs space-y-3">
@@ -1333,6 +1521,55 @@ export function ProblemSessionModal({
                     <strong className="block font-bold">정적 분석 안내</strong>
                     <span>{evaluationResult.staticAnalysisNotice}</span>
                   </div>
+                </div>
+              )}
+
+              {/* Snapshot Mismatch or Version Mismatch Warning */}
+              {!isSnapshotMatching && (
+                <div role="alert" className="p-3 bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded-xs space-y-2">
+                  <div className="flex items-center gap-1.5 font-bold text-amber-900">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>답안 또는 풀이 조건이 평가 당시와 다릅니다.</span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-amber-800">
+                    표시된 점수({evaluationResult.calculatedScore}점)는 이전 입력에 대한 평가 결과입니다. 현재 작성 중인 수정 답안은 안전하게 보존되어 있으며, 과거 평가 점수를 복습 이력에 확정하려면 평가 당시의 답안으로 되돌리거나 새 답안에 대해 다시 평가를 요청해야 합니다.
+                  </p>
+                  {evaluatedSnapshot && (
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAnswerText(evaluatedSnapshot.answer);
+                          setSolvingReason(evaluatedSnapshot.solvingReason);
+                          setIsReasonNotApplicable(evaluatedSnapshot.isReasonNotApplicable);
+                          setReasonNotApplicableJustification(evaluatedSnapshot.reasonNotApplicableJustification);
+                        }}
+                        className="px-2.5 py-1 text-[11px] bg-amber-700 hover:bg-amber-800 text-white rounded-xs font-semibold transition-colors"
+                      >
+                        평가 당시 답안으로 되돌리기
+                      </button>
+                      <button
+                        type="button"
+                        onClick={invalidateEvaluation}
+                        className="px-2.5 py-1 text-[11px] border border-amber-300 hover:bg-amber-100 text-amber-900 rounded-xs font-semibold transition-colors"
+                      >
+                        이전 평가 결과 닫고 현재 답안 유지
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {isVersionMismatch && (
+                <div role="alert" className="p-3 bg-blue-50 border border-blue-300 text-blue-900 text-xs rounded-xs space-y-1">
+                  <div className="flex items-center gap-1.5 font-bold text-blue-900">
+                    <AlertTriangle className="w-4 h-4 text-blue-600 shrink-0" />
+                    <span>문제 버전 변경 안내</span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-blue-800">
+                    이 평가는 문제 버전 v{evaluatedSnapshot?.problemVersion} 기준으로 채점되었습니다. (현재 문제 버전: v{problem.version || 1})
+                    기록 확정 시 평가 당시 버전(v{evaluatedSnapshot?.problemVersion})으로 보존됩니다.
+                  </p>
                 </div>
               )}
 
@@ -1626,7 +1863,7 @@ export function ProblemSessionModal({
                         <button
                           type="button"
                           onClick={handleConfirmAndRecord}
-                          disabled={isSubmitting}
+                          disabled={isSubmitting || !isSnapshotMatching}
                           className="px-2.5 py-1 text-[11px] bg-[#191817] text-white rounded-xs font-bold disabled:opacity-50"
                         >
                           재시도 (AI 재평가 없음)
@@ -1649,13 +1886,15 @@ export function ProblemSessionModal({
                 <button
                   type="button"
                   onClick={handleConfirmAndRecord}
-                  disabled={isSubmitting}
+                  disabled={isSubmitting || !isSnapshotMatching}
                   className="w-full sm:w-auto flex-1 flex items-center justify-center gap-2 py-2.5 px-5 bg-[#191817] hover:bg-[#33302b] text-white text-xs sm:text-sm font-bold rounded-xs shadow-xs transition-all disabled:opacity-50"
                 >
                   <CheckCircle className="w-4 h-4 text-emerald-400" />
                   <span>
                     {isSubmitting
                       ? '기록 저장 중...'
+                      : !isSnapshotMatching
+                      ? '답안 수정됨 (평가 당시 답안 일치 필요)'
                       : submitOutcome?.status === 'retryable_failure'
                       ? '계획 연결 재시도 (AI 재평가 없음)'
                       : '결과 확인 및 복습 이력에 기록 확정하기'}

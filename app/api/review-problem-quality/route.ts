@@ -485,7 +485,7 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
             const signedRecoveryToken = signTaskRecoveryToken({
               userId: auth.user.id,
               taskId,
-              taskType: 'problem_quality_review',
+              taskType: 'review_problem_quality',
               inputIdentifier,
               result: reviewPayload,
               leaseToken: cred.leaseToken,

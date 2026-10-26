@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Subject,
   Problem,
@@ -44,6 +44,14 @@ import {
   clearTaskRecovery,
   type TaskRecoveryRecord,
 } from '../lib/taskRecoveryClient';
+
+export interface ProblemQualityReviewInputSnapshot {
+  problemId: string;
+  problemVersion: number;
+  problem: Problem;
+  reports: ProblemReport[];
+  sourceMarkdown: string;
+}
 
 interface ProblemQualityReviewTabProps {
   userId?: string;
@@ -97,8 +105,18 @@ export function ProblemQualityReviewTab({
   const [isRetryingSaveReview, setIsRetryingSaveReview] = useState(false);
   const [qualityRecovery, setQualityRecovery] = useState<TaskRecoveryRecord | null>(null);
   const [aiReviewResult, setAiReviewResult] = useState<ProblemQualityReviewResult | null>(null);
+  const [reviewedProblemVersion, setReviewedProblemVersion] = useState<number | null>(null);
   const [aiReviewError, setAiReviewError] = useState<string | null>(null);
   const [aiReviewNotice, setAiReviewNotice] = useState<string | null>(null);
+
+  const reviewRequestIdRef = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // Dismiss report modal/dialog state
   const [dismissingReport, setDismissingReport] = useState<ProblemReport | null>(null);
@@ -165,9 +183,10 @@ export function ProblemQualityReviewTab({
     setIsEditing(false);
     setAiReviewResult(null);
     setAiReviewError(null);
+    setReviewedProblemVersion(null);
     setExpandedVersionNum(null);
     setQualityRecovery(
-      effectiveUserId ? getTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id) : null
+      effectiveUserId ? getTaskRecovery(effectiveUserId, 'review_problem_quality', activeProblem.id) : null
     );
   }
 
@@ -202,10 +221,24 @@ export function ProblemQualityReviewTab({
     setAiReviewError(null);
     setAiReviewNotice(null);
 
+    reviewRequestIdRef.current += 1;
+    const currentReqId = reviewRequestIdRef.current;
+    const reqUserId = effectiveUserId;
+    const reqProblemId = activeProblem.id;
+    const reqProblemVersion = activeProblem.version || 1;
+
     try {
       const subjectMaterial = materials.find(
         (m) => Boolean(activeSubject && m.subjectId === activeSubject.id) && m.parsedMarkdown
       );
+
+      const inputSnapshot: ProblemQualityReviewInputSnapshot = {
+        problemId: reqProblemId,
+        problemVersion: reqProblemVersion,
+        problem: activeProblem,
+        reports: activeProblem.reports || [],
+        sourceMarkdown: subjectMaterial?.parsedMarkdown || '',
+      };
 
       const res = await fetch('/api/review-problem-quality', {
         method: 'POST',
@@ -218,22 +251,36 @@ export function ProblemQualityReviewTab({
       });
 
       const data = await res.json();
+
+      if (
+        !mountedRef.current ||
+        currentReqId !== reviewRequestIdRef.current ||
+        effectiveUserId !== reqUserId ||
+        activeProblem?.id !== reqProblemId
+      ) {
+        return;
+      }
+
       if (!res.ok || !data.success) {
         if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && effectiveUserId && activeProblem) {
           const rec = {
             taskId: data.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
+            inputSnapshot,
+            inputVersion: reqProblemVersion,
+            inputIdentifier: `${reqProblemId}:v${reqProblemVersion}`,
             error: data.error,
           };
-          saveTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id, rec);
+          const saveRes = saveTaskRecovery(effectiveUserId, 'review_problem_quality', reqProblemId, rec);
+          const quotaWarning = !saveRes.ok ? ` (로컬 임시 저장 실패: ${saveRes.error})` : '';
           setQualityRecovery({
             ...rec,
             userId: effectiveUserId,
-            taskType: 'problem_quality_review',
+            taskType: 'review_problem_quality',
             savedAt: new Date().toISOString(),
           });
-          setAiReviewError(`${data.error || 'AI 검토는 완료되었으나 결과 보존에 실패했습니다.'} AI 재호출 없이 저장만 다시 시도할 수 있습니다.`);
+          setAiReviewError(`${data.error || 'AI 검토는 완료되었으나 결과 보존에 실패했습니다.'} AI 재호출 없이 저장만 다시 시도할 수 있습니다.${quotaWarning}`);
         } else {
           setAiReviewError(data.error || 'AI 품질 검토 호출에 실패했습니다.');
         }
@@ -241,10 +288,11 @@ export function ProblemQualityReviewTab({
       }
 
       if (effectiveUserId && activeProblem) {
-        clearTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id);
+        clearTaskRecovery(effectiveUserId, 'review_problem_quality', reqProblemId, data.taskId);
       }
       setQualityRecovery(null);
       setAiReviewResult(data.review);
+      setReviewedProblemVersion(reqProblemVersion);
       if (data.settlementError || data.settled === false) {
         setAiReviewNotice(`검토 결과는 안전하게 보존되었으나 크레딧 정산에 실패했습니다 (${data.settlementError || '정산 대기'}).`);
       } else if (data.notice) {
@@ -253,7 +301,7 @@ export function ProblemQualityReviewTab({
     } catch (err) {
       setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
-      setIsAiReviewing(false);
+      if (mountedRef.current) setIsAiReviewing(false);
     }
   };
 
@@ -261,42 +309,82 @@ export function ProblemQualityReviewTab({
     if (!qualityRecovery || !activeProblem || isRetryingSaveReview) return;
     setIsRetryingSaveReview(true);
     setAiReviewError(null);
+
+    reviewRequestIdRef.current += 1;
+    const currentReqId = reviewRequestIdRef.current;
+    const reqUserId = effectiveUserId;
+    const reqProblemId = activeProblem.id;
+    const reqTaskId = qualityRecovery.taskId;
+    const snap = qualityRecovery.inputSnapshot as ProblemQualityReviewInputSnapshot | undefined;
+    const targetVersion = snap?.problemVersion ?? qualityRecovery.inputVersion ?? (activeProblem.version || 1);
+
     try {
       const subjectMaterial = materials.find(
         (m) => Boolean(activeSubject && m.subjectId === activeSubject.id) && m.parsedMarkdown
       );
+      const payload = snap
+        ? {
+            problem: snap.problem,
+            reports: snap.reports,
+            sourceMarkdown: snap.sourceMarkdown,
+            isSaveRetry: true,
+            action: 'retry_save',
+            taskId: qualityRecovery.taskId,
+            signedRecoveryToken: qualityRecovery.signedRecoveryToken,
+            recoveryData: qualityRecovery.recoveryData,
+          }
+        : {
+            problem: activeProblem,
+            reports: activeProblem.reports || [],
+            sourceMarkdown: subjectMaterial?.parsedMarkdown || '',
+            isSaveRetry: true,
+            action: 'retry_save',
+            taskId: qualityRecovery.taskId,
+            signedRecoveryToken: qualityRecovery.signedRecoveryToken,
+            recoveryData: qualityRecovery.recoveryData,
+          };
+
       const res = await fetch('/api/review-problem-quality', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          problem: activeProblem,
-          reports: activeProblem.reports || [],
-          sourceMarkdown: subjectMaterial?.parsedMarkdown || '',
-          isSaveRetry: true,
-          action: 'retry_save',
-          taskId: qualityRecovery.taskId,
-          signedRecoveryToken: qualityRecovery.signedRecoveryToken,
-          recoveryData: qualityRecovery.recoveryData,
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
+
+      if (
+        !mountedRef.current ||
+        currentReqId !== reviewRequestIdRef.current ||
+        effectiveUserId !== reqUserId ||
+        activeProblem?.id !== reqProblemId
+      ) {
+        return;
+      }
+
       if (!res.ok || !data.success) {
         if (data.signedRecoveryToken && data.recoveryData && effectiveUserId && activeProblem) {
-          saveTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id, {
+          const saveRes = saveTaskRecovery(effectiveUserId, 'review_problem_quality', reqProblemId, {
             taskId: data.taskId || qualityRecovery.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
+            inputSnapshot: snap,
+            inputVersion: targetVersion,
+            inputIdentifier: `${reqProblemId}:v${targetVersion}`,
             error: data.error,
           });
+          const quotaWarning = !saveRes.ok ? ` (로컬 임시 저장 실패: ${saveRes.error})` : '';
+          setAiReviewError(`${data.error || '저장 재시도에 실패했습니다.'}${quotaWarning}`);
+        } else {
+          setAiReviewError(data.error || '저장 재시도에 실패했습니다.');
         }
-        setAiReviewError(data.error || '저장 재시도에 실패했습니다.');
         return;
       }
+
       if (effectiveUserId && activeProblem) {
-        clearTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id);
+        clearTaskRecovery(effectiveUserId, 'review_problem_quality', reqProblemId, reqTaskId);
       }
       setQualityRecovery(null);
       setAiReviewResult(data.review);
+      setReviewedProblemVersion(targetVersion);
       if (data.settlementError || data.settled === false) {
         setAiReviewNotice(`검토 결과는 안전하게 보존되었으나 크레딧 정산에 실패했습니다 (${data.settlementError || '정산 대기'}).`);
       } else if (data.notice) {
@@ -305,7 +393,7 @@ export function ProblemQualityReviewTab({
     } catch (err) {
       setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
-      setIsRetryingSaveReview(false);
+      if (mountedRef.current) setIsRetryingSaveReview(false);
     }
   };
 
@@ -924,6 +1012,38 @@ export function ProblemQualityReviewTab({
                 </div>
               )}
 
+              {!isAiReviewing && !aiReviewError && !aiReviewResult && qualityRecovery && (
+                <div className="p-4 bg-amber-50 border border-amber-300 rounded-xs text-xs text-amber-900 flex items-start gap-2 shadow-2xs">
+                  <RotateCcw className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="space-y-2">
+                    <div>
+                      <strong className="block font-bold">이전에 저장되지 않은 AI 품질 검토 결과 복구 가능</strong>
+                      <span>
+                        이 문제에 대해 생성된 AI 품질 검토 결과가 브라우저에 보존되어 있습니다. AI를 재호출하지 않고 저장할 수 있습니다.
+                        {qualityRecovery.inputSnapshot ? (
+                          <span className="block text-[11px] text-amber-700 mt-0.5">
+                            (생성 당시 문제 스냅샷이 보존되어 있어 문제 수정 여부와 관계없이 안전하게 복구됩니다.)
+                          </span>
+                        ) : (
+                          <span className="block text-[11px] text-amber-700 mt-0.5">
+                            (주의: 이전 버전 복구 기록으로 스냅샷이 없어, 현재 문제 데이터가 당시와 일치할 때만 복구됩니다.)
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleRetrySaveReview}
+                      disabled={isRetryingSaveReview}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xs transition-colors disabled:opacity-50"
+                    >
+                      {isRetryingSaveReview ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                      <span>검토 결과 저장만 다시 시도 (AI 미호출)</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {aiReviewError && (
                 <div className="p-4 bg-red-50 border border-red-300 rounded-xs text-xs text-red-900 flex items-start gap-2 shadow-2xs">
                   <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
@@ -972,6 +1092,16 @@ export function ProblemQualityReviewTab({
                       </span>
                     </div>
                   </div>
+
+                  {reviewedProblemVersion !== null && activeProblem.version !== undefined && reviewedProblemVersion !== activeProblem.version && (
+                    <div className="p-2.5 bg-blue-50 border border-blue-300 rounded-xs text-xs text-blue-900 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+                      <div>
+                        <strong className="block font-bold">검토 대상 문제 버전 안내</strong>
+                        <span>이 검토 소견은 문제 버전 v{reviewedProblemVersion}에 대한 결과입니다. 현재 문제는 v{activeProblem.version}으로 변경되었습니다.</span>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Deterministic Rule Verification Badges */}
                   <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1.5">

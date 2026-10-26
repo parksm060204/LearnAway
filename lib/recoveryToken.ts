@@ -438,6 +438,25 @@ export function signTaskRecoveryToken(params: {
   return Buffer.from(JSON.stringify(tokenObj), 'utf-8').toString('base64url');
 }
 
+export const CANONICAL_TASK_TYPES = {
+  EVALUATE_ANSWER: 'evaluate_answer',
+  LOGIC_QUESTIONS: 'logic_questions',
+  TRANSFER_PROBLEM: 'transfer_problem',
+  REVIEW_PROBLEM_QUALITY: 'review_problem_quality',
+} as const;
+
+export function isTaskTypeCompatible(tokenTaskType: string, expectedTaskType: string): boolean {
+  if (tokenTaskType === expectedTaskType) return true;
+  // Explicit restricted alias support for quality review tasks
+  if (
+    (tokenTaskType === 'problem_quality_review' && expectedTaskType === 'review_problem_quality') ||
+    (tokenTaskType === 'review_problem_quality' && expectedTaskType === 'problem_quality_review')
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export type VerifyTaskRecoveryTokenResult =
   | { ok: true; payload: TaskRecoveryTokenPayload }
   | { ok: false; error: string; code: 'EXPIRED' | 'TAMPERED' | 'MISMATCH' | 'MALFORMED' | 'UNCONFIGURED' };
@@ -522,7 +541,7 @@ export function verifyTaskRecoveryToken(
     return { ok: false, error: '작업 식별자가 일치하지 않습니다.', code: 'MISMATCH' };
   }
 
-  if (p.taskType !== expected.taskType) {
+  if (!isTaskTypeCompatible(p.taskType, expected.taskType)) {
     return { ok: false, error: '작업 유형이 일치하지 않습니다.', code: 'MISMATCH' };
   }
 

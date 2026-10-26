@@ -9,6 +9,7 @@ import {
   LogicStrengthenSession,
   Problem,
   ProblemDraft,
+  ProblemSourceRef,
   RechallengeReservation,
   RubricCriterion,
   Subject,
@@ -41,6 +42,40 @@ import {
   clearTaskRecovery,
   type TaskRecoveryRecord,
 } from '../lib/taskRecoveryClient';
+
+export interface LogicQuestionsInputSnapshot {
+  sessionId: string;
+  subjectId: string;
+  domain: string;
+  problemTitle: string;
+  problemPrompt: string;
+  modelAnswer: string;
+  rubric: RubricCriterion[];
+  originalAnswer: string;
+  solvingReason?: string;
+  diagnosisSummary?: string;
+  problemVersion?: number;
+}
+
+export interface TransferProblemInputSnapshot {
+  sessionId: string;
+  subjectId: string;
+  domain: string;
+  problemTitle: string;
+  problemPrompt: string;
+  modelAnswer: string;
+  rubric: RubricCriterion[];
+  originalAnswer: string;
+  revisedAnswer: string;
+  revisedAnswerConfirmed: boolean;
+  vulnerableCriteria: string[];
+  concepts: { id: string; title: string }[];
+  problemType: string;
+  difficulty: string;
+  sourceMarkdownHash?: string;
+  sourceMaterials?: ProblemSourceRef[];
+  problemVersion?: number;
+}
 
 interface LogicStrengthenModalProps {
   userId?: string;
@@ -341,13 +376,31 @@ export function LogicStrengthenModal({
       }
       if (!res.ok || !data.success) {
         if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && effectiveUserId) {
+          const snapshot: LogicQuestionsInputSnapshot = {
+            sessionId: requestSessionId,
+            subjectId: subject.id,
+            domain: subject.domain || 'math_stats',
+            problemTitle: base.problemTitleSnapshot,
+            problemPrompt: base.problemPromptSnapshot,
+            modelAnswer: base.modelAnswerSnapshot,
+            rubric: base.rubricSnapshot,
+            originalAnswer: base.originalAnswer,
+            solvingReason: base.originalSolvingReason,
+            diagnosisSummary: base.originalDiagnosisSummary,
+            problemVersion: base.problemVersion,
+          };
           const rec = {
             taskId: data.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
+            inputSnapshot: snapshot,
+            inputVersion: base.problemVersion,
             error: data.error,
           };
-          saveTaskRecovery(effectiveUserId, 'logic_questions', session.id, rec);
+          const saveRes = saveTaskRecovery(effectiveUserId, 'logic_questions', requestSessionId, rec);
+          if (!saveRes.ok) {
+            setSaveWarning(saveRes.error || '로컬 저장소 용량이 초과되어 복구 데이터를 보존하지 못했습니다.');
+          }
           setQuestionsRecovery({
             ...rec,
             userId: effectiveUserId,
@@ -361,7 +414,7 @@ export function LogicStrengthenModal({
         return;
       }
       if (effectiveUserId) {
-        clearTaskRecovery(effectiveUserId, 'logic_questions', session.id);
+        clearTaskRecovery(effectiveUserId, 'logic_questions', requestSessionId, data.taskId);
       }
       setQuestionsRecovery(null);
       const newVersion = latest.questionSetVersion + 1;
@@ -412,22 +465,31 @@ export function LogicStrengthenModal({
   const handleRetrySaveQuestions = async () => {
     if (!questionsRecovery || isRetryingSaveQuestions) return;
     const base = sessionRef.current;
+    const requestId = beginAsyncRequest(questionsTrackerRef.current);
+    const controller = new AbortController();
+    registerAsyncController(questionsTrackerRef.current, requestId, controller);
+    const requestSessionId = base.id;
+    const requestUserId = effectiveUserId;
+    const requestTaskId = questionsRecovery.taskId;
+    const snapshot = questionsRecovery.inputSnapshot as LogicQuestionsInputSnapshot | undefined;
+
     setIsRetryingSaveQuestions(true);
     setError(null);
     try {
       const res = await fetch('/api/logic-questions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
-          subjectId: subject.id,
-          domain: subject.domain || 'math_stats',
-          problemTitle: base.problemTitleSnapshot,
-          problemPrompt: base.problemPromptSnapshot,
-          modelAnswer: base.modelAnswerSnapshot,
-          rubric: base.rubricSnapshot,
-          originalAnswer: base.originalAnswer,
-          solvingReason: base.originalSolvingReason,
-          diagnosisSummary: base.originalDiagnosisSummary,
+          subjectId: snapshot?.subjectId || subject.id,
+          domain: snapshot?.domain || (subject.domain || 'math_stats'),
+          problemTitle: snapshot?.problemTitle || base.problemTitleSnapshot,
+          problemPrompt: snapshot?.problemPrompt || base.problemPromptSnapshot,
+          modelAnswer: snapshot?.modelAnswer || base.modelAnswerSnapshot,
+          rubric: snapshot?.rubric || base.rubricSnapshot,
+          originalAnswer: snapshot?.originalAnswer || base.originalAnswer,
+          solvingReason: snapshot ? snapshot.solvingReason : base.originalSolvingReason,
+          diagnosisSummary: snapshot ? snapshot.diagnosisSummary : base.originalDiagnosisSummary,
           isSaveRetry: true,
           action: 'retry_save',
           taskId: questionsRecovery.taskId,
@@ -436,23 +498,42 @@ export function LogicStrengthenModal({
         }),
       });
       const data = await res.json();
+      const latest = sessionRef.current;
+      const isValid =
+        shouldApplyResponse({
+          mounted: mountedRef.current,
+          requestId,
+          latestRequestId: questionsTrackerRef.current.generation,
+          requestSessionId,
+          activeSessionId: activeSessionIdRef.current,
+          snapshotHash: snapshot ? currentQuestionsHash(base) : currentQuestionsHash(latest),
+          currentHash: currentQuestionsHash(latest),
+        }) && effectiveUserId === requestUserId;
+
+      if (!isValid) {
+        return;
+      }
+
       if (!res.ok || !data.success) {
         if (data.signedRecoveryToken && data.recoveryData && effectiveUserId) {
-          saveTaskRecovery(effectiveUserId, 'logic_questions', base.id, {
+          const rec = {
             taskId: data.taskId || questionsRecovery.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
+            inputSnapshot: snapshot,
+            inputVersion: snapshot?.problemVersion ?? base.problemVersion,
             error: data.error,
-          });
+          };
+          saveTaskRecovery(effectiveUserId, 'logic_questions', requestSessionId, rec);
         }
         setError(data.error || '질문 저장 재시도에 실패했습니다.');
         return;
       }
+
       if (effectiveUserId) {
-        clearTaskRecovery(effectiveUserId, 'logic_questions', base.id);
+        clearTaskRecovery(effectiveUserId, 'logic_questions', requestSessionId, requestTaskId);
       }
       setQuestionsRecovery(null);
-      const latest = sessionRef.current;
       const newVersion = latest.questionSetVersion + 1;
       const versioned = (data.questions as LogicStrengthenSession['questions']).map((q) => ({
         ...q,
@@ -488,9 +569,13 @@ export function LogicStrengthenModal({
         setNotice(`질문 세트 v${newVersion}이 성공적으로 저장되었습니다.`);
       }
     } catch (cause) {
-      setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+      const aborted = cause instanceof Error && cause.name === 'AbortError';
+      if (!aborted && mountedRef.current && requestId === questionsTrackerRef.current.generation) {
+        setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+      }
     } finally {
-      setIsRetryingSaveQuestions(false);
+      const { loading } = settleAsyncRequest(questionsTrackerRef.current, requestId);
+      if (mountedRef.current) setIsRetryingSaveQuestions(loading);
     }
   };
 
@@ -762,13 +847,37 @@ export function LogicStrengthenModal({
       }
       if (!res.ok || !data.success) {
         if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && effectiveUserId) {
+          const snapshot: TransferProblemInputSnapshot = {
+            sessionId: requestSessionId,
+            subjectId: subject.id,
+            domain: subject.domain || 'math_stats',
+            problemTitle: base.problemTitleSnapshot,
+            problemPrompt: base.problemPromptSnapshot,
+            modelAnswer: base.modelAnswerSnapshot,
+            rubric: base.rubricSnapshot,
+            originalAnswer: base.originalAnswer,
+            revisedAnswer: base.revisedEvaluatedAnswer || base.revisedAnswer,
+            revisedAnswerConfirmed: Boolean(base.revisedAttemptId),
+            vulnerableCriteria: vulnerable,
+            concepts: [{ id: concept.id, title: concept.title }],
+            problemType: problem.type,
+            difficulty: problem.difficulty || 'advanced_college',
+            sourceMarkdownHash: base.sourceMarkdownHash,
+            sourceMaterials: base.sourceMaterials,
+            problemVersion: base.problemVersion,
+          };
           const rec = {
             taskId: data.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
+            inputSnapshot: snapshot,
+            inputVersion: base.problemVersion,
             error: data.error,
           };
-          saveTaskRecovery(effectiveUserId, 'transfer_problem', session.id, rec);
+          const saveRes = saveTaskRecovery(effectiveUserId, 'transfer_problem', requestSessionId, rec);
+          if (!saveRes.ok) {
+            setSaveWarning(saveRes.error || '로컬 저장소 용량이 초과되어 복구 데이터를 보존하지 못했습니다.');
+          }
           setTransferRecovery({
             ...rec,
             userId: effectiveUserId,
@@ -782,7 +891,7 @@ export function LogicStrengthenModal({
         return;
       }
       if (effectiveUserId) {
-        clearTaskRecovery(effectiveUserId, 'transfer_problem', session.id);
+        clearTaskRecovery(effectiveUserId, 'transfer_problem', requestSessionId, data.taskId);
       }
       setTransferRecovery(null);
       const latest = sessionRef.current;
@@ -873,29 +982,38 @@ export function LogicStrengthenModal({
   const handleRetrySaveTransfer = async () => {
     if (!transferRecovery || isRetryingSaveTransfer) return;
     const base = sessionRef.current;
+    const requestId = beginAsyncRequest(transferTrackerRef.current);
+    const controller = new AbortController();
+    registerAsyncController(transferTrackerRef.current, requestId, controller);
+    const requestSessionId = base.id;
+    const requestUserId = effectiveUserId;
+    const requestTaskId = transferRecovery.taskId;
+    const snapshot = transferRecovery.inputSnapshot as TransferProblemInputSnapshot | undefined;
+
     setIsRetryingSaveTransfer(true);
     setError(null);
     try {
-      const vulnerable = base.originalRubricResults
+      const vulnerable = snapshot?.vulnerableCriteria || base.originalRubricResults
         .filter((r) => r.isVulnerable || r.score < r.maxScore * 0.6)
         .map((r) => r.label);
       const res = await fetch('/api/transfer-problem', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
-          subjectId: subject.id,
-          domain: subject.domain || 'math_stats',
-          problemTitle: base.problemTitleSnapshot,
-          problemPrompt: base.problemPromptSnapshot,
-          modelAnswer: base.modelAnswerSnapshot,
-          rubric: base.rubricSnapshot,
-          originalAnswer: base.originalAnswer,
-          revisedAnswer: base.revisedEvaluatedAnswer || base.revisedAnswer,
-          revisedAnswerConfirmed: Boolean(base.revisedAttemptId),
+          subjectId: snapshot?.subjectId || subject.id,
+          domain: snapshot?.domain || (subject.domain || 'math_stats'),
+          problemTitle: snapshot?.problemTitle || base.problemTitleSnapshot,
+          problemPrompt: snapshot?.problemPrompt || base.problemPromptSnapshot,
+          modelAnswer: snapshot?.modelAnswer || base.modelAnswerSnapshot,
+          rubric: snapshot?.rubric || base.rubricSnapshot,
+          originalAnswer: snapshot?.originalAnswer || base.originalAnswer,
+          revisedAnswer: snapshot?.revisedAnswer || (base.revisedEvaluatedAnswer || base.revisedAnswer),
+          revisedAnswerConfirmed: snapshot ? snapshot.revisedAnswerConfirmed : Boolean(base.revisedAttemptId),
           vulnerableCriteria: vulnerable,
-          concepts: [{ id: concept.id, title: concept.title }],
-          problemType: problem.type,
-          difficulty: problem.difficulty || 'advanced_college',
+          concepts: snapshot?.concepts || [{ id: concept.id, title: concept.title }],
+          problemType: snapshot?.problemType || problem.type,
+          difficulty: snapshot?.difficulty || (problem.difficulty || 'advanced_college'),
           isSaveRetry: true,
           action: 'retry_save',
           taskId: transferRecovery.taskId,
@@ -904,23 +1022,42 @@ export function LogicStrengthenModal({
         }),
       });
       const data = await res.json();
+      const latest = sessionRef.current;
+      const isValid =
+        shouldApplyResponse({
+          mounted: mountedRef.current,
+          requestId,
+          latestRequestId: transferTrackerRef.current.generation,
+          requestSessionId,
+          activeSessionId: activeSessionIdRef.current,
+          snapshotHash: snapshot ? transferInputHashFor(base) : transferInputHashFor(latest),
+          currentHash: transferInputHashFor(latest),
+        }) && effectiveUserId === requestUserId;
+
+      if (!isValid) {
+        return;
+      }
+
       if (!res.ok || !data.success) {
         if (data.signedRecoveryToken && data.recoveryData && effectiveUserId) {
-          saveTaskRecovery(effectiveUserId, 'transfer_problem', base.id, {
+          const rec = {
             taskId: data.taskId || transferRecovery.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
+            inputSnapshot: snapshot,
+            inputVersion: snapshot?.problemVersion ?? base.problemVersion,
             error: data.error,
-          });
+          };
+          saveTaskRecovery(effectiveUserId, 'transfer_problem', requestSessionId, rec);
         }
         setError(data.error || '전이 문제 저장 재시도에 실패했습니다.');
         return;
       }
+
       if (effectiveUserId) {
-        clearTaskRecovery(effectiveUserId, 'transfer_problem', base.id);
+        clearTaskRecovery(effectiveUserId, 'transfer_problem', requestSessionId, requestTaskId);
       }
       setTransferRecovery(null);
-      const latest = sessionRef.current;
       const draftVersion = (latest.transferDraftVersion || 0) + 1;
       const now = new Date().toISOString();
       const draft: ProblemDraft = {
@@ -994,9 +1131,13 @@ export function LogicStrengthenModal({
         setNotice(`전이 문제 초안 v${draftVersion}이 성공적으로 저장되었습니다.`);
       }
     } catch (cause) {
-      setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+      const aborted = cause instanceof Error && cause.name === 'AbortError';
+      if (!aborted && mountedRef.current && requestId === transferTrackerRef.current.generation) {
+        setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+      }
     } finally {
-      setIsRetryingSaveTransfer(false);
+      const { loading } = settleAsyncRequest(transferTrackerRef.current, requestId);
+      if (mountedRef.current) setIsRetryingSaveTransfer(loading);
     }
   };
 
