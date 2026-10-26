@@ -988,11 +988,62 @@ async function testUpgradePath() {
   }
   console.log('✓ check_and_increment_rate_limit incremented atomically (attempts=2)');
 
-  console.log('\n=== All Upgrade Path & Scenario Tests (including Migration 33) Passed Successfully! ===\n');
+  // --------------------------------------------------------------------------
+  // Apply Migration 34: Fix AI Task Identity, Cache Isolation, and Settlement Resilience
+  // --------------------------------------------------------------------------
+  console.log('\n=== Applying Migration 34: Fix AI Task Identity, Cache Isolation, and Settlement Resilience ===');
+  const migration34File = files.find(f => f.includes('000034_'));
+  if (!migration34File) {
+    throw new Error('Migration 34 file not found in migrations directory');
+  }
+  console.log(`Applying Migration 34: ${migration34File}...`);
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, migration34File));
+  console.log('✓ Migration 34 executed cleanly!');
+
+  // --------------------------------------------------------------------------
+  // Scenario P: Authoritative task_id in register_ai_task responses (Migration 34)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario P: Authoritative task_id in register_ai_task responses (Migration 34) ---');
+  const inputP = 'authoritative_input_hash_xyz';
+  const taskSceneP1 = 'original_task_p1';
+  const resSceneP1 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', $2, $3, false, 500) as r;
+  `, [taskSceneP1, inputP, userIdA])).rows[0].r;
+  if (!resSceneP1.allowed || resSceneP1.task_id !== taskSceneP1) {
+    throw new Error(`Expected task_id=${taskSceneP1}, got ${resSceneP1.task_id}`);
+  }
+  console.log(`✓ Brand new task correctly returns authoritative task_id=${resSceneP1.task_id}`);
+
+  // Concurrent request on same input with different taskId must return original task_id
+  const taskSceneP2 = 'concurrent_task_p2';
+  const resSceneP2 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', $2, $3, false, 500) as r;
+  `, [taskSceneP2, inputP, userIdA])).rows[0].r;
+  if (resSceneP2.task_id !== taskSceneP1) {
+    throw new Error(`Expected concurrent response to return original task_id=${taskSceneP1}, got ${resSceneP2.task_id}`);
+  }
+  console.log(`✓ Concurrent request on same input returns original task_id=${resSceneP2.task_id}`);
+
+  // Record result
+  await db.query(`
+    select public.record_trial_result_ready($1, '{"questions":["qp1"]}'::jsonb, $2, $3);
+  `, [taskSceneP1, userIdA, resSceneP1.lease_token]);
+
+  // Subsequent request on same completed input must return original task_id
+  const taskSceneP3 = 'subsequent_task_p3';
+  const resSceneP3 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', $2, $3, false, 500) as r;
+  `, [taskSceneP3, inputP, userIdA])).rows[0].r;
+  if (resSceneP3.task_id !== taskSceneP1 || resSceneP3.status !== 'already_completed') {
+    throw new Error(`Expected cached response to return original task_id=${taskSceneP1}, got ${resSceneP3.task_id}`);
+  }
+  console.log(`✓ Cached response on same input returns original task_id=${resSceneP3.task_id}`);
+
+  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33 & 34) Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~33) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~34) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -1000,7 +1051,7 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 33 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 34 on clean database`);
 }
 
 async function main() {

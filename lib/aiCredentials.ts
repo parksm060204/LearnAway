@@ -169,6 +169,7 @@ export interface TrialContext {
   taskId: string;
   taskType: TrialTaskType;
   inputIdentifier: string;
+  legacyInputIdentifier?: string;
   isSaveRetry?: boolean;
 }
 
@@ -186,6 +187,7 @@ export type AiConfigResolution =
       isTrial?: boolean;
       trialRemaining?: number;
       leaseToken?: string;
+      taskId?: string;
     }
   | {
       ok: false;
@@ -210,6 +212,7 @@ export type AiConfigResolution =
       cachedResult?: unknown;
       needsAiConnection?: boolean;
       leaseToken?: string;
+      taskId?: string;
     };
 
 /** Reads the caller's stored secret and distinguishes the three states. */
@@ -291,13 +294,25 @@ export async function resolveAiConfigForUser(
 
     let leaseToken: string | undefined = undefined;
     if (trialContext && userId) {
-      const reg = await registerAiTask(
+      let reg = await registerAiTask(
         userId,
         trialContext.taskId,
         trialContext.taskType,
         trialContext.inputIdentifier,
         true
       );
+      if (!reg.allowed && reg.errorCode === 'TASK_INPUT_MISMATCH' && trialContext.legacyInputIdentifier) {
+        const fallbackReg = await registerAiTask(
+          userId,
+          trialContext.taskId,
+          trialContext.taskType,
+          trialContext.legacyInputIdentifier,
+          true
+        );
+        if (fallbackReg.allowed || fallbackReg.status === 'already_completed' || fallbackReg.status === 'concurrent_in_progress') {
+          reg = fallbackReg;
+        }
+      }
       if (!reg.allowed) {
         if (reg.status === 'already_completed') {
           if (!reg.cachedResult) {
@@ -312,6 +327,7 @@ export async function resolveAiConfigForUser(
             code: 'already_completed',
             cachedResult: reg.cachedResult,
             leaseToken: reg.leaseToken,
+            taskId: reg.taskId,
             message: reg.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
           };
         }
@@ -320,6 +336,7 @@ export async function resolveAiConfigForUser(
             ok: false,
             code: 'concurrent_in_progress',
             errorCode: 'CONCURRENT_EXECUTION_BLOCKED',
+            taskId: reg.taskId,
             message: reg.message || '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
           };
         }
@@ -365,7 +382,7 @@ export async function resolveAiConfigForUser(
       leaseToken = reg.leaseToken;
     }
 
-    return { ok: true, source: 'user', leaseToken, config: buildSchoolConfig(apiKey, lookup.secret.model) };
+    return { ok: true, source: 'user', leaseToken, taskId: trialContext?.taskId, config: buildSchoolConfig(apiKey, lookup.secret.model) };
   }
 
   // Confirmed unregistered: check trial credit reservation or explicit fallback.
@@ -389,13 +406,26 @@ export async function resolveAiConfigForUser(
       };
     }
 
-    const reservation = await registerAiTask(
+    let reservation = await registerAiTask(
       userId,
       trialContext.taskId,
       trialContext.taskType,
       trialContext.inputIdentifier,
       false
     );
+
+    if (!reservation.allowed && reservation.errorCode === 'TASK_INPUT_MISMATCH' && trialContext.legacyInputIdentifier) {
+      const fallbackReservation = await registerAiTask(
+        userId,
+        trialContext.taskId,
+        trialContext.taskType,
+        trialContext.legacyInputIdentifier,
+        false
+      );
+      if (fallbackReservation.allowed || fallbackReservation.status === 'already_completed' || fallbackReservation.status === 'concurrent_in_progress') {
+        reservation = fallbackReservation;
+      }
+    }
 
     if (reservation.status === 'already_completed') {
       if (!reservation.cachedResult) {
@@ -410,6 +440,7 @@ export async function resolveAiConfigForUser(
         code: 'already_completed',
         cachedResult: reservation.cachedResult,
         leaseToken: reservation.leaseToken,
+        taskId: reservation.taskId,
         message: reservation.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
       };
     }
@@ -418,6 +449,7 @@ export async function resolveAiConfigForUser(
       return {
         ok: false,
         code: 'concurrent_in_progress',
+        taskId: reservation.taskId,
         message: reservation.message || '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
       };
     }
@@ -429,6 +461,7 @@ export async function resolveAiConfigForUser(
         isTrial: true,
         trialRemaining: reservation.remaining,
         leaseToken: reservation.leaseToken,
+        taskId: reservation.taskId || trialContext.taskId,
         config: operatorConfig,
       };
     }

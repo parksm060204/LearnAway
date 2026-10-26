@@ -1,4 +1,5 @@
 import { ConceptDraft, ConceptEvidence } from './types';
+import { computeMarkdownHash } from './markdownUtils';
 
 export type ChunkAnalysisStatus = 'pending' | 'running' | 'completed' | 'failed';
 
@@ -48,6 +49,34 @@ export function makeAnalysisJobKey(
   subjectId = ''
 ): string {
   return `analysis_${userId}_${subjectId || 'nosub'}_${materialId}_${markdownHash}_${domain}_${modelId}_${promptVersion}_${chunkingVersion}`;
+}
+
+/**
+ * Deterministically constructs the AI input identifier for an analysis task.
+ * Incorporates subject, material, markdownHash, domain, model, prompt version, and chunking version
+ * so that identical content in different materials or different subjects have distinct task identities.
+ */
+export function computeAnalysisInputIdentifier(
+  subjectId: string,
+  materialId: string,
+  markdownHash: string,
+  domain: string,
+  modelId = 'deepseek-v4.1-flash',
+  promptVersion = 'v2',
+  chunkingVersion = 'v1'
+): string {
+  return computeMarkdownHash(
+    JSON.stringify({
+      version: 'v2',
+      subjectId: subjectId || 'nosub',
+      materialId,
+      markdownHash,
+      domain,
+      modelId,
+      promptVersion,
+      chunkingVersion,
+    })
+  );
 }
 
 /**

@@ -13,6 +13,9 @@ import {
   settleTrialCredit,
   releaseTrialCredit,
   recordTrialResultReady,
+  lookupSavedTaskResult,
+  buildUserScopedTaskId,
+  buildLegacyTaskId,
   MAX_TRIAL_EXECUTION_TIMEOUT_MS,
   MAX_TRIAL_OUTPUT_TOKENS,
 } from '../../../lib/trialCredits';
@@ -52,7 +55,12 @@ export interface EvaluateAnswerRequest {
   solvingReason?: string;
   isReasonNotApplicable?: boolean;
   reasonNotApplicableJustification?: string;
+  taskId?: string;
+  isSaveRetry?: boolean;
+  action?: string;
 }
+
+const EVALUATE_ANSWER_PROMPT_VERSION = 'v2';
 
 const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_PROMPT_CHARS = 12_000;
@@ -485,15 +493,89 @@ export async function POST(req: NextRequest) {
 
     const isMockExam = Boolean(body.mockExamSessionId);
     let trialContext: TrialContext | undefined = undefined;
-    let taskId: string | null = null;
+
+    const normalizedEvaluationInput = {
+      version: EVALUATE_ANSWER_PROMPT_VERSION,
+      problemId: problemId || '',
+      problemVersion: body.problemVersion ?? 1,
+      userAnswer: userAnswer.trim(),
+      solvingReason: (solvingReason || '').trim(),
+      isReasonNotApplicable: Boolean(isReasonNotApplicable),
+      reasonNotApplicableJustification: (reasonNotApplicableJustification || '').trim(),
+      revealedHintCount: Number(revealedHintCount) || 0,
+      hints: Array.isArray(hints) ? hints.slice(0, Number(revealedHintCount) || 0) : [],
+      isMockExam,
+    };
+    const inputIdentifier = computeMarkdownHash(JSON.stringify(normalizedEvaluationInput));
+    const legacyInputIdentifier = isMockExam
+      ? computeMarkdownHash(`mock_exam:${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`)
+      : computeMarkdownHash(`${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`);
+
+    const rawTaskId = (typeof body?.taskId === 'string' && body.taskId.trim()) ? body.taskId.trim() : '';
+    const isLegacyDefault = rawTaskId === `eval_${legacyInputIdentifier}` || rawTaskId === `eval_${inputIdentifier}`;
+    const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
+    let taskId: string = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'eval', inputIdentifier);
+    const legacyTaskId = buildLegacyTaskId('eval', legacyInputIdentifier);
+    const isSaveRetry = Boolean(body?.isSaveRetry || body?.action === 'retry_save');
+
+    if (isSaveRetry) {
+      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifier);
+      if (!saved.success && !explicitTaskId) {
+        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'evaluate_answer', legacyInputIdentifier);
+      }
+      if (!saved.success) {
+        const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
+        return NextResponse.json(
+          {
+            success: false,
+            error: saved.message || '저장 재시도할 기존 평가 결과를 찾을 수 없습니다.',
+            errorCode: saved.errorCode || 'SAVED_TASK_NOT_FOUND',
+          },
+          { status }
+        );
+      }
+      const cached = saved.cachedResult as {
+        evaluation: EvaluationResult;
+        problemId?: string;
+        conceptId?: string;
+        conceptIds?: string[];
+        subjectId?: string;
+        isProvisionalLocal?: boolean;
+      } | null;
+
+      if (!cached || !cached.evaluation) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '저장된 평가 결과 데이터가 비어 있습니다.',
+            errorCode: 'INVALID_CACHED_RESULT',
+          },
+          { status: 500 }
+        );
+      }
+
+      return NextResponse.json({
+        success: true,
+        evaluation: cached.evaluation,
+        problemId: cached.problemId || problemId,
+        conceptId: cached.conceptId || conceptId,
+        conceptIds: cached.conceptIds || conceptIds,
+        subjectId: cached.subjectId || subjectId,
+        isProvisionalLocal: cached.isProvisionalLocal || isProvisional,
+        fromCache: true,
+        persisted: true,
+        settled: true,
+        taskId: saved.taskId || taskId,
+      });
+    }
 
     if (!isMockExam) {
-      const inputIdentifier = computeMarkdownHash(`${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`);
-      taskId = (typeof body === 'object' && body && 'taskId' in body && typeof (body as Record<string, unknown>).taskId === 'string' && (body as Record<string, unknown>).taskId ? (body as Record<string, unknown>).taskId : null) as string || (`eval_${inputIdentifier}`);
       trialContext = {
         taskId,
         taskType: 'evaluate_answer',
         inputIdentifier,
+        legacyInputIdentifier,
+        isSaveRetry,
       };
 
       const userLookup = await lookupConnectionSecret(auth.user.id);
@@ -519,17 +601,20 @@ export async function POST(req: NextRequest) {
           { status: 400 }
         );
       }
-      const inputIdentifier = computeMarkdownHash(`mock_exam:${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`);
-      taskId = (typeof body === 'object' && body && 'taskId' in body && typeof (body as Record<string, unknown>).taskId === 'string' && (body as Record<string, unknown>).taskId ? (body as Record<string, unknown>).taskId : null) as string || (`eval_${inputIdentifier}`);
       trialContext = {
         taskId,
         taskType: 'evaluate_answer',
         inputIdentifier,
+        legacyInputIdentifier,
+        isSaveRetry,
       };
     }
 
     // 3. Resolve AI credentials (user's registered key first, then operator trial credit).
     const cred = await resolveAiConfigForUser(auth.user.id, trialContext);
+    if (cred.taskId) {
+      taskId = cred.taskId;
+    }
     if (!cred.ok) {
       if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
         const cached = cred.cachedResult as {
@@ -549,6 +634,9 @@ export async function POST(req: NextRequest) {
           subjectId: cached.subjectId || subjectId,
           isProvisionalLocal: cached.isProvisionalLocal || isProvisional,
           fromCache: true,
+          persisted: true,
+          settled: true,
+          taskId: cred.taskId || taskId,
         });
       }
       if (cred.code === 'concurrent_in_progress') {
@@ -979,7 +1067,14 @@ ${
       }
     }
 
-    let cacheSuccess = true;
+    const finalReturnedConceptId = evaluationResult.conceptId || evaluationResult.structuredError?.conceptId ||
+      (authoritativeConceptIds.includes(conceptId) ? conceptId : (authoritativeConceptIds[0] || conceptId));
+    evaluationResult.conceptId = finalReturnedConceptId;
+
+    let persisted = false;
+    let settled = false;
+    let settlementError: string | undefined;
+
     if (taskId && cred.leaseToken) {
       const cacheRes = await recordTrialResultReady(
         auth.user.id,
@@ -987,15 +1082,14 @@ ${
         {
           evaluation: evaluationResult,
           problemId,
-          conceptId,
-          conceptIds,
+          conceptId: finalReturnedConceptId,
+          conceptIds: authoritativeConceptIds,
           subjectId,
           isProvisionalLocal: isProvisional,
         },
         cred.leaseToken
       );
       if (!cacheRes.success) {
-        cacheSuccess = false;
         if (
           cacheRes.errorCode === 'STALE_LEASE_TOKEN' ||
           cacheRes.errorCode === 'ALREADY_SETTLED' ||
@@ -1012,22 +1106,54 @@ ${
             { status: 409 }
           );
         }
-        console.warn('Record trial result warning:', cacheRes.error);
+        return NextResponse.json(
+          {
+            success: false,
+            error: `답안 평가는 완료되었으나 결과 보존에 실패했습니다 (${cacheRes.error}). AI 재호출 없이 저장만 다시 시도할 수 있습니다.`,
+            errorCode: cacheRes.errorCode || 'PERSISTENCE_FAILED',
+            canRetrySave: true,
+            taskId,
+            evaluation: evaluationResult,
+            problemId,
+            conceptId: finalReturnedConceptId,
+            conceptIds: authoritativeConceptIds,
+            subjectId,
+            isProvisionalLocal: isProvisional,
+            persisted: false,
+            settled: false,
+          },
+          { status: 500 }
+        );
       }
 
-      if (cacheSuccess) {
-        const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
-        if (!settleResult.success) {
-          console.warn('Trial credit settlement warning:', settleResult.error);
+      persisted = true;
+
+      const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
+      if (!settleResult.success) {
+        settlementError = settleResult.error;
+        settled = false;
+        if (
+          settleResult.errorCode === 'STALE_LEASE_TOKEN' ||
+          settleResult.errorCode === 'ALREADY_REFUNDED' ||
+          settleResult.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+          settleResult.errorCode === 'LEASE_TOKEN_REQUIRED'
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: settleResult.error || '정산 실행권 검증에 실패했습니다.',
+              errorCode: settleResult.errorCode,
+            },
+            { status: 409 }
+          );
         }
       } else {
-        console.warn('Trial credit settlement withheld in evaluate-answer: cache not confirmed');
+        settled = true;
       }
+    } else {
+      persisted = true;
+      settled = true;
     }
-
-    const finalReturnedConceptId = evaluationResult.conceptId || evaluationResult.structuredError?.conceptId ||
-      (authoritativeConceptIds.includes(conceptId) ? conceptId : (authoritativeConceptIds[0] || conceptId));
-    evaluationResult.conceptId = finalReturnedConceptId;
 
     return NextResponse.json({
       success: true,
@@ -1037,6 +1163,13 @@ ${
       conceptIds: authoritativeConceptIds,
       subjectId,
       isProvisionalLocal: isProvisional,
+      taskId,
+      persisted,
+      settled,
+      settlementError,
+      notice: settlementError
+        ? `답안 평가 결과는 보존되었으나 크레딧 정산에 실패했습니다 (${settlementError}).`
+        : undefined,
     });
   } catch (err) {
     return NextResponse.json(

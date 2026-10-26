@@ -244,7 +244,22 @@ export interface TaskRegistrationResult {
   errorCode?: string;
   message?: string;
   creditSource?: 'operator_trial' | 'personal_key';
+  taskId?: string;
 }
+
+export function buildUserScopedTaskId(userId: string, prefix: string, inputIdentifier: string): string {
+  const safeUser = (userId || 'anon').trim();
+  const safePrefix = (prefix || 'task').trim();
+  const safeHash = (inputIdentifier || 'empty').trim();
+  return `${safePrefix}_${safeUser}_${safeHash}`;
+}
+
+export function buildLegacyTaskId(prefix: string, inputIdentifier: string): string {
+  const safePrefix = (prefix || 'task').trim();
+  const safeHash = (inputIdentifier || 'empty').trim();
+  return `${safePrefix}_${safeHash}`;
+}
+
 
 /**
  * Atomically registers/verifies an AI task for both personal_key and operator_trial callers.
@@ -302,6 +317,7 @@ export async function registerAiTask(
       code?: string;
       message?: string;
       credit_source?: 'operator_trial' | 'personal_key';
+      task_id?: string;
     };
 
     if (typeof res.allowed !== 'boolean') {
@@ -313,6 +329,7 @@ export async function registerAiTask(
     }
 
     const errCode = res.error_code || res.code;
+    const resolvedTaskId = typeof res.task_id === 'string' && res.task_id.trim() ? res.task_id.trim() : taskId;
 
     if (res.status === 'already_completed') {
       return {
@@ -322,6 +339,7 @@ export async function registerAiTask(
         cachedResult: res.cached_result,
         leaseToken: res.lease_token,
         creditSource: res.credit_source,
+        taskId: resolvedTaskId,
         message: res.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
       };
     }
@@ -332,6 +350,7 @@ export async function registerAiTask(
         status: 'concurrent_in_progress',
         errorCode: errCode || 'CONCURRENT_EXECUTION_BLOCKED',
         creditSource: res.credit_source,
+        taskId: resolvedTaskId,
         message: res.message || '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
       };
     }
@@ -342,6 +361,7 @@ export async function registerAiTask(
         errorCode: errCode || (isPersonalKey ? 'REGISTRATION_REJECTED' : 'INSUFFICIENT_CREDITS'),
         remaining: res.remaining ?? 0,
         creditSource: res.credit_source,
+        taskId: resolvedTaskId,
         message: res.message || '작업을 실행할 수 없습니다.',
       };
     }
@@ -360,6 +380,7 @@ export async function registerAiTask(
       remaining: res.remaining,
       leaseToken: res.lease_token,
       creditSource: res.credit_source,
+      taskId: resolvedTaskId,
     };
   } catch (err) {
     return {
@@ -391,6 +412,7 @@ export async function checkOperatorDailyUsage(dailyCap = getOperatorDailyCap()):
 
 export interface SavedTaskLookupResult {
   success: boolean;
+  taskId?: string;
   status?: string;
   cachedResult?: unknown;
   leaseToken?: string;
@@ -407,7 +429,8 @@ export async function lookupSavedTaskResult(
   userId: string,
   taskId: string,
   taskType?: TrialTaskType,
-  inputIdentifier?: string
+  inputIdentifier?: string,
+  legacyInputIdentifier?: string
 ): Promise<SavedTaskLookupResult> {
   if (!taskId || !userId) {
     return {
@@ -417,102 +440,116 @@ export async function lookupSavedTaskResult(
     };
   }
 
-  try {
-    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
-    const { data, error } = await client.rpc('lookup_saved_ai_task_result', {
-      p_task_id: taskId,
-      p_user_id: userId,
-      p_task_type: taskType || null,
-      p_input_identifier: inputIdentifier || null,
-    });
+  const doLookup = async (identifier?: string): Promise<SavedTaskLookupResult> => {
+    try {
+      const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+      const { data, error } = await client.rpc('lookup_saved_ai_task_result', {
+        p_task_id: taskId,
+        p_user_id: userId,
+        p_task_type: taskType || null,
+        p_input_identifier: identifier || null,
+      });
 
-    if (!error && data && typeof data === 'object') {
-      const res = data as {
-        success?: boolean;
-        status?: string;
-        cached_result?: unknown;
-        lease_token?: string;
-        credit_source?: string;
-        error_code?: string;
-        message?: string;
-      };
-      if (res.success) {
+      if (!error && data && typeof data === 'object') {
+        const res = data as {
+          success?: boolean;
+          status?: string;
+          cached_result?: unknown;
+          lease_token?: string;
+          credit_source?: string;
+          task_id?: string;
+          error_code?: string;
+          message?: string;
+        };
+        if (res.success) {
+          return {
+            success: true,
+            taskId: res.task_id || taskId,
+            status: res.status,
+            cachedResult: res.cached_result,
+            leaseToken: res.lease_token,
+            creditSource: res.credit_source,
+          };
+        }
         return {
-          success: true,
-          status: res.status,
-          cachedResult: res.cached_result,
-          leaseToken: res.lease_token,
-          creditSource: res.credit_source,
+          success: false,
+          errorCode: res.error_code || 'LOOKUP_FAILED',
+          message: res.message || '보존된 결과를 조회하지 못했습니다.',
         };
       }
+
+      // Direct table query fallback if lookup_saved_ai_task_result RPC is not present
+      const { data: row, error: rowErr } = await client
+        .from('ai_trial_reservations')
+        .select('*')
+        .eq('task_id', taskId)
+        .maybeSingle();
+
+      if (rowErr || !row) {
+        return {
+          success: false,
+          errorCode: 'TASK_NOT_FOUND',
+          message: '저장 재시도할 기존 작업 기록을 찾을 수 없습니다.',
+        };
+      }
+
+      if (row.user_id !== userId) {
+        return {
+          success: false,
+          errorCode: 'TASK_OWNERSHIP_MISMATCH',
+          message: '해당 작업에 대한 접근 권한이 없습니다.',
+        };
+      }
+
+      if (taskType && row.task_type !== taskType) {
+        return {
+          success: false,
+          errorCode: 'TASK_TYPE_MISMATCH',
+          message: '작업 종류가 일치하지 않습니다.',
+        };
+      }
+
+      if (identifier && row.input_identifier !== identifier) {
+        return {
+          success: false,
+          errorCode: 'TASK_INPUT_MISMATCH',
+          message: '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.',
+        };
+      }
+
+      if (!row.cached_result) {
+        return {
+          success: false,
+          errorCode: 'NO_SAVED_RESULT',
+          message: '서버에 보존된 AI 생성 결과가 없습니다. 새로운 작업으로 다시 요청해 주세요.',
+        };
+      }
+
+      return {
+        success: true,
+        taskId: row.task_id || taskId,
+        status: row.status,
+        cachedResult: row.cached_result,
+        leaseToken: row.lease_token,
+        creditSource: row.credit_source,
+      };
+    } catch (err) {
       return {
         success: false,
-        errorCode: res.error_code || 'LOOKUP_FAILED',
-        message: res.message || '보존된 결과를 조회하지 못했습니다.',
+        errorCode: 'LOOKUP_NETWORK_ERROR',
+        message: err instanceof Error ? err.message : '보존된 결과 조회 통신 오류',
       };
     }
+  };
 
-    // Direct table query fallback if lookup_saved_ai_task_result RPC is not present
-    const { data: row, error: rowErr } = await client
-      .from('ai_trial_reservations')
-      .select('*')
-      .eq('task_id', taskId)
-      .maybeSingle();
-
-    if (rowErr || !row) {
-      return {
-        success: false,
-        errorCode: 'TASK_NOT_FOUND',
-        message: '저장 재시도할 기존 작업 기록을 찾을 수 없습니다.',
-      };
+  const primary = await doLookup(inputIdentifier);
+  if (!primary.success && primary.errorCode === 'TASK_INPUT_MISMATCH' && legacyInputIdentifier && legacyInputIdentifier !== inputIdentifier) {
+    const secondary = await doLookup(legacyInputIdentifier);
+    if (secondary.success) {
+      return secondary;
     }
-
-    if (row.user_id !== userId) {
-      return {
-        success: false,
-        errorCode: 'TASK_OWNERSHIP_MISMATCH',
-        message: '해당 작업에 대한 접근 권한이 없습니다.',
-      };
-    }
-
-    if (taskType && row.task_type !== taskType) {
-      return {
-        success: false,
-        errorCode: 'TASK_TYPE_MISMATCH',
-        message: '작업 종류가 일치하지 않습니다.',
-      };
-    }
-
-    if (inputIdentifier && row.input_identifier !== inputIdentifier) {
-      return {
-        success: false,
-        errorCode: 'TASK_INPUT_MISMATCH',
-        message: '동일한 작업 ID에 서로 다른 입력이 전달되었습니다.',
-      };
-    }
-
-    if (!row.cached_result) {
-      return {
-        success: false,
-        errorCode: 'NO_SAVED_RESULT',
-        message: '서버에 보존된 AI 생성 결과가 없습니다. 새로운 작업으로 다시 요청해 주세요.',
-      };
-    }
-
-    return {
-      success: true,
-      status: row.status,
-      cachedResult: row.cached_result,
-      leaseToken: row.lease_token,
-      creditSource: row.credit_source,
-    };
-  } catch (err) {
-    return {
-      success: false,
-      errorCode: 'LOOKUP_NETWORK_ERROR',
-      message: err instanceof Error ? err.message : '보존된 결과 조회 통신 오류',
-    };
   }
+  return primary;
 }
 
 /**
@@ -549,8 +586,8 @@ export async function recordTrialResultReady(
         error: error?.message || '결과 보존 처리 중 오류가 발생했습니다.',
       };
     }
-    const res = data as { success?: boolean; status?: string; error?: string; error_code?: string; errorCode?: string };
-    const errCode = res.error_code || res.errorCode || (!res.success ? 'RECORD_RESULT_FAILED' : undefined);
+    const res = data as { success?: boolean; status?: string; error?: string; error_code?: string; errorCode?: string; code?: string };
+    const errCode = res.error_code || res.errorCode || res.code || (!res.success ? 'RECORD_RESULT_FAILED' : undefined);
     return {
       success: Boolean(res.success),
       status: res.status,
@@ -599,8 +636,8 @@ export async function settleTrialCredit(
         error: error?.message || '체험 크레딧 확정 중 오류가 발생했습니다.',
       };
     }
-    const res = data as { success?: boolean; status?: string; message?: string; error?: string; error_code?: string; errorCode?: string };
-    const errCode = res.error_code || res.errorCode || (!res.success ? 'SETTLE_FAILED' : undefined);
+    const res = data as { success?: boolean; status?: string; message?: string; error?: string; error_code?: string; errorCode?: string; code?: string };
+    const errCode = res.error_code || res.errorCode || res.code || (!res.success ? 'SETTLE_FAILED' : undefined);
     return {
       success: Boolean(res.success),
       status: res.status,

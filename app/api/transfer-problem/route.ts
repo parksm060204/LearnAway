@@ -5,8 +5,17 @@ import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 import { ProblemDifficulty, ProblemType, RubricCriterion } from '../../../lib/types';
 import { validateTransferProblemOutput } from '../../../lib/transferValidation';
-import { recordTrialResultReady, settleTrialCredit, releaseTrialCredit } from '../../../lib/trialCredits';
+import {
+  recordTrialResultReady,
+  settleTrialCredit,
+  releaseTrialCredit,
+  lookupSavedTaskResult,
+  buildUserScopedTaskId,
+  buildLegacyTaskId,
+} from '../../../lib/trialCredits';
 import { computeMarkdownHash } from '../../../lib/markdownUtils';
+
+const TRANSFER_PROBLEM_PROMPT_VERSION = 'v2';
 
 const MAX_PROMPT_CHARS = 5000;
 const MAX_ANSWER_CHARS = 6000;
@@ -103,7 +112,31 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: `채점 기준이 너무 많습니다(최대 ${MAX_RUBRIC_ITEMS}개).` }, { status: 400 });
     }
 
-    const inputIdentifier = computeMarkdownHash(
+    const normalizedRubric = rubric.map((r) => ({
+      id: r.id,
+      label: r.label,
+      maxScore: r.maxScore,
+      description: r.description || '',
+    }));
+    const normalizedConcepts = concepts.map((c) => ({ id: c.id, title: c.title }));
+    const normalizedInput = {
+      version: TRANSFER_PROBLEM_PROMPT_VERSION,
+      domain,
+      problemTitle,
+      problemPrompt,
+      problemType,
+      difficulty,
+      concepts: normalizedConcepts,
+      modelAnswer,
+      originalAnswer,
+      revisedAnswer,
+      revisedAnswerConfirmed,
+      vulnerableCriteria: [...vulnerableCriteria],
+      rubric: normalizedRubric,
+    };
+
+    const inputIdentifier = computeMarkdownHash(JSON.stringify(normalizedInput));
+    const legacyInputIdentifier = computeMarkdownHash(
       JSON.stringify({
         problemTitle,
         problemPrompt,
@@ -116,14 +149,67 @@ export async function POST(req: NextRequest) {
         domain,
       })
     );
-    const taskId = asString(payload.taskId).trim() || (`trans_${inputIdentifier}`);
+
+    const rawTaskId = asString(payload.taskId).trim();
+    const isLegacyDefault = rawTaskId === `trans_${legacyInputIdentifier}` || rawTaskId === `trans_${inputIdentifier}`;
+    const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
+    const taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'trans', inputIdentifier);
+    const legacyTaskId = buildLegacyTaskId('trans', legacyInputIdentifier);
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+
+    // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved results only.
+    if (isSaveRetry) {
+      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'transfer_problem', inputIdentifier, legacyInputIdentifier);
+      if (!saved.success && !explicitTaskId) {
+        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'transfer_problem', legacyInputIdentifier);
+      }
+      if (!saved.success) {
+        const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
+        return NextResponse.json(
+          {
+            success: false,
+            error: saved.message || '저장 재시도할 기존 작업 결과를 찾을 수 없습니다.',
+            errorCode: saved.errorCode || 'SAVED_TASK_NOT_FOUND',
+          },
+          { status }
+        );
+      }
+      const cached = saved.cachedResult as { draft?: unknown; model?: string } | null;
+      if (!cached || !cached.draft) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '서버에 보존된 전이 문제 초안이 없습니다. 새로운 작업으로 다시 요청해 주세요.',
+            errorCode: 'NO_SAVED_RESULT',
+          },
+          { status: 400 }
+        );
+      }
+      let isSettled = saved.status === 'settled';
+      let settlementError: string | undefined;
+      if (!isSettled && saved.leaseToken && saved.creditSource === 'operator_trial') {
+        const settleRes = await settleTrialCredit(auth.user.id, taskId, saved.leaseToken);
+        if (!settleRes.success) {
+          settlementError = settleRes.error;
+        } else {
+          isSettled = true;
+        }
+      }
+      return NextResponse.json({
+        success: true,
+        draft: cached.draft,
+        model: cached.model,
+        fromCache: true,
+        persisted: true,
+        settled: isSettled,
+        settlementError,
+      });
+    }
 
     const cred = await resolveAiConfigForUser(auth.user.id, {
       taskId,
       taskType: 'transfer_problem',
       inputIdentifier,
-      isSaveRetry,
     });
 
     if (!cred.ok) {
@@ -134,6 +220,8 @@ export async function POST(req: NextRequest) {
           draft: cached.draft,
           model: cached.model,
           fromCache: true,
+          persisted: true,
+          settled: true,
         });
       }
       if (cred.code === 'concurrent_in_progress') {
@@ -304,12 +392,76 @@ ${conceptText}
       );
     }
 
+    let persisted = false;
+    let settled = false;
+    let persistError: string | undefined;
+    let settlementError: string | undefined;
+
     if (cred.leaseToken) {
-      await recordTrialResultReady(auth.user.id, taskId, { draft, model: aiCall.model }, cred.leaseToken);
-      await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
+      const saveRes = await recordTrialResultReady(
+        auth.user.id,
+        taskId,
+        { draft, model: aiCall.model },
+        cred.leaseToken
+      );
+
+      if (!saveRes.success) {
+        persistError = saveRes.error || 'AI 결과 서버 보존 실패';
+        if (
+          saveRes.errorCode === 'STALE_LEASE_TOKEN' ||
+          saveRes.errorCode === 'ALREADY_SETTLED' ||
+          saveRes.errorCode === 'ALREADY_REFUNDED' ||
+          saveRes.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+          saveRes.errorCode === 'LEASE_TOKEN_REQUIRED'
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: saveRes.error || '작업 실행권이 만료되었거나 다른 요청에 의해 선점되었습니다.',
+              errorCode: saveRes.errorCode,
+            },
+            { status: 409 }
+          );
+        }
+        return NextResponse.json(
+          {
+            success: false,
+            error: `전이 문제는 생성되었으나 결과 보존에 실패했습니다 (${persistError}). AI 재호출 없이 저장만 다시 시도할 수 있습니다.`,
+            errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
+            canRetrySave: true,
+            taskId,
+            draft,
+            model: aiCall.model,
+            persisted: false,
+            settled: false,
+            persistError,
+          },
+          { status: 500 }
+        );
+      }
+
+      persisted = true;
+
+      const settleRes = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
+      if (!settleRes.success) {
+        settlementError = settleRes.error;
+        settled = false;
+      } else {
+        settled = true;
+      }
+    } else {
+      persisted = true;
+      settled = true;
     }
 
-    return NextResponse.json({ success: true, draft, model: aiCall.model });
+    return NextResponse.json({
+      success: true,
+      draft,
+      model: aiCall.model,
+      persisted,
+      settled,
+      settlementError,
+    });
   } catch (err) {
     return NextResponse.json(
       { success: false, error: `서버 내부 처리 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}` },

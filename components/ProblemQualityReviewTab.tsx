@@ -86,6 +86,7 @@ export function ProblemQualityReviewTab({
   const [isAiReviewing, setIsAiReviewing] = useState(false);
   const [aiReviewResult, setAiReviewResult] = useState<ProblemQualityReviewResult | null>(null);
   const [aiReviewError, setAiReviewError] = useState<string | null>(null);
+  const [aiReviewNotice, setAiReviewNotice] = useState<string | null>(null);
 
   // Dismiss report modal/dialog state
   const [dismissingReport, setDismissingReport] = useState<ProblemReport | null>(null);
@@ -184,6 +185,7 @@ export function ProblemQualityReviewTab({
     if (!activeProblem) return;
     setIsAiReviewing(true);
     setAiReviewError(null);
+    setAiReviewNotice(null);
 
     try {
       const subjectMaterial = materials.find(
@@ -202,11 +204,20 @@ export function ProblemQualityReviewTab({
 
       const data = await res.json();
       if (!res.ok || !data.success) {
-        setAiReviewError(data.error || 'AI 품질 검토 호출에 실패했습니다.');
+        if (data.canRetrySave) {
+          setAiReviewError(`${data.error || 'AI 검토는 완료되었으나 결과 보존에 실패했습니다.'} (저장만 다시 시도할 수 있습니다.)`);
+        } else {
+          setAiReviewError(data.error || 'AI 품질 검토 호출에 실패했습니다.');
+        }
         return;
       }
 
       setAiReviewResult(data.review);
+      if (data.settlementError || data.settled === false) {
+        setAiReviewNotice(`검토 결과는 안전하게 보존되었으나 크레딧 정산에 실패했습니다 (${data.settlementError || '정산 대기'}).`);
+      } else if (data.notice) {
+        setAiReviewNotice(data.notice);
+      }
     } catch (err) {
       setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
@@ -894,6 +905,14 @@ export function ProblemQualityReviewTab({
                       <div className="p-3 bg-amber-50/70 border border-amber-200 rounded-xs text-[11.5px] leading-relaxed text-amber-950 whitespace-pre-wrap">
                         {aiReviewResult.suggestedFixes}
                       </div>
+                    </div>
+                  )}
+
+                  {/* Settlement Notice */}
+                  {aiReviewNotice && (
+                    <div className="p-2.5 bg-amber-50/90 border border-amber-300 rounded-xs text-[11px] text-amber-900 leading-relaxed flex items-start gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                      <span>{aiReviewNotice}</span>
                     </div>
                   )}
 

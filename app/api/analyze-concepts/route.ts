@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
-import { resolveOperatorAiConfig } from '../../../lib/aiConfig';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
@@ -31,6 +30,7 @@ import {
 import {
   makeAnalysisJobKey,
   makeConceptDraftId,
+  computeAnalysisInputIdentifier,
   getOrCreateSessionLedger,
   findSessionLedger,
   findLatestSessionForMaterial,
@@ -552,11 +552,12 @@ export async function POST(req: NextRequest) {
     const totalChunksCount = (dbJobForIdentity?.total_chunks as number) || chunks.length || 1;
 
     // Validate trial limits before reserving credit if user has no personal API key
+    const { lookupConnectionSecret, resolveOperatorAiConfig } = await import('../../../lib/aiCredentials');
+    const userLookup = await lookupConnectionSecret(auth.user.id);
+
     if (action !== 'status' && action !== 'retry_save' && action !== 'pause') {
       const trialVal = validateTrialAnalysisInput(markdown, totalChunksCount);
       if (!trialVal.ok) {
-        const { lookupConnectionSecret } = await import('../../../lib/aiCredentials');
-        const userLookup = await lookupConnectionSecret(auth.user.id);
         if (userLookup.status === 'unregistered') {
           return NextResponse.json(
             {
@@ -571,6 +572,17 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    let effectiveModel = (dbJobForIdentity?.model_id as string) || '';
+    if (!effectiveModel) {
+      if (typeof payload.model === 'string' && payload.model.trim()) {
+        effectiveModel = payload.model.trim();
+      } else if (userLookup.status === 'registered' && userLookup.secret?.model) {
+        effectiveModel = userLookup.secret.model;
+      } else {
+        effectiveModel = resolveOperatorAiConfig()?.model || 'deepseek-v4.1-flash';
+      }
+    }
+
     const expectedJobKey = clientJobKey && dbJobForIdentity
       ? (clientJobKey as string)
       : makeAnalysisJobKey(
@@ -580,9 +592,19 @@ export async function POST(req: NextRequest) {
           domain,
           promptVersion,
           chunkingVersion,
-          (dbJobForIdentity?.model_id as string) || 'deepseek-v4.1-flash',
+          effectiveModel,
           subjectId
         );
+
+    const analysisInputIdentifier = computeAnalysisInputIdentifier(
+      subjectId,
+      materialId,
+      markdownHash,
+      domain,
+      effectiveModel,
+      promptVersion,
+      chunkingVersion
+    );
 
     // 2. Resolve AI credentials.
     // Only actions that actually execute paid AI (process/resume) register the task:
@@ -594,14 +616,16 @@ export async function POST(req: NextRequest) {
       ? await resolveAiConfigForUser(auth.user.id, {
           taskId: expectedJobKey,
           taskType: 'analyze_concepts',
-          inputIdentifier: markdownHash,
+          inputIdentifier: analysisInputIdentifier,
+          legacyInputIdentifier: markdownHash,
           isSaveRetry: true,
         })
       : executesAi
         ? await resolveAiConfigForUser(auth.user.id, {
             taskId: expectedJobKey,
             taskType: 'analyze_concepts',
-            inputIdentifier: markdownHash,
+            inputIdentifier: analysisInputIdentifier,
+            legacyInputIdentifier: markdownHash,
           })
         : await resolveAiConfigForUser(auth.user.id);
 
@@ -1825,6 +1849,9 @@ ${chunk.text}
     const progress = getSessionProgress(session);
     const isCompleted = progress.status === 'completed' || progress.isAllComplete;
     let cacheSuccess = true;
+    let persistResultReadyError: string | undefined;
+    let persistResultReadyErrorCode: string | undefined;
+
     if (isCompleted && cred.ok && cred.leaseToken) {
       const recRes = await recordTrialResultReady(
         auth.user.id,
@@ -1843,6 +1870,8 @@ ${chunk.text}
       );
       if (!recRes.success) {
         cacheSuccess = false;
+        persistResultReadyError = recRes.error;
+        persistResultReadyErrorCode = recRes.errorCode;
         if (
           recRes.errorCode === 'STALE_LEASE_TOKEN' ||
           recRes.errorCode === 'ALREADY_SETTLED' ||
@@ -1902,15 +1931,39 @@ ${chunk.text}
       outcome = { persisted: true, drafts: progress.allDrafts };
     }
 
+    let settled = false;
+    let settlementError: string | undefined;
+
     if (isCompleted && cred.ok && cred.leaseToken) {
       if (cacheSuccess && outcome.persisted) {
         const settleResult = await settleTrialCredit(auth.user.id, jobKey, cred.leaseToken);
         if (!settleResult.success) {
+          settled = false;
+          settlementError = settleResult.error;
+          if (
+            settleResult.errorCode === 'STALE_LEASE_TOKEN' ||
+            settleResult.errorCode === 'ALREADY_REFUNDED' ||
+            settleResult.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+            settleResult.errorCode === 'LEASE_TOKEN_REQUIRED'
+          ) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: settleResult.error || '정산 실행권 검증에 실패했습니다.',
+                errorCode: settleResult.errorCode,
+              },
+              { status: 409 }
+            );
+          }
           console.warn('Trial credit settlement warning in analyze-concepts:', settleResult.error);
+        } else {
+          settled = true;
         }
       } else {
         console.warn('Trial credit settlement withheld in analyze-concepts: cache or persistence not confirmed');
       }
+    } else {
+      settled = true;
     }
 
     if (outcome.persisted === false && progress.allDrafts.length > 0) {
@@ -1933,11 +1986,44 @@ ${chunk.text}
           checkpointStatus: 'completed',
           draftsPersistStatus: 'failed',
           persisted: false,
+          settled: false,
           canRetrySave: true,
           error: `AI 개념 추출 및 체크포인트 커밋은 완료되었으나, concept_drafts 테이블 저장에 실패했습니다. (${outcome.persistError || '초안 저장 오류'}). AI 재호출 없이 초안 저장만 다시 시도할 수 있습니다.`,
           persistError: outcome.persistError,
           drafts: outcome.drafts,
           signedRecoveryToken,
+          count: outcome.drafts.length,
+          markdownHash,
+          model: responseModel,
+          totalChunks: progress.totalChunks,
+          completedChunks: progress.completedChunks,
+          pendingChunks: progress.pendingChunks,
+          failedChunks: progress.failedChunks,
+          isAllComplete: false,
+          status: progress.status,
+          jobKey,
+          generationJobId,
+          domain,
+          subjectId,
+          materialId,
+        },
+        { status: 500 }
+      );
+    }
+
+    if (!cacheSuccess) {
+      return NextResponse.json(
+        {
+          success: false,
+          checkpointCommitted: true,
+          checkpointStatus: 'completed',
+          draftsPersistStatus: outcome.persisted ? 'persisted' : 'failed',
+          persisted: false,
+          settled: false,
+          canRetrySave: true,
+          error: `AI 개념 추출 및 초안 저장은 완료되었으나, 작업 결과 서버 보존에 실패했습니다 (${persistResultReadyError || '결과 보존 실패'}). AI 재호출 없이 저장만 다시 시도할 수 있습니다.`,
+          errorCode: persistResultReadyErrorCode || 'PERSISTENCE_FAILED',
+          drafts: outcome.drafts,
           count: outcome.drafts.length,
           markdownHash,
           model: responseModel,
@@ -1963,6 +2049,11 @@ ${chunk.text}
       checkpointStatus: 'completed',
       draftsPersistStatus: 'persisted',
       persisted: true,
+      settled,
+      settlementError,
+      notice: settlementError
+        ? `개념 분석 결과는 안전하게 보존되었으나 크레딧 정산에 실패했습니다 (${settlementError}).`
+        : undefined,
       drafts: outcome.drafts,
       count: outcome.drafts.length,
       markdownHash,

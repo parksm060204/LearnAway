@@ -13,6 +13,8 @@ import {
   releaseTrialCredit,
   recordTrialResultReady,
   lookupSavedTaskResult,
+  buildUserScopedTaskId,
+  buildLegacyTaskId,
   MAX_TRIAL_EXECUTION_TIMEOUT_MS,
   MAX_TRIAL_OUTPUT_TOKENS,
 } from '../../../lib/trialCredits';
@@ -278,19 +280,29 @@ export async function POST(req: NextRequest) {
 
     const isExplicitTaskId = Boolean(payload.taskId && typeof payload.taskId === 'string' && payload.taskId.trim());
     const explicitTaskId = isExplicitTaskId ? (payload.taskId as string).trim() : null;
-    const isLegacyDefaultTaskId = explicitTaskId === `gen_${legacyInputIdentifier}`;
-    const effectiveInputIdentifier = isLegacyDefaultTaskId ? legacyInputIdentifier : inputIdentifier;
-    const taskId = explicitTaskId || (`gen_${inputIdentifier}`);
+    const isLegacyDefaultTaskId = explicitTaskId === `gen_${legacyInputIdentifier}` || explicitTaskId === `gen_${inputIdentifier}`;
+    const effectiveExplicitTaskId = (explicitTaskId && !isLegacyDefaultTaskId) ? explicitTaskId : null;
+    let taskId = effectiveExplicitTaskId || buildUserScopedTaskId(auth.user.id, 'gen', inputIdentifier);
+    const legacyTaskId = buildLegacyTaskId('gen', legacyInputIdentifier);
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
 
     // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved results only.
     if (isSaveRetry) {
-      const saved = await lookupSavedTaskResult(
+      let saved = await lookupSavedTaskResult(
         auth.user.id,
         taskId,
         'generate_problems',
-        effectiveInputIdentifier
+        inputIdentifier,
+        legacyInputIdentifier
       );
+      if (!saved.success && !effectiveExplicitTaskId) {
+        saved = await lookupSavedTaskResult(
+          auth.user.id,
+          legacyTaskId,
+          'generate_problems',
+          legacyInputIdentifier
+        );
+      }
       if (!saved.success) {
         const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
         return NextResponse.json(
@@ -344,6 +356,7 @@ export async function POST(req: NextRequest) {
         settled: isSettled,
         persistError: outcome.persistError,
         fromCache: true,
+        taskId: saved.taskId || taskId,
       });
     }
 
@@ -363,8 +376,13 @@ export async function POST(req: NextRequest) {
     const cred = await resolveAiConfigForUser(auth.user.id, {
       taskId,
       taskType: 'generate_problems',
-      inputIdentifier: effectiveInputIdentifier,
+      inputIdentifier,
+      legacyInputIdentifier,
+      isSaveRetry,
     });
+    if (cred.taskId) {
+      taskId = cred.taskId;
+    }
     if (!cred.ok) {
       if (cred.code === 'task_input_mismatch' || cred.errorCode === 'TASK_INPUT_MISMATCH') {
         return NextResponse.json(
@@ -865,6 +883,9 @@ ${combinedSource}
       }));
 
       let cacheSuccess = true;
+      let persistResultError: string | undefined;
+      let persistResultErrorCode: string | undefined;
+
       if (cred.leaseToken && draftsWithIds.length > 0) {
         const cacheRes = await recordTrialResultReady(
           auth.user.id,
@@ -878,6 +899,8 @@ ${combinedSource}
         );
         if (!cacheRes.success) {
           cacheSuccess = false;
+          persistResultError = cacheRes.error;
+          persistResultErrorCode = cacheRes.errorCode;
           // Fencing violation or ownership mismatch: abort persistence and settlement immediately!
           if (
             cacheRes.errorCode === 'STALE_LEASE_TOKEN' ||
@@ -918,6 +941,25 @@ ${combinedSource}
         };
       }
 
+      if (!cacheSuccess) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `AI 문제는 생성되었으나 결과 보존에 실패했습니다 (${persistResultError || '결과 보존 실패'}). AI 재호출 없이 저장만 다시 시도할 수 있습니다.`,
+            errorCode: persistResultErrorCode || 'PERSISTENCE_FAILED',
+            canRetrySave: true,
+            taskId,
+            drafts: outcome.drafts,
+            count: outcome.drafts.length,
+            generationJobId,
+            persisted: false,
+            settled: false,
+            persistError: outcome.persistError,
+          },
+          { status: 500 }
+        );
+      }
+
       // Settle credit ONLY when result cache is verified AND database persistence succeeds
       let settlementError: string | undefined;
       let isSettled = false;
@@ -926,6 +968,21 @@ ${combinedSource}
           const settleResult = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
           if (!settleResult.success) {
             settlementError = settleResult.error;
+            if (
+              settleResult.errorCode === 'STALE_LEASE_TOKEN' ||
+              settleResult.errorCode === 'ALREADY_REFUNDED' ||
+              settleResult.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+              settleResult.errorCode === 'LEASE_TOKEN_REQUIRED'
+            ) {
+              return NextResponse.json(
+                {
+                  success: false,
+                  error: settleResult.error || '정산 실행권 검증에 실패했습니다.',
+                  errorCode: settleResult.errorCode,
+                },
+                { status: 409 }
+              );
+            }
             console.warn('Trial credit settlement warning:', settleResult.error);
           } else {
             isSettled = true;
@@ -942,10 +999,14 @@ ${combinedSource}
         drafts: outcome.drafts,
         count: outcome.drafts.length,
         generationJobId,
+        taskId,
         persisted: outcome.persisted,
         settled: isSettled,
         persistError: outcome.persistError,
         settlementError,
+        notice: settlementError
+          ? `문제는 생성 및 보존되었으나 크레딧 정산에 실패했습니다 (${settlementError}).`
+          : undefined,
       });
   } catch (err) {
     console.error('Error generating problems:', err);

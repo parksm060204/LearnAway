@@ -274,6 +274,9 @@ exports.requireApiUser = async () => {
       if (name === 'check_operator_ai_daily_usage') {
         return { data: { allowed: true, call_count: 1, daily_cap: 500 }, error: null };
       }
+      if (name === 'record_trial_result_ready' || name === 'record_ai_trial_result_ready') {
+        return { data: { success: true, status: 'result_ready' }, error: null };
+      }
       if (name === 'settle_trial_credit') {
         return { data: { success: true, status: 'settled', is_existing: false }, error: null };
       }
@@ -17640,6 +17643,600 @@ exports.requireApiUser = async () => {
       assert.equal(res.status, 200);
       const data = await res.json();
       assert.equal(data.isAllComplete, false, '청크 일부만 완료된 경우 isAllComplete: false 유지');
+    });
+  });
+
+  // =========================================================================
+  // =========================================================================
+  // 4대 문제 실제 동작 검증 (AI 결과 보존·정산 / 계정 작업ID / 분석 캐시 / 입력 식별자)
+  // =========================================================================
+
+  const aiClientPath = path.join(output, 'lib', 'aiClient.js');
+  const aiModule = load(aiClientPath);
+
+  await checkAsync('문제 1: AI 결과 보존 실패 시 완전 성공 금지 (500) 및 canRetrySave 제공', async () => {
+    const { POST: logicPost } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const testUser = { id: 'u-prob1-save-fail' };
+    let aiCallCount = 0;
+    aiModule.callAiChat = async () => {
+      aiCallCount++;
+      return {
+        ok: true,
+        content: JSON.stringify({
+          questions: [
+            { id: 'q1', question: '왜 해당 가정을 사용했습니까?', linkedCriterionId: 'r1' },
+            { id: 'q2', question: '다른 해법과의 차이는 무엇입니까?', linkedCriterionId: 'r1' },
+          ],
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    let settleCalled = false;
+    await withFakeSupabase({
+      user: testUser,
+      rpcImpl: (fn) => {
+        if (fn === 'record_trial_result_ready') {
+          return { data: { success: false, code: 'PERSISTENCE_FAILED', message: 'DB connection dropped during save' }, error: null };
+        }
+        if (fn === 'settle_trial_credit') {
+          settleCalled = true;
+          return { data: { success: true }, error: null };
+        }
+        return { data: null, error: null };
+      }
+    }, async () => {
+      const req = new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'sub-p1',
+          domain: 'math_stats',
+          problemTitle: '적분 증명',
+          problemPrompt: '가측 집합 적분',
+          modelAnswer: '모범 답안',
+          originalAnswer: '사용자 답안',
+          rubric: [{ id: 'r1', label: '정확성', maxScore: 10, description: '수학적 엄밀성' }],
+        }),
+      });
+
+      const res = await logicPost(req);
+      assert.equal(res.status, 500, '결과 보존 실패 시 완전 성공 응답 금지 (500 반환)');
+      const data = await res.json();
+      assert.equal(data.success, false);
+      assert.equal(data.persisted, false, 'persisted는 false여야 함');
+      assert.equal(data.settled, false, 'settled는 false여야 함');
+      assert.equal(data.canRetrySave, true, 'AI 결과를 잃지 않고 재시도할 수 있도록 canRetrySave: true 제공');
+      assert.ok(data.questions && data.questions.length === 2, '생성된 AI 결과가 응답에 포함되어 클라이언트 복구 지원');
+      assert.equal(settleCalled, false, '결과 보존 실패 후 무조건 정산하지 않음 (정산 호출 0회)');
+      assert.equal(aiCallCount, 1, '외부 AI는 1회만 호출됨');
+    });
+  });
+
+  await checkAsync('문제 1: 결과 보존 성공 + 정산 실패 시 결과 유지 및 정산만 재시도', async () => {
+    const { POST: logicPost } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const testUser = { id: 'u-prob1-settle-fail' };
+    let aiCallCount = 0;
+    aiModule.callAiChat = async () => {
+      aiCallCount++;
+      return {
+        ok: true,
+        content: JSON.stringify({
+          questions: [
+            { id: 'q1', question: '증명의 첫 단계는 무엇입니까?', linkedCriterionId: 'r1' },
+            { id: 'q2', question: '반례는 무엇입니까?', linkedCriterionId: 'r1' },
+          ],
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    let savedResultCached = null;
+    await withFakeSupabase({
+      user: testUser,
+      rpcImpl: (fn, args) => {
+        if (fn === 'record_trial_result_ready') {
+          savedResultCached = args.p_result;
+          return { data: { success: true }, error: null };
+        }
+        if (fn === 'settle_trial_credit') {
+          return { data: { success: false, code: 'SETTLEMENT_FAILED', message: '크레딧 장부 지연' }, error: null };
+        }
+        return { data: null, error: null };
+      }
+    }, async () => {
+      const req = new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'sub-p1',
+          domain: 'math_stats',
+          problemTitle: '적분 증명',
+          problemPrompt: '가측 집합 적분',
+          modelAnswer: '모범 답안',
+          originalAnswer: '사용자 답안',
+          rubric: [{ id: 'r1', label: '정확성', maxScore: 10, description: '수학적 엄밀성' }],
+        }),
+      });
+
+      const res = await logicPost(req);
+      assert.equal(res.status, 200, '결과 보존 성공 시 결과는 정상 전달 (200 반환)');
+      const data = await res.json();
+      assert.equal(data.success, true);
+      assert.equal(data.persisted, true, '결과는 영속 보존됨');
+      assert.equal(data.settled, false, '정산 실패 상태가 명시됨');
+      assert.ok(data.settlementError, '정산 오류 안내가 포함됨');
+      assert.ok(data.questions && data.questions.length === 2, '결과 내용이 정상 유지됨');
+      assert.ok(savedResultCached, '서버에 결과가 보존됨');
+      assert.equal(aiCallCount, 1, 'AI는 1회만 호출됨');
+    });
+  });
+
+  await checkAsync('문제 1: 저장 복구 요청(isSaveRetry: true) 시 AI 호출 0회 및 중복 차감 0회', async () => {
+    const { POST: logicPost } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const testUser = { id: 'u-prob1-save-retry' };
+    let aiCallCount = 0;
+    aiModule.callAiChat = async () => {
+      aiCallCount++;
+      return { ok: true, content: '{}', model: 'deepseek-v4.1-flash' };
+    };
+
+    const mockSavedQuestions = [
+      { id: 'q-recov-1', question: '복구된 질문 1', linkedCriterionId: 'r1' },
+      { id: 'q-recov-2', question: '복구된 질문 2', linkedCriterionId: 'r1' },
+    ];
+
+    await withFakeSupabase({
+      user: testUser,
+      rpcImpl: (fn) => {
+        if (fn === 'lookup_saved_ai_task_result') {
+          return {
+            data: {
+              success: true,
+              status: 'settled',
+              cached_result: { questions: mockSavedQuestions },
+            },
+            error: null,
+          };
+        }
+        if (fn === 'register_ai_task') {
+          return {
+            data: {
+              allowed: false,
+              status: 'already_completed',
+              cached_result: { questions: mockSavedQuestions },
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      }
+    }, async () => {
+      const req = new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          isSaveRetry: true,
+          subjectId: 'sub-p1',
+          domain: 'math_stats',
+          problemTitle: '적분 증명',
+          problemPrompt: '가측 집합 적분',
+          modelAnswer: '모범 답안',
+          originalAnswer: '사용자 답안',
+          rubric: [{ id: 'r1', label: '정확성', maxScore: 10, description: '수학적 엄밀성' }],
+        }),
+      });
+
+      const res = await logicPost(req);
+      assert.equal(res.status, 200, '저장 복구 요청 성공');
+      const data = await res.json();
+      assert.equal(data.success, true);
+      assert.equal(data.persisted, true);
+      assert.equal(data.settled, true);
+      assert.equal(data.questions[0].id, 'q-recov-1');
+      assert.equal(aiCallCount, 0, '복구 요청 시 외부 AI 호출 0회 보장');
+    });
+  });
+
+  await checkAsync('문제 1: Stale Lease Fencing 보호 (STALE_LEASE_TOKEN 거부 또는 409)', async () => {
+    const { POST: logicPost } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const testUser = { id: 'u-prob1-stale-lease' };
+    aiModule.callAiChat = async () => {
+      return {
+        ok: true,
+        content: JSON.stringify({
+          questions: [
+            { id: 'q1', question: '질문', linkedCriterionId: 'r1' },
+            { id: 'q2', question: '질문2', linkedCriterionId: 'r1' },
+          ],
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    await withFakeSupabase({
+      user: testUser,
+      rpcImpl: (fn) => {
+        if (fn === 'record_trial_result_ready') {
+          return { data: { success: false, error_code: 'STALE_LEASE_TOKEN', code: 'STALE_LEASE_TOKEN', message: '임대 토큰 만료' }, error: null };
+        }
+        return { data: null, error: null };
+      }
+    }, async () => {
+      const req = new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: 'sub-p1',
+          domain: 'math_stats',
+          problemTitle: '적분 증명',
+          problemPrompt: '가측 집합 적분',
+          modelAnswer: '모범 답안',
+          originalAnswer: '사용자 답안',
+          rubric: [{ id: 'r1', label: '정확성', maxScore: 10, description: '수학적 엄밀성' }],
+        }),
+      });
+
+      const res = await logicPost(req);
+      assert.equal(res.status, 409, '만료된 임대로 인한 보존 충돌 시 409 Conflict 반환');
+      const data = await res.json();
+      assert.equal(data.success, false);
+      assert.equal(data.errorCode, 'STALE_LEASE_TOKEN');
+    });
+  });
+
+  await checkAsync('문제 2: A·B 계정의 동일 입력에 대해 사용자 스코프 task_id로 분리 등록 및 독립 처리', async () => {
+    const { POST: logicPost } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const userA = { id: 'user-alpha-id' };
+    const userB = { id: 'user-beta-id' };
+    let aiCallCount = 0;
+    aiModule.callAiChat = async () => {
+      aiCallCount++;
+      return {
+        ok: true,
+        content: JSON.stringify({
+          questions: [
+            { id: 'q1', question: '질문 1', linkedCriterionId: 'r1' },
+            { id: 'q2', question: '질문 2', linkedCriterionId: 'r1' },
+          ],
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    const registeredTaskIds = [];
+    const sharedRpcImpl = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        registeredTaskIds.push({ userId: args.p_user_id, taskId: args.p_task_id });
+        return {
+          data: {
+            allowed: true,
+            status: 'processing',
+            lease_token: `lease-${args.p_user_id}`,
+            task_id: args.p_task_id,
+          },
+          error: null,
+        };
+      }
+      if (fn === 'record_trial_result_ready' || fn === 'settle_trial_credit') {
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    const identicalInput = {
+      subjectId: 'sub-shared',
+      domain: 'math_stats',
+      problemTitle: '동일 문제',
+      problemPrompt: '동일 프롬프트',
+      modelAnswer: '동일 모범답안',
+      originalAnswer: '동일 답안',
+      rubric: [{ id: 'r1', label: '기준', maxScore: 10, description: '설명' }],
+    };
+
+    await withFakeSupabase({ user: userA, rpcImpl: sharedRpcImpl }, async () => {
+      const reqA = new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(identicalInput),
+      });
+      const resA = await logicPost(reqA);
+      assert.equal(resA.status, 200, 'User A request succeeds');
+    });
+
+    await withFakeSupabase({ user: userB, rpcImpl: sharedRpcImpl }, async () => {
+      const reqB = new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(identicalInput),
+      });
+      const resB = await logicPost(reqB);
+      assert.equal(resB.status, 200, 'User B request succeeds without TASK_OWNERSHIP_MISMATCH');
+    });
+
+    assert.equal(registeredTaskIds.length, 2);
+    assert.equal(registeredTaskIds[0].userId, 'user-alpha-id');
+    assert.equal(registeredTaskIds[1].userId, 'user-beta-id');
+    assert.notEqual(registeredTaskIds[0].taskId, registeredTaskIds[1].taskId, 'User A와 User B의 task_id는 계정별로 엄격히 분리됨');
+    assert.ok(registeredTaskIds[0].taskId.includes('user-alpha-id'));
+    assert.ok(registeredTaskIds[1].taskId.includes('user-beta-id'));
+    assert.equal(aiCallCount, 2, 'User A와 User B 각각 1회씩 AI 호출됨');
+  });
+
+  await checkAsync('문제 2: 타 사용자의 명시적 taskId 재사용 시 403 TASK_OWNERSHIP_MISMATCH 거부', async () => {
+    const { POST: logicPost } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const attackerUser = { id: 'user-attacker' };
+
+    await withFakeSupabase({
+      user: attackerUser,
+      rpcImpl: (fn) => {
+        if (fn === 'register_ai_task') {
+          return {
+            data: {
+              allowed: false,
+              error_code: 'TASK_OWNERSHIP_MISMATCH',
+              message: '다른 사용자의 작업 식별자입니다.',
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      }
+    }, async () => {
+      const req = new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          taskId: 'logic_user-victim_explicit-task-123',
+          subjectId: 'sub-shared',
+          domain: 'math_stats',
+          problemTitle: '동일 문제',
+          problemPrompt: '동일 프롬프트',
+          modelAnswer: '동일 모범답안',
+          originalAnswer: '동일 답안',
+          rubric: [{ id: 'r1', label: '기준', maxScore: 10, description: '설명' }],
+        }),
+      });
+
+      const res = await logicPost(req);
+      assert.equal(res.status, 403, '타인 taskId 도용 시 403 Forbidden 반환');
+      const data = await res.json();
+      assert.equal(data.errorCode, 'TASK_OWNERSHIP_MISMATCH');
+    });
+  });
+
+  await checkAsync('문제 3: 동일 본문의 다른 자료(Material A vs Material B) 분석 캐시 충돌 방지', async () => {
+    const { POST: analyzeRoute } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const testUser = { id: 'u-prob3-mat-iso' };
+    const commonMarkdown = '# 해석학 기본\n코시 수열의 수렴성 [PAGE 5]';
+
+    const registeredTasks = [];
+    const rpcHandler = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        registeredTasks.push({ taskId: args.p_task_id, inputIdentifier: args.p_input_identifier });
+        return {
+          data: {
+            allowed: true,
+            status: 'processing',
+            lease_token: 'lease-prob3',
+            task_id: args.p_task_id,
+          },
+          error: null,
+        };
+      }
+      if (fn === 'claim_analysis_chunk_lease') {
+        return { data: { acquired: true, lease_token: 'chunk-lease-1', chunk_index: args.p_chunk_index }, error: null };
+      }
+      if (fn === 'commit_analysis_chunk_result') {
+        return { data: { committed: true, reason: 'committed' }, error: null };
+      }
+      if (fn === 'record_trial_result_ready' || fn === 'settle_trial_credit') {
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    aiModule.callAiChat = async () => {
+      return {
+        ok: true,
+        content: JSON.stringify({
+          concepts: [{
+            title: '코시 수열',
+            domain: 'math_stats',
+            description: '완비공간에서 수렴하는 수열',
+            coreDefinitionFormulaOrAlgorithm: '|x_n - x_m| < \\epsilon',
+            prerequisites: [],
+            relatedConcepts: [],
+            commonMisconceptions: [],
+            examples: ['실수 수열'],
+            sourceEvidence: { type: 'page', pageNumber: 5, quote: '코시 수열의 수렴성' },
+          }],
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    await withFakeSupabase({
+      user: testUser,
+      materials: [
+        { id: 'mat-analytical-1', user_id: testUser.id, subject_id: 'sub-analysis' },
+        { id: 'mat-analytical-2', user_id: testUser.id, subject_id: 'sub-analysis' },
+      ],
+      analysis_jobs: [],
+      analysis_job_chunks: [],
+      concept_drafts: [],
+      rpcImpl: rpcHandler,
+    }, async () => {
+      const reqA = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          subjectId: 'sub-analysis',
+          materialId: 'mat-analytical-1',
+          markdown: commonMarkdown,
+        }),
+      });
+      const resA = await analyzeRoute(reqA);
+      assert.equal(resA.status, 200, 'Material A 분석 성공');
+
+      const reqB = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          subjectId: 'sub-analysis',
+          materialId: 'mat-analytical-2',
+          markdown: commonMarkdown,
+        }),
+      });
+      const resB = await analyzeRoute(reqB);
+      assert.equal(resB.status, 200, 'Material B 분석 성공 (Material A 캐시 충돌 없음)');
+    });
+
+    assert.equal(registeredTasks.length, 2);
+    assert.notEqual(registeredTasks[0].taskId, registeredTasks[1].taskId, 'Material A와 Material B의 작업 식별자는 서로 달라야 함');
+    assert.notEqual(registeredTasks[0].inputIdentifier, registeredTasks[1].inputIdentifier, 'Material A와 Material B의 입력 식별자는 서로 달라야 함');
+    assert.ok(registeredTasks[0].taskId.includes('mat-analytical-1'));
+    assert.ok(registeredTasks[1].taskId.includes('mat-analytical-2'));
+  });
+
+  await checkAsync('문제 4: 실제 AI 입력 구성요소 변경 시 캐시 식별자 불일치 및 갱신 검증', async () => {
+    const { POST: logicPost } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const { POST: transPost } = load(path.join(output, 'app/api/transfer-problem/route.js'));
+    const testUser = { id: 'u-prob4-inputs' };
+
+    const capturedLogicIdentities = [];
+    const capturedTransIdentities = [];
+
+    const rpcSpy = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        if (args.p_task_type === 'logic_questions') {
+          capturedLogicIdentities.push(args.p_input_identifier);
+        } else if (args.p_task_type === 'transfer_problem') {
+          capturedTransIdentities.push(args.p_input_identifier);
+        }
+        return {
+          data: {
+            allowed: true,
+            status: 'processing',
+            lease_token: 'lease-p4',
+            task_id: args.p_task_id,
+          },
+          error: null,
+        };
+      }
+      if (fn === 'record_trial_result_ready' || fn === 'settle_trial_credit') {
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    aiModule.callAiChat = async (options) => {
+      if (options.label === 'transfer-problem') {
+        return {
+          ok: true,
+          content: JSON.stringify({
+            transferredProblemPrompt: '전이 문제 프롬프트',
+            transferredModelAnswer: '전이 문제 모범 답안',
+            transferredRubric: [{ id: 'tr1', label: '기준', maxScore: 10, description: '설명' }],
+            structuralDifferences: '차이점',
+          }),
+          model: 'deepseek-v4.1-flash',
+        };
+      }
+      return {
+        ok: true,
+        content: JSON.stringify({
+          questions: [
+            { id: 'q1', question: '질문', linkedCriterionId: 'r1' },
+            { id: 'q2', question: '질문2', linkedCriterionId: 'r1' },
+          ],
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    await withFakeSupabase({ user: testUser, rpcImpl: rpcSpy }, async () => {
+      // 1. logic-questions: rubric.description만 변경 시 새로운 inputIdentifier 생성 검증
+      const baseLogicPayload = {
+        subjectId: 'sub-p4',
+        domain: 'math_stats',
+        problemTitle: '문제 제목',
+        problemPrompt: '문제 지문',
+        modelAnswer: '모범 답안',
+        originalAnswer: '학생 답안',
+        rubric: [{ id: 'r1', label: '정확성', maxScore: 10, description: '기본 설명 A' }],
+      };
+
+      await logicPost(new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(baseLogicPayload),
+      }));
+
+      const modifiedRubricLogicPayload = {
+        ...baseLogicPayload,
+        rubric: [{ id: 'r1', label: '정확성', maxScore: 10, description: '수정된 다른 설명 B' }],
+      };
+
+      await logicPost(new NextRequest('http://localhost/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(modifiedRubricLogicPayload),
+      }));
+
+      assert.equal(capturedLogicIdentities.length, 2);
+      assert.notEqual(capturedLogicIdentities[0], capturedLogicIdentities[1], '루브릭 설명(description)만 바뀌어도 새로운 입력 식별자가 생성되어야 함');
+
+      // 2. transfer-problem: modelAnswer, vulnerableCriteria만 변경 시 새로운 inputIdentifier 생성 검증
+      const baseTransPayload = {
+        subjectId: 'sub-p4',
+        domain: 'math_stats',
+        problemTitle: '전이 원본 제목',
+        problemPrompt: '전이 원본 지문',
+        problemType: 'essay_descriptive',
+        concepts: [{ id: 'c1', title: '개념1' }],
+        modelAnswer: '모범 답안 원본 A',
+        originalAnswer: '학생 답안',
+        vulnerableCriteria: ['r1'],
+        rubric: [{ id: 'r1', label: '정확성', maxScore: 10, description: '설명' }],
+      };
+
+      await transPost(new NextRequest('http://localhost/api/transfer-problem', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(baseTransPayload),
+      }));
+
+      // Only modelAnswer changed
+      await transPost(new NextRequest('http://localhost/api/transfer-problem', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...baseTransPayload, modelAnswer: '모범 답안 변경본 B' }),
+      }));
+
+      // Only vulnerableCriteria changed
+      await transPost(new NextRequest('http://localhost/api/transfer-problem', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...baseTransPayload, vulnerableCriteria: ['r1', 'r2'] }),
+      }));
+
+      // Only rubric description changed
+      await transPost(new NextRequest('http://localhost/api/transfer-problem', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...baseTransPayload,
+          rubric: [{ id: 'r1', label: '정확성', maxScore: 10, description: '전이 루브릭 설명 변경' }],
+        }),
+      }));
+
+      assert.equal(capturedTransIdentities.length, 4);
+      assert.notEqual(capturedTransIdentities[0], capturedTransIdentities[1], 'modelAnswer만 변경 시 식별자가 달라져야 함');
+      assert.notEqual(capturedTransIdentities[0], capturedTransIdentities[2], 'vulnerableCriteria만 변경 시 식별자가 달라져야 함');
+      assert.notEqual(capturedTransIdentities[0], capturedTransIdentities[3], 'rubric.description만 변경 시 식별자가 달라져야 함');
     });
   });
 

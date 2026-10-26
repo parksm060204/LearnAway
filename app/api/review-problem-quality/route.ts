@@ -3,7 +3,14 @@ import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
-import { recordTrialResultReady, settleTrialCredit, releaseTrialCredit } from '../../../lib/trialCredits';
+import {
+  recordTrialResultReady,
+  settleTrialCredit,
+  releaseTrialCredit,
+  lookupSavedTaskResult,
+  buildUserScopedTaskId,
+  buildLegacyTaskId,
+} from '../../../lib/trialCredits';
 import { computeMarkdownHash } from '../../../lib/markdownUtils';
 import {
   Problem,
@@ -17,6 +24,8 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     ? (value as Record<string, unknown>)
     : null;
 }
+
+const REVIEW_PROBLEM_QUALITY_PROMPT_VERSION = 'v2';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -98,7 +107,32 @@ export async function POST(req: NextRequest) {
 
     const openReports = reports.filter((r) => r.status === 'open' || r.status === 'under_review');
 
-    const inputIdentifier = computeMarkdownHash(
+    const normalizedRubric = (problem.rubric || []).map((r) => ({
+      id: r.id,
+      label: r.label,
+      maxScore: r.maxScore,
+      description: r.description || '',
+    }));
+
+    const normalizedInput = {
+      version: REVIEW_PROBLEM_QUALITY_PROMPT_VERSION,
+      problemId: problem.id,
+      problemVersion: problem.version ?? 1,
+      problemTitle: problem.title || '',
+      categoryLabel: problem.categoryLabel || problem.type || '',
+      promptText: problem.promptText || '',
+      mathFormula: problem.mathFormula || '',
+      codeSnippet: problem.codeSnippet || '',
+      modelAnswer: problem.modelAnswer || '',
+      appliedConditionNote: problem.appliedConditionNote || problem.designIntent || '',
+      sourceRefs: problem.sourceRefs || '',
+      rubric: normalizedRubric,
+      reports: openReports.map((r) => ({ type: r.type, details: r.details, createdAt: r.createdAt || '' })),
+      sourceMarkdown: sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '',
+    };
+    const inputIdentifier = computeMarkdownHash(JSON.stringify(normalizedInput));
+
+    const legacyInputIdentifier = computeMarkdownHash(
       JSON.stringify({
         problemId: problem.id,
         problemTitle: problem.title,
@@ -111,15 +145,87 @@ export async function POST(req: NextRequest) {
         sourceMarkdown: sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '',
       })
     );
-    const taskId = (typeof payload.taskId === 'string' && payload.taskId.trim()) ? payload.taskId.trim() : (`qual_${inputIdentifier}`);
+
+    const rawTaskId = (typeof payload.taskId === 'string' && payload.taskId.trim()) ? payload.taskId.trim() : '';
+    const isLegacyDefault = rawTaskId === `qual_${legacyInputIdentifier}` || rawTaskId === `qual_${inputIdentifier}`;
+    const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
+    let taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'qual', inputIdentifier);
+    const legacyTaskId = buildLegacyTaskId('qual', legacyInputIdentifier);
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+
+    // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved results only.
+    if (isSaveRetry) {
+      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'review_problem_quality', inputIdentifier, legacyInputIdentifier);
+      if (!saved.success && !explicitTaskId) {
+        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'review_problem_quality', legacyInputIdentifier);
+      }
+      if (!saved.success) {
+        const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
+        return NextResponse.json(
+          {
+            success: false,
+            error: saved.message || '저장 재시도할 기존 작업 결과를 찾을 수 없습니다.',
+            errorCode: saved.errorCode || 'SAVED_TASK_NOT_FOUND',
+          },
+          { status }
+        );
+      }
+      const cached = saved.cachedResult as {
+        isReportJustified?: boolean;
+        severity?: 'critical' | 'moderate' | 'minor' | 'none';
+        recommendation?: 'edit_required' | 'suspend' | 'dismiss_report';
+        analysisSummary?: string;
+        suggestedFixes?: string;
+        ruleChecks?: ProblemQualityRuleCheck;
+      } | null;
+
+      if (!cached) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '저장된 검토 결과 데이터가 비어 있습니다.',
+            errorCode: 'INVALID_CACHED_RESULT',
+          },
+          { status: 500 }
+        );
+      }
+
+      const review: ProblemQualityReviewResult = {
+        isReportJustified: Boolean(cached.isReportJustified),
+        severity: cached.severity || 'none',
+        recommendation: cached.recommendation || 'dismiss_report',
+        analysisSummary: cached.analysisSummary || '',
+        suggestedFixes: cached.suggestedFixes || '',
+        ruleChecks: cached.ruleChecks || ruleChecks,
+        canAutoReapprove: false,
+      };
+
+      return NextResponse.json({
+        success: true,
+        review,
+        taskId: saved.taskId || taskId,
+        persisted: true,
+        settled: true,
+        notice: '기존에 검토 완료된 결과가 복원되었습니다.',
+      });
+    }
+
+    let persisted = false;
+    let settled = false;
+    let settlementError: string | undefined;
 
     const cred = await resolveAiConfigForUser(auth.user.id, {
       taskId,
       taskType: 'review_problem_quality',
       inputIdentifier,
+      legacyInputIdentifier,
       isSaveRetry,
     });
+
+    if (cred.taskId) {
+      taskId = cred.taskId;
+    }
+
     if (cred.ok) {
       try {
         const prompt = `당신은 대학 학부/대학원 수준의 수리통계 및 알고리즘 시험 문제 검증 및 학술 품질 관리관입니다.
@@ -134,7 +240,7 @@ ${problem.codeSnippet ? `- 코드: ${problem.codeSnippet}` : ''}
 - 모범 답안: ${problem.modelAnswer}
 - 출제 의도 및 응용조건: ${problem.appliedConditionNote || problem.designIntent || '없음'}
 - 출처: ${problem.sourceRefs || '미지정'}
-- 루브릭: ${JSON.stringify(problem.rubric || [])}
+- 루브릭: ${JSON.stringify(normalizedRubric)}
 
 [접수된 신고 내역 (${openReports.length}건)]
 ${
@@ -189,8 +295,6 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
             await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
           }
 
-          // Auth/credit/permission problems are configuration issues the heuristic
-          // cannot fix, so surface them instead of silently falling back.
           if (aiCall.error.code === 'auth' || aiCall.error.code === 'credit' || aiCall.error.code === 'forbidden') {
             return NextResponse.json(
               { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
@@ -223,14 +327,102 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
         analysisSummary = parsed.analysisSummary || 'AI 검토가 완료되었습니다.';
         suggestedFixes = parsed.suggestedFixes || '';
 
+        // Force edit recommendation if rubric does not sum to 100 or required fields are missing
+        if (!isRubric100 || !hasRequiredFields) {
+          isReportJustified = true;
+          if (severity === 'none' || severity === 'minor') severity = 'critical';
+          recommendation = 'edit_required';
+          suggestedFixes = [
+            !isRubric100 ? `루브릭 배점 합계가 ${rubricSum}점이므로 반드시 100점으로 재조정해야 합니다.` : '',
+            !hasRequiredFields ? '누락된 문제 필수 항목(지문/답안/루브릭)을 보완하십시오.' : '',
+            suggestedFixes,
+          ]
+            .filter(Boolean)
+            .join(' ');
+        }
+
+        const reviewPayload = {
+          isReportJustified,
+          severity,
+          recommendation,
+          analysisSummary,
+          suggestedFixes,
+          ruleChecks,
+          model: aiCall.model,
+        };
+
         if (cred.leaseToken) {
-          await recordTrialResultReady(
+          const saveRes = await recordTrialResultReady(
             auth.user.id,
             taskId,
-            { isReportJustified, severity, recommendation, analysisSummary, suggestedFixes, model: aiCall.model },
+            reviewPayload,
             cred.leaseToken
           );
-          await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
+
+          if (!saveRes.success) {
+            if (
+              saveRes.errorCode === 'STALE_LEASE_TOKEN' ||
+              saveRes.errorCode === 'ALREADY_SETTLED' ||
+              saveRes.errorCode === 'ALREADY_REFUNDED' ||
+              saveRes.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+              saveRes.errorCode === 'LEASE_TOKEN_REQUIRED'
+            ) {
+              return NextResponse.json(
+                {
+                  success: false,
+                  error: saveRes.error || '작업 실행권이 만료되었거나 다른 요청에 의해 선점되었습니다.',
+                  errorCode: saveRes.errorCode,
+                },
+                { status: 409 }
+              );
+            }
+            return NextResponse.json(
+              {
+                success: false,
+                error: `AI 검토는 완료되었으나 결과 보존에 실패했습니다 (${saveRes.error}). AI 재호출 없이 저장만 다시 시도할 수 있습니다.`,
+                errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
+                canRetrySave: true,
+                taskId,
+                review: {
+                  isReportJustified,
+                  severity,
+                  recommendation,
+                  analysisSummary,
+                  suggestedFixes,
+                  ruleChecks,
+                  canAutoReapprove: false,
+                },
+                persisted: false,
+                settled: false,
+              },
+              { status: 500 }
+            );
+          }
+
+          persisted = true;
+
+          const settleRes = await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
+          if (!settleRes.success) {
+            settlementError = settleRes.error;
+            settled = false;
+            if (
+              settleRes.errorCode === 'STALE_LEASE_TOKEN' ||
+              settleRes.errorCode === 'ALREADY_REFUNDED' ||
+              settleRes.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+              settleRes.errorCode === 'LEASE_TOKEN_REQUIRED'
+            ) {
+              return NextResponse.json(
+                {
+                  success: false,
+                  error: settleRes.error || '정산 실행권 검증에 실패했습니다.',
+                  errorCode: settleRes.errorCode,
+                },
+                { status: 409 }
+              );
+            }
+          } else {
+            settled = true;
+          }
         }
       } catch {
         if (cred.leaseToken) {
@@ -243,6 +435,8 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
         recommendation = fallback.recommendation;
         analysisSummary = `${fallback.analysisSummary} (참고: API 연결 장애로 정적 학술 규칙 기반으로 검토되었습니다.)`;
         suggestedFixes = fallback.suggestedFixes;
+        persisted = true;
+        settled = true;
       }
     } else {
       if (cred.code === 'concurrent_in_progress') {
@@ -276,6 +470,8 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
         recommendation = cached.recommendation || (isReportJustified ? 'edit_required' : 'dismiss_report');
         analysisSummary = cached.analysisSummary || 'AI 검토 결과가 캐시에서 복원되었습니다.';
         suggestedFixes = cached.suggestedFixes || '';
+        persisted = true;
+        settled = true;
       } else {
         // Offline / API not configured: deterministic academic heuristic evaluation
         const fallback = generateHeuristicQualityCheck(problem, openReports, isRubric100);
@@ -284,6 +480,8 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
         recommendation = fallback.recommendation;
         analysisSummary = fallback.analysisSummary;
         suggestedFixes = fallback.suggestedFixes;
+        persisted = true;
+        settled = true;
       }
     }
 
@@ -314,8 +512,13 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
     return NextResponse.json({
       success: true,
       review: result,
-      notice:
-        'AI 재검토 결과는 의사결정 참고용 권고안입니다. 학술 지침에 따라 AI의 판단만으로 자동 재승인되지 않으며, 담당자가 확인 후 재승인을 확정해야 합니다.',
+      taskId,
+      persisted,
+      settled,
+      settlementError,
+      notice: settlementError
+        ? `AI 검토 결과는 보존되었으나 크레딧 정산에 실패했습니다 (${settlementError}).`
+        : 'AI 재검토 결과는 의사결정 참고용 권고안입니다. 학술 지침에 따라 AI의 판단만으로 자동 재승인되지 않으며, 담당자가 확인 후 재승인을 확정해야 합니다.',
     });
   } catch (error) {
     console.error('Error in review-problem-quality:', error);

@@ -219,21 +219,19 @@ export function StudyPlanModal({
           <div className="flex items-center gap-1 bg-[#ede8de] p-0.5 rounded-xs">
             <button
               onClick={() => setActiveTab('plan')}
-              className={`px-3 py-1 font-semibold rounded-xs transition-colors ${
-                activeTab === 'plan'
-                  ? 'bg-white text-[#191817] shadow-2xs'
-                  : 'text-[#827d73] hover:text-[#191817]'
-              }`}
+              className={`px-3 py-1 font-semibold rounded-xs transition-colors ${activeTab === 'plan'
+                ? 'bg-white text-[#191817] shadow-2xs'
+                : 'text-[#827d73] hover:text-[#191817]'
+                }`}
             >
               날짜별 학습 계획
             </button>
             <button
               onClick={() => setActiveTab('settings')}
-              className={`px-3 py-1 font-semibold rounded-xs flex items-center gap-1 transition-colors ${
-                activeTab === 'settings'
-                  ? 'bg-white text-[#191817] shadow-2xs'
-                  : 'text-[#827d73] hover:text-[#191817]'
-              }`}
+              className={`px-3 py-1 font-semibold rounded-xs flex items-center gap-1 transition-colors ${activeTab === 'settings'
+                ? 'bg-white text-[#191817] shadow-2xs'
+                : 'text-[#827d73] hover:text-[#191817]'
+                }`}
             >
               <Sliders className="w-3.5 h-3.5" />
               <span>계획 설정 (시간·범위)</span>
@@ -282,7 +280,7 @@ export function StudyPlanModal({
                           100,
                           (studyPlanSummary.todayAssignedMinutes /
                             Math.max(1, studyPlanSummary.todayAvailableMinutes)) *
-                            100
+                          100
                         )}%`,
                       }}
                     />
@@ -376,23 +374,21 @@ export function StudyPlanModal({
                   return (
                     <div
                       key={day.date}
-                      className={`border rounded-xs p-3.5 transition-all ${
-                        isToday
-                          ? 'border-[#c52828] bg-white shadow-xs'
-                          : day.isRestDay
+                      className={`border rounded-xs p-3.5 transition-all ${isToday
+                        ? 'border-[#c52828] bg-white shadow-xs'
+                        : day.isRestDay
                           ? 'border-[#e2ded6] bg-[#faf8f4]/60 opacity-80'
                           : 'border-[#ded6c8] bg-white'
-                      }`}
+                        }`}
                     >
                       {/* Day Header */}
                       <div className="flex flex-wrap items-center justify-between gap-2 pb-2 mb-2 border-b border-[#f1ede4]">
                         <div className="flex items-center gap-2">
                           <span
-                            className={`font-academic-mono text-xs font-bold px-2 py-0.5 rounded-2xs ${
-                              isToday
-                                ? 'bg-[#c52828] text-white'
-                                : 'bg-[#ede8de] text-[#191817]'
-                            }`}
+                            className={`font-academic-mono text-xs font-bold px-2 py-0.5 rounded-2xs ${isToday
+                              ? 'bg-[#c52828] text-white'
+                              : 'bg-[#ede8de] text-[#191817]'
+                              }`}
                           >
                             {day.dayLabel}
                           </span>
@@ -431,26 +427,24 @@ export function StudyPlanModal({
                             return (
                               <div
                                 key={item.id}
-                                className={`p-2.5 rounded-xs border flex flex-col sm:flex-row sm:items-center justify-between gap-2 transition-all ${
-                                  isCompleted
-                                    ? 'bg-emerald-50/60 border-emerald-200'
-                                    : item.needsProblemGeneration
+                                className={`p-2.5 rounded-xs border flex flex-col sm:flex-row sm:items-center justify-between gap-2 transition-all ${isCompleted
+                                  ? 'bg-emerald-50/60 border-emerald-200'
+                                  : item.needsProblemGeneration
                                     ? 'bg-amber-50/60 border-amber-200'
                                     : 'bg-white border-[#ded6c8] hover:border-[#191817]'
-                                }`}
+                                  }`}
                               >
                                 <div className="space-y-1 flex-1">
                                   <div className="flex flex-wrap items-center gap-1.5">
                                     <span
-                                      className={`text-[10px] font-academic-mono font-bold px-1.5 py-0.2 rounded-2xs ${
-                                        item.kind === 'initial_study'
-                                          ? 'bg-blue-100 text-blue-900 border border-blue-300'
-                                          : item.kind === 'vulnerability_fix'
+                                      className={`text-[10px] font-academic-mono font-bold px-1.5 py-0.2 rounded-2xs ${item.kind === 'initial_study'
+                                        ? 'bg-blue-100 text-blue-900 border border-blue-300'
+                                        : item.kind === 'vulnerability_fix'
                                           ? 'bg-rose-100 text-rose-900 border border-rose-300'
                                           : item.kind === 'mixed_mock_exam'
-                                          ? 'bg-purple-100 text-purple-900 border border-purple-300'
-                                          : 'bg-amber-100 text-amber-900 border border-amber-300'
-                                      }`}
+                                            ? 'bg-purple-100 text-purple-900 border border-purple-300'
+                                            : 'bg-amber-100 text-amber-900 border border-amber-300'
+                                        }`}
                                     >
                                       {STUDY_PLAN_ITEM_KIND_LABELS[item.kind]}
                                     </span>
@@ -538,10 +532,10 @@ export function StudyPlanModal({
                                           {item.needsProblemGeneration
                                             ? '문제 출제'
                                             : item.kind === 'initial_study'
-                                            ? '개념 정독'
-                                            : item.kind === 'mixed_mock_exam'
-                                            ? '모의시험'
-                                            : '풀이 시작'}
+                                              ? '개념 정독'
+                                              : item.kind === 'mixed_mock_exam'
+                                                ? '모의시험'
+                                                : '풀이 시작'}
                                         </span>
                                       </button>
 
@@ -686,9 +680,8 @@ export function StudyPlanModal({
                     return (
                       <div
                         key={dow}
-                        className={`p-2 border rounded-xs text-center space-y-1.5 ${
-                          cfg.isRestDay ? 'bg-[#faf8f4] border-[#ded6c8]' : 'bg-white border-[#ded6c8]'
-                        }`}
+                        className={`p-2 border rounded-xs text-center space-y-1.5 ${cfg.isRestDay ? 'bg-[#faf8f4] border-[#ded6c8]' : 'bg-white border-[#ded6c8]'
+                          }`}
                       >
                         <div className="font-bold text-xs text-[#191817]">
                           {koreanDayNames[dow]}요일
@@ -754,11 +747,10 @@ export function StudyPlanModal({
                         key={sub.id}
                         type="button"
                         onClick={() => setSelectedConfigSubjectId(sub.id)}
-                        className={`px-2.5 py-1 text-xs rounded-xs font-medium border ${
-                          sub.id === selectedConfigSubjectId
-                            ? 'bg-[#191817] text-white border-[#191817]'
-                            : 'bg-[#faf8f4] text-[#57544e] border-[#ded6c8]'
-                        }`}
+                        className={`px-2.5 py-1 text-xs rounded-xs font-medium border ${sub.id === selectedConfigSubjectId
+                          ? 'bg-[#191817] text-white border-[#191817]'
+                          : 'bg-[#faf8f4] text-[#57544e] border-[#ded6c8]'
+                          }`}
                       >
                         {sub.name}
                       </button>
@@ -794,11 +786,10 @@ export function StudyPlanModal({
                       return (
                         <label
                           key={c.id}
-                          className={`flex items-start gap-2 p-2 rounded-xs border text-xs cursor-pointer transition-colors ${
-                            isChecked
-                              ? 'bg-white border-[#191817]'
-                              : 'bg-white/50 border-[#ede8de] opacity-75'
-                          }`}
+                          className={`flex items-start gap-2 p-2 rounded-xs border text-xs cursor-pointer transition-colors ${isChecked
+                            ? 'bg-white border-[#191817]'
+                            : 'bg-white/50 border-[#ede8de] opacity-75'
+                            }`}
                         >
                           <input
                             type="checkbox"
@@ -810,11 +801,10 @@ export function StudyPlanModal({
                             <div className="font-semibold text-[#191817] flex items-center justify-between">
                               <span>{c.title}</span>
                               <span
-                                className={`text-[10px] font-academic-mono px-1 rounded-2xs ${
-                                  isUnstudied
-                                    ? 'bg-slate-100 text-slate-700'
-                                    : 'bg-emerald-50 text-emerald-800'
-                                }`}
+                                className={`text-[10px] font-academic-mono px-1 rounded-2xs ${isUnstudied
+                                  ? 'bg-slate-100 text-slate-700'
+                                  : 'bg-emerald-50 text-emerald-800'
+                                  }`}
                               >
                                 {isUnstudied ? '미학습' : `${c.currentScore.toFixed(0)}점`}
                               </span>
@@ -838,9 +828,8 @@ export function StudyPlanModal({
                       return (
                         <label
                           key={pt.type}
-                          className={`flex items-center gap-2 p-2 rounded-xs border text-xs cursor-pointer ${
-                            isChecked ? 'bg-[#faf8f4] border-[#191817] font-semibold' : 'bg-white border-[#ded6c8]'
-                          }`}
+                          className={`flex items-center gap-2 p-2 rounded-xs border text-xs cursor-pointer ${isChecked ? 'bg-[#faf8f4] border-[#191817] font-semibold' : 'bg-white border-[#ded6c8]'
+                            }`}
                         >
                           <input
                             type="checkbox"

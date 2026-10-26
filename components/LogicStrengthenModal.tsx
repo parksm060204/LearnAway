@@ -311,7 +311,11 @@ export function LogicStrengthenModal({
         return;
       }
       if (!res.ok || !data.success) {
-        setError(data.error || '핵심 질문 생성에 실패했습니다.');
+        if (data.canRetrySave) {
+          setError(`${data.error || '질문 생성은 완료되었으나 서버 보존에 실패했습니다.'} (저장만 다시 시도할 수 있습니다.)`);
+        } else {
+          setError(data.error || '핵심 질문 생성에 실패했습니다.');
+        }
         return;
       }
       const newVersion = latest.questionSetVersion + 1;
@@ -343,7 +347,11 @@ export function LogicStrengthenModal({
         questionsInputHash: inputHash,
         status: latest.revisedEvaluation ? latest.status : 'questions_ready',
       });
-      setNotice(`질문 세트 v${newVersion}이 생성되었습니다. 이전 질문과 응답은 이력으로 보존됩니다.`);
+      if (data.settlementError || data.settled === false) {
+        setNotice(`질문 세트 v${newVersion}이 생성되었습니다. (참고: 크레딧 정산 지연 - ${data.settlementError || '정산 대기'})`);
+      } else {
+        setNotice(`질문 세트 v${newVersion}이 생성되었습니다. 이전 질문과 응답은 이력으로 보존됩니다.`);
+      }
     } catch (cause) {
       const aborted = cause instanceof Error && cause.name === 'AbortError';
       if (!aborted && mountedRef.current && requestId === questionsTrackerRef.current.generation) {
@@ -622,7 +630,11 @@ export function LogicStrengthenModal({
         return;
       }
       if (!res.ok || !data.success) {
-        setError(data.error || '전이 문제 생성에 실패했습니다.');
+        if (data.canRetrySave) {
+          setError(`${data.error || '전이 문제 생성은 완료되었으나 서버 보존에 실패했습니다.'} (저장만 다시 시도할 수 있습니다.)`);
+        } else {
+          setError(data.error || '전이 문제 생성에 실패했습니다.');
+        }
         return;
       }
       const latest = sessionRef.current;
@@ -694,7 +706,11 @@ export function LogicStrengthenModal({
         transferDraftVersion: draftVersion,
         transferInputHash: inputHash,
       });
-      setNotice('전이 문제 초안이 생성되었습니다. 검토·승인 전에는 학습 계획에 배정되지 않습니다.');
+      if (data.settlementError || data.settled === false) {
+        setNotice(`전이 문제 초안이 생성되었습니다. (참고: 크레딧 정산 지연 - ${data.settlementError || '정산 대기'}). 검토·승인 전에는 학습 계획에 배정되지 않습니다.`);
+      } else {
+        setNotice('전이 문제 초안이 생성되었습니다. 검토·승인 전에는 학습 계획에 배정되지 않습니다.');
+      }
     } catch (cause) {
       const aborted = cause instanceof Error && cause.name === 'AbortError';
       if (!aborted && mountedRef.current && requestId === transferTrackerRef.current.generation) {
