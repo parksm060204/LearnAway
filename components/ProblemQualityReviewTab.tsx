@@ -166,10 +166,38 @@ export function ProblemQualityReviewTab({
     return reported || filteredProblems[0] || subjectProblems[0] || null;
   }, [selectedProblemId, filteredProblems, subjectProblems]);
 
+  // Persistent screen context ref for race-condition prevention across renders
+  const screenContextRef = useRef({
+    userId: effectiveUserId,
+    subjectId: activeSubject?.id,
+    problemId: activeProblem?.id,
+    problemVersion: activeProblem?.version || 1,
+  });
+
+  useEffect(() => {
+    screenContextRef.current = {
+      userId: effectiveUserId,
+      subjectId: activeSubject?.id,
+      problemId: activeProblem?.id,
+      problemVersion: activeProblem?.version || 1,
+    };
+  });
+
+  const syncedKey = `${activeProblem?.id || ''}:v${activeProblem?.version || 1}:${activeSubject?.id || ''}:${effectiveUserId}`;
+
+  // Invalidate any in-flight review requests whenever problem, version, subject, or user changes
+  useEffect(() => {
+    reviewRequestIdRef.current += 1;
+  }, [syncedKey]);
+
   // Reset the edit/review form and recovery state when the active problem changes (render-phase, hydration-safe).
-  const [syncedProblemId, setSyncedProblemId] = useState<string | null>(null);
-  if (activeProblem && syncedProblemId !== activeProblem.id) {
-    setSyncedProblemId(activeProblem.id);
+  const [syncedProblemKey, setSyncedProblemKey] = useState<string | null>(null);
+  if (activeProblem && syncedProblemKey !== syncedKey) {
+    setSyncedProblemKey(syncedKey);
+    setIsAiReviewing(false);
+    setIsRetryingSaveReview(false);
+    setAiReviewError(null);
+    setAiReviewNotice(null);
     setEditTitle(activeProblem.title);
     setEditPrompt(activeProblem.promptText);
     setEditFormula(activeProblem.mathFormula || '');
@@ -182,7 +210,6 @@ export function ProblemQualityReviewTab({
     setEditValidationError(null);
     setIsEditing(false);
     setAiReviewResult(null);
-    setAiReviewError(null);
     setReviewedProblemVersion(null);
     setExpandedVersionNum(null);
     setQualityRecovery(
@@ -224,6 +251,7 @@ export function ProblemQualityReviewTab({
     reviewRequestIdRef.current += 1;
     const currentReqId = reviewRequestIdRef.current;
     const reqUserId = effectiveUserId;
+    const reqSubjectId = activeSubject?.id;
     const reqProblemId = activeProblem.id;
     const reqProblemVersion = activeProblem.version || 1;
 
@@ -252,17 +280,16 @@ export function ProblemQualityReviewTab({
 
       const data = await res.json();
 
-      if (
-        !mountedRef.current ||
-        currentReqId !== reviewRequestIdRef.current ||
-        effectiveUserId !== reqUserId ||
-        activeProblem?.id !== reqProblemId
-      ) {
-        return;
-      }
+      const isCurrentActive =
+        mountedRef.current &&
+        currentReqId === reviewRequestIdRef.current &&
+        screenContextRef.current.userId === reqUserId &&
+        screenContextRef.current.subjectId === reqSubjectId &&
+        screenContextRef.current.problemId === reqProblemId &&
+        screenContextRef.current.problemVersion === reqProblemVersion;
 
       if (!res.ok || !data.success) {
-        if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && effectiveUserId && activeProblem) {
+        if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && reqUserId) {
           const rec = {
             taskId: data.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
@@ -272,24 +299,33 @@ export function ProblemQualityReviewTab({
             inputIdentifier: `${reqProblemId}:v${reqProblemVersion}`,
             error: data.error,
           };
-          const saveRes = saveTaskRecovery(effectiveUserId, 'review_problem_quality', reqProblemId, rec);
+          const saveRes = saveTaskRecovery(reqUserId, 'review_problem_quality', reqProblemId, rec);
           const quotaWarning = !saveRes.ok ? ` (로컬 임시 저장 실패: ${saveRes.error})` : '';
-          setQualityRecovery({
-            ...rec,
-            userId: effectiveUserId,
-            taskType: 'review_problem_quality',
-            savedAt: new Date().toISOString(),
-          });
-          setAiReviewError(`${data.error || 'AI 검토는 완료되었으나 결과 보존에 실패했습니다.'} AI 재호출 없이 저장만 다시 시도할 수 있습니다.${quotaWarning}`);
-        } else {
+
+          if (isCurrentActive) {
+            setQualityRecovery({
+              ...rec,
+              userId: reqUserId,
+              taskType: 'review_problem_quality',
+              savedAt: new Date().toISOString(),
+            });
+            setAiReviewError(`${data.error || 'AI 검토는 완료되었으나 결과 보존에 실패했습니다.'} AI 재호출 없이 저장만 다시 시도할 수 있습니다.${quotaWarning}`);
+          }
+        } else if (isCurrentActive) {
           setAiReviewError(data.error || 'AI 품질 검토 호출에 실패했습니다.');
         }
         return;
       }
 
-      if (effectiveUserId && activeProblem) {
-        clearTaskRecovery(effectiveUserId, 'review_problem_quality', reqProblemId, data.taskId);
+      // Safe clean: clear recovery record for the specific problem and task
+      if (reqUserId) {
+        clearTaskRecovery(reqUserId, 'review_problem_quality', reqProblemId, data.taskId);
       }
+
+      if (!isCurrentActive) {
+        return;
+      }
+
       setQualityRecovery(null);
       setAiReviewResult(data.review);
       setReviewedProblemVersion(reqProblemVersion);
@@ -299,9 +335,27 @@ export function ProblemQualityReviewTab({
         setAiReviewNotice(data.notice);
       }
     } catch (err) {
-      setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
+      const isCurrentActive =
+        mountedRef.current &&
+        currentReqId === reviewRequestIdRef.current &&
+        screenContextRef.current.userId === reqUserId &&
+        screenContextRef.current.subjectId === reqSubjectId &&
+        screenContextRef.current.problemId === reqProblemId &&
+        screenContextRef.current.problemVersion === reqProblemVersion;
+      if (isCurrentActive) {
+        setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
+      }
     } finally {
-      if (mountedRef.current) setIsAiReviewing(false);
+      const isCurrentActive =
+        mountedRef.current &&
+        currentReqId === reviewRequestIdRef.current &&
+        screenContextRef.current.userId === reqUserId &&
+        screenContextRef.current.subjectId === reqSubjectId &&
+        screenContextRef.current.problemId === reqProblemId &&
+        screenContextRef.current.problemVersion === reqProblemVersion;
+      if (isCurrentActive) {
+        setIsAiReviewing(false);
+      }
     }
   };
 
@@ -313,10 +367,12 @@ export function ProblemQualityReviewTab({
     reviewRequestIdRef.current += 1;
     const currentReqId = reviewRequestIdRef.current;
     const reqUserId = effectiveUserId;
+    const reqSubjectId = activeSubject?.id;
     const reqProblemId = activeProblem.id;
     const reqTaskId = qualityRecovery.taskId;
     const snap = qualityRecovery.inputSnapshot as ProblemQualityReviewInputSnapshot | undefined;
     const targetVersion = snap?.problemVersion ?? qualityRecovery.inputVersion ?? (activeProblem.version || 1);
+    const reqProblemVersion = targetVersion;
 
     try {
       const subjectMaterial = materials.find(
@@ -351,18 +407,17 @@ export function ProblemQualityReviewTab({
       });
       const data = await res.json();
 
-      if (
-        !mountedRef.current ||
-        currentReqId !== reviewRequestIdRef.current ||
-        effectiveUserId !== reqUserId ||
-        activeProblem?.id !== reqProblemId
-      ) {
-        return;
-      }
+      const isCurrentActive =
+        mountedRef.current &&
+        currentReqId === reviewRequestIdRef.current &&
+        screenContextRef.current.userId === reqUserId &&
+        screenContextRef.current.subjectId === reqSubjectId &&
+        screenContextRef.current.problemId === reqProblemId &&
+        screenContextRef.current.problemVersion === reqProblemVersion;
 
       if (!res.ok || !data.success) {
-        if (data.signedRecoveryToken && data.recoveryData && effectiveUserId && activeProblem) {
-          const saveRes = saveTaskRecovery(effectiveUserId, 'review_problem_quality', reqProblemId, {
+        if (data.signedRecoveryToken && data.recoveryData && reqUserId) {
+          const saveRes = saveTaskRecovery(reqUserId, 'review_problem_quality', reqProblemId, {
             taskId: data.taskId || qualityRecovery.taskId,
             signedRecoveryToken: data.signedRecoveryToken,
             recoveryData: data.recoveryData,
@@ -372,16 +427,24 @@ export function ProblemQualityReviewTab({
             error: data.error,
           });
           const quotaWarning = !saveRes.ok ? ` (로컬 임시 저장 실패: ${saveRes.error})` : '';
-          setAiReviewError(`${data.error || '저장 재시도에 실패했습니다.'}${quotaWarning}`);
-        } else {
+
+          if (isCurrentActive) {
+            setAiReviewError(`${data.error || '저장 재시도에 실패했습니다.'}${quotaWarning}`);
+          }
+        } else if (isCurrentActive) {
           setAiReviewError(data.error || '저장 재시도에 실패했습니다.');
         }
         return;
       }
 
-      if (effectiveUserId && activeProblem) {
-        clearTaskRecovery(effectiveUserId, 'review_problem_quality', reqProblemId, reqTaskId);
+      if (reqUserId) {
+        clearTaskRecovery(reqUserId, 'review_problem_quality', reqProblemId, reqTaskId);
       }
+
+      if (!isCurrentActive) {
+        return;
+      }
+
       setQualityRecovery(null);
       setAiReviewResult(data.review);
       setReviewedProblemVersion(targetVersion);
@@ -391,9 +454,27 @@ export function ProblemQualityReviewTab({
         setAiReviewNotice(data.notice);
       }
     } catch (err) {
-      setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
+      const isCurrentActive =
+        mountedRef.current &&
+        currentReqId === reviewRequestIdRef.current &&
+        screenContextRef.current.userId === reqUserId &&
+        screenContextRef.current.subjectId === reqSubjectId &&
+        screenContextRef.current.problemId === reqProblemId &&
+        screenContextRef.current.problemVersion === reqProblemVersion;
+      if (isCurrentActive) {
+        setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
+      }
     } finally {
-      if (mountedRef.current) setIsRetryingSaveReview(false);
+      const isCurrentActive =
+        mountedRef.current &&
+        currentReqId === reviewRequestIdRef.current &&
+        screenContextRef.current.userId === reqUserId &&
+        screenContextRef.current.subjectId === reqSubjectId &&
+        screenContextRef.current.problemId === reqProblemId &&
+        screenContextRef.current.problemVersion === reqProblemVersion;
+      if (isCurrentActive) {
+        setIsRetryingSaveReview(false);
+      }
     }
   };
 

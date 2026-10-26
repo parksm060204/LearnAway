@@ -14,7 +14,12 @@ import {
   toAcademicDifficultyLevel,
   ACADEMIC_ERROR_LABELS,
   RubricCriterion,
+  ProblemVersionSnapshot,
+  ProblemSourceProvenance,
+  SourceVerificationStatus,
 } from '../lib/types';
+import { isSupabaseConfigured } from '../lib/supabase/config';
+import { createClient as createBrowserSupabaseClient } from '../lib/supabase/client';
 import { MathFormula } from './MathFormula';
 import { AcademicMathView } from './AcademicMathView';
 import { ProblemReportModal } from './ProblemReportModal';
@@ -80,18 +85,198 @@ export interface EvaluateAnswerInputSnapshot {
   subjectId?: string;
   domain?: string;
   isProvisionalLocal?: boolean;
+  sourceProvenance?: ProblemSourceProvenance;
 }
 
 
-// Snapshot of every input that the AI evaluation depends on. Recording is only
-// allowed while the current inputs still match this snapshot.
-interface EvaluationInputSnapshot {
+// Snapshot of every input and evaluated problem content that the AI evaluation depends on.
+// Recording is only allowed while the current inputs still match this snapshot, and the
+// Attempt is constructed entirely from this evaluated problem snapshot.
+export interface EvaluationInputSnapshot {
   answer: string;
   solvingReason: string;
   isReasonNotApplicable: boolean;
   reasonNotApplicableJustification: string;
   hintCount: number;
-  problemVersion?: number;
+  problemVersion: number;
+
+  problemTitle: string;
+  problemPrompt: string;
+  modelAnswer: string;
+  rubric: RubricCriterion[];
+  conceptId?: string;
+  conceptIds?: string[];
+  subjectId?: string;
+  sourceProvenance?: ProblemSourceProvenance;
+  appliedConditionNote?: string;
+  mathFormula?: string;
+  codeSnippet?: string;
+}
+
+export function extractProblemProvenance(
+  source?: {
+    sourceMaterialId?: string;
+    sourceConceptIds?: string[];
+    sourceExcerpt?: string;
+    sourcePage?: string;
+    sourceContentVersion?: string;
+    sourceVerificationStatus?: SourceVerificationStatus;
+  }
+): ProblemSourceProvenance | undefined {
+  if (!source) return undefined;
+  if (
+    source.sourceMaterialId ||
+    source.sourceConceptIds ||
+    source.sourceExcerpt ||
+    source.sourcePage ||
+    source.sourceContentVersion ||
+    source.sourceVerificationStatus
+  ) {
+    return {
+      sourceMaterialId: source.sourceMaterialId,
+      sourceConceptIds: source.sourceConceptIds,
+      sourceExcerpt: source.sourceExcerpt,
+      sourcePage: source.sourcePage,
+      sourceContentVersion: source.sourceContentVersion,
+      sourceVerificationStatus: source.sourceVerificationStatus,
+    };
+  }
+  return undefined;
+}
+
+export async function resolveEvaluatedProblemSnapshot(
+  problem: Problem,
+  targetVersion: number,
+  concept: Concept,
+  subject: Subject,
+  snap?: EvaluateAnswerInputSnapshot
+): Promise<{
+  version: number;
+  title: string;
+  promptText: string;
+  modelAnswer: string;
+  rubric: RubricCriterion[];
+  conceptId?: string;
+  conceptIds?: string[];
+  subjectId?: string;
+  sourceProvenance?: ProblemSourceProvenance;
+  appliedConditionNote?: string;
+  mathFormula?: string;
+  codeSnippet?: string;
+} | null> {
+  // 1. Check if snap has complete problem fields
+  if (
+    snap &&
+    typeof snap.problemPrompt === 'string' && snap.problemPrompt.trim() &&
+    typeof snap.modelAnswer === 'string' && snap.modelAnswer.trim() &&
+    Array.isArray(snap.rubric) && snap.rubric.length > 0
+  ) {
+    return {
+      version: targetVersion,
+      title: snap.problemTitle || problem.title,
+      promptText: snap.problemPrompt,
+      modelAnswer: snap.modelAnswer,
+      rubric: snap.rubric,
+      conceptId: snap.conceptId || concept.id,
+      conceptIds: snap.conceptIds || problem.conceptIds || [concept.id],
+      subjectId: snap.subjectId || subject.id,
+      sourceProvenance: snap.sourceProvenance,
+      appliedConditionNote: snap.appliedConditionNote,
+      mathFormula: snap.mathFormula,
+      codeSnippet: snap.codeSnippet,
+    };
+  }
+
+  // 2. If targetVersion matches current problem.version
+  const currentVersion = problem.version ?? 1;
+  if (targetVersion === currentVersion) {
+    if (
+      typeof problem.promptText === 'string' && problem.promptText.trim() &&
+      typeof problem.modelAnswer === 'string' && problem.modelAnswer.trim() &&
+      Array.isArray(problem.rubric) && problem.rubric.length > 0
+    ) {
+      return {
+        version: currentVersion,
+        title: problem.title,
+        promptText: problem.promptText,
+        modelAnswer: problem.modelAnswer,
+        rubric: problem.rubric,
+        conceptId: concept.id,
+        conceptIds: problem.conceptIds || [concept.id],
+        subjectId: subject.id,
+        sourceProvenance: extractProblemProvenance(problem),
+        appliedConditionNote: problem.appliedConditionNote,
+        mathFormula: problem.mathFormula,
+        codeSnippet: problem.codeSnippet,
+      };
+    }
+  }
+
+  // 3. Search in problem.versionHistory
+  const historySnapshot = (problem.versionHistory || []).find((h) => h.version === targetVersion);
+  if (
+    historySnapshot &&
+    typeof historySnapshot.promptText === 'string' && historySnapshot.promptText.trim() &&
+    typeof historySnapshot.modelAnswer === 'string' && historySnapshot.modelAnswer.trim() &&
+    Array.isArray(historySnapshot.rubric) && historySnapshot.rubric.length > 0
+  ) {
+    return {
+      version: targetVersion,
+      title: historySnapshot.title || problem.title,
+      promptText: historySnapshot.promptText,
+      modelAnswer: historySnapshot.modelAnswer,
+      rubric: historySnapshot.rubric,
+      conceptId: concept.id,
+      conceptIds: historySnapshot.conceptIds || problem.conceptIds || [concept.id],
+      subjectId: subject.id,
+      sourceProvenance: extractProblemProvenance(historySnapshot),
+      appliedConditionNote: historySnapshot.appliedConditionNote,
+      mathFormula: historySnapshot.mathFormula,
+      codeSnippet: historySnapshot.codeSnippet,
+    };
+  }
+
+  // 4. Try querying server if Supabase is configured
+  if (isSupabaseConfigured()) {
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const { data, error } = await supabase
+        .from('problem_versions')
+        .select('snapshot')
+        .eq('problem_id', problem.id)
+        .eq('version', targetVersion)
+        .maybeSingle();
+
+      if (!error && data?.snapshot) {
+        const s = data.snapshot as ProblemVersionSnapshot;
+        if (
+          typeof s.promptText === 'string' && s.promptText.trim() &&
+          typeof s.modelAnswer === 'string' && s.modelAnswer.trim() &&
+          Array.isArray(s.rubric) && s.rubric.length > 0
+        ) {
+          return {
+            version: targetVersion,
+            title: s.title || problem.title,
+            promptText: s.promptText,
+            modelAnswer: s.modelAnswer,
+            rubric: s.rubric,
+            conceptId: concept.id,
+            conceptIds: s.conceptIds || problem.conceptIds || [concept.id],
+            subjectId: subject.id,
+            sourceProvenance: extractProblemProvenance(s),
+            appliedConditionNote: s.appliedConditionNote,
+            mathFormula: s.mathFormula,
+            codeSnippet: s.codeSnippet,
+          };
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to fetch problem version from Supabase:', e);
+    }
+  }
+
+  // 5. Cannot resolve accurate snapshot
+  return null;
 }
 
 interface ProblemSessionModalProps {
@@ -313,6 +498,34 @@ export function ProblemSessionModal({
     };
   }, []);
 
+  const screenContextRef = useRef({
+    userId,
+    subjectId: subject.id,
+    problemId: problem.id,
+    problemVersion: problem.version ?? 1,
+  });
+
+  useEffect(() => {
+    screenContextRef.current = {
+      userId,
+      subjectId: subject.id,
+      problemId: problem.id,
+      problemVersion: problem.version ?? 1,
+    };
+  });
+
+  const sessionProblemKey = `${userId || ''}:${subject.id}:${problem.id}:v${problem.version ?? 1}`;
+  const [prevSessionProblemKey, setPrevSessionProblemKey] = useState(sessionProblemKey);
+  if (sessionProblemKey !== prevSessionProblemKey) {
+    setPrevSessionProblemKey(sessionProblemKey);
+    setIsEvaluating(false);
+    setIsRetryingSave(false);
+  }
+
+  useEffect(() => {
+    evalRequestIdRef.current += 1;
+  }, [sessionProblemKey]);
+
   const recoveryKey = userId ? `${userId}:${problem.id}` : '';
   const [prevRecoveryKey, setPrevRecoveryKey] = useState(recoveryKey);
   const [recoveryRecord, setRecoveryRecord] = useState<TaskRecoveryRecord | null>(() =>
@@ -342,7 +555,10 @@ export function ProblemSessionModal({
 
   if (!isOpen) return null;
 
-  const buildEvaluationSnapshot = (): EvaluationInputSnapshot => ({
+  const buildEvaluationSnapshot = (
+    prob: Problem = problem,
+    targetVersion: number = problem.version ?? 1
+  ): EvaluationInputSnapshot => ({
     answer: answerText.trim(),
     solvingReason: isReasonNotApplicable ? '' : solvingReason.trim(),
     isReasonNotApplicable,
@@ -350,7 +566,18 @@ export function ProblemSessionModal({
       ? reasonNotApplicableJustification.trim()
       : '',
     hintCount: revealedHints.length,
-    problemVersion: problem.version ?? 1,
+    problemVersion: targetVersion,
+    problemTitle: prob.title,
+    problemPrompt: prob.promptText,
+    modelAnswer: prob.modelAnswer,
+    rubric: prob.rubric,
+    conceptId: concept.id,
+    conceptIds: prob.conceptIds || [concept.id],
+    subjectId: subject.id,
+    sourceProvenance: extractProblemProvenance(prob),
+    appliedConditionNote: prob.appliedConditionNote,
+    mathFormula: prob.mathFormula,
+    codeSnippet: prob.codeSnippet,
   });
 
   // Stale evaluations are guarded by matchesSnapshot so they cannot be committed
@@ -414,6 +641,7 @@ export function ProblemSessionModal({
 
     const currentReqId = ++evalRequestIdRef.current;
     const reqUserId = userId;
+    const reqSubjectId = subject.id;
     const reqProblemId = problem.id;
     const reqProblemVersion = problem.version ?? 1;
 
@@ -431,6 +659,7 @@ export function ProblemSessionModal({
       codeSnippet: problem.codeSnippet,
       modelAnswer: problem.modelAnswer,
       rubric: problem.rubric,
+      sourceProvenance: extractProblemProvenance(problem),
       userAnswer: trimmed,
       revealedHintCount: revealedHints.length,
       hints: revealedHints.map((index) => problem.hints[index]),
@@ -480,8 +709,10 @@ export function ProblemSessionModal({
       if (
         !mountedRef.current ||
         currentReqId !== evalRequestIdRef.current ||
-        userId !== reqUserId ||
-        problem.id !== reqProblemId
+        screenContextRef.current.userId !== reqUserId ||
+        screenContextRef.current.subjectId !== reqSubjectId ||
+        screenContextRef.current.problemId !== reqProblemId ||
+        screenContextRef.current.problemVersion !== reqProblemVersion
       ) {
         return;
       }
@@ -529,6 +760,17 @@ export function ProblemSessionModal({
           : '',
         hintCount: revealedHints.length,
         problemVersion: reqProblemVersion,
+        problemTitle: problem.title,
+        problemPrompt: problem.promptText,
+        modelAnswer: problem.modelAnswer,
+        rubric: problem.rubric,
+        conceptId: concept.id,
+        conceptIds: problem.conceptIds || [concept.id],
+        subjectId: subject.id,
+        sourceProvenance: extractProblemProvenance(problem),
+        appliedConditionNote: problem.appliedConditionNote,
+        mathFormula: problem.mathFormula,
+        codeSnippet: problem.codeSnippet,
       });
       setCurrentAttemptId(`att-${Date.now()}-${Math.random().toString(36).substring(7)}`);
 
@@ -549,6 +791,7 @@ export function ProblemSessionModal({
     setEvaluationError(null);
     const currentReqId = ++evalRequestIdRef.current;
     const reqUserId = userId;
+    const reqSubjectId = subject.id;
     const reqProblemId = problem.id;
     const reqProblemVersion = problem.version ?? 1;
     const reqTaskId = recoveryRecord.taskId;
@@ -556,63 +799,43 @@ export function ProblemSessionModal({
     const snap = recoveryRecord.inputSnapshot as EvaluateAnswerInputSnapshot | undefined;
     const targetVersion = snap?.problemVersion ?? recoveryRecord.inputVersion ?? reqProblemVersion;
 
+    const resolvedProb = await resolveEvaluatedProblemSnapshot(problem, targetVersion, concept, subject, snap);
+    if (!resolvedProb) {
+      setEvaluationError(`버전 v${targetVersion}의 문제 스냅샷(지문·모범답안·루브릭)을 조회할 수 없어 복구를 중단했습니다. 현재 문제 내용으로 대체하거나 혼합 기록하지 않습니다.`);
+      setIsRetryingSave(false);
+      return;
+    }
+
     try {
-      const payload = snap
-        ? {
-            problemId: snap.problemId || reqProblemId,
-            problemVersion: targetVersion,
-            conceptId: snap.conceptId || concept.id,
-            conceptIds: snap.conceptIds || (problem.conceptIds || [concept.id]),
-            subjectId: snap.subjectId || subject.id,
-            domain: snap.domain || (subject.domain || 'math_stats'),
-            problemTitle: snap.problemTitle || problem.title,
-            problemPrompt: snap.problemPrompt || problem.promptText,
-            appliedConditionNote: snap.appliedConditionNote ?? problem.appliedConditionNote,
-            mathFormula: snap.mathFormula ?? problem.mathFormula,
-            codeSnippet: snap.codeSnippet ?? problem.codeSnippet,
-            modelAnswer: snap.modelAnswer || problem.modelAnswer,
-            rubric: snap.rubric || problem.rubric,
-            userAnswer: snap.userAnswer,
-            revealedHintCount: snap.revealedHintCount,
-            hints: snap.hints || [],
-            solvingReason: snap.solvingReason,
-            isReasonNotApplicable: snap.isReasonNotApplicable,
-            reasonNotApplicableJustification: snap.reasonNotApplicableJustification,
-            isProvisionalLocal: snap.isProvisionalLocal ?? Boolean((problem as { isProvisionalLocal?: boolean }).isProvisionalLocal),
-            isSaveRetry: true,
-            action: 'retry_save',
-            taskId: recoveryRecord.taskId,
-            signedRecoveryToken: recoveryRecord.signedRecoveryToken,
-            recoveryData: recoveryRecord.recoveryData,
-          }
-        : {
-            problemId: problem.id,
-            problemVersion: reqProblemVersion,
-            conceptId: concept.id,
-            conceptIds: problem.conceptIds || [concept.id],
-            subjectId: subject.id,
-            domain: subject.domain || 'math_stats',
-            problemTitle: problem.title,
-            problemPrompt: problem.promptText,
-            appliedConditionNote: problem.appliedConditionNote,
-            mathFormula: problem.mathFormula,
-            codeSnippet: problem.codeSnippet,
-            modelAnswer: problem.modelAnswer,
-            rubric: problem.rubric,
-            userAnswer: answerText.trim(),
-            revealedHintCount: revealedHints.length,
-            hints: revealedHints.map((index) => problem.hints[index]),
-            solvingReason: isReasonNotApplicable ? undefined : solvingReason.trim(),
-            isReasonNotApplicable,
-            reasonNotApplicableJustification: isReasonNotApplicable
-              ? reasonNotApplicableJustification.trim()
-              : undefined,
-            isSaveRetry: true,
-            action: 'retry_save',
-            taskId: recoveryRecord.taskId,
-            signedRecoveryToken: recoveryRecord.signedRecoveryToken,
-            recoveryData: recoveryRecord.recoveryData,
-          };
+      const payload = {
+        problemId: snap?.problemId || reqProblemId,
+        problemVersion: targetVersion,
+        conceptId: resolvedProb.conceptId || concept.id,
+        conceptIds: resolvedProb.conceptIds || problem.conceptIds || [concept.id],
+        subjectId: resolvedProb.subjectId || subject.id,
+        domain: snap?.domain || (subject.domain || 'math_stats'),
+        problemTitle: resolvedProb.title,
+        problemPrompt: resolvedProb.promptText,
+        appliedConditionNote: resolvedProb.appliedConditionNote,
+        mathFormula: resolvedProb.mathFormula,
+        codeSnippet: resolvedProb.codeSnippet,
+        modelAnswer: resolvedProb.modelAnswer,
+        rubric: resolvedProb.rubric,
+        userAnswer: snap ? snap.userAnswer : answerText.trim(),
+        revealedHintCount: snap ? snap.revealedHintCount : revealedHints.length,
+        hints: snap?.hints || revealedHints.map((index) => problem.hints[index]),
+        solvingReason: snap ? snap.solvingReason : (isReasonNotApplicable ? undefined : solvingReason.trim()),
+        isReasonNotApplicable: snap ? snap.isReasonNotApplicable : isReasonNotApplicable,
+        reasonNotApplicableJustification: snap
+          ? snap.reasonNotApplicableJustification
+          : (isReasonNotApplicable ? reasonNotApplicableJustification.trim() : undefined),
+        isProvisionalLocal: snap?.isProvisionalLocal ?? Boolean((problem as { isProvisionalLocal?: boolean }).isProvisionalLocal),
+        isSaveRetry: true,
+        action: 'retry_save',
+        taskId: recoveryRecord.taskId,
+        signedRecoveryToken: recoveryRecord.signedRecoveryToken,
+        recoveryData: recoveryRecord.recoveryData,
+      };
 
       const res = await fetch('/api/evaluate-answer', {
         method: 'POST',
@@ -625,8 +848,9 @@ export function ProblemSessionModal({
       if (
         !mountedRef.current ||
         currentReqId !== evalRequestIdRef.current ||
-        userId !== reqUserId ||
-        problem.id !== reqProblemId
+        screenContextRef.current.userId !== reqUserId ||
+        screenContextRef.current.subjectId !== reqSubjectId ||
+        screenContextRef.current.problemId !== reqProblemId
       ) {
         return;
       }
@@ -664,6 +888,17 @@ export function ProblemSessionModal({
           : (isReasonNotApplicable ? reasonNotApplicableJustification.trim() : ''),
         hintCount: snap ? snap.revealedHintCount : revealedHints.length,
         problemVersion: targetVersion,
+        problemTitle: resolvedProb.title,
+        problemPrompt: resolvedProb.promptText,
+        modelAnswer: resolvedProb.modelAnswer,
+        rubric: resolvedProb.rubric,
+        conceptId: resolvedProb.conceptId,
+        conceptIds: resolvedProb.conceptIds,
+        subjectId: resolvedProb.subjectId,
+        sourceProvenance: resolvedProb.sourceProvenance,
+        appliedConditionNote: resolvedProb.appliedConditionNote,
+        mathFormula: resolvedProb.mathFormula,
+        codeSnippet: resolvedProb.codeSnippet,
       });
       setCurrentAttemptId(`att-${Date.now()}-${Math.random().toString(36).substring(7)}`);
       if (evalData.recommendedErrorType) {
@@ -687,18 +922,36 @@ export function ProblemSessionModal({
       evaluatedSnapshot.reasonNotApplicableJustification === current.reasonNotApplicableJustification &&
       evaluatedSnapshot.hintCount === current.hintCount;
 
-    if (!evaluationResult || isSubmitting || !matchesSnapshot) return;
+    const hasCompleteSnapshot = Boolean(
+      evaluatedSnapshot &&
+      typeof evaluatedSnapshot.problemPrompt === 'string' &&
+      evaluatedSnapshot.problemPrompt.trim() &&
+      typeof evaluatedSnapshot.modelAnswer === 'string' &&
+      evaluatedSnapshot.modelAnswer.trim() &&
+      Array.isArray(evaluatedSnapshot.rubric) &&
+      evaluatedSnapshot.rubric.length > 0
+    );
+
+    if (!evaluationResult || isSubmitting || !matchesSnapshot || !hasCompleteSnapshot) {
+      if (!hasCompleteSnapshot && evaluatedSnapshot) {
+        setEvaluationError('평가 당시의 문제 스냅샷(지문·모범답안·루브릭)을 확인할 수 없어 기록 확정을 중단했습니다. 최신 문제 버전으로 다시 평가를 진행해 주세요.');
+      }
+      return;
+    }
     setIsSubmitting(true);
 
     const snapshot = evaluatedSnapshot;
     const attemptIdToUse = currentAttemptId || `att-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    if (!currentAttemptId) {
+      setCurrentAttemptId(attemptIdToUse);
+    }
 
     const newAttempt: Attempt = {
       id: attemptIdToUse,
       problemId: problem.id,
-      conceptId: concept.id,
-      conceptIds: problem.conceptIds || [concept.id],
-      subjectId: subject.id,
+      conceptId: snapshot.conceptId || concept.id,
+      conceptIds: snapshot.conceptIds || problem.conceptIds || [concept.id],
+      subjectId: snapshot.subjectId || subject.id,
       at: new Date().toISOString(),
       answer: snapshot.answer,
       confidence,
@@ -715,12 +968,12 @@ export function ProblemSessionModal({
       isAiEvaluated: evaluationResult.isAiEvaluated,
       academicErrorType: evaluationResult.academicErrorType,
       structuredError: evaluationResult.structuredError,
-      sourceProvenance: evaluationResult.sourceProvenance,
-      modelAnswerSnapshot: problem.modelAnswer,
-      problemTitleSnapshot: problem.title,
-      problemPromptSnapshot: problem.promptText,
-      problemVersion: snapshot.problemVersion ?? problem.version ?? 1,
-      rubricSnapshot: problem.rubric,
+      sourceProvenance: snapshot.sourceProvenance || evaluationResult.sourceProvenance,
+      modelAnswerSnapshot: snapshot.modelAnswer,
+      problemTitleSnapshot: snapshot.problemTitle,
+      problemPromptSnapshot: snapshot.problemPrompt,
+      problemVersion: snapshot.problemVersion,
+      rubricSnapshot: snapshot.rubric,
       // Stage 8 fields — record the exact inputs that were evaluated
       solvingReason: snapshot.isReasonNotApplicable ? undefined : snapshot.solvingReason,
       isReasonNotApplicable: snapshot.isReasonNotApplicable,
@@ -784,6 +1037,16 @@ export function ProblemSessionModal({
     evaluatedSnapshot.isReasonNotApplicable === currentSnapshot.isReasonNotApplicable &&
     evaluatedSnapshot.reasonNotApplicableJustification === currentSnapshot.reasonNotApplicableJustification &&
     evaluatedSnapshot.hintCount === currentSnapshot.hintCount;
+
+  const hasCompleteSnapshot = Boolean(
+    evaluatedSnapshot &&
+    typeof evaluatedSnapshot.problemPrompt === 'string' &&
+    evaluatedSnapshot.problemPrompt.trim() &&
+    typeof evaluatedSnapshot.modelAnswer === 'string' &&
+    evaluatedSnapshot.modelAnswer.trim() &&
+    Array.isArray(evaluatedSnapshot.rubric) &&
+    evaluatedSnapshot.rubric.length > 0
+  );
 
   const isVersionMismatch =
     evaluatedSnapshot?.problemVersion !== undefined &&
@@ -1560,6 +1823,18 @@ export function ProblemSessionModal({
                 </div>
               )}
 
+              {evaluatedSnapshot && !hasCompleteSnapshot && (
+                <div role="alert" className="p-3 bg-red-50 border border-red-300 text-red-900 text-xs rounded-xs space-y-1">
+                  <div className="flex items-center gap-1.5 font-bold text-red-900">
+                    <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                    <span>평가 당시 문제 스냅샷 누락</span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-red-800">
+                    평가 당시의 문제 스냅샷(지문·모범답안·루브릭)을 조회할 수 없습니다. 현재 문제 내용으로 대체하거나 혼합 기록하지 않으므로, 최신 문제 버전으로 다시 평가해 주세요.
+                  </p>
+                </div>
+              )}
+
               {isVersionMismatch && (
                 <div role="alert" className="p-3 bg-blue-50 border border-blue-300 text-blue-900 text-xs rounded-xs space-y-1">
                   <div className="flex items-center gap-1.5 font-bold text-blue-900">
@@ -1863,7 +2138,7 @@ export function ProblemSessionModal({
                         <button
                           type="button"
                           onClick={handleConfirmAndRecord}
-                          disabled={isSubmitting || !isSnapshotMatching}
+                          disabled={isSubmitting || !isSnapshotMatching || !hasCompleteSnapshot}
                           className="px-2.5 py-1 text-[11px] bg-[#191817] text-white rounded-xs font-bold disabled:opacity-50"
                         >
                           재시도 (AI 재평가 없음)
@@ -1886,13 +2161,15 @@ export function ProblemSessionModal({
                 <button
                   type="button"
                   onClick={handleConfirmAndRecord}
-                  disabled={isSubmitting || !isSnapshotMatching}
+                  disabled={isSubmitting || !isSnapshotMatching || !hasCompleteSnapshot}
                   className="w-full sm:w-auto flex-1 flex items-center justify-center gap-2 py-2.5 px-5 bg-[#191817] hover:bg-[#33302b] text-white text-xs sm:text-sm font-bold rounded-xs shadow-xs transition-all disabled:opacity-50"
                 >
                   <CheckCircle className="w-4 h-4 text-emerald-400" />
                   <span>
                     {isSubmitting
                       ? '기록 저장 중...'
+                      : evaluatedSnapshot && !hasCompleteSnapshot
+                      ? '문제 스냅샷 누락으로 기록 확정 불가'
                       : !isSnapshotMatching
                       ? '답안 수정됨 (평가 당시 답안 일치 필요)'
                       : submitOutcome?.status === 'retryable_failure'

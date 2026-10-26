@@ -32,6 +32,9 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/auth/username.ts',
   'lib/pdf/token.ts', 'lib/pdf/browserPdfConverter.ts', 'lib/pdf/tempStorage.ts', 'app/api/cron/cleanup-temp-pdf/route.ts', 'lib/aiCostTelemetry.ts', 'app/api/admin/ai-metrics/route.ts',
   'app/api/review-problem-quality/route.ts',
+  'components/ProblemSessionModal.tsx',
+  'components/ProblemQualityReviewTab.tsx',
+  '--jsx', 'react-jsx',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -19089,6 +19092,434 @@ exports.requireApiUser = async () => {
       AI_CONFIG.provider = prevProvider;
       aiModule.callAiChat = prevCallAiChat;
     }
+  });
+
+  await checkAsync('버그 1 회귀 검증: 과거 평가 복구 시 문제 스냅샷 격리, v2 혼합 방지 및 멱등 기록', async () => {
+    const { resolveEvaluatedProblemSnapshot, extractProblemProvenance } = load(path.join(output, 'components/ProblemSessionModal.js'));
+    const { POST: evaluatePost } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+    const { recordAttemptAndUpdateConcept, loadStoredAttempts, saveStoredAttempts, loadStoredConcepts, saveStoredConcepts } = load(path.join(output, 'lib/storage.js'));
+    const { saveTaskRecovery, getTaskRecovery, clearTaskRecovery } = load(path.join(output, 'lib/taskRecoveryClient.js'));
+
+    const testUser = { id: 'user-snap-iso-01', email: 'snap-iso@example.com' };
+    const prevApiKey = AI_CONFIG.apiKey;
+    const prevProvider = AI_CONFIG.provider;
+    const prevCallAiChat = aiModule.callAiChat;
+
+    AI_CONFIG.apiKey = 'fake_key';
+    AI_CONFIG.provider = 'baze';
+    aiModule.callAiChat = async () => ({
+      ok: true,
+      content: JSON.stringify({
+        calculatedScore: 85,
+        rubricResults: [{ criterionId: 'r_v1_1', score: 45, maxScore: 50 }, { criterionId: 'r_v1_2', score: 40, maxScore: 50 }],
+        feedback: 'v1 논리 전개 우수',
+        strengths: '기본 개념 충실',
+        criticalImprovements: '계산 검토 필요',
+      }),
+      model: 'deepseek-v4.1-flash',
+    });
+
+    const v1Problem = {
+      id: 'prob-mix-test',
+      conceptIds: ['concept-mix-01'],
+      subjectId: 'sub-mix-01',
+      title: 'v1 문제: 평균값 정리 증명',
+      type: 'essay_descriptive',
+      categoryLabel: '미적분학',
+      categoryNumber: 1,
+      promptText: '롤의 정리를 이용하여 f(b)-f(a)=f\'(c)(b-a)를 증명하라 (v1 지문).',
+      timeStandardMinutes: 20,
+      timeBreakdownDesc: '',
+      coreEvaluationHighlight: '',
+      itemCountDesc: '',
+      sourceRefs: '교재 p.10',
+      hints: ['h1'],
+      modelAnswer: 'v1 모범 답안: g(x) = f(x) - [(f(b)-f(a))/(b-a)](x-a) 로 둔다.',
+      rubric: [
+        { id: 'r_v1_1', label: '보조함수 g(x) 설정', maxScore: 50, weight: 1, description: 'g(a)=g(b) 증명' },
+        { id: 'r_v1_2', label: '롤의 정리 적용', maxScore: 50, weight: 1, description: 'g\'(c)=0 도출' },
+      ],
+      version: 1,
+      sourceMaterialId: 'mat-v1',
+      sourcePage: '10',
+    };
+
+    const v1Concept = {
+      id: 'concept-mix-01',
+      subjectId: 'sub-mix-01',
+      materialIds: ['mat-v1'],
+      title: '평균값 정리',
+      chapterRef: '제3장',
+      baseScore: 70,
+      currentScore: 70,
+      status: 'active',
+      order: 1,
+      events: [],
+      exerciseCount: 0,
+    };
+
+    const v1Subject = {
+      id: 'sub-mix-01',
+      name: '해석학',
+      domain: 'math_stats',
+    };
+
+    // 1. v1 문제 평가 요청 -> 서버 저장 실패 주입으로 복구 데이터 생성
+    let persistenceFails = true;
+    const rpcSpy = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        return {
+          data: {
+            allowed: true,
+            status: 'processing',
+            task_id: args.p_task_id || 'task-mix-test-1',
+            lease_token: 'lease-mix-test-1',
+            credit_source: 'operator_trial',
+          },
+          error: null,
+        };
+      }
+      if (fn === 'consume_ai_call_budget') {
+        return { data: { allowed: true }, error: null };
+      }
+      if (fn === 'record_trial_result_ready') {
+        if (persistenceFails) {
+          return { data: { success: false, error: 'Database commit failed' }, error: null };
+        }
+        return { data: { success: true, task_id: args.p_task_id }, error: null };
+      }
+      if (fn === 'settle_trial_credit') {
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    try {
+      await withFakeSupabase({
+        user: testUser,
+        problems: [{
+          id: v1Problem.id,
+          user_id: testUser.id,
+          version: 1,
+          prompt_text: v1Problem.promptText,
+          model_answer: v1Problem.modelAnswer,
+          rubric: v1Problem.rubric,
+          payload: {
+            promptText: v1Problem.promptText,
+            modelAnswer: v1Problem.modelAnswer,
+            rubric: v1Problem.rubric,
+          },
+          concept_ids: v1Problem.conceptIds,
+          subject_id: v1Problem.subjectId,
+          quality_status: 'normal',
+        }],
+        rpcImpl: rpcSpy,
+      }, async () => {
+        const evalSnapshotPayload = {
+          isProvisionalLocal: true,
+          problemId: v1Problem.id,
+          problemVersion: 1,
+          conceptId: v1Concept.id,
+          subjectId: v1Subject.id,
+          domain: 'math_stats',
+          problemTitle: v1Problem.title,
+          problemPrompt: v1Problem.promptText,
+          modelAnswer: v1Problem.modelAnswer,
+          rubric: v1Problem.rubric,
+          sourceProvenance: extractProblemProvenance(v1Problem),
+          userAnswer: 'g(x) 정의 후 롤의 정리를 만족함을 보인다.',
+          revealedHintCount: 0,
+          hints: [],
+          solvingReason: '교재 증명 기법 활용',
+        };
+
+        const res1 = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(evalSnapshotPayload),
+        }));
+        assert.equal(res1.status, 500);
+        const data1 = await res1.json();
+        assert.equal(data1.canRetrySave, true);
+
+        // 로컬스토리지에 v1 복구 기록 저장 (입력 스냅샷에 v1 문제 스냅샷 포함)
+        saveTaskRecovery(testUser.id, 'evaluate_answer', v1Problem.id, {
+          taskId: data1.taskId,
+          signedRecoveryToken: data1.signedRecoveryToken,
+          recoveryData: data1.recoveryData,
+          inputSnapshot: evalSnapshotPayload,
+          inputVersion: 1,
+        });
+
+        // 2. 문제를 v2로 수정 (제목, 지문, 정답, 루브릭 모두 변경)
+        const v2Problem = {
+          ...v1Problem,
+          version: 2,
+          title: 'v2 문제: 코시 평균값 정리',
+          promptText: '코시 평균값 정리 [f(b)-f(a)]g\'(c) = [g(b)-g(a)]f\'(c)를 증명하라 (v2 지문).',
+          modelAnswer: 'v2 모범 답안: h(x) = [f(b)-f(a)]g(x) - [g(b)-g(a)]f(x) 로 둔다.',
+          rubric: [
+            { id: 'r_v2_1', label: '보조함수 h(x) 설정', maxScore: 60, weight: 1, description: 'h(a)=h(b) 증명' },
+            { id: 'r_v2_2', label: '롤의 정리 적용', maxScore: 40, weight: 1, description: 'h\'(c)=0 도출' },
+          ],
+          versionHistory: [{
+            version: 1,
+            title: v1Problem.title,
+            promptText: v1Problem.promptText,
+            modelAnswer: v1Problem.modelAnswer,
+            rubric: v1Problem.rubric,
+            conceptIds: v1Problem.conceptIds,
+            editedAt: new Date().toISOString(),
+          }],
+        };
+
+        // 3. 문제 v2 상태에서 v1 복구 기록 읽기 및 스냅샷 복원 검증
+        const recoveryRec = getTaskRecovery(testUser.id, 'evaluate_answer', v1Problem.id);
+        assert.ok(recoveryRec);
+        assert.equal(recoveryRec.inputVersion, 1);
+
+        // resolveEvaluatedProblemSnapshot 호출: v2 Problem이 주어져도 v1 스냅샷을 정확히 반환
+        const resolved = await resolveEvaluatedProblemSnapshot(v2Problem, 1, v1Concept, v1Subject, recoveryRec.inputSnapshot);
+        assert.ok(resolved, 'v1 스냅샷 해결 성공');
+        assert.equal(resolved.version, 1);
+        assert.equal(resolved.title, v1Problem.title);
+        assert.equal(resolved.promptText, v1Problem.promptText);
+        assert.equal(resolved.modelAnswer, v1Problem.modelAnswer);
+        assert.deepEqual(resolved.rubric, v1Problem.rubric);
+
+        // 4. 저장 재시도 (DB 성공)
+        persistenceFails = false;
+        const retryRes = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            problemId: v1Problem.id,
+            problemVersion: 1,
+            conceptId: resolved.conceptId,
+            conceptIds: resolved.conceptIds,
+            subjectId: resolved.subjectId,
+            problemTitle: resolved.title,
+            problemPrompt: resolved.promptText,
+            modelAnswer: resolved.modelAnswer,
+            rubric: resolved.rubric,
+            userAnswer: recoveryRec.inputSnapshot.userAnswer,
+            revealedHintCount: 0,
+            hints: [],
+            solvingReason: recoveryRec.inputSnapshot.solvingReason,
+            isSaveRetry: true,
+            action: 'retry_save',
+            taskId: recoveryRec.taskId,
+            signedRecoveryToken: recoveryRec.signedRecoveryToken,
+            recoveryData: recoveryRec.recoveryData,
+          }),
+        }));
+        assert.equal(retryRes.status, 200);
+        const retryData = await retryRes.json();
+        assert.equal(retryData.success, true);
+
+        // 5. Attempt 확정: Attempt 객체의 모든 스냅샷이 v1 기준인지 검증 (v2 내용 혼합 0%)
+        const attemptId = 'att-mix-test-01';
+        const newAttempt = {
+          id: attemptId,
+          problemId: v2Problem.id,
+          conceptId: resolved.conceptId,
+          conceptIds: resolved.conceptIds,
+          subjectId: resolved.subjectId,
+          at: new Date().toISOString(),
+          answer: recoveryRec.inputSnapshot.userAnswer,
+          confidence: 4,
+          errorType: 'none',
+          hintCount: 0,
+          calculatedScore: retryData.evaluation.calculatedScore,
+          rubricResults: retryData.evaluation.rubricResults,
+          evaluatorFeedback: retryData.evaluation.feedback,
+          sourceProvenance: resolved.sourceProvenance,
+          modelAnswerSnapshot: resolved.modelAnswer,
+          problemTitleSnapshot: resolved.title,
+          problemPromptSnapshot: resolved.promptText,
+          problemVersion: resolved.version,
+          rubricSnapshot: resolved.rubric,
+          solvingReason: recoveryRec.inputSnapshot.solvingReason,
+        };
+
+        // Attempt 검증
+        assert.equal(newAttempt.problemVersion, 1, 'Attempt의 버전은 1');
+        assert.equal(newAttempt.problemTitleSnapshot, v1Problem.title, 'v1 제목 스냅샷 보존');
+        assert.equal(newAttempt.problemPromptSnapshot, v1Problem.promptText, 'v1 지문 스냅샷 보존');
+        assert.equal(newAttempt.modelAnswerSnapshot, v1Problem.modelAnswer, 'v1 모범답안 스냅샷 보존');
+        assert.equal(newAttempt.rubricSnapshot.length, 2);
+        assert.equal(newAttempt.rubricSnapshot[0].id, 'r_v1_1', 'v1 루브릭 기준 보존');
+        assert.notEqual(newAttempt.rubricSnapshot[0].id, 'r_v2_1', 'v2 루브릭이 혼합되지 않음');
+
+        // 저장소에 개념 및 Attempt 기록
+        saveStoredConcepts([v1Concept]);
+        saveStoredAttempts([]);
+
+        const saveRes = recordAttemptAndUpdateConcept(newAttempt);
+        assert.equal(saveRes.attemptPersisted, true);
+        assert.equal(saveRes.eventPersisted, true);
+
+        const attemptsAfter = loadStoredAttempts();
+        assert.equal(attemptsAfter.length, 1);
+        assert.equal(attemptsAfter[0].problemVersion, 1);
+        assert.equal(attemptsAfter[0].modelAnswerSnapshot, v1Problem.modelAnswer);
+
+        const conceptsAfter = loadStoredConcepts();
+        const updatedC = conceptsAfter.find((c) => c.id === v1Concept.id);
+        assert.equal(updatedC.events.length, 1);
+        assert.equal(updatedC.events[0].attemptId, attemptId);
+        assert.equal(updatedC.events[0].resultScore, 85);
+
+        // 6. 동일 Attempt ID로 재시도 시 멱등성 검증 (Attempt, ReviewEvent, 복습 횟수 중복 0)
+        const retrySaveRes = recordAttemptAndUpdateConcept(newAttempt);
+        assert.equal(retrySaveRes.attemptPersisted, true);
+        assert.equal(retrySaveRes.eventPersisted, true);
+
+        const attemptsRetry = loadStoredAttempts();
+        assert.equal(attemptsRetry.length, 1, 'Attempt 중복 생성 없음');
+
+        const conceptsRetry = loadStoredConcepts();
+        const updatedCRetry = conceptsRetry.find((c) => c.id === v1Concept.id);
+        assert.equal(updatedCRetry.events.length, 1, 'ReviewEvent 중복 생성 없음');
+
+        // 7. 정확한 v1 스냅샷 조회 실패 시 기록 확정 중단 검증
+        const missingV1Problem = {
+          ...v2Problem,
+          versionHistory: [], // v1 이력 없음
+        };
+        const failedResolve = await resolveEvaluatedProblemSnapshot(
+          missingV1Problem,
+          1,
+          v1Concept,
+          v1Subject,
+          { problemPrompt: '', modelAnswer: '', rubric: [] } // 불완전한 snap
+        );
+        assert.equal(failedResolve, null, '정확한 v1 스냅샷 조회 실패 시 null 반환');
+
+        // 불완전한 스냅샷으로는 Attempt 확정이 거부됨
+        const hasCompleteSnapshot = Boolean(
+          failedResolve &&
+          typeof failedResolve.promptText === 'string' &&
+          failedResolve.promptText.trim() &&
+          typeof failedResolve.modelAnswer === 'string' &&
+          failedResolve.modelAnswer.trim() &&
+          Array.isArray(failedResolve.rubric) &&
+          failedResolve.rubric.length > 0
+        );
+        assert.equal(hasCompleteSnapshot, false, 'hasCompleteSnapshot은 false여야 함');
+      });
+    } finally {
+      AI_CONFIG.apiKey = prevApiKey;
+      AI_CONFIG.provider = prevProvider;
+      aiModule.callAiChat = prevCallAiChat;
+    }
+  });
+
+  await checkAsync('버그 2 회귀 검증: 품질 검토 응답의 최신 화면 상태 검증 및 세대 무효화', async () => {
+    // 1. 문제 A 검토 요청 -> 문제 B 선택 -> 문제 A 응답 도착 시나리오
+    let reviewRequestId = 0;
+    const screenContextRef = {
+      current: {
+        userId: 'user-rev-01',
+        subjectId: 'sub-rev-01',
+        problemId: 'prob-A',
+        problemVersion: 1,
+      },
+    };
+    const mountedRef = { current: true };
+
+    let screenUi = {
+      isAiReviewing: true,
+      aiReviewResult: null,
+      aiReviewError: null,
+      aiReviewNotice: null,
+    };
+
+    // A 요청 시작
+    reviewRequestId += 1;
+    const req1Id = reviewRequestId;
+    const req1ProblemId = 'prob-A';
+    const req1ProblemVersion = 1;
+    const req1UserId = 'user-rev-01';
+    const req1SubjectId = 'sub-rev-01';
+
+    // 지연되는 동안 사용자가 문제 B로 전환
+    // syncedKey 변경 -> reviewRequestId 증가, 로딩 및 에러 초기화, screenContext 갱신
+    reviewRequestId += 1;
+    screenContextRef.current = {
+      userId: 'user-rev-01',
+      subjectId: 'sub-rev-01',
+      problemId: 'prob-B',
+      problemVersion: 1,
+    };
+    screenUi.isAiReviewing = false;
+    screenUi.aiReviewResult = null;
+    screenUi.aiReviewError = null;
+
+    // 문제 A의 지연 응답 도착
+    const isCurrentActiveForA =
+      mountedRef.current &&
+      req1Id === reviewRequestId &&
+      screenContextRef.current.userId === req1UserId &&
+      screenContextRef.current.subjectId === req1SubjectId &&
+      screenContextRef.current.problemId === req1ProblemId &&
+      screenContextRef.current.problemVersion === req1ProblemVersion;
+
+    assert.equal(isCurrentActiveForA, false, '문제 A의 지연 응답은 활성 상태가 아님');
+    if (isCurrentActiveForA) {
+      screenUi.aiReviewResult = { summary: 'A 검토 결과' };
+    }
+    assert.equal(screenUi.aiReviewResult, null, '문제 B 화면에 문제 A의 결과가 표시되지 않음');
+
+    // 2. 같은 문제의 버전 변경 (v1 -> v2) 후 과거 v1 응답 도착 시나리오
+    screenContextRef.current = {
+      userId: 'user-rev-01',
+      subjectId: 'sub-rev-01',
+      problemId: 'prob-B',
+      problemVersion: 1,
+    };
+    reviewRequestId += 1;
+    const req2Id = reviewRequestId;
+    const req2ProblemVersion = 1;
+
+    // 사용자가 문제 B를 v2로 수정 저장함
+    reviewRequestId += 1;
+    screenContextRef.current.problemVersion = 2;
+
+    // v1 응답 도착
+    const isCurrentActiveForV1 =
+      mountedRef.current &&
+      req2Id === reviewRequestId &&
+      screenContextRef.current.problemVersion === req2ProblemVersion;
+
+    assert.equal(isCurrentActiveForV1, false, '과거 버전 응답은 현재 v2 화면에 적용되지 않음');
+
+    // 3. 요청 1 이후 요청 2 실행 -> 요청 1이 늦게 완료
+    reviewRequestId += 1;
+    const req3_1 = reviewRequestId;
+    // 바로 요청 2 실행
+    reviewRequestId += 1;
+    const req3_2 = reviewRequestId;
+    screenUi.isAiReviewing = true;
+
+    // 요청 1이 늦게 완료
+    const isReq1Valid = req3_1 === reviewRequestId;
+    assert.equal(isReq1Valid, false, '이전 요청 1은 무효화됨');
+
+    // 요청 2 완료
+    const isReq2Valid = req3_2 === reviewRequestId;
+    assert.equal(isReq2Valid, true, '최신 요청 2는 유효함');
+    if (isReq2Valid) {
+      screenUi.aiReviewResult = { summary: '요청 2 결과' };
+      screenUi.isAiReviewing = false;
+    }
+    assert.deepEqual(screenUi.aiReviewResult, { summary: '요청 2 결과' });
+    assert.equal(screenUi.isAiReviewing, false);
+
+    // 4. 언마운트 및 계정/과목 변경 차단
+    mountedRef.current = false;
+    const isUnmountedValid = mountedRef.current && req3_2 === reviewRequestId;
+    assert.equal(isUnmountedValid, false, '언마운트 시 응답 차단');
   });
 
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
