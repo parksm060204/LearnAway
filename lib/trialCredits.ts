@@ -238,6 +238,7 @@ export async function reserveTrialCredit(
 export interface TaskRegistrationResult {
   allowed: boolean;
   status?: 'processing' | 'already_completed' | 'concurrent_in_progress' | 'reserved';
+  dbStatus?: 'result_ready' | 'settled' | 'processing' | 'reserved' | 'released' | 'failed_refunded' | string;
   remaining?: number;
   leaseToken?: string;
   cachedResult?: unknown;
@@ -310,6 +311,7 @@ export async function registerAiTask(
     const res = data as {
       allowed?: boolean;
       status?: 'processing' | 'already_completed' | 'concurrent_in_progress' | 'reserved';
+      db_status?: string;
       remaining?: number;
       lease_token?: string;
       cached_result?: unknown;
@@ -335,6 +337,7 @@ export async function registerAiTask(
       return {
         allowed: false,
         status: 'already_completed',
+        dbStatus: res.db_status,
         remaining: res.remaining ?? 0,
         cachedResult: res.cached_result,
         leaseToken: res.lease_token,
@@ -348,6 +351,7 @@ export async function registerAiTask(
       return {
         allowed: false,
         status: 'concurrent_in_progress',
+        dbStatus: res.db_status,
         errorCode: errCode || 'CONCURRENT_EXECUTION_BLOCKED',
         creditSource: res.credit_source,
         taskId: resolvedTaskId,
@@ -377,6 +381,7 @@ export async function registerAiTask(
     return {
       allowed: true,
       status: res.status || 'processing',
+      dbStatus: res.db_status || res.status,
       remaining: res.remaining,
       leaseToken: res.lease_token,
       creditSource: res.credit_source,

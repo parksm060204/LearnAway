@@ -55,6 +55,7 @@ interface ProblemReviewModalProps {
   onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
   initialMode?: 'drafts' | 'quality_reports';
+  userId?: string;
 }
 
 export function ProblemReviewModal({
@@ -76,6 +77,7 @@ export function ProblemReviewModal({
   onReapproveProblem,
   onSuspendProblem,
   initialMode,
+  userId,
 }: ProblemReviewModalProps) {
   // Mode switcher: 'drafts' vs 'quality_reports'
   const [mainMode, setMainMode] = useState<'drafts' | 'quality_reports'>(initialMode || 'drafts');
@@ -364,6 +366,7 @@ export function ProblemReviewModal({
 
         {mainMode === 'quality_reports' ? (
           <ProblemQualityReviewTab
+            userId={userId}
             activeSubject={activeSubject}
             problems={problems}
             materials={materials}

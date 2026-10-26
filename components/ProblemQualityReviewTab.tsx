@@ -36,9 +36,17 @@ import {
   EyeOff,
   Save,
   Loader2,
+  RotateCcw,
 } from 'lucide-react';
+import {
+  saveTaskRecovery,
+  getTaskRecovery,
+  clearTaskRecovery,
+  type TaskRecoveryRecord,
+} from '../lib/taskRecoveryClient';
 
 interface ProblemQualityReviewTabProps {
+  userId?: string;
   activeSubject?: Subject | null;
   problems: Problem[];
   materials?: Material[];
@@ -50,6 +58,7 @@ interface ProblemQualityReviewTabProps {
 }
 
 export function ProblemQualityReviewTab({
+  userId,
   activeSubject,
   problems,
   materials = [],
@@ -59,6 +68,7 @@ export function ProblemQualityReviewTab({
   onReapproveProblem,
   onSuspendProblem,
 }: ProblemQualityReviewTabProps) {
+  const effectiveUserId = userId || activeSubject?.ownerId || 'default_user';
   // Filter problems for active subject
   const subjectProblems = useMemo(() => {
     return problems.filter((p) => Boolean(activeSubject && p.subjectId === activeSubject.id));
@@ -84,6 +94,8 @@ export function ProblemQualityReviewTab({
 
   // AI Re-review state
   const [isAiReviewing, setIsAiReviewing] = useState(false);
+  const [isRetryingSaveReview, setIsRetryingSaveReview] = useState(false);
+  const [qualityRecovery, setQualityRecovery] = useState<TaskRecoveryRecord | null>(null);
   const [aiReviewResult, setAiReviewResult] = useState<ProblemQualityReviewResult | null>(null);
   const [aiReviewError, setAiReviewError] = useState<string | null>(null);
   const [aiReviewNotice, setAiReviewNotice] = useState<string | null>(null);
@@ -136,7 +148,7 @@ export function ProblemQualityReviewTab({
     return reported || filteredProblems[0] || subjectProblems[0] || null;
   }, [selectedProblemId, filteredProblems, subjectProblems]);
 
-  // Reset the edit/review form when the active problem changes (render-phase, hydration-safe).
+  // Reset the edit/review form and recovery state when the active problem changes (render-phase, hydration-safe).
   const [syncedProblemId, setSyncedProblemId] = useState<string | null>(null);
   if (activeProblem && syncedProblemId !== activeProblem.id) {
     setSyncedProblemId(activeProblem.id);
@@ -154,6 +166,9 @@ export function ProblemQualityReviewTab({
     setAiReviewResult(null);
     setAiReviewError(null);
     setExpandedVersionNum(null);
+    setQualityRecovery(
+      effectiveUserId ? getTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id) : null
+    );
   }
 
   // Calculate rubric sum
@@ -204,14 +219,31 @@ export function ProblemQualityReviewTab({
 
       const data = await res.json();
       if (!res.ok || !data.success) {
-        if (data.canRetrySave) {
-          setAiReviewError(`${data.error || 'AI 검토는 완료되었으나 결과 보존에 실패했습니다.'} (저장만 다시 시도할 수 있습니다.)`);
+        if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && effectiveUserId && activeProblem) {
+          const rec = {
+            taskId: data.taskId,
+            signedRecoveryToken: data.signedRecoveryToken,
+            recoveryData: data.recoveryData,
+            error: data.error,
+          };
+          saveTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id, rec);
+          setQualityRecovery({
+            ...rec,
+            userId: effectiveUserId,
+            taskType: 'problem_quality_review',
+            savedAt: new Date().toISOString(),
+          });
+          setAiReviewError(`${data.error || 'AI 검토는 완료되었으나 결과 보존에 실패했습니다.'} AI 재호출 없이 저장만 다시 시도할 수 있습니다.`);
         } else {
           setAiReviewError(data.error || 'AI 품질 검토 호출에 실패했습니다.');
         }
         return;
       }
 
+      if (effectiveUserId && activeProblem) {
+        clearTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id);
+      }
+      setQualityRecovery(null);
       setAiReviewResult(data.review);
       if (data.settlementError || data.settled === false) {
         setAiReviewNotice(`검토 결과는 안전하게 보존되었으나 크레딧 정산에 실패했습니다 (${data.settlementError || '정산 대기'}).`);
@@ -222,6 +254,58 @@ export function ProblemQualityReviewTab({
       setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
       setIsAiReviewing(false);
+    }
+  };
+
+  const handleRetrySaveReview = async () => {
+    if (!qualityRecovery || !activeProblem || isRetryingSaveReview) return;
+    setIsRetryingSaveReview(true);
+    setAiReviewError(null);
+    try {
+      const subjectMaterial = materials.find(
+        (m) => Boolean(activeSubject && m.subjectId === activeSubject.id) && m.parsedMarkdown
+      );
+      const res = await fetch('/api/review-problem-quality', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          problem: activeProblem,
+          reports: activeProblem.reports || [],
+          sourceMarkdown: subjectMaterial?.parsedMarkdown || '',
+          isSaveRetry: true,
+          action: 'retry_save',
+          taskId: qualityRecovery.taskId,
+          signedRecoveryToken: qualityRecovery.signedRecoveryToken,
+          recoveryData: qualityRecovery.recoveryData,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        if (data.signedRecoveryToken && data.recoveryData && effectiveUserId && activeProblem) {
+          saveTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id, {
+            taskId: data.taskId || qualityRecovery.taskId,
+            signedRecoveryToken: data.signedRecoveryToken,
+            recoveryData: data.recoveryData,
+            error: data.error,
+          });
+        }
+        setAiReviewError(data.error || '저장 재시도에 실패했습니다.');
+        return;
+      }
+      if (effectiveUserId && activeProblem) {
+        clearTaskRecovery(effectiveUserId, 'problem_quality_review', activeProblem.id);
+      }
+      setQualityRecovery(null);
+      setAiReviewResult(data.review);
+      if (data.settlementError || data.settled === false) {
+        setAiReviewNotice(`검토 결과는 안전하게 보존되었으나 크레딧 정산에 실패했습니다 (${data.settlementError || '정산 대기'}).`);
+      } else if (data.notice) {
+        setAiReviewNotice(data.notice);
+      }
+    } catch (err) {
+      setAiReviewError(`네트워크 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
+    } finally {
+      setIsRetryingSaveReview(false);
     }
   };
 
@@ -843,9 +927,22 @@ export function ProblemQualityReviewTab({
               {aiReviewError && (
                 <div className="p-4 bg-red-50 border border-red-300 rounded-xs text-xs text-red-900 flex items-start gap-2 shadow-2xs">
                   <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                  <div>
-                    <strong className="block font-bold">AI 검토 호출 오류</strong>
-                    <span>{aiReviewError}</span>
+                  <div className="space-y-2">
+                    <div>
+                      <strong className="block font-bold">AI 검토 호출 오류</strong>
+                      <span>{aiReviewError}</span>
+                    </div>
+                    {qualityRecovery && (
+                      <button
+                        type="button"
+                        onClick={handleRetrySaveReview}
+                        disabled={isRetryingSaveReview}
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xs transition-colors"
+                      >
+                        {isRetryingSaveReview ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                        <span>검토 결과 저장만 다시 시도 (AI 미호출)</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               )}

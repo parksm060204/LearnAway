@@ -188,6 +188,8 @@ export type AiConfigResolution =
       trialRemaining?: number;
       leaseToken?: string;
       taskId?: string;
+      creditSource?: 'operator_trial' | 'personal_key';
+      dbStatus?: string;
     }
   | {
       ok: false;
@@ -213,6 +215,8 @@ export type AiConfigResolution =
       needsAiConnection?: boolean;
       leaseToken?: string;
       taskId?: string;
+      creditSource?: 'operator_trial' | 'personal_key';
+      dbStatus?: string;
     };
 
 /** Reads the caller's stored secret and distinguishes the three states. */
@@ -328,6 +332,8 @@ export async function resolveAiConfigForUser(
             cachedResult: reg.cachedResult,
             leaseToken: reg.leaseToken,
             taskId: reg.taskId,
+            creditSource: reg.creditSource || 'personal_key',
+            dbStatus: reg.dbStatus || 'result_ready',
             message: reg.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
           };
         }
@@ -441,6 +447,8 @@ export async function resolveAiConfigForUser(
         cachedResult: reservation.cachedResult,
         leaseToken: reservation.leaseToken,
         taskId: reservation.taskId,
+        creditSource: reservation.creditSource || 'operator_trial',
+        dbStatus: reservation.dbStatus || 'result_ready',
         message: reservation.message || '이미 완료된 작업의 결과가 보존되어 있습니다.',
       };
     }

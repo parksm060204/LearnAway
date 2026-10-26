@@ -14,6 +14,7 @@ import {
   buildLegacyTaskId,
 } from '../../../lib/trialCredits';
 import { computeMarkdownHash } from '../../../lib/markdownUtils';
+import { signTaskRecoveryToken, verifyTaskRecoveryToken } from '../../../lib/recoveryToken';
 
 const LOGIC_QUESTIONS_PROMPT_VERSION = 'v2';
 
@@ -136,13 +137,126 @@ export async function POST(req: NextRequest) {
     const taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'logic', inputIdentifier);
     const legacyTaskId = buildLegacyTaskId('logic', legacyInputIdentifier);
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+    const signedRecoveryToken = asString(payload.signedRecoveryToken).trim();
+    const clientRecoveryData = payload.recoveryData || (payload.questions ? { questions: payload.questions, model: payload.model } : null);
 
-    // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved results only.
+    // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved or server-signed results.
     if (isSaveRetry) {
       let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'logic_questions', inputIdentifier, legacyInputIdentifier);
       if (!saved.success && !explicitTaskId) {
         saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'logic_questions', legacyInputIdentifier);
       }
+
+      const cached = saved.cachedResult as { questions?: unknown; model?: string } | null;
+
+      if (saved.success && cached && cached.questions) {
+        const authoritativeTaskId = saved.taskId || taskId;
+        let isSettled = saved.status === 'settled';
+        let settlementError: string | undefined;
+        if (!isSettled && saved.leaseToken && saved.creditSource === 'operator_trial') {
+          const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, saved.leaseToken);
+          if (!settleRes.success) {
+            settlementError = settleRes.error;
+          } else {
+            isSettled = true;
+          }
+        } else if (saved.creditSource === 'personal_key') {
+          isSettled = true;
+        }
+        return NextResponse.json({
+          success: true,
+          questions: cached.questions,
+          model: cached.model,
+          taskId: authoritativeTaskId,
+          fromCache: true,
+          persisted: true,
+          settled: isSettled,
+          settlementError,
+        });
+      }
+
+      // If DB has no preserved result, verify signed recovery token issued by the server
+      if (signedRecoveryToken && clientRecoveryData) {
+        const verifyRes = verifyTaskRecoveryToken(signedRecoveryToken, {
+          userId: auth.user.id,
+          taskId,
+          taskType: 'logic_questions',
+          inputIdentifier,
+          result: clientRecoveryData,
+        });
+
+        if (!verifyRes.ok) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: `복구 토큰 검증 실패: ${verifyRes.error}`,
+              errorCode: verifyRes.code,
+            },
+            { status: verifyRes.code === 'MISMATCH' ? 403 : 400 }
+          );
+        }
+
+        const recoveryPayload = clientRecoveryData as { questions?: unknown; model?: string };
+        const questionsToSave = recoveryPayload.questions || clientRecoveryData;
+        const modelToSave = recoveryPayload.model || 'deepseek-v4.1-flash';
+
+        let persisted = false;
+        let settled = false;
+        let settlementError: string | undefined;
+
+        if (verifyRes.payload.leaseToken) {
+          const saveRes = await recordTrialResultReady(
+            auth.user.id,
+            taskId,
+            { questions: questionsToSave, model: modelToSave },
+            verifyRes.payload.leaseToken
+          );
+
+          if (!saveRes.success && saveRes.errorCode !== 'ALREADY_SETTLED') {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `복구 결과 서버 보존 재시도 실패: ${saveRes.error}`,
+                errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
+                canRetrySave: true,
+                taskId,
+                signedRecoveryToken,
+                recoveryData: clientRecoveryData,
+                questions: questionsToSave,
+                model: modelToSave,
+                persisted: false,
+                settled: false,
+              },
+              { status: 500 }
+            );
+          }
+
+          persisted = true;
+
+          const settleRes = await settleTrialCredit(auth.user.id, taskId, verifyRes.payload.leaseToken);
+          if (!settleRes.success) {
+            settlementError = settleRes.error;
+            settled = false;
+          } else {
+            settled = true;
+          }
+        } else {
+          persisted = true;
+          settled = true;
+        }
+
+        return NextResponse.json({
+          success: true,
+          questions: questionsToSave,
+          model: modelToSave,
+          taskId,
+          fromCache: false,
+          persisted,
+          settled,
+          settlementError,
+        });
+      }
+
       if (!saved.success) {
         const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
         return NextResponse.json(
@@ -154,36 +268,15 @@ export async function POST(req: NextRequest) {
           { status }
         );
       }
-      const cached = saved.cachedResult as { questions?: unknown; model?: string } | null;
-      if (!cached || !cached.questions) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: '서버에 보존된 AI 질문 결과가 없습니다. 새로운 작업으로 다시 요청해 주세요.',
-            errorCode: 'NO_SAVED_RESULT',
-          },
-          { status: 400 }
-        );
-      }
-      let isSettled = saved.status === 'settled';
-      let settlementError: string | undefined;
-      if (!isSettled && saved.leaseToken && saved.creditSource === 'operator_trial') {
-        const settleRes = await settleTrialCredit(auth.user.id, taskId, saved.leaseToken);
-        if (!settleRes.success) {
-          settlementError = settleRes.error;
-        } else {
-          isSettled = true;
-        }
-      }
-      return NextResponse.json({
-        success: true,
-        questions: cached.questions,
-        model: cached.model,
-        fromCache: true,
-        persisted: true,
-        settled: isSettled,
-        settlementError,
-      });
+
+      return NextResponse.json(
+        {
+          success: false,
+          error: '서버에 보존된 AI 질문 결과가 없습니다. 새로운 작업으로 다시 요청해 주세요.',
+          errorCode: 'NO_SAVED_RESULT',
+        },
+        { status: 400 }
+      );
     }
 
     const cred = await resolveAiConfigForUser(auth.user.id, {
@@ -195,13 +288,30 @@ export async function POST(req: NextRequest) {
     if (!cred.ok) {
       if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
         const cached = cred.cachedResult as { questions?: unknown; model?: string };
+        const authoritativeTaskId = cred.taskId || taskId;
+        let isSettled = cred.dbStatus === 'settled';
+        let settlementError: string | undefined;
+
+        if (!isSettled && cred.leaseToken && cred.creditSource === 'operator_trial') {
+          const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, cred.leaseToken);
+          if (!settleRes.success) {
+            settlementError = settleRes.error;
+          } else {
+            isSettled = true;
+          }
+        } else if (cred.creditSource === 'personal_key') {
+          isSettled = true;
+        }
+
         return NextResponse.json({
           success: true,
           questions: cached.questions,
           model: cached.model,
+          taskId: authoritativeTaskId,
           fromCache: true,
           persisted: true,
-          settled: true,
+          settled: isSettled,
+          settlementError,
         });
       }
       if (cred.code === 'concurrent_in_progress') {
@@ -376,6 +486,16 @@ ${diagnosisSummary || '(요약 없음)'}
             { status: 409 }
           );
         }
+        const signedRecoveryToken = signTaskRecoveryToken({
+          userId: auth.user.id,
+          taskId,
+          taskType: 'logic_questions',
+          inputIdentifier,
+          result: { questions, model: aiCall.model },
+          leaseToken: cred.leaseToken,
+          modelId: aiCall.model,
+        });
+
         return NextResponse.json(
           {
             success: false,
@@ -383,6 +503,8 @@ ${diagnosisSummary || '(요약 없음)'}
             errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
             canRetrySave: true,
             taskId,
+            signedRecoveryToken,
+            recoveryData: { questions, model: aiCall.model },
             questions,
             model: aiCall.model,
             persisted: false,

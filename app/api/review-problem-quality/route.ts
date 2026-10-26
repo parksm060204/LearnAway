@@ -12,6 +12,7 @@ import {
   buildLegacyTaskId,
 } from '../../../lib/trialCredits';
 import { computeMarkdownHash } from '../../../lib/markdownUtils';
+import { signTaskRecoveryToken, verifyTaskRecoveryToken } from '../../../lib/recoveryToken';
 import {
   Problem,
   ProblemReport,
@@ -152,13 +153,147 @@ export async function POST(req: NextRequest) {
     let taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'qual', inputIdentifier);
     const legacyTaskId = buildLegacyTaskId('qual', legacyInputIdentifier);
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+    const signedRecoveryToken = (typeof payload.signedRecoveryToken === 'string' && payload.signedRecoveryToken.trim()) ? payload.signedRecoveryToken.trim() : '';
+    const clientRecoveryData = payload.recoveryData || payload.review || null;
 
-    // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved results only.
+    // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved or server-signed results.
     if (isSaveRetry) {
       let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'review_problem_quality', inputIdentifier, legacyInputIdentifier);
       if (!saved.success && !explicitTaskId) {
         saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'review_problem_quality', legacyInputIdentifier);
       }
+
+      const cached = saved.cachedResult as {
+        isReportJustified?: boolean;
+        severity?: 'critical' | 'moderate' | 'minor' | 'none';
+        recommendation?: 'edit_required' | 'suspend' | 'dismiss_report';
+        analysisSummary?: string;
+        suggestedFixes?: string;
+        ruleChecks?: ProblemQualityRuleCheck;
+      } | null;
+
+      if (saved.success && cached) {
+        const authoritativeTaskId = saved.taskId || taskId;
+        let isSettled = saved.status === 'settled';
+        let settlementError: string | undefined;
+
+        if (!isSettled && saved.leaseToken && saved.creditSource === 'operator_trial') {
+          const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, saved.leaseToken);
+          if (!settleRes.success) {
+            settlementError = settleRes.error;
+          } else {
+            isSettled = true;
+          }
+        } else if (saved.creditSource === 'personal_key') {
+          isSettled = true;
+        }
+
+        const review: ProblemQualityReviewResult = {
+          isReportJustified: Boolean(cached.isReportJustified),
+          severity: cached.severity || 'none',
+          recommendation: cached.recommendation || 'dismiss_report',
+          analysisSummary: cached.analysisSummary || '',
+          suggestedFixes: cached.suggestedFixes || '',
+          ruleChecks: cached.ruleChecks || ruleChecks,
+          canAutoReapprove: false,
+        };
+
+        return NextResponse.json({
+          success: true,
+          review,
+          taskId: authoritativeTaskId,
+          persisted: true,
+          settled: isSettled,
+          settlementError,
+          notice: '기존에 검토 완료된 결과가 복원되었습니다.',
+        });
+      }
+
+      // If DB has no preserved result, verify signed recovery token issued by the server
+      if (signedRecoveryToken && clientRecoveryData) {
+        const verifyRes = verifyTaskRecoveryToken(signedRecoveryToken, {
+          userId: auth.user.id,
+          taskId,
+          taskType: 'review_problem_quality',
+          inputIdentifier,
+          result: clientRecoveryData,
+        });
+
+        if (!verifyRes.ok) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: `복구 토큰 검증 실패: ${verifyRes.error}`,
+              errorCode: verifyRes.code,
+            },
+            { status: verifyRes.code === 'MISMATCH' ? 403 : 400 }
+          );
+        }
+
+        const recoveryPayload = clientRecoveryData as Record<string, unknown>;
+        let persisted = false;
+        let settled = false;
+        let settlementError: string | undefined;
+
+        if (verifyRes.payload.leaseToken) {
+          const saveRes = await recordTrialResultReady(
+            auth.user.id,
+            taskId,
+            recoveryPayload,
+            verifyRes.payload.leaseToken
+          );
+
+          if (!saveRes.success && saveRes.errorCode !== 'ALREADY_SETTLED') {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `복구 결과 서버 보존 재시도 실패: ${saveRes.error}`,
+                errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
+                canRetrySave: true,
+                taskId,
+                signedRecoveryToken,
+                recoveryData: clientRecoveryData,
+                persisted: false,
+                settled: false,
+              },
+              { status: 500 }
+            );
+          }
+
+          persisted = true;
+
+          const settleRes = await settleTrialCredit(auth.user.id, taskId, verifyRes.payload.leaseToken);
+          if (!settleRes.success) {
+            settlementError = settleRes.error;
+            settled = false;
+          } else {
+            settled = true;
+          }
+        } else {
+          persisted = true;
+          settled = true;
+        }
+
+        const review: ProblemQualityReviewResult = {
+          isReportJustified: Boolean(recoveryPayload.isReportJustified),
+          severity: (recoveryPayload.severity as ProblemQualityReviewResult['severity']) || 'none',
+          recommendation: (recoveryPayload.recommendation as ProblemQualityReviewResult['recommendation']) || 'dismiss_report',
+          analysisSummary: (recoveryPayload.analysisSummary as string) || '',
+          suggestedFixes: (recoveryPayload.suggestedFixes as string) || '',
+          ruleChecks: (recoveryPayload.ruleChecks as ProblemQualityRuleCheck) || ruleChecks,
+          canAutoReapprove: false,
+        };
+
+        return NextResponse.json({
+          success: true,
+          review,
+          taskId,
+          persisted,
+          settled,
+          settlementError,
+        });
+      }
+
       if (!saved.success) {
         const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
         return NextResponse.json(
@@ -170,44 +305,15 @@ export async function POST(req: NextRequest) {
           { status }
         );
       }
-      const cached = saved.cachedResult as {
-        isReportJustified?: boolean;
-        severity?: 'critical' | 'moderate' | 'minor' | 'none';
-        recommendation?: 'edit_required' | 'suspend' | 'dismiss_report';
-        analysisSummary?: string;
-        suggestedFixes?: string;
-        ruleChecks?: ProblemQualityRuleCheck;
-      } | null;
 
-      if (!cached) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: '저장된 검토 결과 데이터가 비어 있습니다.',
-            errorCode: 'INVALID_CACHED_RESULT',
-          },
-          { status: 500 }
-        );
-      }
-
-      const review: ProblemQualityReviewResult = {
-        isReportJustified: Boolean(cached.isReportJustified),
-        severity: cached.severity || 'none',
-        recommendation: cached.recommendation || 'dismiss_report',
-        analysisSummary: cached.analysisSummary || '',
-        suggestedFixes: cached.suggestedFixes || '',
-        ruleChecks: cached.ruleChecks || ruleChecks,
-        canAutoReapprove: false,
-      };
-
-      return NextResponse.json({
-        success: true,
-        review,
-        taskId: saved.taskId || taskId,
-        persisted: true,
-        settled: true,
-        notice: '기존에 검토 완료된 결과가 복원되었습니다.',
-      });
+      return NextResponse.json(
+        {
+          success: false,
+          error: '저장된 검토 결과 데이터가 비어 있습니다.',
+          errorCode: 'INVALID_CACHED_RESULT',
+        },
+        { status: 500 }
+      );
     }
 
     let persisted = false;
@@ -376,6 +482,15 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
                 { status: 409 }
               );
             }
+            const signedRecoveryToken = signTaskRecoveryToken({
+              userId: auth.user.id,
+              taskId,
+              taskType: 'problem_quality_review',
+              inputIdentifier,
+              result: reviewPayload,
+              leaseToken: cred.leaseToken,
+              modelId: aiCall.model,
+            });
             return NextResponse.json(
               {
                 success: false,
@@ -383,6 +498,8 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
                 errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
                 canRetrySave: true,
                 taskId,
+                signedRecoveryToken,
+                recoveryData: reviewPayload,
                 review: {
                   isReportJustified,
                   severity,
@@ -471,7 +588,24 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
         analysisSummary = cached.analysisSummary || 'AI 검토 결과가 캐시에서 복원되었습니다.';
         suggestedFixes = cached.suggestedFixes || '';
         persisted = true;
-        settled = true;
+
+        const authoritativeTaskId = cred.taskId || taskId;
+        taskId = authoritativeTaskId;
+        let isSettled = cred.dbStatus === 'settled';
+
+        if (!isSettled && cred.creditSource === 'operator_trial' && cred.leaseToken) {
+          const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, cred.leaseToken);
+          if (!settleRes.success) {
+            settlementError = settleRes.error;
+            isSettled = false;
+          } else {
+            isSettled = true;
+          }
+        } else if (cred.creditSource === 'personal_key') {
+          isSettled = true;
+        }
+
+        settled = isSettled;
       } else {
         // Offline / API not configured: deterministic academic heuristic evaluation
         const fallback = generateHeuristicQualityCheck(problem, openReports, isRubric100);

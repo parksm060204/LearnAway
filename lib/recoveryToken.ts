@@ -349,3 +349,193 @@ export function verifyRecoveryToken(
 
   return { ok: true, payload: p };
 }
+
+/**
+ * Deterministically canonicalizes JSON for consistent hashing across object key permutations.
+ */
+export function canonicalizeJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    if (value === undefined) return 'null';
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => (item === undefined ? 'null' : canonicalizeJson(item))).join(',')}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj)
+    .filter((k) => obj[k] !== undefined)
+    .sort();
+  const entries = keys.map((k) => `${JSON.stringify(k)}:${canonicalizeJson(obj[k])}`);
+  return `{${entries.join(',')}}`;
+}
+
+/**
+ * Computes deterministic SHA-256 hash of arbitrary task result object.
+ */
+export function computeTaskResultHash(result: unknown): string {
+  if (result === null || result === undefined) return '';
+  return crypto.createHash('sha256').update(canonicalizeJson(result)).digest('hex');
+}
+
+export interface TaskRecoveryTokenPayload {
+  userId: string;
+  taskId: string;
+  taskType: string;
+  inputIdentifier: string;
+  resultHash: string;
+  leaseToken?: string;
+  modelId?: string;
+  schemaVersion: string;
+  expiresAt: number;
+}
+
+/**
+ * Signs an AI task generation result into a tamper-proof recovery token.
+ */
+export function signTaskRecoveryToken(params: {
+  userId: string;
+  taskId: string;
+  taskType: string;
+  inputIdentifier: string;
+  result: unknown;
+  leaseToken?: string;
+  modelId?: string;
+  expiresInMs?: number;
+  schemaVersion?: string;
+}): string {
+  const expiresAt = Date.now() + (params.expiresInMs ?? 24 * 60 * 60 * 1000);
+  const resultHash = computeTaskResultHash(params.result);
+  const schemaVersion = params.schemaVersion || 'v1';
+
+  const payload: TaskRecoveryTokenPayload = {
+    userId: params.userId,
+    taskId: params.taskId,
+    taskType: params.taskType,
+    inputIdentifier: params.inputIdentifier,
+    resultHash,
+    leaseToken: params.leaseToken || '',
+    modelId: params.modelId || '',
+    schemaVersion,
+    expiresAt,
+  };
+
+  const dataToSign = [
+    payload.userId,
+    payload.taskId,
+    payload.taskType,
+    payload.inputIdentifier,
+    payload.resultHash,
+    payload.leaseToken,
+    payload.modelId,
+    payload.schemaVersion,
+    payload.expiresAt,
+  ].join('|');
+
+  const secret = getRecoverySecret();
+  const hmac = crypto.createHmac('sha256', secret).update(dataToSign).digest('hex');
+
+  const tokenObj = { p: payload, s: hmac };
+  return Buffer.from(JSON.stringify(tokenObj), 'utf-8').toString('base64url');
+}
+
+export type VerifyTaskRecoveryTokenResult =
+  | { ok: true; payload: TaskRecoveryTokenPayload }
+  | { ok: false; error: string; code: 'EXPIRED' | 'TAMPERED' | 'MISMATCH' | 'MALFORMED' | 'UNCONFIGURED' };
+
+/**
+ * Cryptographically verifies a task recovery token against caller context and result content.
+ */
+export function verifyTaskRecoveryToken(
+  tokenStr: string,
+  expected: {
+    userId: string;
+    taskId: string;
+    taskType: string;
+    inputIdentifier: string;
+    result: unknown;
+    now?: number;
+  }
+): VerifyTaskRecoveryTokenResult {
+  if (!tokenStr || typeof tokenStr !== 'string') {
+    return { ok: false, error: '복구 토큰이 제공되지 않았습니다.', code: 'MALFORMED' };
+  }
+
+  let secret: string;
+  try {
+    secret = getRecoverySecret();
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : '서버 복구 서명 비밀키 누락',
+      code: 'UNCONFIGURED',
+    };
+  }
+
+  let tokenObj: { p?: TaskRecoveryTokenPayload; s?: string };
+  try {
+    const json = Buffer.from(tokenStr, 'base64url').toString('utf-8');
+    tokenObj = JSON.parse(json);
+  } catch {
+    return { ok: false, error: '복구 토큰 형식이 올바르지 않습니다.', code: 'MALFORMED' };
+  }
+
+  if (!tokenObj.p || !tokenObj.s) {
+    return { ok: false, error: '복구 토큰 필수 데이터가 누락되었습니다.', code: 'MALFORMED' };
+  }
+
+  const p = tokenObj.p;
+
+  // 1. Verify HMAC signature first
+  const dataToSign = [
+    p.userId,
+    p.taskId,
+    p.taskType,
+    p.inputIdentifier,
+    p.resultHash,
+    p.leaseToken || '',
+    p.modelId || '',
+    p.schemaVersion || 'v1',
+    p.expiresAt,
+  ].join('|');
+
+  const expectedHmac = crypto.createHmac('sha256', secret).update(dataToSign).digest('hex');
+  const hmacBuffer = Buffer.from(tokenObj.s, 'hex');
+  const expectedBuffer = Buffer.from(expectedHmac, 'hex');
+
+  if (hmacBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(hmacBuffer, expectedBuffer)) {
+    return { ok: false, error: '복구 토큰 서명이 위조되었거나 변조되었습니다.', code: 'TAMPERED' };
+  }
+
+  // 2. Check Expiration
+  const currentTime = expected.now ?? Date.now();
+  if (p.expiresAt < currentTime) {
+    return { ok: false, error: '복구 토큰의 유효 기간이 만료되었습니다.', code: 'EXPIRED' };
+  }
+
+  // 3. Strict User Ownership Check
+  if (p.userId !== expected.userId) {
+    return { ok: false, error: '다른 사용자의 복구 토큰을 재사용할 수 없습니다.', code: 'MISMATCH' };
+  }
+
+  // 4. Task ID & Task Type Check
+  if (p.taskId !== expected.taskId) {
+    return { ok: false, error: '작업 식별자가 일치하지 않습니다.', code: 'MISMATCH' };
+  }
+
+  if (p.taskType !== expected.taskType) {
+    return { ok: false, error: '작업 유형이 일치하지 않습니다.', code: 'MISMATCH' };
+  }
+
+  // 5. Input Identifier Check
+  if (p.inputIdentifier !== expected.inputIdentifier) {
+    return { ok: false, error: '작업 입력 식별자가 일치하지 않습니다.', code: 'MISMATCH' };
+  }
+
+  // 6. Verify Result Content Integrity
+  const computedHash = computeTaskResultHash(expected.result);
+  if (p.resultHash !== computedHash) {
+    return { ok: false, error: '제출된 복구 결과 데이터가 서버가 서명한 원본과 일치하지 않습니다.', code: 'TAMPERED' };
+  }
+
+  return { ok: true, payload: p };
+}

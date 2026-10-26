@@ -51,6 +51,12 @@ import {
   Compass,
 } from 'lucide-react';
 import { useTrialCredits, notifyTrialCreditsUpdated } from '../lib/trialCreditsClient';
+import {
+  saveTaskRecovery,
+  getTaskRecovery,
+  clearTaskRecovery,
+  type TaskRecoveryRecord,
+} from '../lib/taskRecoveryClient';
 
 // Snapshot of every input that the AI evaluation depends on. Recording is only
 // allowed while the current inputs still match this snapshot.
@@ -270,6 +276,17 @@ export function ProblemSessionModal({
 
   // Stage 4: AI Evaluation State
   const [isEvaluating, setIsEvaluating] = useState(false);
+  const [isRetryingSave, setIsRetryingSave] = useState(false);
+  const recoveryKey = userId ? `${userId}:${problem.id}` : '';
+  const [prevRecoveryKey, setPrevRecoveryKey] = useState(recoveryKey);
+  const [recoveryRecord, setRecoveryRecord] = useState<TaskRecoveryRecord | null>(() =>
+    userId ? getTaskRecovery(userId, 'evaluate_answer', problem.id) : null
+  );
+
+  if (recoveryKey !== prevRecoveryKey) {
+    setPrevRecoveryKey(recoveryKey);
+    setRecoveryRecord(userId ? getTaskRecovery(userId, 'evaluate_answer', problem.id) : null);
+  }
   const [evaluationError, setEvaluationError] = useState<string | null>(null);
   const [evaluationResult, setEvaluationResult] = useState<EvaluationResult | null>(null);
   const [evaluatedSnapshot, setEvaluatedSnapshot] = useState<EvaluationInputSnapshot | null>(null);
@@ -393,10 +410,31 @@ export function ProblemSessionModal({
 
       const data = await res.json();
       if (!res.ok || !data.success) {
-        setEvaluationError(data.error || 'AI 평가 요청에 실패했습니다.');
+        if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && userId) {
+          const rec = {
+            taskId: data.taskId,
+            signedRecoveryToken: data.signedRecoveryToken,
+            recoveryData: data.recoveryData,
+            error: data.error,
+          };
+          saveTaskRecovery(userId, 'evaluate_answer', problem.id, rec);
+          setRecoveryRecord({
+            ...rec,
+            userId,
+            taskType: 'evaluate_answer',
+            savedAt: new Date().toISOString(),
+          });
+          setEvaluationError(`${data.error || '답안 평가는 완료되었으나 결과 보존에 실패했습니다.'} AI 재호출 없이 저장만 다시 시도할 수 있습니다.`);
+        } else {
+          setEvaluationError(data.error || 'AI 평가 요청에 실패했습니다.');
+        }
         return;
       }
 
+      if (userId) {
+        clearTaskRecovery(userId, 'evaluate_answer', problem.id);
+      }
+      setRecoveryRecord(null);
       const evalData: EvaluationResult = data.evaluation;
       notifyTrialCreditsUpdated();
       setEvaluationResult(evalData);
@@ -419,6 +457,83 @@ export function ProblemSessionModal({
       setEvaluationError(`네트워크 연결 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
     } finally {
       setIsEvaluating(false);
+    }
+  };
+
+  const handleRetrySave = async () => {
+    if (!recoveryRecord || isRetryingSave) return;
+    setIsRetryingSave(true);
+    setEvaluationError(null);
+    try {
+      const res = await fetch('/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          problemId: problem.id,
+          problemVersion: problem.version ?? 1,
+          conceptId: concept.id,
+          conceptIds: problem.conceptIds || [concept.id],
+          subjectId: subject.id,
+          domain: subject.domain || 'math_stats',
+          problemTitle: problem.title,
+          problemPrompt: problem.promptText,
+          appliedConditionNote: problem.appliedConditionNote,
+          mathFormula: problem.mathFormula,
+          codeSnippet: problem.codeSnippet,
+          modelAnswer: problem.modelAnswer,
+          rubric: problem.rubric,
+          userAnswer: answerText.trim(),
+          revealedHintCount: revealedHints.length,
+          hints: revealedHints.map((index) => problem.hints[index]),
+          solvingReason: isReasonNotApplicable ? undefined : solvingReason.trim(),
+          isReasonNotApplicable,
+          reasonNotApplicableJustification: isReasonNotApplicable
+            ? reasonNotApplicableJustification.trim()
+            : undefined,
+          isSaveRetry: true,
+          action: 'retry_save',
+          taskId: recoveryRecord.taskId,
+          signedRecoveryToken: recoveryRecord.signedRecoveryToken,
+          recoveryData: recoveryRecord.recoveryData,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        if (data.signedRecoveryToken && data.recoveryData && userId) {
+          saveTaskRecovery(userId, 'evaluate_answer', problem.id, {
+            taskId: data.taskId || recoveryRecord.taskId,
+            signedRecoveryToken: data.signedRecoveryToken,
+            recoveryData: data.recoveryData,
+            error: data.error,
+          });
+        }
+        setEvaluationError(data.error || '저장 재시도에 실패했습니다.');
+        return;
+      }
+      if (userId) {
+        clearTaskRecovery(userId, 'evaluate_answer', problem.id);
+      }
+      setRecoveryRecord(null);
+      const evalData: EvaluationResult = data.evaluation;
+      notifyTrialCreditsUpdated();
+      setEvaluationResult(evalData);
+      setEvaluatedSnapshot({
+        answer: answerText.trim(),
+        solvingReason: isReasonNotApplicable ? '' : solvingReason.trim(),
+        isReasonNotApplicable,
+        reasonNotApplicableJustification: isReasonNotApplicable
+          ? reasonNotApplicableJustification.trim()
+          : '',
+        hintCount: revealedHints.length,
+      });
+      setCurrentAttemptId(`att-${Date.now()}-${Math.random().toString(36).substring(7)}`);
+      if (evalData.recommendedErrorType) {
+        setErrorType(evalData.recommendedErrorType);
+      }
+    } catch (err) {
+      setEvaluationError(`네트워크 연결 오류: ${err instanceof Error ? err.message : '알 수 없는 오류'}`);
+    } finally {
+      setIsRetryingSave(false);
     }
   };
 
@@ -1158,14 +1273,27 @@ export function ProblemSessionModal({
                 </div>
               </div>
 
-              <button
-                type="button"
-                onClick={handleRequestEvaluation}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-[#c52828] hover:bg-[#a82020] text-white text-xs font-bold rounded-xs transition-colors"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>평가 다시 시도하기</span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                {recoveryRecord && (
+                  <button
+                    type="button"
+                    onClick={handleRetrySave}
+                    disabled={isRetryingSave}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xs transition-colors"
+                  >
+                    {isRetryingSave ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                    <span>저장만 다시 시도 (AI 미호출)</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleRequestEvaluation}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-[#c52828] hover:bg-[#a82020] text-white text-xs font-bold rounded-xs transition-colors"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>평가 다시 시도하기</span>
+                </button>
+              </div>
             </div>
           )}
 

@@ -1039,11 +1039,47 @@ async function testUpgradePath() {
   }
   console.log(`✓ Cached response on same input returns original task_id=${resSceneP3.task_id}`);
 
-  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33 & 34) Passed Successfully! ===\n');
+  // --------------------------------------------------------------------------
+  // Apply Migration 35
+  // --------------------------------------------------------------------------
+  console.log('=== Applying Migration 35: Fix AI Task Settlement Discrimination and Snapshot Cache ===');
+  const migration35File = '20260101000035_fix_ai_task_settlement_and_snapshot_cache.sql';
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, migration35File));
+  console.log('✓ Migration 35 executed cleanly!');
+
+  // --------------------------------------------------------------------------
+  // Scenario Q: Explicit db_status ('result_ready' vs 'settled') in register_ai_task (Migration 35)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario Q: Explicit db_status in already_completed response (Migration 35) ---');
+  // At this point, taskSceneP1 is in 'result_ready' status (record_trial_result_ready was called but settle was not)
+  const resSceneQ1 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', $2, $3, false, 500) as r;
+  `, [taskSceneP3, inputP, userIdA])).rows[0].r;
+
+  if (resSceneQ1.status !== 'already_completed' || resSceneQ1.db_status !== 'result_ready') {
+    throw new Error(`Expected db_status='result_ready', got ${resSceneQ1.db_status}`);
+  }
+  console.log(`✓ register_ai_task correctly returns db_status='result_ready' before settlement`);
+
+  // Now settle the task
+  await db.query(`
+    select public.settle_trial_credit($1, $2, $3);
+  `, [taskSceneP1, userIdA, resSceneP1.lease_token]);
+
+  const resSceneQ2 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', $2, $3, false, 500) as r;
+  `, [taskSceneP3, inputP, userIdA])).rows[0].r;
+
+  if (resSceneQ2.status !== 'already_completed' || resSceneQ2.db_status !== 'settled') {
+    throw new Error(`Expected db_status='settled' after settlement, got ${resSceneQ2.db_status}`);
+  }
+  console.log(`✓ register_ai_task correctly returns db_status='settled' after settlement`);
+
+  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33, 34 & 35) Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~34) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~35) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -1051,7 +1087,7 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 34 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 35 on clean database`);
 }
 
 async function main() {

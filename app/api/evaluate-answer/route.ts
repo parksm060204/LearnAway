@@ -8,6 +8,7 @@ import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 import { computeMarkdownHash } from '../../../lib/markdownUtils';
+import { signTaskRecoveryToken, verifyTaskRecoveryToken } from '../../../lib/recoveryToken';
 import {
   validateTrialEvaluateAnswerInput,
   settleTrialCredit,
@@ -58,9 +59,11 @@ export interface EvaluateAnswerRequest {
   taskId?: string;
   isSaveRetry?: boolean;
   action?: string;
+  signedRecoveryToken?: string;
+  recoveryData?: unknown;
 }
 
-const EVALUATE_ANSWER_PROMPT_VERSION = 'v2';
+const EVALUATE_ANSWER_PROMPT_VERSION = 'v3';
 
 const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_PROMPT_CHARS = 12_000;
@@ -496,8 +499,24 @@ export async function POST(req: NextRequest) {
 
     const normalizedEvaluationInput = {
       version: EVALUATE_ANSWER_PROMPT_VERSION,
+      domain,
       problemId: problemId || '',
       problemVersion: body.problemVersion ?? 1,
+      isProvisional: Boolean(isProvisional),
+      mockExamSessionId: body.mockExamSessionId || '',
+      verifiedPrompt: (verifiedPrompt || '').trim(),
+      verifiedModelAnswer: (verifiedModelAnswer || '').trim(),
+      verifiedRubric: checkedRubric.map((c) => ({
+        id: c.id,
+        label: c.label,
+        maxScore: c.maxScore,
+        description: c.description || c.label,
+      })),
+      mathFormula: (verifiedMathFormula || '').trim(),
+      codeSnippet: (verifiedCodeSnippet || '').trim(),
+      appliedConditionNote: (verifiedAppliedCondition || '').trim(),
+      problemType: resolvedProblemType || '',
+      conceptIds: [...authoritativeConceptIds].sort(),
       userAnswer: userAnswer.trim(),
       solvingReason: (solvingReason || '').trim(),
       isReasonNotApplicable: Boolean(isReasonNotApplicable),
@@ -519,11 +538,142 @@ export async function POST(req: NextRequest) {
     const isSaveRetry = Boolean(body?.isSaveRetry || body?.action === 'retry_save');
 
     if (isSaveRetry) {
-      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifier);
-      if (!saved.success && !explicitTaskId) {
+      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', inputIdentifier);
+      if (!saved.success && explicitTaskId) {
+        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'evaluate_answer', inputIdentifier);
+      }
+      if (!saved.success) {
         saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'evaluate_answer', legacyInputIdentifier);
       }
       if (!saved.success) {
+        const clientRecoveryToken = typeof body.signedRecoveryToken === 'string' ? body.signedRecoveryToken : undefined;
+        const clientRecoveryData = body.recoveryData;
+        if (clientRecoveryToken && clientRecoveryData && typeof clientRecoveryData === 'object') {
+          const verifyRes = verifyTaskRecoveryToken(clientRecoveryToken, {
+            userId: auth.user.id,
+            taskId,
+            taskType: 'evaluate_answer',
+            inputIdentifier,
+            result: clientRecoveryData,
+          });
+          if (!verifyRes.ok) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `복구 토큰 검증 실패: ${verifyRes.error}. 위변조되었거나 만료된 복구 데이터입니다.`,
+                errorCode: 'RECOVERY_TOKEN_INVALID',
+              },
+              { status: 400 }
+            );
+          }
+          const recovered = clientRecoveryData as {
+            evaluation: EvaluationResult;
+            problemId?: string;
+            conceptId?: string;
+            conceptIds?: string[];
+            subjectId?: string;
+            isProvisionalLocal?: boolean;
+          };
+          if (!recovered || !recovered.evaluation) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: '복구된 평가 결과 데이터가 유효하지 않습니다.',
+                errorCode: 'INVALID_RECOVERY_DATA',
+              },
+              { status: 400 }
+            );
+          }
+
+          let persisted = false;
+          let settled = false;
+          let settlementError: string | undefined;
+
+          if (verifyRes.payload.leaseToken) {
+            const saveRes = await recordTrialResultReady(
+              auth.user.id,
+              taskId,
+              recovered,
+              verifyRes.payload.leaseToken
+            );
+            if (!saveRes.success) {
+              if (
+                saveRes.errorCode === 'STALE_LEASE_TOKEN' ||
+                saveRes.errorCode === 'ALREADY_SETTLED' ||
+                saveRes.errorCode === 'ALREADY_REFUNDED' ||
+                saveRes.errorCode === 'TASK_OWNERSHIP_MISMATCH' ||
+                saveRes.errorCode === 'LEASE_TOKEN_REQUIRED'
+              ) {
+                return NextResponse.json(
+                  {
+                    success: false,
+                    error: saveRes.error || '작업 실행권이 만료되었거나 다른 요청에 의해 선점되었습니다.',
+                    errorCode: saveRes.errorCode,
+                  },
+                  { status: 409 }
+                );
+              }
+              const signedRecoveryToken = signTaskRecoveryToken({
+                userId: auth.user.id,
+                taskId,
+                taskType: 'evaluate_answer',
+                inputIdentifier,
+                result: recovered,
+                leaseToken: verifyRes.payload.leaseToken,
+                modelId: verifyRes.payload.modelId,
+              });
+              return NextResponse.json(
+                {
+                  success: false,
+                  error: `평가 결과 보존에 다시 실패했습니다 (${saveRes.error}). AI 재호출 없이 저장만 다시 시도할 수 있습니다.`,
+                  errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
+                  canRetrySave: true,
+                  taskId,
+                  signedRecoveryToken,
+                  recoveryData: recovered,
+                  evaluation: recovered.evaluation,
+                  problemId: recovered.problemId || problemId,
+                  conceptId: recovered.conceptId || conceptId,
+                  conceptIds: recovered.conceptIds || conceptIds,
+                  subjectId: recovered.subjectId || subjectId,
+                  isProvisionalLocal: recovered.isProvisionalLocal || isProvisional,
+                  persisted: false,
+                  settled: false,
+                },
+                { status: 500 }
+              );
+            }
+
+            persisted = true;
+
+            const settleRes = await settleTrialCredit(auth.user.id, taskId, verifyRes.payload.leaseToken);
+            if (!settleRes.success) {
+              settlementError = settleRes.error;
+              settled = false;
+            } else {
+              settled = true;
+            }
+          } else {
+            persisted = true;
+            settled = true;
+          }
+
+          return NextResponse.json({
+            success: true,
+            evaluation: recovered.evaluation,
+            problemId: recovered.problemId || problemId,
+            conceptId: recovered.conceptId || conceptId,
+            conceptIds: recovered.conceptIds || conceptIds,
+            subjectId: recovered.subjectId || subjectId,
+            isProvisionalLocal: recovered.isProvisionalLocal || isProvisional,
+            fromCache: false,
+            persisted,
+            settled,
+            settlementError,
+            taskId,
+          });
+        }
+
         const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
         return NextResponse.json(
           {
@@ -554,6 +704,22 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      const authoritativeTaskId = saved.taskId || taskId;
+      let isSettled = saved.status === 'settled';
+      let settlementError: string | undefined;
+
+      if (!isSettled && saved.leaseToken) {
+        const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, saved.leaseToken);
+        if (!settleRes.success) {
+          settlementError = settleRes.error;
+          isSettled = false;
+        } else {
+          isSettled = true;
+        }
+      } else {
+        isSettled = true;
+      }
+
       return NextResponse.json({
         success: true,
         evaluation: cached.evaluation,
@@ -564,8 +730,9 @@ export async function POST(req: NextRequest) {
         isProvisionalLocal: cached.isProvisionalLocal || isProvisional,
         fromCache: true,
         persisted: true,
-        settled: true,
-        taskId: saved.taskId || taskId,
+        settled: isSettled,
+        settlementError,
+        taskId: authoritativeTaskId,
       });
     }
 
@@ -574,7 +741,6 @@ export async function POST(req: NextRequest) {
         taskId,
         taskType: 'evaluate_answer',
         inputIdentifier,
-        legacyInputIdentifier,
         isSaveRetry,
       };
 
@@ -605,7 +771,6 @@ export async function POST(req: NextRequest) {
         taskId,
         taskType: 'evaluate_answer',
         inputIdentifier,
-        legacyInputIdentifier,
         isSaveRetry,
       };
     }
@@ -625,6 +790,22 @@ export async function POST(req: NextRequest) {
           subjectId?: string;
           isProvisionalLocal?: boolean;
         };
+        const authoritativeTaskId = cred.taskId || taskId;
+        let isSettled = cred.dbStatus === 'settled';
+        let settlementError: string | undefined;
+
+        if (!isSettled && cred.creditSource === 'operator_trial' && cred.leaseToken) {
+          const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, cred.leaseToken);
+          if (!settleRes.success) {
+            settlementError = settleRes.error;
+            isSettled = false;
+          } else {
+            isSettled = true;
+          }
+        } else if (cred.creditSource === 'personal_key') {
+          isSettled = true;
+        }
+
         return NextResponse.json({
           success: true,
           evaluation: cached.evaluation,
@@ -635,8 +816,9 @@ export async function POST(req: NextRequest) {
           isProvisionalLocal: cached.isProvisionalLocal || isProvisional,
           fromCache: true,
           persisted: true,
-          settled: true,
-          taskId: cred.taskId || taskId,
+          settled: isSettled,
+          settlementError,
+          taskId: authoritativeTaskId,
         });
       }
       if (cred.code === 'concurrent_in_progress') {
@@ -1106,6 +1288,23 @@ ${
             { status: 409 }
           );
         }
+        const recoveryData = {
+          evaluation: evaluationResult,
+          problemId,
+          conceptId: finalReturnedConceptId,
+          conceptIds: authoritativeConceptIds,
+          subjectId,
+          isProvisionalLocal: isProvisional,
+        };
+        const signedRecoveryToken = signTaskRecoveryToken({
+          userId: auth.user.id,
+          taskId,
+          taskType: 'evaluate_answer',
+          inputIdentifier,
+          result: recoveryData,
+          leaseToken: cred.leaseToken,
+          modelId: cred.config.model,
+        });
         return NextResponse.json(
           {
             success: false,
@@ -1113,6 +1312,8 @@ ${
             errorCode: cacheRes.errorCode || 'PERSISTENCE_FAILED',
             canRetrySave: true,
             taskId,
+            signedRecoveryToken,
+            recoveryData,
             evaluation: evaluationResult,
             problemId,
             conceptId: finalReturnedConceptId,

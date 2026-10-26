@@ -34,9 +34,16 @@ import {
   previousApprovedTransfers,
   selectApprovedTransferProblem,
 } from '../lib/transferValidation';
-import { X, Sparkles, BrainCircuit, CheckCircle2, AlertTriangle, CalendarClock, Loader2, ShieldCheck, GitBranch, Trash2 } from 'lucide-react';
+import { X, Sparkles, BrainCircuit, CheckCircle2, AlertTriangle, CalendarClock, Loader2, ShieldCheck, GitBranch, Trash2, RotateCcw } from 'lucide-react';
+import {
+  saveTaskRecovery,
+  getTaskRecovery,
+  clearTaskRecovery,
+  type TaskRecoveryRecord,
+} from '../lib/taskRecoveryClient';
 
 interface LogicStrengthenModalProps {
+  userId?: string;
   isOpen: boolean;
   onClose: () => void;
   subject: Subject;
@@ -150,7 +157,9 @@ export function LogicStrengthenModal({
   onCancelReservation,
   onSaveTransferDraft,
   onStartTransferProblem,
+  userId,
 }: LogicStrengthenModalProps) {
+  const effectiveUserId = userId || subject.ownerId || 'default_user';
   const [session, setSessionState] = useState<LogicStrengthenSession>(() => {
     const attemptId = sourceAttempt.id;
     const activeId = getActiveLogicSessionId(attemptId);
@@ -177,6 +186,26 @@ export function LogicStrengthenModal({
   const [isGenerating, setIsGenerating] = useState(false);
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [isGeneratingTransfer, setIsGeneratingTransfer] = useState(false);
+  const [isRetryingSaveQuestions, setIsRetryingSaveQuestions] = useState(false);
+  const [isRetryingSaveTransfer, setIsRetryingSaveTransfer] = useState(false);
+  const sessionRecoveryKey = session.id && effectiveUserId ? `${effectiveUserId}:${session.id}` : '';
+  const [prevSessionRecoveryKey, setPrevSessionRecoveryKey] = useState(sessionRecoveryKey);
+  const [questionsRecovery, setQuestionsRecovery] = useState<TaskRecoveryRecord | null>(() =>
+    session.id && effectiveUserId ? getTaskRecovery(effectiveUserId, 'logic_questions', session.id) : null
+  );
+  const [transferRecovery, setTransferRecovery] = useState<TaskRecoveryRecord | null>(() =>
+    session.id && effectiveUserId ? getTaskRecovery(effectiveUserId, 'transfer_problem', session.id) : null
+  );
+
+  if (sessionRecoveryKey !== prevSessionRecoveryKey) {
+    setPrevSessionRecoveryKey(sessionRecoveryKey);
+    setQuestionsRecovery(
+      session.id && effectiveUserId ? getTaskRecovery(effectiveUserId, 'logic_questions', session.id) : null
+    );
+    setTransferRecovery(
+      session.id && effectiveUserId ? getTaskRecovery(effectiveUserId, 'transfer_problem', session.id) : null
+    );
+  }
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [saveWarning, setSaveWarning] = useState<string | null>(null);
@@ -311,13 +340,30 @@ export function LogicStrengthenModal({
         return;
       }
       if (!res.ok || !data.success) {
-        if (data.canRetrySave) {
-          setError(`${data.error || '질문 생성은 완료되었으나 서버 보존에 실패했습니다.'} (저장만 다시 시도할 수 있습니다.)`);
+        if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && effectiveUserId) {
+          const rec = {
+            taskId: data.taskId,
+            signedRecoveryToken: data.signedRecoveryToken,
+            recoveryData: data.recoveryData,
+            error: data.error,
+          };
+          saveTaskRecovery(effectiveUserId, 'logic_questions', session.id, rec);
+          setQuestionsRecovery({
+            ...rec,
+            userId: effectiveUserId,
+            taskType: 'logic_questions',
+            savedAt: new Date().toISOString(),
+          });
+          setError(`${data.error || '질문 생성은 완료되었으나 서버 보존에 실패했습니다.'} AI 재호출 없이 저장만 다시 시도할 수 있습니다.`);
         } else {
           setError(data.error || '핵심 질문 생성에 실패했습니다.');
         }
         return;
       }
+      if (effectiveUserId) {
+        clearTaskRecovery(effectiveUserId, 'logic_questions', session.id);
+      }
+      setQuestionsRecovery(null);
       const newVersion = latest.questionSetVersion + 1;
       const versioned = (data.questions as LogicStrengthenSession['questions']).map((q) => ({
         ...q,
@@ -360,6 +406,91 @@ export function LogicStrengthenModal({
     } finally {
       const { loading } = settleAsyncRequest(questionsTrackerRef.current, requestId);
       if (mountedRef.current) setIsGenerating(loading);
+    }
+  };
+
+  const handleRetrySaveQuestions = async () => {
+    if (!questionsRecovery || isRetryingSaveQuestions) return;
+    const base = sessionRef.current;
+    setIsRetryingSaveQuestions(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/logic-questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: subject.id,
+          domain: subject.domain || 'math_stats',
+          problemTitle: base.problemTitleSnapshot,
+          problemPrompt: base.problemPromptSnapshot,
+          modelAnswer: base.modelAnswerSnapshot,
+          rubric: base.rubricSnapshot,
+          originalAnswer: base.originalAnswer,
+          solvingReason: base.originalSolvingReason,
+          diagnosisSummary: base.originalDiagnosisSummary,
+          isSaveRetry: true,
+          action: 'retry_save',
+          taskId: questionsRecovery.taskId,
+          signedRecoveryToken: questionsRecovery.signedRecoveryToken,
+          recoveryData: questionsRecovery.recoveryData,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        if (data.signedRecoveryToken && data.recoveryData && effectiveUserId) {
+          saveTaskRecovery(effectiveUserId, 'logic_questions', base.id, {
+            taskId: data.taskId || questionsRecovery.taskId,
+            signedRecoveryToken: data.signedRecoveryToken,
+            recoveryData: data.recoveryData,
+            error: data.error,
+          });
+        }
+        setError(data.error || '질문 저장 재시도에 실패했습니다.');
+        return;
+      }
+      if (effectiveUserId) {
+        clearTaskRecovery(effectiveUserId, 'logic_questions', base.id);
+      }
+      setQuestionsRecovery(null);
+      const latest = sessionRef.current;
+      const newVersion = latest.questionSetVersion + 1;
+      const versioned = (data.questions as LogicStrengthenSession['questions']).map((q) => ({
+        ...q,
+        id: `v${newVersion}-${q.id}`,
+      }));
+      const archived: LogicQuestionSet[] =
+        latest.questions.length > 0
+          ? [
+              ...latest.questionSets,
+              {
+                version: latest.questionSetVersion,
+                questions: latest.questions,
+                answers: latest.questionAnswers,
+                generatedAt: latest.questionsGeneratedAt || new Date().toISOString(),
+                model: latest.questionsModel,
+                inputHash: latest.questionsInputHash || '',
+              },
+            ]
+          : latest.questionSets;
+      updateSession({
+        questions: versioned,
+        questionAnswers: {},
+        questionSetVersion: newVersion,
+        questionSets: archived,
+        questionsGeneratedAt: new Date().toISOString(),
+        questionsModel: data.model,
+        questionsInputHash: latest.questionsInputHash,
+        status: latest.revisedEvaluation ? latest.status : 'questions_ready',
+      });
+      if (data.settlementError || data.settled === false) {
+        setNotice(`질문 세트 v${newVersion}이 저장되었습니다. (참고: 크레딧 정산 지연 - ${data.settlementError || '정산 대기'})`);
+      } else {
+        setNotice(`질문 세트 v${newVersion}이 성공적으로 저장되었습니다.`);
+      }
+    } catch (cause) {
+      setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+    } finally {
+      setIsRetryingSaveQuestions(false);
     }
   };
 
@@ -630,13 +761,30 @@ export function LogicStrengthenModal({
         return;
       }
       if (!res.ok || !data.success) {
-        if (data.canRetrySave) {
-          setError(`${data.error || '전이 문제 생성은 완료되었으나 서버 보존에 실패했습니다.'} (저장만 다시 시도할 수 있습니다.)`);
+        if (data.canRetrySave && data.signedRecoveryToken && data.recoveryData && effectiveUserId) {
+          const rec = {
+            taskId: data.taskId,
+            signedRecoveryToken: data.signedRecoveryToken,
+            recoveryData: data.recoveryData,
+            error: data.error,
+          };
+          saveTaskRecovery(effectiveUserId, 'transfer_problem', session.id, rec);
+          setTransferRecovery({
+            ...rec,
+            userId: effectiveUserId,
+            taskType: 'transfer_problem',
+            savedAt: new Date().toISOString(),
+          });
+          setError(`${data.error || '전이 문제 생성은 완료되었으나 서버 보존에 실패했습니다.'} AI 재호출 없이 저장만 다시 시도할 수 있습니다.`);
         } else {
           setError(data.error || '전이 문제 생성에 실패했습니다.');
         }
         return;
       }
+      if (effectiveUserId) {
+        clearTaskRecovery(effectiveUserId, 'transfer_problem', session.id);
+      }
+      setTransferRecovery(null);
       const latest = sessionRef.current;
       const draftVersion = (latest.transferDraftVersion || 0) + 1;
       const now = new Date().toISOString();
@@ -722,6 +870,136 @@ export function LogicStrengthenModal({
     }
   };
 
+  const handleRetrySaveTransfer = async () => {
+    if (!transferRecovery || isRetryingSaveTransfer) return;
+    const base = sessionRef.current;
+    setIsRetryingSaveTransfer(true);
+    setError(null);
+    try {
+      const vulnerable = base.originalRubricResults
+        .filter((r) => r.isVulnerable || r.score < r.maxScore * 0.6)
+        .map((r) => r.label);
+      const res = await fetch('/api/transfer-problem', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subjectId: subject.id,
+          domain: subject.domain || 'math_stats',
+          problemTitle: base.problemTitleSnapshot,
+          problemPrompt: base.problemPromptSnapshot,
+          modelAnswer: base.modelAnswerSnapshot,
+          rubric: base.rubricSnapshot,
+          originalAnswer: base.originalAnswer,
+          revisedAnswer: base.revisedEvaluatedAnswer || base.revisedAnswer,
+          revisedAnswerConfirmed: Boolean(base.revisedAttemptId),
+          vulnerableCriteria: vulnerable,
+          concepts: [{ id: concept.id, title: concept.title }],
+          problemType: problem.type,
+          difficulty: problem.difficulty || 'advanced_college',
+          isSaveRetry: true,
+          action: 'retry_save',
+          taskId: transferRecovery.taskId,
+          signedRecoveryToken: transferRecovery.signedRecoveryToken,
+          recoveryData: transferRecovery.recoveryData,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        if (data.signedRecoveryToken && data.recoveryData && effectiveUserId) {
+          saveTaskRecovery(effectiveUserId, 'transfer_problem', base.id, {
+            taskId: data.taskId || transferRecovery.taskId,
+            signedRecoveryToken: data.signedRecoveryToken,
+            recoveryData: data.recoveryData,
+            error: data.error,
+          });
+        }
+        setError(data.error || '전이 문제 저장 재시도에 실패했습니다.');
+        return;
+      }
+      if (effectiveUserId) {
+        clearTaskRecovery(effectiveUserId, 'transfer_problem', base.id);
+      }
+      setTransferRecovery(null);
+      const latest = sessionRef.current;
+      const draftVersion = (latest.transferDraftVersion || 0) + 1;
+      const now = new Date().toISOString();
+      const draft: ProblemDraft = {
+        id: `draft-transfer-${latest.id}-v${draftVersion}`,
+        subjectId: subject.id,
+        conceptIds: data.draft.conceptIds,
+        conceptTitles: [concept.title],
+        title: data.draft.title,
+        type: data.draft.type,
+        difficulty: data.draft.difficulty,
+        categoryLabel: '전이 문제 (조건 변형)',
+        categoryNumber: 0,
+        promptText: data.draft.promptText,
+        mathFormula: data.draft.mathFormula,
+        codeSnippet: data.draft.codeSnippet,
+        designIntent: data.draft.designIntent,
+        appliedConditionNote: data.draft.transferChanges,
+        sourceRefs: data.draft.sourceRefs,
+        sourceEvidenceQuote: data.draft.evidenceQuote,
+        sourceMarkdownHash: latest.sourceMarkdownHash,
+        sourceMaterials: latest.sourceMaterials,
+        timeStandardMinutes: data.draft.timeStandardMinutes,
+        timeBreakdownDesc: `${data.draft.timeStandardMinutes}분 (조건 분석 및 전이 적용)`,
+        coreEvaluationHighlight: data.draft.understandingFocus,
+        itemCountDesc: '전이 문제 1문항',
+        modelAnswer: data.draft.modelAnswer,
+        rubric: data.draft.rubric,
+        hints: data.draft.hints,
+        status: data.draft.numericOnlySuspected ? 'needs_review' : 'draft',
+        isApproved: false,
+        isDemo: false,
+        verificationStatus: {
+          hasRequiredFields: true,
+          isScore100: true,
+          scoreSum: 100,
+          hasConceptLink: true,
+          isSourceVerified: false,
+          note: [
+            `변형 유형: ${data.draft.transferKind}`,
+            `원래 조건: ${data.draft.originalCondition}`,
+            `바뀐 조건: ${data.draft.newCondition}`,
+            data.draft.answerEvidenceVerified ? '원답안 인용 확인됨' : '원답안 인용 없음(자료 근거 미확인)',
+            data.draft.numericOnlySuspected ? '숫자/변수명만 바뀐 것으로 의심됨 — 검토 필요' : '',
+          ]
+            .filter(Boolean)
+            .join(' | '),
+        },
+        createdAt: now,
+        updatedAt: now,
+        isTransfer: true,
+        sourceProblemId: problem.id,
+        logicSessionId: latest.id,
+        transferChanges: data.draft.transferChanges,
+        understandingFocus: data.draft.understandingFocus,
+        transferKind: data.draft.transferKind,
+        originalCondition: data.draft.originalCondition,
+        newCondition: data.draft.newCondition,
+      };
+      if (!onSaveTransferDraft(draft)) {
+        setError('전이 문제 초안 저장에 실패했습니다. 이전 초안은 유지됩니다.');
+        return;
+      }
+      updateSession({
+        transferDraftId: draft.id,
+        transferDraftVersion: draftVersion,
+        transferInputHash: transferInputHashFor(sessionRef.current),
+      });
+      if (data.settlementError || data.settled === false) {
+        setNotice(`전이 문제 초안 v${draftVersion}이 저장되었습니다. (참고: 크레딧 정산 지연 - ${data.settlementError || '정산 대기'})`);
+      } else {
+        setNotice(`전이 문제 초안 v${draftVersion}이 성공적으로 저장되었습니다.`);
+      }
+    } catch (cause) {
+      setError(`네트워크 오류: ${cause instanceof Error ? cause.message : '알 수 없는 오류'}`);
+    } finally {
+      setIsRetryingSaveTransfer(false);
+    }
+  };
+
   const handleReserveTransfer = () => {
     if (!approvedTransferProblem) {
       setError('전이 문제를 먼저 승인해 주세요.');
@@ -778,7 +1056,35 @@ export function LogicStrengthenModal({
               이전 회차를 보는 중입니다(읽기 전용). 최근 회차로 돌아가려면 아래 회차 목록에서 선택하세요.
             </p>
           )}
-          {error && <p role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800 text-xs">{error}</p>}
+          {error && (
+            <div role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800 text-xs space-y-2">
+              <p>{error}</p>
+              <div className="flex flex-wrap items-center gap-2">
+                {questionsRecovery && (
+                  <button
+                    type="button"
+                    onClick={handleRetrySaveQuestions}
+                    disabled={isRetryingSaveQuestions}
+                    className="flex items-center gap-1.5 px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-xs font-bold transition-colors"
+                  >
+                    {isRetryingSaveQuestions ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                    <span>질문 저장만 다시 시도 (AI 미호출)</span>
+                  </button>
+                )}
+                {transferRecovery && (
+                  <button
+                    type="button"
+                    onClick={handleRetrySaveTransfer}
+                    disabled={isRetryingSaveTransfer}
+                    className="flex items-center gap-1.5 px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-xs font-bold transition-colors"
+                  >
+                    {isRetryingSaveTransfer ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                    <span>전이 문제 저장만 다시 시도 (AI 미호출)</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
           {notice && <p role="status" className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs">{notice}</p>}
           {saveWarning && <p role="alert" className="p-3 bg-amber-50 border border-amber-300 text-amber-900 text-xs">{saveWarning}</p>}
 

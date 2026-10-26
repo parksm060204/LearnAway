@@ -18240,6 +18240,364 @@ exports.requireApiUser = async () => {
     });
   });
 
+  await checkAsync('버그 1: 서로 다른 문제의 평가 캐시 충돌 방지 및 문제 스냅샷 격리 검증', async () => {
+    const { POST: evaluatePost } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+    const testUser = { id: 'u-eval-cache-isolation' };
+    const registeredTasks = [];
+
+    const rpcSpy = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        registeredTasks.push({ ...args });
+        return {
+          data: {
+            allowed: true,
+            status: 'processing',
+            lease_token: 'lease-eval-iso',
+            task_id: args.p_task_id,
+          },
+          error: null,
+        };
+      }
+      if (fn === 'consume_ai_call_budget') {
+        return { data: { allowed: true }, error: null };
+      }
+      if (fn === 'record_trial_result_ready' || fn === 'settle_trial_credit') {
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    aiModule.callAiChat = async () => ({
+      ok: true,
+      content: JSON.stringify({
+        calculatedScore: 100,
+        rubricResults: [{ criterionId: 'r1', score: 100, feedback: '완벽', evidence: '2', isVulnerable: false }],
+        feedback: '만점',
+        strengths: ['정확함'],
+        criticalImprovements: [],
+        needsReview: false,
+        academicErrorType: 'NO_ERROR',
+        methodSelectionDiagnosis: {
+          summary: '적절',
+          ratings: { appropriate_method: 'proficient', precondition_understanding: 'proficient', constraint_alignment: 'proficient', alternatives_limitations: 'proficient' },
+        },
+      }),
+      model: 'deepseek-v4.1-flash',
+    });
+
+    await withFakeSupabase({ user: testUser, rpcImpl: rpcSpy }, async () => {
+      // 1. isProvisionalLocal=true이고 problemId 없는 문제 A (1+1=2) vs 문제 B (9+9=18), 동일한 학생 답안 "2"
+      const resA = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          isProvisionalLocal: true,
+          conceptId: 'c1',
+          subjectId: 's1',
+          domain: 'math_stats',
+          problemTitle: '문제 A',
+          problemPrompt: '1+1은 얼마인가?',
+          modelAnswer: '2',
+          rubric: [{ id: 'r1', label: '정답성', maxScore: 100, description: '답 2' }],
+          userAnswer: '2',
+          revealedHintCount: 0,
+        }),
+      }));
+      assert.equal(resA.status, 200);
+
+      const resB = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          isProvisionalLocal: true,
+          conceptId: 'c1',
+          subjectId: 's1',
+          domain: 'math_stats',
+          problemTitle: '문제 B',
+          problemPrompt: '9+9는 얼마인가?',
+          modelAnswer: '18',
+          rubric: [{ id: 'r1', label: '정답성', maxScore: 100, description: '답 18' }],
+          userAnswer: '2',
+          revealedHintCount: 0,
+        }),
+      }));
+      assert.equal(resB.status, 200);
+
+      assert.equal(registeredTasks.length, 2);
+      assert.notEqual(registeredTasks[0].p_input_identifier, registeredTasks[1].p_input_identifier, '서로 다른 로컬 문제는 학생 답안이 같아도 입력 식별자가 서로 달라야 함');
+      assert.notEqual(registeredTasks[0].p_task_id, registeredTasks[1].p_task_id, '서로 다른 로컬 문제는 작업 ID가 달라야 함');
+
+      // 2. 동일 문제에서 모범답안만 변경된 경우
+      await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          isProvisionalLocal: true,
+          conceptId: 'c1',
+          subjectId: 's1',
+          domain: 'math_stats',
+          problemTitle: '문제 A',
+          problemPrompt: '1+1은 얼마인가?',
+          modelAnswer: '2 (또는 이진수 10)',
+          rubric: [{ id: 'r1', label: '정답성', maxScore: 100, description: '답 2' }],
+          userAnswer: '2',
+          revealedHintCount: 0,
+        }),
+      }));
+      assert.notEqual(registeredTasks[2].p_input_identifier, registeredTasks[0].p_input_identifier, '모범답안만 변경되어도 입력 식별자가 갱신되어 이전 캐시를 재사용하지 않아야 함');
+
+      // 3. 동일 문제에서 루브릭 설명(description)만 변경된 경우
+      await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          isProvisionalLocal: true,
+          conceptId: 'c1',
+          subjectId: 's1',
+          domain: 'math_stats',
+          problemTitle: '문제 A',
+          problemPrompt: '1+1은 얼마인가?',
+          modelAnswer: '2',
+          rubric: [{ id: 'r1', label: '정답성', maxScore: 100, description: '답 2 및 풀이 과정 명시 시 100점' }],
+          userAnswer: '2',
+          revealedHintCount: 0,
+        }),
+      }));
+      assert.notEqual(registeredTasks[3].p_input_identifier, registeredTasks[0].p_input_identifier, '루브릭 설명만 변경되어도 입력 식별자가 달라져야 함');
+    });
+  });
+
+  await checkAsync('버그 2: 결과 보존 실패 후 서명된 복구 토큰 기반 저장만 재시도 및 변조 거부 검증', async () => {
+    const { POST: evaluatePost } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+    const testUser = { id: 'u-recovery-tester' };
+    let aiCallCount = 0;
+    let persistenceShouldFail = true;
+    const recordedResults = [];
+
+    const rpcSpy = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        return {
+          data: {
+            allowed: true,
+            status: 'processing',
+            lease_token: 'lease-rec-123',
+            task_id: args.p_task_id,
+          },
+          error: null,
+        };
+      }
+      if (fn === 'consume_ai_call_budget') {
+        return { data: { allowed: true }, error: null };
+      }
+      if (fn === 'record_trial_result_ready') {
+        if (persistenceShouldFail) {
+          return { data: { success: false, error: 'DB disk full' }, error: null };
+        }
+        recordedResults.push(args);
+        return { data: { success: true }, error: null };
+      }
+      if (fn === 'settle_trial_credit') {
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    aiModule.callAiChat = async () => {
+      aiCallCount++;
+      return {
+        ok: true,
+        content: JSON.stringify({
+          calculatedScore: 90,
+          rubricResults: [{ criterionId: 'r1', score: 90, feedback: '우수', evidence: '풀이', isVulnerable: false }],
+          feedback: '피드백',
+          strengths: ['강점'],
+          criticalImprovements: [],
+          needsReview: false,
+          academicErrorType: 'CALCULATION_ERROR',
+          methodSelectionDiagnosis: {
+            summary: '방법 적절',
+            ratings: { appropriate_method: 'proficient', precondition_understanding: 'proficient', constraint_alignment: 'proficient', alternatives_limitations: 'proficient' },
+          },
+        }),
+        model: 'deepseek-v4.1-flash',
+      };
+    };
+
+    let data1;
+    const evalPayload = {
+      isProvisionalLocal: true,
+      conceptId: 'c-rec',
+      subjectId: 's-rec',
+      domain: 'math_stats',
+      problemTitle: '복구 테스트 문제',
+      problemPrompt: '지문 내용',
+      modelAnswer: '모범 답안',
+      rubric: [{ id: 'r1', label: '정확성', maxScore: 100, description: '설명' }],
+      userAnswer: '내 답안',
+      revealedHintCount: 0,
+    };
+
+    await withFakeSupabase({ user: testUser, rpcImpl: rpcSpy }, async () => {
+      // 1. AI 생성은 성공했으나 결과 서버 보존 실패 주입
+      const res1 = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(evalPayload),
+      }));
+      assert.equal(res1.status, 500);
+      data1 = await res1.json();
+      assert.equal(data1.canRetrySave, true, '결과 보존 실패 시 canRetrySave: true 반환');
+      assert.ok(data1.signedRecoveryToken, '서명된 복구 토큰 발급');
+      assert.ok(data1.recoveryData, '복구 데이터 반환');
+      assert.equal(aiCallCount, 1, '최초 AI 호출 1회 발생');
+
+      // 2. 변조된 복구 토큰으로 재시도 -> 거부
+      const resTampered = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...evalPayload,
+          isSaveRetry: true,
+          action: 'retry_save',
+          taskId: data1.taskId,
+          signedRecoveryToken: data1.signedRecoveryToken + 'tampered',
+          recoveryData: data1.recoveryData,
+        }),
+      }));
+      assert.equal(resTampered.status, 400, '변조된 토큰은 거부되어야 함');
+      assert.equal(aiCallCount, 1, '거부 중 외부 AI 재호출 없어야 함');
+    });
+
+    // 3. 다른 사용자가 복구 시도 -> 거부
+    await withFakeSupabase({ user: { id: 'u-other-intruder' }, rpcImpl: rpcSpy }, async () => {
+      const resOther = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...evalPayload,
+          isSaveRetry: true,
+          action: 'retry_save',
+          taskId: data1.taskId,
+          signedRecoveryToken: data1.signedRecoveryToken,
+          recoveryData: data1.recoveryData,
+        }),
+      }));
+      assert.equal(resOther.status, 400, '다른 사용자의 복구 토큰은 거부');
+    });
+
+    // 4. 원래 사용자로서 정상 저장 재시도 (DB 정상화)
+    persistenceShouldFail = false;
+    await withFakeSupabase({ user: testUser, rpcImpl: rpcSpy }, async () => {
+      const resRetry = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...evalPayload,
+          isSaveRetry: true,
+          action: 'retry_save',
+          taskId: data1.taskId,
+          signedRecoveryToken: data1.signedRecoveryToken,
+          recoveryData: data1.recoveryData,
+        }),
+      }));
+      const dataRetry = await resRetry.json();
+      assert.equal(resRetry.status, 200, '저장 재시도 성공: ' + (dataRetry.error || JSON.stringify(dataRetry)));
+      assert.equal(dataRetry.success, true);
+      assert.equal(dataRetry.evaluation.calculatedScore, 90);
+      assert.equal(aiCallCount, 1, '전체 과정에서 외부 AI 호출은 최초 1회만 유지 (AI 미호출)');
+      assert.equal(recordedResults.length, 1, '서버 DB에 결과가 정상 보존됨');
+    });
+  });
+
+  await checkAsync('버그 3: 캐시 존재를 정산 완료로 오인하지 않고 실제 DB status에 따른 멱등 정산 검증', async () => {
+    const { POST: evaluatePost } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+    const testUser = { id: 'u-settle-tester' };
+    const settledTasks = [];
+    let dbStatus = 'result_ready'; // Persistence completed, but settlement pending/failed
+    let settlementShouldFail = true;
+
+    const rpcSpy = (fn, args) => {
+      if (fn === 'register_ai_task') {
+        // Return already_completed with cached_result and db_status
+        return {
+          data: {
+            allowed: true,
+            status: 'already_completed',
+            db_status: dbStatus,
+            task_id: 'task-auth-origin-1',
+            lease_token: 'lease-auth-origin-1',
+            credit_source: 'operator_trial',
+            cached_result: {
+              evaluation: { calculatedScore: 85, rubricResults: [] },
+            },
+          },
+          error: null,
+        };
+      }
+      if (fn === 'settle_trial_credit') {
+        settledTasks.push({ ...args });
+        if (settlementShouldFail) {
+          return { data: { success: false, error: 'Settlement RPC timeout' }, error: null };
+        }
+        return { data: { success: true }, error: null };
+      }
+      return { data: null, error: null };
+    };
+
+    await withFakeSupabase({ user: testUser, rpcImpl: rpcSpy }, async () => {
+      const payload = {
+        isProvisionalLocal: true,
+        conceptId: 'c-set',
+        subjectId: 's-set',
+        domain: 'math_stats',
+        problemTitle: '정산 테스트',
+        problemPrompt: '지문',
+        modelAnswer: '모범 답안',
+        rubric: [{ id: 'r1', label: '정확성', maxScore: 100, description: '설명' }],
+        userAnswer: '내 답안',
+        revealedHintCount: 0,
+      };
+
+      // 1. result_ready 상태에서 캐시 재조회 시 settlement 재시도 발생하나 실패하는 경우: settled: false 반환
+      const res1 = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }));
+      assert.equal(res1.status, 200);
+      const data1 = await res1.json();
+      assert.equal(data1.settled, false, '정산 실패 시 settled는 false여야 함 (캐시 존재=정산 완료 오인 금지)');
+      assert.ok(data1.settlementError, '정산 실패 사유가 포함되어야 함');
+      assert.equal(settledTasks.length, 1);
+      assert.equal(settledTasks[0].p_task_id, 'task-auth-origin-1', '권위 있는 기존 작업 ID로 정산 시도');
+      assert.equal(settledTasks[0].p_lease_token, 'lease-auth-origin-1', '기존 작업의 권위 있는 leaseToken 사용');
+
+      // 2. 정산 정상화 후 재조회: 멱등 정산 재시도 성공 및 settled: true 반환
+      settlementShouldFail = false;
+      const res2 = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }));
+      assert.equal(res2.status, 200);
+      const data2 = await res2.json();
+      assert.equal(data2.settled, true, '정산 재시도 성공 시 settled: true');
+      assert.equal(settledTasks.length, 2);
+
+      // 3. DB가 이미 'settled'로 완료된 경우: 중복 settle_trial_credit 호출 없이 settled: true 반환
+      dbStatus = 'settled';
+      const res3 = await evaluatePost(new NextRequest('http://localhost/api/evaluate-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }));
+      assert.equal(res3.status, 200);
+      const data3 = await res3.json();
+      assert.equal(data3.settled, true);
+      assert.equal(settledTasks.length, 2, '이미 settled 상태인 경우 불필요한 중복 정산 RPC 미발생');
+    });
+  });
+
     if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
   else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
   AI_CONFIG.apiKey = savedApiKeyPlan03;
