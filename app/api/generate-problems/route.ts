@@ -573,7 +573,7 @@ ${combinedSource}
         executionTimeMs: aiExecutionTimeMs,
         status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
         errorCode: aiCall.error.code,
-        creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+        creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
         inputText: userPrompt,
       });
 
@@ -599,7 +599,7 @@ ${combinedSource}
       outputText: content,
       executionTimeMs: aiExecutionTimeMs,
       status: 'success',
-      creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+      creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
     });
 
       const cleanedJson = content.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();

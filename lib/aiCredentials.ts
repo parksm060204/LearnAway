@@ -161,6 +161,7 @@ export function operatorFallbackAllowed(env: Record<string, string | undefined> 
 import {
   registerAiTask,
   isOperatorEmergencyStopped,
+  checkOperatorDailyUsage,
   type TrialTaskType,
 } from './trialCredits';
 
@@ -481,6 +482,7 @@ export async function resolveAiConfigForUser(
       return {
         ok: false,
         code: 'operator_disabled',
+        errorCode: reservation.errorCode,
         needsAiConnection: true,
         message: reservation.message || '운영자 AI 체험 제공 한도가 초과되었거나 점검 중입니다.',
       };
@@ -495,9 +497,27 @@ export async function resolveAiConfigForUser(
 
   // Confirmed unregistered: operator key only under an explicit policy.
   if (operatorFallbackAllowed()) {
+    if (isOperatorEmergencyStopped()) {
+      return {
+        ok: false,
+        code: 'operator_disabled',
+        needsAiConnection: true,
+        message: '운영자 AI 체험 서비스가 일시 점검 중입니다. 설정 > 내 AI API 연결에서 개인 API 키를 등록해 주세요.',
+      };
+    }
+    const isDailyCapExceeded = await checkOperatorDailyUsage();
+    if (isDailyCapExceeded) {
+      return {
+        ok: false,
+        code: 'operator_disabled',
+        errorCode: 'OPERATOR_DAILY_CAP_EXCEEDED',
+        needsAiConnection: true,
+        message: '금일 운영자 AI 체험 제공 한도가 초과되었습니다. 내일 다시 이용하시거나 개인 API 키를 등록해 주세요.',
+      };
+    }
     const operatorConfig = resolveOperatorAiConfig();
     if (operatorConfig) {
-      return { ok: true, source: 'operator', config: operatorConfig };
+      return { ok: true, source: 'operator', isTrial: true, config: operatorConfig };
     }
   }
   return {

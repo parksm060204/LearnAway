@@ -66,46 +66,87 @@ export async function POST(req: NextRequest) {
     }
 
     const admin = createAdminClient();
-    const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0].trim() || 'unknown';
+    const forwardedHeader = req.headers.get('x-forwarded-for');
+    const realIpHeader = req.headers.get('x-real-ip');
+    const clientIp = (forwardedHeader ? forwardedHeader.split(',')[0].trim() : '') || realIpHeader?.trim() || '127.0.0.1';
 
-    // 1. Persistent Server-Side Rate Limiting via DB
-    if (action === 'register') {
-      const { data: allowed, error: rateErr } = await admin.rpc('check_and_increment_rate_limit', {
-        p_key: `auth_reg_ip:${clientIp}`,
-        p_max_attempts: 5,
-        p_window_seconds: 900, // 5 signups per 15 minutes per IP
-      });
-      if (!rateErr && allowed === false) {
+    async function evaluateRateLimit(
+      key: string,
+      maxAttempts: number,
+      windowSeconds: number,
+      exceededMessage: string
+    ): Promise<NextResponse | null> {
+      try {
+        const { data: allowed, error: rateErr } = await admin.rpc('check_and_increment_rate_limit', {
+          p_key: key,
+          p_max_attempts: maxAttempts,
+          p_window_seconds: windowSeconds,
+        });
+
+        if (rateErr || typeof allowed !== 'boolean') {
+          return NextResponse.json(
+            {
+              success: false,
+              code: 'RATE_LIMIT_CHECK_FAILED',
+              errorCode: 'RATE_LIMIT_CHECK_FAILED',
+              error: '인증 서비스 확인 중 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+            },
+            { status: 503 }
+          );
+        }
+
+        if (allowed === false) {
+          return NextResponse.json(
+            {
+              success: false,
+              code: 'RATE_LIMIT_EXCEEDED',
+              errorCode: 'RATE_LIMIT_EXCEEDED',
+              error: exceededMessage,
+            },
+            { status: 429 }
+          );
+        }
+
+        return null;
+      } catch {
         return NextResponse.json(
-          { success: false, code: 'RATE_LIMIT_EXCEEDED', errorCode: 'RATE_LIMIT_EXCEEDED', error: '가입 요청이 너무 많습니다. 15분 후 다시 시도해 주세요.' },
-          { status: 429 }
+          {
+            success: false,
+            code: 'RATE_LIMIT_CHECK_FAILED',
+            errorCode: 'RATE_LIMIT_CHECK_FAILED',
+            error: '인증 서비스 확인 중 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+          },
+          { status: 503 }
         );
       }
+    }
+
+    // 1. Persistent Server-Side Rate Limiting via DB (strictly fail-closed)
+    if (action === 'register') {
+      const regLimitRes = await evaluateRateLimit(
+        `auth_reg_ip:${clientIp}`,
+        5,
+        900,
+        '가입 요청이 너무 많습니다. 15분 후 다시 시도해 주세요.'
+      );
+      if (regLimitRes) return regLimitRes;
     } else {
       // Login rate limiting: by IP and by username
-      const { data: allowedIp } = await admin.rpc('check_and_increment_rate_limit', {
-        p_key: `auth_login_ip:${clientIp}`,
-        p_max_attempts: 15,
-        p_window_seconds: 300,
-      });
-      if (allowedIp === false) {
-        return NextResponse.json(
-          { success: false, code: 'RATE_LIMIT_EXCEEDED', errorCode: 'RATE_LIMIT_EXCEEDED', error: '로그인 시도가 너무 많습니다. 5분 후 다시 시도해 주세요.' },
-          { status: 429 }
-        );
-      }
+      const ipLimitRes = await evaluateRateLimit(
+        `auth_login_ip:${clientIp}`,
+        15,
+        300,
+        '로그인 시도가 너무 많습니다. 5분 후 다시 시도해 주세요.'
+      );
+      if (ipLimitRes) return ipLimitRes;
 
-      const { data: allowedUser } = await admin.rpc('check_and_increment_rate_limit', {
-        p_key: `auth_login_user:${normalized}`,
-        p_max_attempts: 5,
-        p_window_seconds: 300,
-      });
-      if (allowedUser === false) {
-        return NextResponse.json(
-          { success: false, code: 'RATE_LIMIT_EXCEEDED', errorCode: 'RATE_LIMIT_EXCEEDED', error: '해당 아이디의 연속된 로그인 실패로 일시 차단되었습니다. 5분 후 다시 시도해 주세요.' },
-          { status: 429 }
-        );
-      }
+      const userLimitRes = await evaluateRateLimit(
+        `auth_login_user:${normalized}`,
+        5,
+        300,
+        '해당 아이디의 연속된 로그인 실패로 일시 차단되었습니다. 5분 후 다시 시도해 주세요.'
+      );
+      if (userLimitRes) return userLimitRes;
     }
 
     const syntheticEmail = usernameToEmail(normalized);
@@ -154,7 +195,7 @@ export async function POST(req: NextRequest) {
           );
         }
         return NextResponse.json(
-          { success: false, error: `계정 생성 중 오류가 발생했습니다: ${msg}` },
+          { success: false, error: '계정 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.' },
           { status: 500 }
         );
       }
@@ -249,9 +290,9 @@ export async function POST(req: NextRequest) {
     }
 
     return NextResponse.json({ success: false, error: '지원하지 않는 동작입니다.' }, { status: 400 });
-  } catch (error) {
+  } catch {
     return NextResponse.json(
-      { success: false, error: error instanceof Error ? error.message : '요청 처리 중 오류가 발생했습니다.' },
+      { success: false, error: '요청 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.' },
       { status: 500 }
     );
   }

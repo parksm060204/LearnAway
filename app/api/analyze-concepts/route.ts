@@ -731,10 +731,177 @@ export async function POST(req: NextRequest) {
     }
 
     if (!cred.ok && cred.code === 'already_completed' && action !== 'status' && action !== 'retry_save') {
+      const cached = cred.cachedResult as Record<string, unknown> | null;
+      // 1. Verify user / subject / material / input ownership
+      if (cached && typeof cached === 'object') {
+        if (cached.userId && cached.userId !== auth.user.id) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: '다른 사용자의 분석 캐시 결과를 재사용할 수 없습니다.',
+              errorCode: 'TASK_OWNERSHIP_MISMATCH',
+            },
+            { status: 403 }
+          );
+        }
+        if (cached.subjectId && session.subjectId && cached.subjectId !== session.subjectId) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: '과목 식별자가 캐시된 작업 결과와 일치하지 않습니다.',
+              errorCode: 'TASK_SUBJECT_MISMATCH',
+            },
+            { status: 400 }
+          );
+        }
+        if (cached.materialId && session.materialId && cached.materialId !== session.materialId) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: '자료 식별자가 캐시된 작업 결과와 일치하지 않습니다.',
+              errorCode: 'TASK_MATERIAL_MISMATCH',
+            },
+            { status: 400 }
+          );
+        }
+        if (cached.markdownHash && session.markdownHash && cached.markdownHash !== session.markdownHash) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: '자료 본문 해시가 캐시된 작업 결과와 일치하지 않습니다.',
+              errorCode: 'TASK_INPUT_MISMATCH',
+            },
+            { status: 400 }
+          );
+        }
+      }
+
       const progress = getSessionProgress(session);
-      const cachedDrafts = (cred.cachedResult && typeof cred.cachedResult === 'object' && Array.isArray((cred.cachedResult as { drafts?: unknown[] }).drafts))
-        ? (cred.cachedResult as { drafts: ConceptDraft[] }).drafts
+      const cachedDrafts: ConceptDraft[] = (cached && Array.isArray(cached.drafts))
+        ? (cached.drafts as ConceptDraft[])
         : progress.allDrafts;
+
+      // Check chunk status: verify if all chunks are actually complete
+      let chunksAllDone = false;
+      if (cached && typeof cached.isAllComplete === 'boolean') {
+        chunksAllDone = cached.isAllComplete;
+      } else if (progress.status === 'completed' || progress.isAllComplete) {
+        chunksAllDone = true;
+      } else if (session.totalChunks > 0 && progress.completedChunks >= session.totalChunks) {
+        chunksAllDone = true;
+      } else if (cached && cached.completedChunks !== undefined && cached.totalChunks !== undefined) {
+        chunksAllDone = Number(cached.completedChunks) >= Number(cached.totalChunks);
+      }
+
+      // 2. Separate AI cache from persistence: Check whether drafts are persisted or need persistence
+      let persistOutcome: { persisted: boolean; drafts: ConceptDraft[]; persistError?: string } = {
+        persisted: false,
+        drafts: cachedDrafts.length > 0 ? cachedDrafts : progress.allDrafts,
+        persistError: undefined,
+      };
+
+      if (supabaseClient && persistOutcome.drafts.length > 0) {
+        // Read-back verification first: check if already in DB
+        const draftIds = persistOutcome.drafts.map((d) => d.id);
+        let allInDb = false;
+        try {
+          const { data: dbDrafts, error: checkErr } = await supabaseClient
+            .from('concept_drafts')
+            .select('id')
+            .in('id', draftIds);
+          if (!checkErr && dbDrafts && dbDrafts.length === draftIds.length) {
+            allInDb = true;
+            persistOutcome.persisted = true;
+          }
+        } catch {
+          allInDb = false;
+        }
+
+        // If not all drafts in DB, attempt save without re-calling paid AI
+        if (!allInDb) {
+          try {
+            persistOutcome = await persistConceptDraftsForResponse(
+              supabaseClient,
+              persistOutcome.drafts,
+              `gen_${jobKey}`
+            );
+            // Read-back verification after save
+            if (persistOutcome.persisted) {
+              const { data: verifiedDrafts, error: verifyErr } = await supabaseClient
+                .from('concept_drafts')
+                .select('id')
+                .in('id', draftIds);
+              if (verifyErr || !verifiedDrafts || verifiedDrafts.length !== draftIds.length) {
+                persistOutcome.persisted = false;
+                persistOutcome.persistError = '초안 저장 후 read-back 검증에 실패했습니다.';
+              }
+            }
+          } catch (e) {
+            persistOutcome = {
+              persisted: false,
+              drafts: persistOutcome.drafts,
+              persistError: e instanceof Error ? e.message : '초안 저장에 실패했습니다.',
+            };
+          }
+        }
+      } else if (!supabaseClient) {
+        persistOutcome.persisted = true;
+      } else if (persistOutcome.drafts.length === 0) {
+        persistOutcome.persisted = true;
+      }
+
+      // Settle if leaseToken is available and persistence is confirmed
+      if (persistOutcome.persisted && cred.leaseToken) {
+        await settleTrialCredit(auth.user.id, jobKey, cred.leaseToken).catch(() => {});
+      }
+
+      // If persistence failed, DO NOT return completed! Return error with retry path
+      if (!persistOutcome.persisted) {
+        const signedRecoveryToken = signRecoveryToken({
+          userId: auth.user.id,
+          jobId: jobKey,
+          materialId: session.materialId,
+          subjectId: session.subjectId,
+          domain: session.domain,
+          chunkIndex: 1,
+          markdownHash: session.markdownHash,
+          modelId: session.modelId,
+          drafts: persistOutcome.drafts,
+        });
+
+        return NextResponse.json(
+          {
+            success: false,
+            checkpointCommitted: true,
+            checkpointStatus: chunksAllDone ? 'completed' : progress.status,
+            draftsPersistStatus: 'failed',
+            persisted: false,
+            canRetrySave: true,
+            error: `AI 분석 결과 캐시는 존재하나 concept_drafts 테이블 저장에 실패했습니다 (${persistOutcome.persistError || '초안 저장 오류'}). AI 재호출 없이 초안 저장만 다시 시도할 수 있습니다.`,
+            persistError: persistOutcome.persistError,
+            drafts: persistOutcome.drafts,
+            signedRecoveryToken,
+            count: persistOutcome.drafts.length,
+            markdownHash: session.markdownHash,
+            model: session.modelId,
+            totalChunks: progress.totalChunks || 1,
+            completedChunks: progress.completedChunks,
+            pendingChunks: progress.pendingChunks,
+            failedChunks: progress.failedChunks,
+            isAllComplete: false,
+            status: 'persist_failed',
+            jobKey,
+            materialId: session.materialId,
+            subjectId: session.subjectId,
+            domain: session.domain,
+            fromCache: true,
+          },
+          { status: 500 }
+        );
+      }
+
+      const isAllComplete = chunksAllDone && persistOutcome.persisted;
+
       return NextResponse.json({
         success: true,
         jobKey,
@@ -745,16 +912,16 @@ export async function POST(req: NextRequest) {
         modelId: session.modelId,
         promptVersion: session.promptVersion,
         chunkingVersion: session.chunkingVersion,
-        checkpointStatus: 'completed',
+        checkpointStatus: chunksAllDone ? 'completed' : progress.status,
         draftsPersistStatus: 'persisted',
-        status: 'completed',
+        status: isAllComplete ? 'completed' : progress.status,
         totalChunks: progress.totalChunks || 1,
-        completedChunks: progress.completedChunks || progress.totalChunks || 1,
+        completedChunks: progress.completedChunks || (chunksAllDone ? (progress.totalChunks || 1) : 0),
         runningChunks: 0,
-        pendingChunks: 0,
-        failedChunks: 0,
-        isAllComplete: true,
-        drafts: cachedDrafts.length > 0 ? cachedDrafts : progress.allDrafts,
+        pendingChunks: progress.pendingChunks,
+        failedChunks: progress.failedChunks,
+        isAllComplete,
+        drafts: persistOutcome.drafts,
         fromCache: true,
       });
     }
@@ -1659,7 +1826,21 @@ ${chunk.text}
     const isCompleted = progress.status === 'completed' || progress.isAllComplete;
     let cacheSuccess = true;
     if (isCompleted && cred.ok && cred.leaseToken) {
-      const recRes = await recordTrialResultReady(auth.user.id, jobKey, { drafts: progress.allDrafts }, cred.leaseToken);
+      const recRes = await recordTrialResultReady(
+        auth.user.id,
+        jobKey,
+        {
+          drafts: progress.allDrafts,
+          userId: auth.user.id,
+          subjectId: session.subjectId,
+          materialId: session.materialId,
+          markdownHash: session.markdownHash,
+          totalChunks: progress.totalChunks,
+          completedChunks: progress.completedChunks,
+          isAllComplete: true,
+        },
+        cred.leaseToken
+      );
       if (!recRes.success) {
         cacheSuccess = false;
         if (
@@ -1699,6 +1880,17 @@ ${chunk.text}
           progress.allDrafts,
           generationJobId
         );
+        if (outcome.persisted) {
+          const draftIds = progress.allDrafts.map((d) => d.id);
+          const { data: verified, error: vErr } = await supabaseClient
+            .from('concept_drafts')
+            .select('id')
+            .in('id', draftIds);
+          if (vErr || !verified || verified.length !== draftIds.length) {
+            outcome.persisted = false;
+            outcome.persistError = '초안 저장 후 read-back 검증에 실패했습니다.';
+          }
+        }
       } catch (e) {
         outcome = {
           persisted: false,

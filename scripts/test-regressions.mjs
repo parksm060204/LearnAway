@@ -31,6 +31,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/trialCredits.ts', 'lib/drive/googleDrive.ts', 'app/api/auth/username/route.ts', 'app/api/guest-login/route.ts', 'lib/auth/session.ts', 'lib/auth/apiAuth.ts',
   'lib/auth/username.ts',
   'lib/pdf/token.ts', 'lib/pdf/browserPdfConverter.ts', 'lib/pdf/tempStorage.ts', 'app/api/cron/cleanup-temp-pdf/route.ts', 'lib/aiCostTelemetry.ts', 'app/api/admin/ai-metrics/route.ts',
+  'app/api/review-problem-quality/route.ts',
   '--outDir', output, '--module', 'commonjs', '--target', 'ES2020', '--moduleResolution', 'node',
   '--esModuleInterop', '--skipLibCheck', '--strict'], { cwd: root, encoding: 'utf8' });
 
@@ -110,7 +111,7 @@ exports.requireApiUser = async () => {
   fs.mkdirSync(path.dirname(supabaseClientPath), { recursive: true });
   fs.writeFileSync(
     supabaseClientPath,
-    `exports.createClient = () => globalThis.__fakeSupabaseClient;`
+    `exports.createClient = () => globalThis.__fakeSupabaseClient || globalThis.__defaultFakeSupabaseClient;`
   );
   delete load.cache[supabaseClientPath];
 
@@ -119,7 +120,7 @@ exports.requireApiUser = async () => {
   fs.mkdirSync(path.dirname(supabaseServerPath), { recursive: true });
   fs.writeFileSync(
     supabaseServerPath,
-    `exports.createClient = async () => globalThis.__fakeSupabaseClient || { rpc: async () => ({ data: null, error: null }) };`
+    `exports.createClient = async () => globalThis.__fakeSupabaseClient || globalThis.__defaultFakeSupabaseClient || { rpc: async () => ({ data: null, error: null }) };`
   );
   delete load.cache[supabaseServerPath];
 
@@ -259,7 +260,7 @@ exports.requireApiUser = async () => {
   process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
   const aiClient = load(path.join(output, 'lib/aiClient.js'));
   const aiCredentials = load(path.join(output, 'lib/aiCredentials.js'));
-  globalThis.__fakeSupabaseClient = {
+  const defaultFakeSupabaseClient = {
     rpc: async (name) => {
       if (name === 'consume_ai_call_budget') {
         return { data: { allowed: true, remaining: 9, retryAfterSeconds: 60 }, error: null };
@@ -267,8 +268,11 @@ exports.requireApiUser = async () => {
       if (name === 'get_or_create_trial_credits') {
         return { data: { success: true, granted_credits: 3, remaining_credits: 3, is_first_grant: false }, error: null };
       }
-      if (name === 'reserve_trial_credit') {
+      if (name === 'reserve_trial_credit' || name === 'register_ai_task') {
         return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lease_mock_token_123' }, error: null };
+      }
+      if (name === 'check_operator_ai_daily_usage') {
+        return { data: { allowed: true, call_count: 1, daily_cap: 500 }, error: null };
       }
       if (name === 'settle_trial_credit') {
         return { data: { success: true, status: 'settled', is_existing: false }, error: null };
@@ -279,6 +283,8 @@ exports.requireApiUser = async () => {
       return { data: null, error: null };
     },
   };
+  globalThis.__defaultFakeSupabaseClient = defaultFakeSupabaseClient;
+  globalThis.__fakeSupabaseClient = defaultFakeSupabaseClient;
   const { NextRequest } = load(path.join(root, 'node_modules/next/server'));
   const { POST } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
   const { POST: convertPdf } = load(path.join(output, 'app/api/convert/route.js'));
@@ -648,11 +654,12 @@ exports.requireApiUser = async () => {
       rpcResults: options.rpcResults || {},
       rpcImpl: options.rpcImpl || null,
       isAdmin: options.isAdmin !== undefined ? options.isAdmin : true,
+      operator_daily_usage: options.operator_daily_usage !== undefined ? options.operator_daily_usage : 0,
     };
     // Seed any additional table arrays provided in options.
     for (const key of Object.keys(options)) {
       if (['user', 'subjects', 'materials', 'objects', 'fail', 'rpcResult'].includes(key)) continue;
-      if (Array.isArray(options[key])) state[key] = options[key];
+      state[key] = options[key];
     }
     const clone = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
     const nowIso = () => new Date().toISOString();
@@ -863,6 +870,7 @@ exports.requireApiUser = async () => {
           return { data: { user: state.user }, error: null };
         },
         async signInWithPassword({ email }) {
+          state.signInWithPasswordCalls = (state.signInWithPasswordCalls || 0) + 1;
           if (state.fail.signInWithPassword) {
             return { data: { user: null, session: null }, error: { message: 'Invalid login credentials' } };
           }
@@ -877,6 +885,7 @@ exports.requireApiUser = async () => {
         },
         admin: {
           async createUser({ email, user_metadata }) {
+            state.createUserCalls = (state.createUserCalls || 0) + 1;
             if (state.fail.createUser) {
               return { data: null, error: { message: state.fail.createUserMessage || 'User already registered' } };
             }
@@ -917,6 +926,15 @@ exports.requireApiUser = async () => {
           return Promise.resolve({ data: null, error: null });
         }
         if (name === 'check_and_increment_rate_limit') {
+          if (state.failRateLimitRpc) {
+            return Promise.resolve({ data: null, error: { message: 'simulated rate limit RPC error', code: '50000' } });
+          }
+          if (state.rateLimitRpcReturnNull) {
+            return Promise.resolve({ data: null, error: null });
+          }
+          if (state.rateLimitRpcThrow) {
+            return Promise.reject(new Error('simulated rate limit RPC network exception'));
+          }
           if (state.isAdmin === false) {
             return Promise.resolve({ data: null, error: { message: 'permission denied for function check_and_increment_rate_limit', code: '42501' } });
           }
@@ -983,6 +1001,21 @@ exports.requireApiUser = async () => {
             error: null,
           });
         }
+        if (name === 'reserve_trial_credit') {
+          state.reserveTrialCreditCallCount = (state.reserveTrialCreditCallCount || 0) + 1;
+        }
+        if (name === 'register_ai_task' && state.failRegisterAiTaskRpc) {
+          if (state.failRegisterAiTaskRpc === 'throw') {
+            return Promise.reject(new Error('simulated register_ai_task network exception'));
+          }
+          if (state.failRegisterAiTaskRpc === 'null') {
+            return Promise.resolve({ data: null, error: null });
+          }
+          if (state.failRegisterAiTaskRpc === 'malformed') {
+            return Promise.resolve({ data: { unexpected_format: true }, error: null });
+          }
+          return Promise.resolve({ data: null, error: { message: 'simulated register_ai_task RPC error', code: '50000' } });
+        }
         if (name === 'reserve_trial_credit' || name === 'register_ai_task') {
           if (state.isAdmin === false) {
             return Promise.resolve({ data: null, error: { message: `permission denied for function ${name}`, code: '42501' } });
@@ -1011,6 +1044,42 @@ exports.requireApiUser = async () => {
           const taskId = params && params.p_task_id;
           const taskType = params && params.p_task_type;
           const inputIdentifier = params && params.p_input_identifier;
+
+          if (!isPersonalKey) {
+            const cap = (params && params.p_daily_cap) || 500;
+            if ((state.operator_daily_usage || 0) >= cap) {
+              return Promise.resolve({
+                data: {
+                  allowed: false,
+                  error_code: 'OPERATOR_DAILY_CAP_EXCEEDED',
+                  remaining: userCredits ? userCredits.balance : 0,
+                  message: '금일 운영자 AI 체험 제공 한도가 초과되었습니다.',
+                },
+                error: null,
+              });
+            }
+          }
+
+          // Mirror Migration 33: check for active lease or cached result on identical input across different taskIds
+          const activeOnInput = resList.find((r) =>
+            r.user_id === userId &&
+            r.task_type === taskType &&
+            r.input_identifier === inputIdentifier &&
+            r.status === 'processing' &&
+            r.lease_expires_at &&
+            new Date(r.lease_expires_at).getTime() > Date.now()
+          );
+          if (activeOnInput && activeOnInput.task_id !== taskId) {
+            return Promise.resolve({
+              data: {
+                allowed: false,
+                status: 'concurrent_in_progress',
+                error_code: 'CONCURRENT_EXECUTION_BLOCKED',
+                message: '동일한 작업이 현재 실행 중입니다. 잠시 후 결과를 확인해 주세요.',
+              },
+              error: null,
+            });
+          }
 
           const existing = resList.find((r) => r.task_id === taskId);
           if (existing) {
@@ -1138,6 +1207,7 @@ exports.requireApiUser = async () => {
             }
             userCredits.balance -= 1;
             userCredits.updated_at = nowIso();
+            state.operator_daily_usage = (state.operator_daily_usage || 0) + 1;
           }
 
           const leaseToken = 'lease_' + Math.random().toString(36).slice(2);
@@ -1411,6 +1481,18 @@ exports.requireApiUser = async () => {
                 estimatedCostUsd: Math.round(pkRows.reduce((acc, r) => acc + (r.estimated_cost_usd || 0), 0) * 1e6) / 1e6,
                 estimatedCostKrw: Math.round(pkRows.reduce((acc, r) => acc + (r.estimated_cost_krw || 0), 0) * 100) / 100,
               },
+            },
+            error: null,
+          });
+        }
+        if (name === 'check_operator_ai_daily_usage') {
+          const cap = (params && params.p_daily_cap) || 500;
+          const calls = state.operator_daily_usage || 0;
+          return Promise.resolve({
+            data: {
+              allowed: calls < cap,
+              call_count: calls,
+              daily_cap: cap,
             },
             error: null,
           });
@@ -5182,8 +5264,8 @@ exports.requireApiUser = async () => {
     const request = (value) => new NextRequest('http://localhost/api/logic-questions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
     global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'A', linkedCriterionId: 'r' }, { id: 'q2', question: 'B', linkedCriterionId: 'r' }] }) } }] });
     const ok = await POST(request(reqBody));
-    assert.equal(ok.status, 200);
     const okJson = await ok.json();
+    assert.equal(ok.status, 200, JSON.stringify(okJson));
     assert.equal(okJson.questions.length, 2);
     global.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({ questions: [{ id: 'q1', question: 'A', linkedCriterionId: 'r' }] }) } }] });
     const bad = await POST(request(reqBody));
@@ -17129,6 +17211,435 @@ exports.requireApiUser = async () => {
       assert.equal(res.records.length, 5, '목록은 limit=5 페이징 적용');
       assert.equal(res.summary.totalRequests, 25, 'RPC 장애 시에도 대체 경로로 전체 25건 누락 없이 정확히 집계');
       assert.equal(res.summary.personalKeyConsumption.tokens, 7500);
+    });
+  });
+
+  // =========================================================================
+  // 보안 취약점 3건 및 데이터 무결성 1건 검증 (Problems 1 ~ 4)
+  // =========================================================================
+
+  // --- 문제 1: 모든 운영자 AI 호출에 비용 통제 적용 ---
+  await checkAsync('문제 1: 폴백 ON + 긴급 중지 ON 시 외부 AI 호출 0회 및 차단 (operator_disabled)', async () => {
+    const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+    const prevFallback = process.env.AI_ALLOW_OPERATOR_FALLBACK;
+    const prevStop = process.env.OPERATOR_EMERGENCY_STOP;
+    process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
+    process.env.OPERATOR_EMERGENCY_STOP = 'true';
+
+    try {
+      await withFakeSupabase({ user: { id: 'user-p1-emerg' }, ai_trial_credits: [{ user_id: 'user-p1-emerg', balance: 3, granted_credits: 3 }] }, async () => {
+        const config = await resolveAiConfigForUser('user-p1-emerg', {
+          taskId: 'task-emerg-1',
+          taskType: 'logic_questions',
+          inputIdentifier: 'hash-emerg-1',
+        });
+        assert.equal(config.ok, false);
+        assert.equal(config.code, 'operator_disabled');
+      });
+    } finally {
+      if (prevFallback !== undefined) process.env.AI_ALLOW_OPERATOR_FALLBACK = prevFallback;
+      else delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
+      if (prevStop !== undefined) process.env.OPERATOR_EMERGENCY_STOP = prevStop;
+      else delete process.env.OPERATOR_EMERGENCY_STOP;
+    }
+  });
+
+  await checkAsync('문제 1: 폴백 ON + 일일 한도 소진 시 외부 AI 호출 0회 및 차단 (OPERATOR_DAILY_CAP_EXCEEDED)', async () => {
+    const { resolveAiConfigForUser } = load(path.join(output, 'lib/aiCredentials.js'));
+    const prevFallback = process.env.AI_ALLOW_OPERATOR_FALLBACK;
+    const prevCap = process.env.OPERATOR_DAILY_CALL_CAP;
+    process.env.AI_ALLOW_OPERATOR_FALLBACK = 'true';
+    process.env.OPERATOR_DAILY_CALL_CAP = '5';
+
+    try {
+      await withFakeSupabase({
+        user: { id: 'user-p1-cap' },
+        operator_daily_usage: 5,
+        ai_trial_credits: [{ user_id: 'user-p1-cap', balance: 3, granted_credits: 3 }],
+      }, async () => {
+        const config = await resolveAiConfigForUser('user-p1-cap', {
+          taskId: 'task-cap-1',
+          taskType: 'transfer_problem',
+          inputIdentifier: 'hash-cap-1',
+        });
+        assert.equal(config.ok, false);
+        assert.equal(config.errorCode, 'OPERATOR_DAILY_CAP_EXCEEDED');
+      });
+    } finally {
+      if (prevFallback !== undefined) process.env.AI_ALLOW_OPERATOR_FALLBACK = prevFallback;
+      else delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
+      if (prevCap !== undefined) process.env.OPERATOR_DAILY_CALL_CAP = prevCap;
+      else delete process.env.OPERATOR_DAILY_CAP_EXCEEDED;
+    }
+  });
+
+  await checkAsync('문제 1: 체험 크레딧 소진 시 운영자 키 호출 차단 및 개인 키는 잔액 무변화', async () => {
+    const { registerAiTask } = load(path.join(output, 'lib/trialCredits.js'));
+    await withFakeSupabase({
+      user: { id: 'user-p1-credits' },
+      ai_trial_credits: [{ user_id: 'user-p1-credits', balance: 0, granted_credits: 3 }],
+    }, async () => {
+      // 1. Operator trial with 0 balance -> blocked
+      const opRes = await registerAiTask('user-p1-credits', 'task-op-1', 'review_problem_quality', 'hash-rev-1', false);
+      assert.equal(opRes.allowed, false);
+      assert.equal(opRes.errorCode, 'INSUFFICIENT_CREDITS');
+
+      // 2. Personal key with 0 balance -> allowed, balance remains 0
+      const pkRes = await registerAiTask('user-p1-credits', 'task-pk-1', 'review_problem_quality', 'hash-rev-2', true);
+      assert.equal(pkRes.allowed, true);
+      assert.equal(pkRes.remaining, 0);
+    });
+  });
+
+  await checkAsync('문제 1: 임의 taskId 변조로 동일 입력 동시 실행 방어 무력화 시도 차단', async () => {
+    const { registerAiTask } = load(path.join(output, 'lib/trialCredits.js'));
+    await withFakeSupabase({
+      user: { id: 'user-p1-tamper' },
+      ai_trial_credits: [{ user_id: 'user-p1-tamper', balance: 3, granted_credits: 3 }],
+      ai_trial_reservations: [
+        {
+          id: 'res-orig',
+          user_id: 'user-p1-tamper',
+          task_id: 'task-orig-id',
+          task_type: 'logic_questions',
+          input_identifier: 'identical-prompt-hash',
+          credit_source: 'operator_trial',
+          status: 'processing',
+          lease_token: 'valid-lease-orig',
+          lease_expires_at: new Date(Date.now() + 60000).toISOString(),
+        },
+      ],
+    }, async () => {
+      const resTamper = await registerAiTask('user-p1-tamper', 'task-random-tampered-id', 'logic_questions', 'identical-prompt-hash', false);
+      assert.equal(resTamper.allowed, false);
+      assert.equal(resTamper.errorCode, 'CONCURRENT_EXECUTION_BLOCKED');
+    });
+  });
+
+  // --- 문제 2: 작업 등록 오류 시 구형 예약 함수로 우회하는 경로 제거 ---
+  await checkAsync('문제 2: register_ai_task RPC 오류·예외·null·잘못된 구조 시 allowed:false 및 구형 RPC 호출 0회', async () => {
+    const { registerAiTask } = load(path.join(output, 'lib/trialCredits.js'));
+
+    // Case 1: RPC Error
+    await withFakeSupabase({
+      user: { id: 'user-p2-test' },
+      failRegisterAiTaskRpc: 'error',
+    }, async (client) => {
+      const res = await registerAiTask('user-p2-test', 'task-err-1', 'evaluate_answer', 'hash-1', false);
+      assert.equal(res.allowed, false);
+      assert.equal(client.__state.reserveTrialCreditCallCount || 0, 0, '구형 reserve_trial_credit RPC 호출 0회');
+    });
+
+    // Case 2: RPC Exception / Network Throw
+    await withFakeSupabase({
+      user: { id: 'user-p2-test' },
+      failRegisterAiTaskRpc: 'throw',
+    }, async (client) => {
+      const res = await registerAiTask('user-p2-test', 'task-err-2', 'evaluate_answer', 'hash-2', false);
+      assert.equal(res.allowed, false);
+      assert.equal(client.__state.reserveTrialCreditCallCount || 0, 0, '구형 reserve_trial_credit RPC 호출 0회');
+    });
+
+    // Case 3: Null response
+    await withFakeSupabase({
+      user: { id: 'user-p2-test' },
+      failRegisterAiTaskRpc: 'null',
+    }, async (client) => {
+      const res = await registerAiTask('user-p2-test', 'task-err-3', 'evaluate_answer', 'hash-3', false);
+      assert.equal(res.allowed, false);
+      assert.equal(client.__state.reserveTrialCreditCallCount || 0, 0, '구형 reserve_trial_credit RPC 호출 0회');
+    });
+
+    // Case 4: Malformed response
+    await withFakeSupabase({
+      user: { id: 'user-p2-test' },
+      failRegisterAiTaskRpc: 'malformed',
+    }, async (client) => {
+      const res = await registerAiTask('user-p2-test', 'task-err-4', 'evaluate_answer', 'hash-4', false);
+      assert.equal(res.allowed, false);
+      assert.equal(client.__state.reserveTrialCreditCallCount || 0, 0, '구형 reserve_trial_credit RPC 호출 0회');
+    });
+  });
+
+  await checkAsync('문제 2: 개인 키 작업을 운영자 체험으로 재사용 시 TASK_CREDIT_SOURCE_MISMATCH 거부', async () => {
+    const { registerAiTask } = load(path.join(output, 'lib/trialCredits.js'));
+    await withFakeSupabase({
+      user: { id: 'user-p2-source' },
+      ai_trial_credits: [{ user_id: 'user-p2-source', balance: 3, granted_credits: 3 }],
+      ai_trial_reservations: [
+        {
+          task_id: 'task-pk-source-1',
+          user_id: 'user-p2-source',
+          task_type: 'evaluate_answer',
+          input_identifier: 'hash-src-1',
+          credit_source: 'personal_key',
+          status: 'released',
+        },
+      ],
+    }, async () => {
+      const res = await registerAiTask('user-p2-source', 'task-pk-source-1', 'evaluate_answer', 'hash-src-1', false);
+      assert.equal(res.allowed, false);
+      assert.equal(res.errorCode, 'TASK_CREDIT_SOURCE_MISMATCH');
+    });
+  });
+
+  // --- 문제 3: 인증 요청 제한 조회 실패 시 가입·로그인 중단 ---
+  await checkAsync('문제 3: 제한 RPC 실패·예외·null 시 가입 및 로그인 즉시 중단 (503) 및 인증 함수 호출 0회', async () => {
+    const { POST: authRoute } = load(path.join(output, 'app/api/auth/username/route.js'));
+
+    // 1. 가입 시 제한 RPC 실패 -> 503, createUser 호출 0회
+    await withFakeSupabase({
+      failRateLimitRpc: true,
+    }, async (client) => {
+      const req = new NextRequest('http://localhost/api/auth/username', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '203.0.113.195' },
+        body: JSON.stringify({ action: 'register', username: 'student_rate_1', password: 'Password123!' }),
+      });
+      const res = await authRoute(req);
+      assert.equal(res.status, 503, 'RPC 실패 시 503 Service Unavailable');
+      assert.equal(client.__state.createUserCalls || 0, 0, 'createUser 절대 호출되지 않음');
+    });
+
+    // 2. 가입 시 제한 RPC null 반환 -> 503, createUser 호출 0회
+    await withFakeSupabase({
+      rateLimitRpcReturnNull: true,
+    }, async (client) => {
+      const req = new NextRequest('http://localhost/api/auth/username', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '203.0.113.195' },
+        body: JSON.stringify({ action: 'register', username: 'student_rate_2', password: 'Password123!' }),
+      });
+      const res = await authRoute(req);
+      assert.equal(res.status, 503);
+      assert.equal(client.__state.createUserCalls || 0, 0, 'createUser 절대 호출되지 않음');
+    });
+
+    // 3. 로그인 시 IP 제한 또는 사용자별 제한 중 하나라도 실패 -> 503, signInWithPassword 호출 0회
+    await withFakeSupabase({
+      failRateLimitRpc: true,
+    }, async (client) => {
+      const req = new NextRequest('http://localhost/api/auth/username', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '203.0.113.195' },
+        body: JSON.stringify({ action: 'login', username: 'student_rate_3', password: 'Password123!' }),
+      });
+      const res = await authRoute(req);
+      assert.equal(res.status, 503);
+      assert.equal(client.__state.signInWithPasswordCalls || 0, 0, 'signInWithPassword 절대 호출되지 않음');
+    });
+
+    // 4. 제한 초과 시 429
+    await withFakeSupabase({
+      auth_rate_limits: [{ key: 'auth_reg_ip:203.0.113.199', attempts: 10, window_start: Date.now() }],
+    }, async (client) => {
+      const req = new NextRequest('http://localhost/api/auth/username', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-forwarded-for': '203.0.113.199' },
+        body: JSON.stringify({ action: 'register', username: 'student_rate_4', password: 'Password123!' }),
+      });
+      const res = await authRoute(req);
+      assert.equal(res.status, 429, '제한 초과 시 429 Too Many Requests');
+      assert.equal(client.__state.createUserCalls || 0, 0, '초과 시 createUser 호출 0회');
+    });
+  });
+
+  // --- 문제 4: 분석 캐시 응답의 거짓 저장 완료 수정 ---
+  await checkAsync('문제 4: AI 캐시 결과 존재 + 초안 저장 실패 시 완료 응답 금지 및 저장 재시도 경로 제공', async () => {
+    const { POST: analyzeRoute } = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+    const testUser = { id: 'user-p4-cache' };
+
+    const mockCachedDrafts = [
+      {
+        id: 'cd-1',
+        title: '미적분학 기본정리',
+        definition: '미분과 적분의 관계',
+        importance: 'high',
+        keyFormula: 'F(b)-F(a)',
+        subjectId: 'sub-p4-math',
+        materialId: 'mat-p4-calc',
+      },
+    ];
+
+    // Scenario 1: DB persistence fails -> Must NOT return completed, draftsPersistStatus must be 'failed'
+    await withFakeSupabase({
+      user: testUser,
+      subjects: [{ id: 'sub-p4-math', user_id: testUser.id, name: '미적분학' }],
+      materials: [{ id: 'mat-p4-calc', user_id: testUser.id, subject_id: 'sub-p4-math', content_hash: 'hash-p4-calc' }],
+      concept_drafts: [],
+      fail: { upsert: true },
+      rpcImpl: (name) => {
+        if (name === 'register_ai_task') {
+          return {
+            data: {
+              allowed: false,
+              status: 'already_completed',
+              cached_result: {
+                drafts: mockCachedDrafts,
+                userId: testUser.id,
+                subjectId: 'sub-p4-math',
+                materialId: 'mat-p4-calc',
+                isAllComplete: true,
+              },
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      const req = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          subjectId: 'sub-p4-math',
+          materialId: 'mat-p4-calc',
+          markdown: '# 미적분학 정리',
+        }),
+      });
+
+      const res = await analyzeRoute(req);
+      assert.equal(res.status, 500);
+      const data = await res.json();
+      assert.equal(data.success, false, '초안 저장 실패 시 성공 응답 반환 금지');
+      assert.equal(data.draftsPersistStatus, 'failed', 'draftsPersistStatus는 failed여야 함');
+      assert.equal(data.persisted, false);
+      assert.equal(data.canRetrySave, true, 'AI 재호출 없이 저장만 재시도 가능한 경로 제공');
+      assert.equal(data.isAllComplete, false);
+    });
+
+    // Scenario 2: Save retry succeeds -> 1 draft persisted, completed
+    await withFakeSupabase({
+      user: testUser,
+      subjects: [{ id: 'sub-p4-math', user_id: testUser.id, name: '미적분학' }],
+      materials: [{ id: 'mat-p4-calc', user_id: testUser.id, subject_id: 'sub-p4-math', content_hash: 'hash-p4-calc' }],
+      concept_drafts: [],
+      rpcImpl: (name) => {
+        if (name === 'register_ai_task') {
+          return {
+            data: {
+              allowed: false,
+              status: 'already_completed',
+              cached_result: {
+                drafts: mockCachedDrafts,
+                userId: testUser.id,
+                subjectId: 'sub-p4-math',
+                materialId: 'mat-p4-calc',
+                isAllComplete: true,
+              },
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      },
+    }, async (client) => {
+      const req = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          subjectId: 'sub-p4-math',
+          materialId: 'mat-p4-calc',
+          markdown: '# 미적분학 정리',
+        }),
+      });
+
+      const res = await analyzeRoute(req);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.success, true);
+      assert.equal(data.fromCache, true);
+      assert.equal(data.draftsPersistStatus, 'persisted');
+      assert.equal(data.isAllComplete, true);
+      assert.equal(client.__state.concept_drafts.length, 1, '정상 저장 완료 시 초안 1건 유지');
+    });
+
+    // Scenario 3: Cross-user cached result reuse -> Forbidden 403
+    await withFakeSupabase({
+      user: testUser,
+      subjects: [{ id: 'sub-p4-math', user_id: testUser.id, name: '미적분학' }],
+      materials: [{ id: 'mat-p4-calc', user_id: testUser.id, subject_id: 'sub-p4-math', content_hash: 'hash-p4-calc' }],
+      concept_drafts: [],
+      rpcImpl: (name) => {
+        if (name === 'register_ai_task') {
+          return {
+            data: {
+              allowed: false,
+              status: 'already_completed',
+              cached_result: {
+                drafts: mockCachedDrafts,
+                userId: 'different-attacker-uuid',
+                subjectId: 'sub-p4-math',
+                materialId: 'mat-p4-calc',
+                isAllComplete: true,
+              },
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      const req = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          subjectId: 'sub-p4-math',
+          materialId: 'mat-p4-calc',
+          markdown: '# 미적분학 정리',
+        }),
+      });
+
+      const res = await analyzeRoute(req);
+      assert.equal(res.status, 403, '타 사용자의 캐시 재사용은 403 Forbidden 거부');
+      const data = await res.json();
+      assert.equal(data.errorCode, 'TASK_OWNERSHIP_MISMATCH');
+    });
+
+    // Scenario 4: Incomplete chunk status -> isAllComplete MUST be false
+    await withFakeSupabase({
+      user: testUser,
+      subjects: [{ id: 'sub-p4-math', user_id: testUser.id, name: '미적분학' }],
+      materials: [{ id: 'mat-p4-calc', user_id: testUser.id, subject_id: 'sub-p4-math', content_hash: 'hash-p4-calc' }],
+      concept_drafts: [],
+      rpcImpl: (name) => {
+        if (name === 'register_ai_task') {
+          return {
+            data: {
+              allowed: false,
+              status: 'already_completed',
+              cached_result: {
+                drafts: mockCachedDrafts,
+                userId: testUser.id,
+                subjectId: 'sub-p4-math',
+                materialId: 'mat-p4-calc',
+                isAllComplete: false,
+              },
+            },
+            error: null,
+          };
+        }
+        return { data: null, error: null };
+      },
+    }, async () => {
+      const req = new NextRequest('http://localhost/api/analyze-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'process',
+          subjectId: 'sub-p4-math',
+          materialId: 'mat-p4-calc',
+          markdown: '# 미적분학 정리',
+        }),
+      });
+
+      const res = await analyzeRoute(req);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.isAllComplete, false, '청크 일부만 완료된 경우 isAllComplete: false 유지');
     });
   });
 

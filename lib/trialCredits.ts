@@ -1,7 +1,13 @@
 import { createClient } from './supabase/server';
 import { createAdminClient, hasAdminClientConfig } from './supabase/admin';
 
-export type TrialTaskType = 'analyze_concepts' | 'generate_problems' | 'evaluate_answer';
+export type TrialTaskType =
+  | 'analyze_concepts'
+  | 'generate_problems'
+  | 'evaluate_answer'
+  | 'logic_questions'
+  | 'transfer_problem'
+  | 'review_problem_quality';
 
 export const DEFAULT_TRIAL_GRANTED_CREDITS = 3; // General account default
 export const DEFAULT_GUEST_TRIAL_GRANTED_CREDITS = 1; // Guest account default
@@ -272,13 +278,17 @@ export async function registerAiTask(
     });
 
     if (error || !data || typeof data !== 'object') {
-      if (!isPersonalKey) {
-        return reserveTrialCredit(userId, taskId, taskType, inputIdentifier, dailyCap);
-      }
+      const isMissingFunction = error && (
+        error.code === '42883' ||
+        error.code === 'PGRST202' ||
+        /function .* does not exist/i.test(error.message || '')
+      );
       return {
         allowed: false,
-        errorCode: 'TASK_REGISTRATION_FAILED',
-        message: error?.message || '작업 등록 중 오류가 발생했습니다.',
+        errorCode: isMissingFunction ? 'MIGRATION_REQUIRED' : 'TASK_REGISTRATION_FAILED',
+        message: isMissingFunction
+          ? '필수 데이터베이스 마이그레이션(register_ai_task)이 적용되지 않았습니다. 관리자 조치가 필요합니다.'
+          : (error?.message || '작업 등록 중 오류가 발생했습니다.'),
       };
     }
 
@@ -293,6 +303,14 @@ export async function registerAiTask(
       message?: string;
       credit_source?: 'operator_trial' | 'personal_key';
     };
+
+    if (typeof res.allowed !== 'boolean') {
+      return {
+        allowed: false,
+        errorCode: 'TASK_REGISTRATION_INVALID_RESPONSE',
+        message: '작업 등록 응답 구조가 유효하지 않습니다.',
+      };
+    }
 
     const errCode = res.error_code || res.code;
 
@@ -328,6 +346,14 @@ export async function registerAiTask(
       };
     }
 
+    if (!isPersonalKey && (!res.lease_token || typeof res.lease_token !== 'string')) {
+      return {
+        allowed: false,
+        errorCode: 'LEASE_TOKEN_REQUIRED',
+        message: '작업 실행 토큰이 발급되지 않아 AI 호출이 차단되었습니다.',
+      };
+    }
+
     return {
       allowed: true,
       status: res.status || 'processing',
@@ -341,6 +367,25 @@ export async function registerAiTask(
       errorCode: 'TASK_REGISTRATION_NETWORK_ERROR',
       message: err instanceof Error ? err.message : '작업 등록 통신 오류',
     };
+  }
+}
+
+/**
+ * Checks whether the operator daily call limit has been reached today.
+ */
+export async function checkOperatorDailyUsage(dailyCap = getOperatorDailyCap()): Promise<boolean> {
+  try {
+    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const today = new Date().toISOString().slice(0, 10);
+    const { data, error } = await client
+      .from('operator_ai_daily_usage')
+      .select('call_count')
+      .eq('usage_date', today)
+      .maybeSingle();
+    if (error || !data) return false;
+    return (data.call_count || 0) >= dailyCap;
+  } catch {
+    return false;
   }
 }
 

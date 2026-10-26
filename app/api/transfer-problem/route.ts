@@ -5,6 +5,8 @@ import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 import { ProblemDifficulty, ProblemType, RubricCriterion } from '../../../lib/types';
 import { validateTransferProblemOutput } from '../../../lib/transferValidation';
+import { recordTrialResultReady, settleTrialCredit, releaseTrialCredit } from '../../../lib/trialCredits';
+import { computeMarkdownHash } from '../../../lib/markdownUtils';
 
 const MAX_PROMPT_CHARS = 5000;
 const MAX_ANSWER_CHARS = 6000;
@@ -101,9 +103,58 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: `채점 기준이 너무 많습니다(최대 ${MAX_RUBRIC_ITEMS}개).` }, { status: 400 });
     }
 
-    const cred = await resolveAiConfigForUser(auth.user.id);
+    const inputIdentifier = computeMarkdownHash(
+      JSON.stringify({
+        problemTitle,
+        problemPrompt,
+        rubric: rubric.map((r) => ({ id: r.id, label: r.label, maxScore: r.maxScore })),
+        concepts: concepts.map((c) => ({ id: c.id, title: c.title })),
+        originalAnswer,
+        revisedAnswer,
+        problemType,
+        difficulty,
+        domain,
+      })
+    );
+    const taskId = asString(payload.taskId).trim() || (`trans_${inputIdentifier}`);
+    const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+
+    const cred = await resolveAiConfigForUser(auth.user.id, {
+      taskId,
+      taskType: 'transfer_problem',
+      inputIdentifier,
+      isSaveRetry,
+    });
+
     if (!cred.ok) {
-      const needsAiConnection = cred.code === 'no_credentials';
+      if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
+        const cached = cred.cachedResult as { draft?: unknown; model?: string };
+        return NextResponse.json({
+          success: true,
+          draft: cached.draft,
+          model: cached.model,
+          fromCache: true,
+        });
+      }
+      if (cred.code === 'concurrent_in_progress') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'CONCURRENT_EXECUTION_BLOCKED' },
+          { status: 409 }
+        );
+      }
+      if (cred.code === 'task_input_mismatch' || cred.errorCode === 'TASK_INPUT_MISMATCH') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'TASK_INPUT_MISMATCH' },
+          { status: 400 }
+        );
+      }
+      if (cred.code === 'task_ownership_mismatch' || cred.errorCode === 'TASK_OWNERSHIP_MISMATCH') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'TASK_OWNERSHIP_MISMATCH' },
+          { status: 403 }
+        );
+      }
+      const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
       return NextResponse.json(
         { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
         { status: needsAiConnection ? 400 : 502 }
@@ -120,8 +171,8 @@ export async function POST(req: NextRequest) {
 
 [전이 문제 인정 기준 — 단순 숫자·변수명 변경은 불인정]
 ${domain === 'math_stats'
-  ? '- 정리의 적용 조건 변경 / 반례 구성 / 두 개념을 연결한 유도 / 다른 표현·조건에서의 동일 원리 적용'
-  : '- 입력 규모·제약 변경에 따른 알고리즘 재선택 / 경계 사례와 반례 / 불변식·정당성·복잡도 설명 / 자료구조·조건 변경 설계'}
+        ? '- 정리의 적용 조건 변경 / 반례 구성 / 두 개념을 연결한 유도 / 다른 표현·조건에서의 동일 원리 적용'
+        : '- 입력 규모·제약 변경에 따른 알고리즘 재선택 / 경계 사례와 반례 / 불변식·정당성·복잡도 설명 / 자료구조·조건 변경 설계'}
 각 문제에는 지문, 유형("${problemType}" 정확히), 난도("${difficulty}" 정확히), 연결 개념, 변형 유형(transferKind), 원래 조건(originalCondition), 바뀐 조건(newCondition), 바뀐 조건 요약(transferChanges), 확인하려는 이해 요소(understandingFocus), 예상 풀이 시간, 모범답안, 총점 100점 루브릭(항목 ID 중복 금지, 각 배점은 0보다 큰 유한한 수), 힌트를 포함하십시오.
 숫자나 변수명만 바꾼 문제는 전이 문제가 아닙니다. originalCondition과 newCondition은 서로 달라야 합니다.
 evidenceQuote에는 학생 원답안에 실제로 존재하는 문장만 인용하고, 없으면 빈 문자열로 두십시오.
@@ -197,9 +248,13 @@ ${conceptText}
         executionTimeMs: aiExecutionTimeMs,
         status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
         errorCode: aiCall.error.code,
-        creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+        creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
         inputText: userPrompt,
       });
+
+      if (cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
+      }
 
       return NextResponse.json(
         { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
@@ -219,7 +274,7 @@ ${conceptText}
       outputText: content,
       executionTimeMs: aiExecutionTimeMs,
       status: 'success',
-      creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+      creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
     });
 
     let draft;
@@ -240,10 +295,18 @@ ${conceptText}
         originalAnswer,
       });
     } catch (cause) {
+      if (cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'invalid_output', cred.leaseToken);
+      }
       return NextResponse.json(
         { success: false, error: cause instanceof Error ? cause.message : 'AI 전이 문제 검증에 실패했습니다.' },
         { status: 502 }
       );
+    }
+
+    if (cred.leaseToken) {
+      await recordTrialResultReady(auth.user.id, taskId, { draft, model: aiCall.model }, cred.leaseToken);
+      await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
     }
 
     return NextResponse.json({ success: true, draft, model: aiCall.model });

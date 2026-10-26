@@ -519,6 +519,13 @@ export async function POST(req: NextRequest) {
           { status: 400 }
         );
       }
+      const inputIdentifier = computeMarkdownHash(`mock_exam:${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`);
+      taskId = (typeof body === 'object' && body && 'taskId' in body && typeof (body as Record<string, unknown>).taskId === 'string' && (body as Record<string, unknown>).taskId ? (body as Record<string, unknown>).taskId : null) as string || (`eval_${inputIdentifier}`);
+      trialContext = {
+        taskId,
+        taskType: 'evaluate_answer',
+        inputIdentifier,
+      };
     }
 
     // 3. Resolve AI credentials (user's registered key first, then operator trial credit).
@@ -790,7 +797,7 @@ ${
         executionTimeMs: aiExecutionTimeMs,
         status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
         errorCode: aiCall.error.code,
-        creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+        creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
         inputText: userPrompt,
       });
 
@@ -816,7 +823,7 @@ ${
       outputText: content,
       executionTimeMs: aiExecutionTimeMs,
       status: 'success',
-      creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+      creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
     });
 
     // 7. Parse and Validate AI Evaluation Output

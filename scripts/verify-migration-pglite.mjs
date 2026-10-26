@@ -872,11 +872,127 @@ async function testUpgradePath() {
   }
   console.log('✓ Permission lockdown strictly verified for aggregate_ai_usage_telemetry and clear_ai_task_lease');
 
-  console.log('\n=== All Upgrade Path & Scenario Tests Passed Successfully! ===\n');
+  // Reset to service_role
+  await setAuthContext(db, { uid: userIdA, role: 'service_role' });
+
+  // --------------------------------------------------------------------------
+  // Apply Migration 33: Expand AI task types, concurrency hardening & rate limiting
+  // --------------------------------------------------------------------------
+  console.log('\n=== Applying Migration 33: Expand AI task types, concurrency hardening & rate limiting ===');
+  const migration33File = files.find(f => f.includes('000033_'));
+  if (!migration33File) {
+    throw new Error('Migration 33 file not found in migrations directory');
+  }
+  console.log(`Applying Migration 33: ${migration33File}...`);
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, migration33File));
+  console.log('✓ Migration 33 executed cleanly!');
+
+  // --------------------------------------------------------------------------
+  // Scenario M: Extended task types in register_ai_task & reserve_trial_credit
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario M: Extended task types (logic_questions, transfer_problem, review_problem_quality) ---');
+  await db.query(`update public.ai_trial_credits set granted_credits = 10, balance = 10 where user_id = $1;`, [userIdA]);
+
+  const taskM1 = 'task_logic_' + Date.now();
+  const resM1 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', 'input_logic_1', $2, false, 500) as r;
+  `, [taskM1, userIdA])).rows[0].r;
+  if (!resM1.allowed || resM1.status !== 'processing') {
+    throw new Error(`Scenario M1 logic_questions failed: ${JSON.stringify(resM1)}`);
+  }
+  console.log('✓ logic_questions registered and allowed with active lease token');
+
+  const taskM2 = 'task_transfer_' + Date.now();
+  const resM2 = (await db.query(`
+    select public.register_ai_task($1, 'transfer_problem', 'input_trans_1', $2, false, 500) as r;
+  `, [taskM2, userIdA])).rows[0].r;
+  if (!resM2.allowed || resM2.status !== 'processing') {
+    throw new Error(`Scenario M2 transfer_problem failed: ${JSON.stringify(resM2)}`);
+  }
+  console.log('✓ transfer_problem registered and allowed with active lease token');
+
+  const taskM3 = 'task_review_' + Date.now();
+  const resM3 = (await db.query(`
+    select public.register_ai_task($1, 'review_problem_quality', 'input_rev_1', $2, false, 500) as r;
+  `, [taskM3, userIdA])).rows[0].r;
+  if (!resM3.allowed || resM3.status !== 'processing') {
+    throw new Error(`Scenario M3 review_problem_quality failed: ${JSON.stringify(resM3)}`);
+  }
+  console.log('✓ review_problem_quality registered and allowed with active lease token');
+
+  // --------------------------------------------------------------------------
+  // Scenario N: Input-level concurrency lock & arbitrary taskId tampering defense
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario N: Input-level concurrency lock & arbitrary taskId tampering defense ---');
+  const inputN = 'identical_input_hash_xyz';
+  const taskN1 = 'custom_task_id_alpha';
+  const resN1 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', $2, $3, false, 500) as r;
+  `, [taskN1, inputN, userIdA])).rows[0].r;
+  if (!resN1.allowed || !resN1.lease_token) {
+    throw new Error(`Scenario N taskN1 failed: ${JSON.stringify(resN1)}`);
+  }
+  console.log('✓ taskN1 registered with lease token');
+
+  // Client attempts to bypass concurrency check by generating a DIFFERENT taskId for the SAME input
+  const taskN2 = 'tampered_task_id_beta';
+  const resN2 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', $2, $3, false, 500) as r;
+  `, [taskN2, inputN, userIdA])).rows[0].r;
+  if (resN2.allowed !== false || resN2.status !== 'concurrent_in_progress') {
+    throw new Error(`Tampered taskId for same input must be blocked with concurrent_in_progress: ${JSON.stringify(resN2)}`);
+  }
+  console.log('✓ Tampered taskId with identical input correctly rejected with concurrent_in_progress');
+
+  // Now record result ready for taskN1
+  await db.query(`
+    select public.record_trial_result_ready($1, '{"questions":["q1"]}'::jsonb, $2, $3);
+  `, [taskN1, userIdA, resN1.lease_token]);
+
+  // Now client requests taskN3 with yet another taskId on the same input -> must return cached result
+  const taskN3 = 'new_request_task_id_gamma';
+  const resN3 = (await db.query(`
+    select public.register_ai_task($1, 'logic_questions', $2, $3, false, 500) as r;
+  `, [taskN3, inputN, userIdA])).rows[0].r;
+  if (resN3.status !== 'already_completed' || !resN3.cached_result) {
+    throw new Error(`Identical input must return already_completed with cached_result: ${JSON.stringify(resN3)}`);
+  }
+  console.log('✓ Subsequent request with different taskId on same completed input returns already_completed cache');
+
+  // --------------------------------------------------------------------------
+  // Scenario O: Atomic concurrent initial rate limit requests
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario O: Atomic concurrent initial rate limit requests ---');
+  const rateLimitKey = 'test_rate_limit_initial_' + Date.now();
+  const rl1 = (await db.query(`
+    select public.check_and_increment_rate_limit($1, 5, 60) as r;
+  `, [rateLimitKey])).rows[0].r;
+  if (rl1 !== true) {
+    throw new Error(`Initial rate limit call failed: ${JSON.stringify(rl1)}`);
+  }
+  const count1 = (await db.query(`select attempts from public.auth_rate_limits where key = $1;`, [rateLimitKey])).rows[0].attempts;
+  if (count1 !== 1) {
+    throw new Error(`Expected attempts=1, got ${count1}`);
+  }
+  console.log('✓ check_and_increment_rate_limit created initial entry atomically (attempts=1)');
+
+  const rl2 = (await db.query(`
+    select public.check_and_increment_rate_limit($1, 5, 60) as r;
+  `, [rateLimitKey])).rows[0].r;
+  if (rl2 !== true) {
+    throw new Error(`Second rate limit call failed: ${JSON.stringify(rl2)}`);
+  }
+  const count2 = (await db.query(`select attempts from public.auth_rate_limits where key = $1;`, [rateLimitKey])).rows[0].attempts;
+  if (count2 !== 2) {
+    throw new Error(`Expected attempts=2, got ${count2}`);
+  }
+  console.log('✓ check_and_increment_rate_limit incremented atomically (attempts=2)');
+
+  console.log('\n=== All Upgrade Path & Scenario Tests (including Migration 33) Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~32) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~33) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -884,7 +1000,7 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 32 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 33 on clean database`);
 }
 
 async function main() {

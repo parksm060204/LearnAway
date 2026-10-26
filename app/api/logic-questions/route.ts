@@ -5,6 +5,8 @@ import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 import { RubricCriterion } from '../../../lib/types';
 import { LOGIC_QUESTION_MAX, LOGIC_QUESTION_MIN, validateLogicQuestionsOutput } from '../../../lib/logicValidation';
+import { recordTrialResultReady, settleTrialCredit, releaseTrialCredit } from '../../../lib/trialCredits';
+import { computeMarkdownHash } from '../../../lib/markdownUtils';
 
 const MAX_ANSWER_CHARS = 6000;
 const MAX_PROMPT_CHARS = 4000;
@@ -86,9 +88,57 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const cred = await resolveAiConfigForUser(auth.user.id);
+    const inputIdentifier = computeMarkdownHash(
+      JSON.stringify({
+        problemTitle,
+        problemPrompt,
+        rubric: rubric.map((r) => ({ id: r.id, label: r.label, maxScore: r.maxScore })),
+        modelAnswer,
+        originalAnswer,
+        solvingReason,
+        diagnosisSummary,
+        domain,
+      })
+    );
+    const taskId = asString(payload.taskId).trim() || (`logic_${inputIdentifier}`);
+    const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+
+    const cred = await resolveAiConfigForUser(auth.user.id, {
+      taskId,
+      taskType: 'logic_questions',
+      inputIdentifier,
+      isSaveRetry,
+    });
+
     if (!cred.ok) {
-      const needsAiConnection = cred.code === 'no_credentials';
+      if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
+        const cached = cred.cachedResult as { questions?: unknown; model?: string };
+        return NextResponse.json({
+          success: true,
+          questions: cached.questions,
+          model: cached.model,
+          fromCache: true,
+        });
+      }
+      if (cred.code === 'concurrent_in_progress') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'CONCURRENT_EXECUTION_BLOCKED' },
+          { status: 409 }
+        );
+      }
+      if (cred.code === 'task_input_mismatch' || cred.errorCode === 'TASK_INPUT_MISMATCH') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'TASK_INPUT_MISMATCH' },
+          { status: 400 }
+        );
+      }
+      if (cred.code === 'task_ownership_mismatch' || cred.errorCode === 'TASK_OWNERSHIP_MISMATCH') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'TASK_OWNERSHIP_MISMATCH' },
+          { status: 403 }
+        );
+      }
+      const needsAiConnection = cred.needsAiConnection ?? (cred.code === 'no_credentials');
       return NextResponse.json(
         { success: false, error: cred.message, errorCode: needsAiConnection ? 'AI_CONNECTION_REQUIRED' : cred.code, needsAiConnection },
         { status: needsAiConnection ? 400 : 502 }
@@ -168,9 +218,13 @@ ${diagnosisSummary || '(요약 없음)'}
         executionTimeMs: aiExecutionTimeMs,
         status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
         errorCode: aiCall.error.code,
-        creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+        creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
         inputText: userPrompt,
       });
+
+      if (cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
+      }
 
       return NextResponse.json(
         { success: false, error: aiCall.error.message, errorCode: aiCall.error.code },
@@ -190,7 +244,7 @@ ${diagnosisSummary || '(요약 없음)'}
       outputText: content,
       executionTimeMs: aiExecutionTimeMs,
       status: 'success',
-      creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+      creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
     });
 
     let questions;
@@ -198,10 +252,18 @@ ${diagnosisSummary || '(요약 없음)'}
       const cleaned = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
       questions = validateLogicQuestionsOutput(JSON.parse(cleaned), rubric, originalAnswer);
     } catch (cause) {
+      if (cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'invalid_output', cred.leaseToken);
+      }
       return NextResponse.json(
         { success: false, error: cause instanceof Error ? cause.message : 'AI 질문 결과 검증에 실패했습니다.' },
         { status: 502 }
       );
+    }
+
+    if (cred.leaseToken) {
+      await recordTrialResultReady(auth.user.id, taskId, { questions, model: aiCall.model }, cred.leaseToken);
+      await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
     }
 
     return NextResponse.json({ success: true, questions, model: aiCall.model });

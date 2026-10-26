@@ -3,6 +3,8 @@ import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
 import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
+import { recordTrialResultReady, settleTrialCredit, releaseTrialCredit } from '../../../lib/trialCredits';
+import { computeMarkdownHash } from '../../../lib/markdownUtils';
 import {
   Problem,
   ProblemReport,
@@ -96,7 +98,28 @@ export async function POST(req: NextRequest) {
 
     const openReports = reports.filter((r) => r.status === 'open' || r.status === 'under_review');
 
-    const cred = await resolveAiConfigForUser(auth.user.id);
+    const inputIdentifier = computeMarkdownHash(
+      JSON.stringify({
+        problemId: problem.id,
+        problemTitle: problem.title,
+        promptText: problem.promptText,
+        mathFormula: problem.mathFormula || '',
+        codeSnippet: problem.codeSnippet || '',
+        modelAnswer: problem.modelAnswer,
+        rubric: problem.rubric,
+        reports: openReports.map((r) => ({ type: r.type, details: r.details })),
+        sourceMarkdown: sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '',
+      })
+    );
+    const taskId = (typeof payload.taskId === 'string' && payload.taskId.trim()) ? payload.taskId.trim() : (`qual_${inputIdentifier}`);
+    const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+
+    const cred = await resolveAiConfigForUser(auth.user.id, {
+      taskId,
+      taskType: 'review_problem_quality',
+      inputIdentifier,
+      isSaveRetry,
+    });
     if (cred.ok) {
       try {
         const prompt = `당신은 대학 학부/대학원 수준의 수리통계 및 알고리즘 시험 문제 검증 및 학술 품질 관리관입니다.
@@ -158,9 +181,13 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
             executionTimeMs: aiExecutionTimeMs,
             status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
             errorCode: aiCall.error.code,
-            creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+            creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
             inputText: prompt,
           });
+
+          if (cred.leaseToken) {
+            await releaseTrialCredit(auth.user.id, taskId, 'ai_call_failed', cred.leaseToken);
+          }
 
           // Auth/credit/permission problems are configuration issues the heuristic
           // cannot fix, so surface them instead of silently falling back.
@@ -184,7 +211,7 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
           outputText: aiCall.content,
           executionTimeMs: aiExecutionTimeMs,
           status: 'success',
-          creditSource: cred.isTrial ? 'operator_trial' : 'personal_key',
+          creditSource: (cred.source === 'operator' || cred.isTrial) ? 'operator_trial' : 'personal_key',
         });
 
         const cleanJson = aiCall.content.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -195,7 +222,20 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
         recommendation = parsed.recommendation || (isReportJustified ? 'edit_required' : 'dismiss_report');
         analysisSummary = parsed.analysisSummary || 'AI 검토가 완료되었습니다.';
         suggestedFixes = parsed.suggestedFixes || '';
+
+        if (cred.leaseToken) {
+          await recordTrialResultReady(
+            auth.user.id,
+            taskId,
+            { isReportJustified, severity, recommendation, analysisSummary, suggestedFixes, model: aiCall.model },
+            cred.leaseToken
+          );
+          await settleTrialCredit(auth.user.id, taskId, cred.leaseToken);
+        }
       } catch {
+        if (cred.leaseToken) {
+          await releaseTrialCredit(auth.user.id, taskId, 'parse_or_runtime_error', cred.leaseToken);
+        }
         // Fallback to deterministic heuristic evaluation if AI API call fails
         const fallback = generateHeuristicQualityCheck(problem, openReports, isRubric100);
         isReportJustified = fallback.isReportJustified;
@@ -205,13 +245,46 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
         suggestedFixes = fallback.suggestedFixes;
       }
     } else {
-      // Offline / API not configured: deterministic academic heuristic evaluation
-      const fallback = generateHeuristicQualityCheck(problem, openReports, isRubric100);
-      isReportJustified = fallback.isReportJustified;
-      severity = fallback.severity;
-      recommendation = fallback.recommendation;
-      analysisSummary = fallback.analysisSummary;
-      suggestedFixes = fallback.suggestedFixes;
+      if (cred.code === 'concurrent_in_progress') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'CONCURRENT_EXECUTION_BLOCKED' },
+          { status: 409 }
+        );
+      }
+      if (cred.code === 'task_input_mismatch' || cred.errorCode === 'TASK_INPUT_MISMATCH') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'TASK_INPUT_MISMATCH' },
+          { status: 400 }
+        );
+      }
+      if (cred.code === 'task_ownership_mismatch' || cred.errorCode === 'TASK_OWNERSHIP_MISMATCH') {
+        return NextResponse.json(
+          { success: false, error: cred.message, errorCode: 'TASK_OWNERSHIP_MISMATCH' },
+          { status: 403 }
+        );
+      }
+      if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
+        const cached = cred.cachedResult as {
+          isReportJustified?: boolean;
+          severity?: 'critical' | 'moderate' | 'minor' | 'none';
+          recommendation?: 'edit_required' | 'suspend' | 'dismiss_report';
+          analysisSummary?: string;
+          suggestedFixes?: string;
+        };
+        isReportJustified = Boolean(cached.isReportJustified);
+        severity = cached.severity || (isReportJustified ? 'moderate' : 'none');
+        recommendation = cached.recommendation || (isReportJustified ? 'edit_required' : 'dismiss_report');
+        analysisSummary = cached.analysisSummary || 'AI 검토 결과가 캐시에서 복원되었습니다.';
+        suggestedFixes = cached.suggestedFixes || '';
+      } else {
+        // Offline / API not configured: deterministic academic heuristic evaluation
+        const fallback = generateHeuristicQualityCheck(problem, openReports, isRubric100);
+        isReportJustified = fallback.isReportJustified;
+        severity = fallback.severity;
+        recommendation = fallback.recommendation;
+        analysisSummary = fallback.analysisSummary;
+        suggestedFixes = fallback.suggestedFixes;
+      }
     }
 
     // Force edit recommendation if rubric does not sum to 100 or required fields are missing
