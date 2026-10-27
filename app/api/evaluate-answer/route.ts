@@ -7,7 +7,7 @@ import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
-import { computeMarkdownHash } from '../../../lib/markdownUtils';
+import { computeMarkdownHash, computeAiTaskInputIdentifier } from '../../../lib/markdownUtils';
 import { signTaskRecoveryToken, verifyTaskRecoveryToken } from '../../../lib/recoveryToken';
 import {
   validateTrialEvaluateAnswerInput,
@@ -525,25 +525,34 @@ export async function POST(req: NextRequest) {
       hints: Array.isArray(hints) ? hints.slice(0, Number(revealedHintCount) || 0) : [],
       isMockExam,
     };
-    const inputIdentifier = computeMarkdownHash(JSON.stringify(normalizedEvaluationInput));
+    const inputIdentifier = computeAiTaskInputIdentifier(normalizedEvaluationInput, 'v1');
     const legacyInputIdentifier = isMockExam
       ? computeMarkdownHash(`mock_exam:${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`)
       : computeMarkdownHash(`${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`);
+    const legacyJsonInputIdentifier = computeMarkdownHash(JSON.stringify(normalizedEvaluationInput));
 
     const rawTaskId = (typeof body?.taskId === 'string' && body.taskId.trim()) ? body.taskId.trim() : '';
-    const isLegacyDefault = rawTaskId === `eval_${legacyInputIdentifier}` || rawTaskId === `eval_${inputIdentifier}`;
+    const isLegacyDefault =
+      rawTaskId === `eval_${legacyInputIdentifier}` ||
+      rawTaskId === `eval_${legacyJsonInputIdentifier}` ||
+      rawTaskId === `eval_${inputIdentifier}` ||
+      rawTaskId === `eval_${auth.user.id}_${legacyInputIdentifier}` ||
+      rawTaskId === `eval_${auth.user.id}_${legacyJsonInputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
     let taskId: string = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'eval', inputIdentifier);
     const legacyTaskId = buildLegacyTaskId('eval', legacyInputIdentifier);
     const isSaveRetry = Boolean(body?.isSaveRetry || body?.action === 'retry_save');
 
     if (isSaveRetry) {
-      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', inputIdentifier);
+      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifier);
       if (!saved.success && explicitTaskId) {
-        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'evaluate_answer', inputIdentifier);
+        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifier);
       }
       if (!saved.success) {
         saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'evaluate_answer', legacyInputIdentifier);
+      }
+      if (!saved.success && legacyJsonInputIdentifier !== legacyInputIdentifier) {
+        saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', legacyJsonInputIdentifier);
       }
       if (!saved.success) {
         const clientRecoveryToken = typeof body.signedRecoveryToken === 'string' ? body.signedRecoveryToken : undefined;
@@ -554,6 +563,7 @@ export async function POST(req: NextRequest) {
             taskId,
             taskType: 'evaluate_answer',
             inputIdentifier,
+            legacyInputIdentifier,
             result: clientRecoveryData,
           });
           if (!verifyRes.ok) {

@@ -133,7 +133,9 @@ export function ensureLearningOriginals(
     const byId = new Map<string, unknown>();
     for (const record of origin.value) {
       const id = idOf(record);
-      if (id) byId.set(id, record);
+      if (id && !serverIds.has(id) && !migrated.has(id)) {
+        byId.set(id, record);
+      }
     }
     for (const record of live.value) {
       const id = idOf(record);

@@ -11,7 +11,7 @@ import {
   buildUserScopedTaskId,
   buildLegacyTaskId,
 } from '../../../lib/trialCredits';
-import { computeMarkdownHash } from '../../../lib/markdownUtils';
+import { computeMarkdownHash, computeAiTaskInputIdentifier } from '../../../lib/markdownUtils';
 import { signTaskRecoveryToken, verifyTaskRecoveryToken } from '../../../lib/recoveryToken';
 import {
   Problem,
@@ -131,7 +131,7 @@ export async function POST(req: NextRequest) {
       reports: openReports.map((r) => ({ type: r.type, details: r.details, createdAt: r.createdAt || '' })),
       sourceMarkdown: sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '',
     };
-    const inputIdentifier = computeMarkdownHash(JSON.stringify(normalizedInput));
+    const inputIdentifier = computeAiTaskInputIdentifier(normalizedInput, 'v1');
 
     const legacyInputIdentifier = computeMarkdownHash(
       JSON.stringify({
@@ -148,7 +148,10 @@ export async function POST(req: NextRequest) {
     );
 
     const rawTaskId = (typeof payload.taskId === 'string' && payload.taskId.trim()) ? payload.taskId.trim() : '';
-    const isLegacyDefault = rawTaskId === `qual_${legacyInputIdentifier}` || rawTaskId === `qual_${inputIdentifier}`;
+    const isLegacyDefault =
+      rawTaskId === `qual_${legacyInputIdentifier}` ||
+      rawTaskId === `qual_${inputIdentifier}` ||
+      rawTaskId === `qual_${auth.user.id}_${legacyInputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
     let taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'qual', inputIdentifier);
     const legacyTaskId = buildLegacyTaskId('qual', legacyInputIdentifier);
@@ -216,6 +219,7 @@ export async function POST(req: NextRequest) {
           taskId,
           taskType: 'review_problem_quality',
           inputIdentifier,
+          legacyInputIdentifier,
           result: clientRecoveryData,
         });
 

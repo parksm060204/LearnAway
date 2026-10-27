@@ -92,14 +92,14 @@ export interface CloudLibrary {
   originalPathByMaterialId: Record<string, string>;
 }
 
-export type RepoResult<T> = { ok: true; data: T } | { ok: false; error: string };
+export type RepoResult<T> = { ok: true; data: T; count?: number | null } | { ok: false; error: string };
 
 export function repoError<T = never>(error: string): RepoResult<T> {
   return { ok: false, error };
 }
 
-export function repoOk<T>(data: T): RepoResult<T> {
-  return { ok: true, data };
+export function repoOk<T>(data: T, count?: number | null): RepoResult<T> {
+  return count !== undefined ? { ok: true, data, count } : { ok: true, data };
 }
 
 /** Range pagination parameters for PostgREST queries. */
@@ -113,6 +113,9 @@ export const CLOUD_MAX_PAGES = 100; // supports up to 100,000 items
 
 /**
  * Robust paginated collector that retrieves every page from the server.
+ * - Dynamically advances offset by the actual number of received rows rather than requested pageSize,
+ *   preventing premature completion when server max-rows or reverse proxies clamp page size.
+ * - Terminates when the server returns 0 rows (empty page) or when total count (if provided) is reached.
  * - Deduplicates rows by `id` so concurrent inserts shifting offsets never double-count.
  * - Aborts with error if any intermediate page fails; NEVER treats partial reads as complete.
  * - Explicitly returns error if the safety limit (maxPages) is exceeded with remaining records.
@@ -124,13 +127,20 @@ export async function fetchAllPages<T extends { id: string }>(
 ): Promise<RepoResult<T[]>> {
   const seen = new Set<string>();
   const all: T[] = [];
+  let currentFrom = 0;
+  let serverBatchSize: number | null = null;
 
   for (let page = 0; page < maxPages; page++) {
-    const from = page * pageSize;
+    const from = currentFrom;
     const to = from + pageSize - 1;
     const result = await fetchPage({ from, to });
     if (!result.ok) {
       return result;
+    }
+
+    const receivedCount = result.data.length;
+    if (receivedCount === 0) {
+      return repoOk(all, result.count);
     }
 
     for (const row of result.data) {
@@ -139,12 +149,29 @@ export async function fetchAllPages<T extends { id: string }>(
       all.push(row);
     }
 
-    if (result.data.length < pageSize) {
-      return repoOk(all);
+    // If server provided total count and we've gathered all records, terminate early
+    if (result.count != null && typeof result.count === 'number' && result.count >= 0) {
+      if (all.length >= result.count || currentFrom + receivedCount >= result.count) {
+        return repoOk(all, result.count);
+      }
     }
 
+    // If the server returns fewer items than the observed server batch size,
+    // this is the final short page and we can complete without an unnecessary extra round-trip.
+    if (serverBatchSize !== null && receivedCount < serverBatchSize) {
+      return repoOk(all, result.count);
+    }
+
+    if (serverBatchSize === null) {
+      serverBatchSize = receivedCount;
+    } else {
+      serverBatchSize = Math.max(serverBatchSize, receivedCount);
+    }
+
+    currentFrom += receivedCount;
+
     if (page === maxPages - 1) {
-      return repoError(`데이터가 최대 페이지 한도(${maxPages * pageSize}건)를 초과하여 전체 목록을 수집할 수 없습니다.`);
+      return repoError(`데이터가 최대 페이지 한도(${maxPages}회 요청)를 초과하여 전체 목록을 수집할 수 없습니다.`);
     }
   }
 

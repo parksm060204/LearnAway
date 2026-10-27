@@ -180,6 +180,7 @@ exports.requireApiUser = async () => {
   const googleDrive = load(path.join(output, 'lib/drive/googleDrive.js'));
   const aiCostTelemetry = load(path.join(output, 'lib/aiCostTelemetry.js'));
   const trialCredits = load(path.join(output, 'lib/trialCredits.js'));
+  const recoveryToken = load(path.join(output, 'lib/recoveryToken.js'));
   const { INITIAL_SUBJECTS, INITIAL_CONCEPTS, INITIAL_PROBLEMS } = load(path.join(output, 'lib/initialData.js'));
   let passed = 0;
   const check = (name, fn) => { fn(); passed++; console.log(`PASS ${name}`); };
@@ -6935,7 +6936,7 @@ exports.requireApiUser = async () => {
     assert.equal(stripped.file_size, undefined);
   });
 
-  check('mergeConcepts preserves local needsSourceReview and sourceEvidence', () => {
+  check('mergeConcepts enforces server-authoritative quality/evidence and clears old local warnings', () => {
     const serverConcept = {
       id: 'c-1',
       subjectId: 's-1',
@@ -6953,8 +6954,8 @@ exports.requireApiUser = async () => {
 
     const merged = cloudMerge.mergeConcepts([serverConcept], [localConcept]);
     assert.equal(merged.length, 1);
-    assert.equal(merged[0].needsSourceReview, true, 'local needsSourceReview preserved');
-    assert.equal(merged[0].sourceEvidence.verified, false, 'local sourceEvidence verification state preserved');
+    assert.equal(merged[0].needsSourceReview, false, 'Server re-review false is authoritative (warning cleared)');
+    assert.equal(merged[0].sourceEvidence.verified, true, 'Server new verified:true evidence is not overwritten by old local');
   });
 
   check('GatewayPage does not contain hardcoded passwords and guards dev email login', () => {
@@ -19585,7 +19586,7 @@ exports.requireApiUser = async () => {
     storageScope.setStorageScope({ kind: 'legacy' });
   });
 
-  await checkAsync('Problem 3: mergeLearning respects server-authoritative status (quarantine, outdated, needsSourceReview)', async () => {
+  await checkAsync('Problem 1: mergeLearning enforces server-authoritative quality/review and prevents resurrection of old warnings', async () => {
     const localConcept = {
       id: 'c-1',
       subjectId: 's-1',
@@ -19597,122 +19598,214 @@ exports.requireApiUser = async () => {
       exerciseCount: 1,
       retentionRate: 1,
       needsSourceReview: false,
+      sourceEvidence: { verified: false, quote: 'Old local quote' },
     };
-    const remoteConcept = {
+    // 1. 서버 경고 true + 옛 로컬 false → 서버 경고 유지
+    const remoteWarningConcept = {
       ...localConcept,
       needsSourceReview: true,
-      updatedAt: '2026-01-01T12:00:00Z',
+      sourceEvidence: { verified: false, quote: 'Old quote' },
     };
+    const mergedWarning = cloudMerge.mergeConcepts([remoteWarningConcept], [localConcept], new Set());
+    assert.equal(mergedWarning[0].needsSourceReview, true, '서버 경고 true + 옛 로컬 false → 서버 경고 유지');
 
-    const mergedConcepts = cloudMerge.mergeConcepts([remoteConcept], [localConcept], new Set());
-    assert.equal(mergedConcepts.length, 1);
-    assert.equal(mergedConcepts[0].needsSourceReview, true, 'Server needsSourceReview: true is preserved');
+    // 2. 서버 재검토 완료 false + 옛 로컬 true → 경고 해제 유지
+    const remoteReReviewedConcept = {
+      ...localConcept,
+      needsSourceReview: false,
+      sourceEvidence: { verified: true, quote: 'New authoritative quote' },
+    };
+    const staleLocalConcept = {
+      ...localConcept,
+      needsSourceReview: true,
+      sourceEvidence: { verified: false, quote: 'Old unverified quote' },
+    };
+    const mergedCleared = cloudMerge.mergeConcepts([remoteReReviewedConcept], [staleLocalConcept], new Set());
+    assert.equal(mergedCleared[0].needsSourceReview, false, '서버 재검토 완료 false + 옛 로컬 true → 경고 해제 유지');
 
-    const remoteVerifiedConcept = { ...remoteConcept, needsSourceReview: false };
-    const mergedConcepts2 = cloudMerge.mergeConcepts([remoteVerifiedConcept], [{ ...localConcept, needsSourceReview: false }], new Set());
-    assert.equal(mergedConcepts2[0].needsSourceReview, false, 'Server re-verified needsSourceReview: false is preserved when local is clear');
+    // 3. 서버 새 verified:true 근거가 옛 verified:false 근거로 바뀌지 않음
+    assert.equal(mergedCleared[0].sourceEvidence.verified, true, '서버 새 verified:true 근거 유지');
+    assert.equal(mergedCleared[0].sourceEvidence.quote, 'New authoritative quote', '서버 새 근거 내용 유지');
 
-    const localProblem = {
+    // 4. 문제의 서버 재승인(reapproved, isOutdated: false, needsSourceReview: false)으로 옛 로컬 경고 부활 방지
+    const remoteApprovedProblem = {
       id: 'p-1',
       subjectId: 's-1',
       conceptIds: ['c-1'],
       type: 'essay_descriptive',
       question: 'Question',
       modelAnswer: 'Answer',
-      qualityStatus: 'normal',
+      qualityStatus: 'reapproved',
       isOutdated: false,
       needsSourceReview: false,
       isApproved: true,
       reports: [],
     };
-    const remoteProblem = {
-      ...localProblem,
-      qualityStatus: 'suspended',
+    const staleLocalProblem = {
+      ...remoteApprovedProblem,
+      qualityStatus: 'reported',
       isOutdated: true,
       needsSourceReview: true,
-      reports: [{ reason: 'Error in formulation', reportedAt: '2026-01-01T10:00:00Z' }],
-      updatedAt: '2026-01-01T12:00:00Z',
+      reports: [{ id: 'old-resolved-rep', details: 'Old report already resolved' }],
     };
+    const mergedProblem = cloudMerge.mergeProblems([remoteApprovedProblem], [staleLocalProblem], {}, new Set());
+    assert.equal(mergedProblem[0].qualityStatus, 'reapproved', '서버 재승인 qualityStatus 유지');
+    assert.equal(mergedProblem[0].isOutdated, false, '서버 최신 검증에 따라 isOutdated: false 유지');
+    assert.equal(mergedProblem[0].needsSourceReview, false, '서버 최신 검증에 따라 needsSourceReview: false 유지');
 
-    const mergedProblems = cloudMerge.mergeProblems([remoteProblem], [localProblem], {}, new Set());
-    assert.equal(mergedProblems.length, 1);
-    assert.equal(mergedProblems[0].qualityStatus, 'suspended', 'Server suspended qualityStatus is preserved');
-    assert.equal(mergedProblems[0].isOutdated, true, 'Server isOutdated: true is preserved');
-    assert.equal(mergedProblems[0].needsSourceReview, true, 'Server needsSourceReview: true is preserved');
-    assert.equal(mergedProblems[0].reports.length, 1, 'Server reports preserved');
-
-    const remoteApprovedProblem = {
-      ...remoteProblem,
-      qualityStatus: 'reapproved',
-      isOutdated: false,
-    };
-    const localReportedProblem = {
-      ...localProblem,
+    // 5. 실제 미저장 변경(새로 접수된 로컬 미동기화 신고)은 소실되지 않고 보존
+    const remoteNormalProblem = { ...remoteApprovedProblem, qualityStatus: 'normal' };
+    const problemWithNewUnsavedReport = {
+      ...remoteNormalProblem,
+      reports: [{ id: 'new-unsaved-rep', details: '새로 로컬에서 접수된 미저장 신고' }],
       qualityStatus: 'reported',
-      isOutdated: false,
     };
-    const mergedProblems2 = cloudMerge.mergeProblems([remoteApprovedProblem], [localReportedProblem], {}, new Set());
-    assert.equal(mergedProblems2[0].qualityStatus, 'reapproved', 'Server approved qualityStatus is preserved');
-    assert.equal(mergedProblems2[0].isOutdated, false, 'Server re-validated freshness is preserved');
+    const mergedWithUnsaved = cloudMerge.mergeProblems([remoteNormalProblem], [problemWithNewUnsavedReport], {}, new Set());
+    assert.equal(mergedWithUnsaved[0].reports.some((r) => r.id === 'new-unsaved-rep'), true, '실제 미저장 신고 보존');
+    assert.equal(mergedWithUnsaved[0].qualityStatus, 'reported', '미저장 신고에 따른 reported 상태 보존');
 
-    const mergedDeleted = cloudMerge.mergeProblems([], [localProblem], {}, new Set([localProblem.id]));
-    assert.equal(mergedDeleted.length, 0, 'Server deleted item recorded in migratedIds is not resurrected');
+    // 서버 재승인 항목에 미저장 신고가 있어도 재승인 상태는 유지되며 신고는 보존
+    const mergedReapprovedWithUnsaved = cloudMerge.mergeProblems([remoteApprovedProblem], [problemWithNewUnsavedReport], {}, new Set());
+    assert.equal(mergedReapprovedWithUnsaved[0].reports.some((r) => r.id === 'new-unsaved-rep'), true, '재승인 항목에서도 미저장 신고 내용 보존');
+    assert.equal(mergedReapprovedWithUnsaved[0].qualityStatus, 'reapproved', '서버 재승인 상태 유지');
 
-    const unmigratedLocal = { ...localProblem, id: 'p-new-local' };
-    const mergedNew = cloudMerge.mergeProblems([remoteProblem], [unmigratedLocal], {}, new Set());
+    // 6. 서버 삭제 항목 부활 방지 및 미이관 신규 항목 보존
+    const mergedDeleted = cloudMerge.mergeProblems([], [staleLocalProblem], {}, new Set([staleLocalProblem.id]));
+    assert.equal(mergedDeleted.length, 0, 'Server deleted item in migratedIds is not resurrected');
+
+    const unmigratedLocal = { ...remoteApprovedProblem, id: 'p-new-local' };
+    const mergedNew = cloudMerge.mergeProblems([remoteApprovedProblem], [unmigratedLocal], {}, new Set());
     assert.equal(mergedNew.some((p) => p.id === 'p-new-local'), true, 'New local problem not yet on server is preserved');
   });
 
-  await checkAsync('Problem 4: fetchAllPages collects large datasets deterministically and fails safe on error', async () => {
-    // 1. Collect 2500 items across 3 pages
-    const allItems = Array.from({ length: 2500 }, (_, i) => ({
-      id: `item-${String(i).padStart(5, '0')}`,
-      value: i,
+  await checkAsync('Problem 2: AI task input identifier uses canonical SHA-256 and preserves legacy recovery token compatibility', async () => {
+    // 1. Canonical key sorting: key order independence
+    const inputA = { type: 'evaluate-answer', prompt: 'P1', rubric: 'R1', modelAnswer: 'M1', userAnswer: 'U1' };
+    const inputB = { userAnswer: 'U1', rubric: 'R1', type: 'evaluate-answer', modelAnswer: 'M1', prompt: 'P1' };
+    const idA = markdownUtils.computeAiTaskInputIdentifier(inputA, 'v1');
+    const idB = markdownUtils.computeAiTaskInputIdentifier(inputB, 'v1');
+    assert.equal(idA, idB, 'Different key ordering produces identical canonical identifier');
+    assert.match(idA, /^sha256_v1_[0-9a-f]{64}$/, 'Versioned SHA-256 format');
+
+    // 2. Sensitive to every field affecting output
+    const idWithDifferentRubric = markdownUtils.computeAiTaskInputIdentifier({ ...inputA, rubric: 'R2' }, 'v1');
+    assert.notEqual(idA, idWithDifferentRubric, 'Changing rubric changes identifier');
+
+    const idWithDifferentModelAnswer = markdownUtils.computeAiTaskInputIdentifier({ ...inputA, modelAnswer: 'M2' }, 'v1');
+    assert.notEqual(idA, idWithDifferentModelAnswer, 'Changing modelAnswer changes identifier');
+
+    const idWithDifferentUserAnswer = markdownUtils.computeAiTaskInputIdentifier({ ...inputA, userAnswer: 'U2' }, 'v1');
+    assert.notEqual(idA, idWithDifferentUserAnswer, 'Changing userAnswer changes identifier');
+
+    const idWithHints = markdownUtils.computeAiTaskInputIdentifier({ ...inputA, hints: ['H1'] }, 'v1');
+    assert.notEqual(idA, idWithHints, 'Adding hints changes identifier');
+
+    // 3. Collision resistance: weak 32-bit hash collision inputs produce distinct SHA-256 identifiers
+    const str1 = 'evaluation_input_case_alpha_12345';
+    const str2 = 'evaluation_input_case_beta__12345';
+    const sha1 = markdownUtils.computeAiTaskInputIdentifier(str1, 'v1');
+    const sha2 = markdownUtils.computeAiTaskInputIdentifier(str2, 'v1');
+    assert.notEqual(sha1, sha2, 'Different inputs produce distinct SHA-256 identifiers');
+
+    // 4. Legacy recovery token verification compatibility
+    const legacyWeakHash = 'fnv_weak_hash_12345';
+    const newShaHash = idA;
+    const sampleResult = { score: 95, feedback: 'Good job' };
+
+    const legacyToken = recoveryToken.signTaskRecoveryToken({
+      userId: 'user-token-1',
+      taskId: 'task-legacy-1',
+      taskType: 'evaluate_answer',
+      inputIdentifier: legacyWeakHash,
+      result: sampleResult,
+    });
+
+    // Verifying with legacyInputIdentifier succeeds
+    const verifyResult = recoveryToken.verifyTaskRecoveryToken(legacyToken, {
+      userId: 'user-token-1',
+      taskId: 'task-legacy-1',
+      taskType: 'evaluate_answer',
+      inputIdentifier: newShaHash,
+      legacyInputIdentifier: legacyWeakHash,
+      result: sampleResult,
+    });
+    assert.equal(verifyResult.ok, true, 'Legacy recovery token verified with legacyInputIdentifier fallback');
+
+    // Tampered input or mismatched hash fails
+    const tamperedResult = recoveryToken.verifyTaskRecoveryToken(legacyToken, {
+      userId: 'user-token-1',
+      taskId: 'task-legacy-1',
+      taskType: 'evaluate_answer',
+      inputIdentifier: newShaHash,
+      legacyInputIdentifier: 'different_legacy_hash',
+      result: sampleResult,
+    });
+    assert.equal(tamperedResult.ok, false, 'Tampered legacy identifier correctly rejected');
+  });
+
+  await checkAsync('Problem 4: fetchAllPages handles small server limits, total count, boundaries and failure preservation', async () => {
+    // 1. Server limit smaller than requested pageSize (server limit: 100, requested pageSize: 1000, total items: 150)
+    // Old implementation failed here because 100 < 1000 was treated as last page, missing remaining 50 items!
+    const total150Items = Array.from({ length: 150 }, (_, i) => ({
+      id: `p4-item-${String(i).padStart(4, '0')}`,
+      val: i,
     }));
 
-    const mockFetcher = async ({ from, to }) => {
-      const page = allItems.slice(from, to + 1);
-      return cloudTypes.repoOk(page);
+    const smallServerLimitFetcher = async ({ from, to }) => {
+      // Server enforces max 100 items per response regardless of requested range
+      const requestedSlice = total150Items.slice(from, to + 1);
+      const clampedSlice = requestedSlice.slice(0, 100);
+      return cloudTypes.repoOk(clampedSlice);
     };
 
-    const result = await cloudTypes.fetchAllPages(mockFetcher, 1000, 5);
-    assert.equal(result.ok, true);
-    assert.equal(result.data.length, 2500, 'All 2500 items collected across pages');
-    assert.equal(result.data[0].id, 'item-00000');
-    assert.equal(result.data[2499].id, 'item-02499');
+    const smallLimitResult = await cloudTypes.fetchAllPages(smallServerLimitFetcher, 1000, 10);
+    assert.equal(smallLimitResult.ok, true);
+    assert.equal(smallLimitResult.data.length, 150, 'All 150 items collected when server limit (100) < pageSize (1000)');
+    assert.equal(smallLimitResult.data[0].id, 'p4-item-0000');
+    assert.equal(smallLimitResult.data[149].id, 'p4-item-0149');
 
-    // 2. Deduplication across concurrent shifts
-    const mockDuplicatingFetcher = async ({ from }) => {
-      if (from === 0) {
-        return cloudTypes.repoOk([{ id: 'dup-1' }, { id: 'dup-2' }]);
-      } else if (from === 2) {
-        return cloudTypes.repoOk([{ id: 'dup-2' }, { id: 'dup-3' }]);
-      } else {
-        return cloudTypes.repoOk([]);
+    // 2. Empty list handling
+    const emptyFetcher = async () => cloudTypes.repoOk([]);
+    const emptyResult = await cloudTypes.fetchAllPages(emptyFetcher, 100);
+    assert.equal(emptyResult.ok, true);
+    assert.equal(emptyResult.data.length, 0, 'Empty server response yields empty array');
+
+    // 3. Exact page boundary (100 items, server returns 100 items with count 100)
+    const exact100Items = Array.from({ length: 100 }, (_, i) => ({ id: `exact-${i}` }));
+    const exactBoundaryFetcher = async ({ from }) => {
+      const slice = exact100Items.slice(from, from + 100);
+      return cloudTypes.repoOk(slice, 100);
+    };
+    const boundaryResult = await cloudTypes.fetchAllPages(exactBoundaryFetcher, 100);
+    assert.equal(boundaryResult.ok, true);
+    assert.equal(boundaryResult.data.length, 100, 'Exact page boundary collected with exact count termination');
+
+    // 4. Intermediate failure preserves cache (returns ok: false, never partial data)
+    let pageStep = 0;
+    const failingFetcher = async () => {
+      pageStep++;
+      if (pageStep === 2) {
+        return cloudTypes.repoError('Transient database error');
       }
+      return cloudTypes.repoOk([{ id: 'row-1' }]);
     };
-    const dupResult = await cloudTypes.fetchAllPages(mockDuplicatingFetcher, 2);
+    const failResult = await cloudTypes.fetchAllPages(failingFetcher, 1);
+    assert.equal(failResult.ok, false);
+    assert.equal(failResult.error, 'Transient database error');
+
+    // 5. Deduplication across concurrent shifts
+    const duplicatingFetcher = async ({ from }) => {
+      if (from === 0) return cloudTypes.repoOk([{ id: 'dup-1' }, { id: 'dup-2' }]);
+      if (from === 2) return cloudTypes.repoOk([{ id: 'dup-2' }, { id: 'dup-3' }]);
+      return cloudTypes.repoOk([]);
+    };
+    const dupResult = await cloudTypes.fetchAllPages(duplicatingFetcher, 2);
     assert.equal(dupResult.ok, true);
-    assert.equal(dupResult.data.length, 3, 'Duplicate IDs across pages are deduplicated');
+    assert.equal(dupResult.data.length, 3, 'Deduplicated rows on concurrent offset shift');
     assert.deepEqual(dupResult.data.map((d) => d.id), ['dup-1', 'dup-2', 'dup-3']);
 
-    // 3. Fail-safe abort on error (never return partial data)
-    let pageCount = 0;
-    const mockFailingFetcher = async () => {
-      pageCount++;
-      if (pageCount === 2) {
-        return cloudTypes.repoError('Network timeout');
-      }
-      return cloudTypes.repoOk([{ id: 'ok-1' }]);
-    };
-    const failResult = await cloudTypes.fetchAllPages(mockFailingFetcher, 1);
-    assert.equal(failResult.ok, false, 'Error results in ok: false');
-    assert.equal(failResult.error, 'Network timeout');
-
-    // 4. Exceeding maxPages returns explicit error
-    const infiniteFetcher = async ({ from }) => {
-      return cloudTypes.repoOk([{ id: `inf-${from}` }]);
-    };
+    // 6. Max pages limit exceeded
+    const infiniteFetcher = async ({ from }) => cloudTypes.repoOk([{ id: `inf-${from}` }]);
     const maxPageResult = await cloudTypes.fetchAllPages(infiniteFetcher, 1, 3);
     assert.equal(maxPageResult.ok, false);
     assert.ok(maxPageResult.error.includes('최대 페이지 한도'));

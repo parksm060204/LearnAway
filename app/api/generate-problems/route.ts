@@ -32,7 +32,7 @@ import {
   toAcademicDifficultyLevel,
   SourceVerificationStatus,
 } from '../../../lib/types';
-import { computeMarkdownHash, verifyPageGrounding } from '../../../lib/markdownUtils';
+import { computeMarkdownHash, computeAiTaskInputIdentifier, verifyPageGrounding } from '../../../lib/markdownUtils';
 export { verifyPageGrounding };
 
 interface SourceInput {
@@ -273,14 +273,25 @@ export async function POST(req: NextRequest) {
     // Legacy inputIdentifier for backward compatibility and recovering older tasks
     const legacyInputIdentifier = computeMarkdownHash(`${subjectId}:${conceptKey}:${problemType}:${difficulty}:${markdownHash}`);
 
-    // Authoritative normalized inputIdentifier: includes difficultyLevel, applied count, problemType, legacy difficulty, subject, concepts, and material versions
-    const inputIdentifier = computeMarkdownHash(
-      `${subjectId}:${conceptKey}:${problemType}:${difficulty}:${difficultyLevel}:${count}:${markdownHash}:${sourceVersions}`
-    );
+    // Authoritative normalized inputIdentifier using versioned SHA-256
+    const normalizedGenerationInput = {
+      subjectId,
+      conceptKey,
+      problemType,
+      difficulty,
+      difficultyLevel,
+      count,
+      markdownHash,
+      sourceVersions,
+    };
+    const inputIdentifier = computeAiTaskInputIdentifier(normalizedGenerationInput, 'v1');
 
     const isExplicitTaskId = Boolean(payload.taskId && typeof payload.taskId === 'string' && payload.taskId.trim());
     const explicitTaskId = isExplicitTaskId ? (payload.taskId as string).trim() : null;
-    const isLegacyDefaultTaskId = explicitTaskId === `gen_${legacyInputIdentifier}` || explicitTaskId === `gen_${inputIdentifier}`;
+    const isLegacyDefaultTaskId =
+      explicitTaskId === `gen_${legacyInputIdentifier}` ||
+      explicitTaskId === `gen_${inputIdentifier}` ||
+      explicitTaskId === `gen_${auth.user.id}_${legacyInputIdentifier}`;
     const effectiveExplicitTaskId = (explicitTaskId && !isLegacyDefaultTaskId) ? explicitTaskId : null;
     let taskId = effectiveExplicitTaskId || buildUserScopedTaskId(auth.user.id, 'gen', inputIdentifier);
     const legacyTaskId = buildLegacyTaskId('gen', legacyInputIdentifier);

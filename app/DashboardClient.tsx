@@ -563,10 +563,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         }
         const migratedIds = getMigratedIds(currentUser.id);
 
+        // Include live problems so un-synced local reports and revisions are preserved
+        const liveProblems = loadStoredProblems();
+        const candidateProblems = [...liveProblems, ...originals.data.problems];
+
         const mergedConcepts = mergeConcepts(library.data.concepts, originals.data.concepts, migratedIds);
         const mergedProblems = mergeProblems(
           library.data.problems,
-          originals.data.problems,
+          candidateProblems,
           library.data.problemVersions,
           migratedIds
         );

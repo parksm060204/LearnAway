@@ -10,15 +10,17 @@ default-deny authentication, and SSRF domain protection.
 import os
 import sys
 import time
+import ssl
 import asyncio
 import tempfile
 import multiprocessing as mp
 from typing import Optional, Dict, Any
+import urllib.parse
 from urllib.parse import urlparse
 import urllib.request
 import urllib.error
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, Header, HTTPException, status
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException, status, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -41,6 +43,13 @@ DOWNLOAD_QUEUE_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_QUEUE_TIMEOUT_SECONDS
 # Concurrency semaphore to protect CPU/memory on container instances
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+active_downloads_count = 0
+active_downloads_lock = asyncio.Lock()
+
+
+def get_active_download_count() -> int:
+    global active_downloads_count
+    return active_downloads_count
 
 
 class StorageConvertRequest(BaseModel):
@@ -79,6 +88,8 @@ async def health_check():
         "version": "1.1.0",
         "maxPages": MAX_PAGES_DEFAULT,
         "maxBytes": MAX_FILE_BYTES,
+        "activeDownloads": active_downloads_count,
+        "maxConcurrentDownloads": MAX_CONCURRENT_DOWNLOADS,
     }
 
 
@@ -172,74 +183,138 @@ def validate_storage_url(signed_url: str) -> None:
         )
 
 
-class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+async def _async_http_download(
+    url: str,
+    max_bytes: int = MAX_FILE_BYTES,
+    max_redirects: int = 5,
+) -> bytes:
     """
-    Validates redirected target URLs to ensure SSRF protections are preserved across redirects.
+    Asynchronously streams HTTP/HTTPS storage downloads without background thread pools.
+    Supports native cancellation on timeout, chunked encoding, redirect verification,
+    and strict max byte enforcement.
     """
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    current_url = url
+    for _ in range(max_redirects + 1):
+        validate_storage_url(current_url)
+        parsed = urlparse(current_url)
+        is_ssl = (parsed.scheme == "https")
+        port = parsed.port or (443 if is_ssl else 80)
+        host = parsed.hostname
+        if not host:
+            raise ValueError(f"Invalid host in storage URL: {current_url}")
+
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        ssl_ctx = ssl.create_default_context() if is_ssl else None
+
+        reader, writer = await asyncio.open_connection(
+            host, port, ssl=ssl_ctx, server_hostname=host if is_ssl else None
+        )
         try:
-            validate_storage_url(newurl)
-        except HTTPException as exc:
-            raise urllib.error.HTTPError(newurl, exc.status_code, exc.detail, headers, fp)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+            req_lines = [
+                f"GET {path} HTTP/1.1",
+                f"Host: {parsed.netloc}",
+                "User-Agent: LearnAway-PdfWorker/1.0",
+                "Connection: close",
+                "",
+                "",
+            ]
+            writer.write("\r\n".join(req_lines).encode("latin-1"))
+            await writer.drain()
 
+            status_line = await reader.readline()
+            if not status_line:
+                raise ValueError("스토리지 서버로부터 빈 응답을 받았습니다.")
+            parts = status_line.decode("latin-1").strip().split(None, 2)
+            if len(parts) < 2:
+                raise ValueError(f"잘못된 HTTP 상태 라인: {status_line}")
+            status_code = int(parts[1])
 
-class DownloadSession:
-    """
-    Thread-safe session state tracking for active streaming downloads,
-    enabling immediate socket closure upon cancellation or timeout.
-    """
-    def __init__(self):
-        self.response = None
-        self.is_aborted = False
+            headers: Dict[str, str] = {}
+            while True:
+                line = await reader.readline()
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                header_str = line.decode("latin-1").strip()
+                if ":" in header_str:
+                    k, v = header_str.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
 
-    def abort(self):
-        self.is_aborted = True
-        if self.response:
+            if status_code in (301, 302, 303, 307, 308):
+                location = headers.get("location")
+                if not location:
+                    raise ValueError("리다이렉트 응답에 Location 헤더가 없습니다.")
+                current_url = urllib.parse.urljoin(current_url, location)
+                continue
+
+            if status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"스토리지 서버 응답 오류 (HTTP {status_code}).",
+                )
+
+            is_chunked = (headers.get("transfer-encoding", "").lower() == "chunked")
+            cl_header = headers.get("content-length")
+            if cl_header and cl_header.isdigit() and int(cl_header) > max_bytes:
+                raise ValueError("SIZE_EXCEEDED")
+
+            body_chunks = []
+            total_read = 0
+
+            if is_chunked:
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    chunk_len_str = line.decode("latin-1").strip().split(";")[0]
+                    if not chunk_len_str:
+                        continue
+                    chunk_len = int(chunk_len_str, 16)
+                    if chunk_len == 0:
+                        while True:
+                            trailer = await reader.readline()
+                            if not trailer or trailer in (b"\r\n", b"\n"):
+                                break
+                        break
+                    chunk_data = await reader.readexactly(chunk_len)
+                    await reader.readexactly(2)  # Trailing CRLF
+                    total_read += len(chunk_data)
+                    if total_read > max_bytes:
+                        raise ValueError("SIZE_EXCEEDED")
+                    body_chunks.append(chunk_data)
+            else:
+                cl = int(cl_header) if cl_header and cl_header.isdigit() else None
+                while True:
+                    to_read = min(64 * 1024, max_bytes - total_read + 1)
+                    data = await reader.read(to_read)
+                    if not data:
+                        break
+                    total_read += len(data)
+                    if total_read > max_bytes:
+                        raise ValueError("SIZE_EXCEEDED")
+                    body_chunks.append(data)
+                    if cl is not None and total_read >= cl:
+                        break
+
+            return b"".join(body_chunks)
+        finally:
             try:
-                self.response.close()
+                writer.close()
             except Exception:
                 pass
 
 
-def _download_stream_sync(session: DownloadSession, signed_url: str) -> bytes:
-    opener = urllib.request.build_opener(SafeRedirectHandler)
-    req = urllib.request.Request(
-        signed_url,
-        headers={"User-Agent": "LearnAway-PdfWorker/1.0"},
-    )
-    response = opener.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS)
-    session.response = response
-    chunks = []
-    total_read = 0
-    chunk_size = 64 * 1024
-    try:
-        while True:
-            if session.is_aborted:
-                raise TimeoutError("Download was aborted")
-            chunk = response.read(chunk_size)
-            if not chunk:
-                break
-            total_read += len(chunk)
-            if total_read > MAX_FILE_BYTES:
-                raise ValueError("SIZE_EXCEEDED")
-            chunks.append(chunk)
-    finally:
-        try:
-            response.close()
-        except Exception:
-            pass
-    return b"".join(chunks)
-
-
 async def download_storage_file_async(signed_url: str) -> bytes:
     """
-    Asynchronously streams storage file downloads in an offloaded thread with:
+    Asynchronously streams storage file downloads natively in the event loop with:
     - Bounded concurrency queue (429 on saturation)
     - Total execution timeout (504 on timeout)
     - Max size limits (413 on exceed)
-    - Immediate socket closure on abort/timeout/cancel
+    - Immediate native cancellation and socket closure on abort/timeout/cancel
     - Preserved SSRF domain and redirect validation
+    - Real-time active download counter tracking
     """
     try:
         async with asyncio.timeout(DOWNLOAD_QUEUE_TIMEOUT_SECONDS):
@@ -250,19 +325,20 @@ async def download_storage_file_async(signed_url: str) -> bytes:
             detail="다운로드 대기열이 가득 찼습니다. 잠시 후 다시 시도해 주세요.",
         )
 
-    session = DownloadSession()
+    global active_downloads_count
+    async with active_downloads_lock:
+        active_downloads_count += 1
+
     try:
         async with asyncio.timeout(DOWNLOAD_TIMEOUT_SECONDS):
-            content = await asyncio.to_thread(_download_stream_sync, session, signed_url)
+            content = await _async_http_download(signed_url)
             return content
     except (TimeoutError, asyncio.TimeoutError):
-        session.abort()
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"스토리지 원본 다운로드 시간 초과({int(DOWNLOAD_TIMEOUT_SECONDS)}초).",
         )
     except asyncio.CancelledError:
-        session.abort()
         raise
     except ValueError as ve:
         if str(ve) == "SIZE_EXCEEDED":
@@ -277,17 +353,16 @@ async def download_storage_file_async(signed_url: str) -> bytes:
     except HTTPException:
         raise
     except Exception as e:
-        if session.is_aborted:
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail=f"스토리지 원본 다운로드 시간 초과({int(DOWNLOAD_TIMEOUT_SECONDS)}초).",
-            )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"스토리지 원본 다운로드 실패: {str(e)}",
         )
     finally:
-        download_semaphore.release()
+        try:
+            async with active_downloads_lock:
+                active_downloads_count = max(0, active_downloads_count - 1)
+        finally:
+            download_semaphore.release()
 
 
 

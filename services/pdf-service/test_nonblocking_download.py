@@ -58,24 +58,35 @@ class MockStorageHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/pdf")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            # Send small chunk, sleep 3.5 seconds to simulate slow connection
             chunk = b"chunk1"
             self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
             self.wfile.flush()
             time.sleep(3.5)
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
+        elif self.path == "/hang-before-headers.pdf":
+            # Delay before sending response headers
+            time.sleep(10)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.end_headers()
+        elif self.path == "/hang-during-body.pdf":
+            # Send headers then delay indefinitely during body streaming
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.end_headers()
+            self.wfile.write(b"%PDF-1.4 header bytes...")
+            self.wfile.flush()
+            time.sleep(10)
         elif self.path == "/hang.pdf":
             self.send_response(200)
             self.send_header("Content-Type", "application/pdf")
             self.end_headers()
-            # Send headers and sleep for 10 seconds (exceeds 2s timeout)
             time.sleep(10)
         elif self.path == "/huge.pdf":
             self.send_response(200)
             self.send_header("Content-Type", "application/pdf")
             self.end_headers()
-            # Stream 2MB in chunks (exceeds 500KB test limit)
             chunk = b"A" * 65536
             for _ in range(35):
                 try:
@@ -135,13 +146,27 @@ def run_tests():
             raise RuntimeError(f"PDF service failed to start on port {pdf_port}")
         print("[TEST] PDF service is healthy and ready")
 
-        # Test 1: Slow download does NOT block concurrent /health requests
-        print("[TEST 1] Verifying non-blocking download (event loop responsiveness)...")
         convert_url = f"http://127.0.0.1:{pdf_port}/convert/storage"
         headers = {
             "Content-Type": "application/json",
             "X-Service-Token": "test-service-token-12345",
         }
+
+        # Helper to query /health
+        def get_health():
+            t0 = time.time()
+            req = urllib.request.Request(health_url)
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return data, time.time() - t0
+
+        # Initial check
+        h_init, lat_init = get_health()
+        assert h_init["activeDownloads"] == 0, f"Expected 0 active downloads initially, got {h_init['activeDownloads']}"
+        print(f"[TEST 0] Initial /health responded in {lat_init*1000:.1f}ms: activeDownloads={h_init['activeDownloads']}")
+
+        # Test 1: Slow download does NOT block concurrent /health requests
+        print("[TEST 1] Verifying non-blocking download (event loop responsiveness)...")
         slow_body = json.dumps({
             "signedUrl": f"http://127.0.0.1:{storage_port}/slow.pdf",
             "userId": "u1",
@@ -169,32 +194,70 @@ def run_tests():
         # While slow download is in progress, make 3 health checks and measure response latency
         time.sleep(0.3)
         for i in range(3):
-            t0 = time.time()
-            req_health = urllib.request.Request(health_url)
-            with urllib.request.urlopen(req_health, timeout=1) as resp:
-                assert resp.status == 200
-            latency = time.time() - t0
+            h_data, latency = get_health()
             assert latency < 0.3, f"Health check took too long ({latency}s) - event loop may be blocked!"
-            print(f"  Health check {i+1} responded in {latency*1000:.1f}ms while download was active")
+            print(f"  Health check {i+1} responded in {latency*1000:.1f}ms (activeDownloads={h_data['activeDownloads']})")
 
         slow_done.wait(timeout=6)
         print(f"  Slow download finished with status: {slow_status[0]}")
-        # Could be 504 (timeout) or 422 (invalid test pdf chunks), but NOT blocking
 
-        # Test 2: Timeout handling (504)
-        print("[TEST 2] Verifying download timeout (504) and resource cleanup...")
-        hang_body = json.dumps({
-            "signedUrl": f"http://127.0.0.1:{storage_port}/hang.pdf",
-            "userId": "u1",
-            "jobId": "j2",
+        # Test 2A: Delay before response headers (504 timeout)
+        print("[TEST 2A] Verifying timeout on delay BEFORE response headers...")
+        hang_header_body = json.dumps({
+            "signedUrl": f"http://127.0.0.1:{storage_port}/hang-before-headers.pdf",
+            "userId": "u-hdr",
+            "jobId": "j-hdr",
         }).encode("utf-8")
-        req_hang = urllib.request.Request(convert_url, data=hang_body, headers=headers, method="POST")
+        req_hang_hdr = urllib.request.Request(convert_url, data=hang_header_body, headers=headers, method="POST")
+        t_start = time.time()
         try:
-            with urllib.request.urlopen(req_hang, timeout=5) as resp:
-                assert False, "Should have timed out"
+            with urllib.request.urlopen(req_hang_hdr, timeout=5) as resp:
+                assert False, "Should have timed out before headers"
         except urllib.error.HTTPError as he:
+            elapsed = time.time() - t_start
             assert he.code == 504, f"Expected 504 Gateway Timeout, got {he.code}"
-            print(f"  Got expected 504 Gateway Timeout for hung download")
+            assert 1.5 <= elapsed <= 3.5, f"Expected timeout ~2.0s, took {elapsed:.2f}s"
+            print(f"  Got expected 504 Gateway Timeout in {elapsed:.2f}s for delay before headers")
+
+        # Test 2B: Delay DURING body streaming (504 timeout)
+        print("[TEST 2B] Verifying timeout on delay DURING body streaming...")
+        hang_body_data = json.dumps({
+            "signedUrl": f"http://127.0.0.1:{storage_port}/hang-during-body.pdf",
+            "userId": "u-body",
+            "jobId": "j-body",
+        }).encode("utf-8")
+        req_hang_body = urllib.request.Request(convert_url, data=hang_body_data, headers=headers, method="POST")
+        t_start = time.time()
+        try:
+            with urllib.request.urlopen(req_hang_body, timeout=5) as resp:
+                assert False, "Should have timed out during body"
+        except urllib.error.HTTPError as he:
+            elapsed = time.time() - t_start
+            assert he.code == 504, f"Expected 504 Gateway Timeout, got {he.code}"
+            assert 1.5 <= elapsed <= 3.5, f"Expected timeout ~2.0s, took {elapsed:.2f}s"
+            print(f"  Got expected 504 Gateway Timeout in {elapsed:.2f}s for delay during body streaming")
+
+        # Test 2C: Client cancellation (client drops socket abruptly)
+        print("[TEST 2C] Verifying client cancellation cleanup...")
+        cancel_s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        cancel_s.connect(('127.0.0.1', pdf_port))
+        cancel_req = (
+            f"POST /convert/storage HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{pdf_port}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"X-Service-Token: test-service-token-12345\r\n"
+            f"Content-Length: {len(hang_body_data)}\r\n\r\n"
+        ).encode("latin-1") + hang_body_data
+        cancel_s.sendall(cancel_req)
+        time.sleep(0.3)
+        # Abruptly close socket from client side
+        cancel_s.close()
+        # Storage download has DOWNLOAD_TIMEOUT_SECONDS = 2.0s.
+        # Wait for download timeout cycle to complete and verify activeDownloads cleanly returns to 0
+        time.sleep(2.2)
+        h_cancel, _ = get_health()
+        assert h_cancel["activeDownloads"] == 0, f"Expected 0 active downloads after cancellation, got {h_cancel['activeDownloads']}"
+        print("  Client socket drop handled cleanly, activeDownloads reset to 0")
 
         # Test 3: Size exceed limit (413)
         print("[TEST 3] Verifying file size limit exceeded (413)...")
@@ -211,9 +274,9 @@ def run_tests():
             assert he.code == 413, f"Expected 413 Request Entity Too Large, got {he.code}"
             print(f"  Got expected 413 Request Entity Too Large for huge file")
 
-        # Test 4: Concurrency queue saturation (429)
-        print("[TEST 4] Verifying download concurrency limits (semaphore)...")
-        # With MAX_CONCURRENT_DOWNLOADS=2, run 2 hanging downloads and 1 extra to trigger 429
+        # Test 4: Concurrency queue saturation & ACTIVE DOWNLOAD COUNT MEASUREMENT
+        print("[TEST 4] Verifying download concurrency limits and measuring active task count...")
+        # With MAX_CONCURRENT_DOWNLOADS=2, run 2 hanging downloads
         hang_threads = []
         statuses = []
         status_lock = threading.Lock()
@@ -221,7 +284,7 @@ def run_tests():
         def do_hang(idx):
             try:
                 body = json.dumps({
-                    "signedUrl": f"http://127.0.0.1:{storage_port}/hang.pdf",
+                    "signedUrl": f"http://127.0.0.1:{storage_port}/hang-during-body.pdf",
                     "userId": f"u{idx}",
                     "jobId": f"j{idx}",
                 }).encode("utf-8")
@@ -237,19 +300,34 @@ def run_tests():
         t2 = threading.Thread(target=do_hang, args=(2,))
         t1.start()
         t2.start()
-        time.sleep(0.2)
-        # 3rd request should hit queue timeout (0.8s) while 1 and 2 are active (2.0s)
+
+        # Measure active task count while tasks are running
+        time.sleep(0.4)
+        h_active, lat_active = get_health()
+        print(f"  Measured active downloads under load: {h_active['activeDownloads']} (maxConcurrent: {h_active['maxConcurrentDownloads']}) in {lat_active*1000:.1f}ms")
+        assert h_active["activeDownloads"] == 2, f"Expected exactly 2 active downloads, got {h_active['activeDownloads']}"
+        assert h_active["activeDownloads"] <= h_active["maxConcurrentDownloads"], "Active downloads exceeded maximum capacity!"
+        assert lat_active < 0.2, f"/health took too long under saturation ({lat_active}s)"
+
+        # 3rd request should hit queue timeout (0.8s) because slots 1 and 2 are busy (2.0s)
         t3 = threading.Thread(target=do_hang, args=(3,))
         t3.start()
+
         t1.join(timeout=6)
         t2.join(timeout=6)
         t3.join(timeout=6)
 
-        assert 429 in statuses or 504 in statuses, f"Expected 429 or 504 in {statuses}"
-        print(f"  Concurrency queue correctly handled with statuses: {statuses}")
+        assert 429 in statuses, f"Expected 429 in statuses: {statuses}"
+        assert 504 in statuses, f"Expected 504 in statuses: {statuses}"
+        print(f"  Concurrency queue correctly bounded with statuses: {statuses}")
 
-        # Test 5: Normal PDF conversion and cleanup
-        print("[TEST 5] Verifying normal PDF conversion and temp file cleanup...")
+        # Verify active downloads count dropped back to 0
+        h_after, lat_after = get_health()
+        assert h_after["activeDownloads"] == 0, f"Expected activeDownloads to drop to 0, got {h_after['activeDownloads']}"
+        print(f"  Active downloads cleanly cleared back to {h_after['activeDownloads']} after timeouts (lat: {lat_after*1000:.1f}ms)")
+
+        # Test 5: Normal PDF conversion and cleanup immediately AFTER failure tests
+        print("[TEST 5] Verifying normal PDF conversion and temp file cleanup after timeouts...")
         normal_body = json.dumps({
             "signedUrl": f"http://127.0.0.1:{storage_port}/normal.pdf",
             "userId": "u-ok",
@@ -260,7 +338,7 @@ def run_tests():
             assert resp.status == 200, f"Expected 200, got {resp.status}"
             data = json.loads(resp.read().decode("utf-8"))
             assert data.get("success") is True, f"Conversion failed: {data}"
-            print("  Normal PDF converted successfully to Markdown")
+            print("  Normal PDF converted successfully to Markdown after failure tests")
 
         # Test 6: Safe redirect
         print("[TEST 6] Verifying safe redirect handling...")

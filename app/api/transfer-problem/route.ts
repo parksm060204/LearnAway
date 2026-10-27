@@ -13,7 +13,7 @@ import {
   buildUserScopedTaskId,
   buildLegacyTaskId,
 } from '../../../lib/trialCredits';
-import { computeMarkdownHash } from '../../../lib/markdownUtils';
+import { computeMarkdownHash, computeAiTaskInputIdentifier } from '../../../lib/markdownUtils';
 import { signTaskRecoveryToken, verifyTaskRecoveryToken } from '../../../lib/recoveryToken';
 
 const TRANSFER_PROBLEM_PROMPT_VERSION = 'v2';
@@ -136,7 +136,7 @@ export async function POST(req: NextRequest) {
       rubric: normalizedRubric,
     };
 
-    const inputIdentifier = computeMarkdownHash(JSON.stringify(normalizedInput));
+    const inputIdentifier = computeAiTaskInputIdentifier(normalizedInput, 'v1');
     const legacyInputIdentifier = computeMarkdownHash(
       JSON.stringify({
         problemTitle,
@@ -152,7 +152,10 @@ export async function POST(req: NextRequest) {
     );
 
     const rawTaskId = asString(payload.taskId).trim();
-    const isLegacyDefault = rawTaskId === `trans_${legacyInputIdentifier}` || rawTaskId === `trans_${inputIdentifier}`;
+    const isLegacyDefault =
+      rawTaskId === `trans_${legacyInputIdentifier}` ||
+      rawTaskId === `trans_${inputIdentifier}` ||
+      rawTaskId === `trans_${auth.user.id}_${legacyInputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
     const taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'trans', inputIdentifier);
     const legacyTaskId = buildLegacyTaskId('trans', legacyInputIdentifier);
@@ -202,6 +205,7 @@ export async function POST(req: NextRequest) {
           taskId,
           taskType: 'transfer_problem',
           inputIdentifier,
+          legacyInputIdentifier,
           result: clientRecoveryData,
         });
 

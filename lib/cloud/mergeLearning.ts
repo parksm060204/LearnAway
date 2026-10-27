@@ -30,11 +30,9 @@ export function mergeConcepts(
       lastCalculatedAt: mine.lastCalculatedAt,
       postponedUntil: mine.postponedUntil,
       postponeDays: mine.postponeDays,
-      // Either remote or local flagging needsSourceReview keeps it flagged
-      needsSourceReview: Boolean(remote.needsSourceReview || mine.needsSourceReview),
-      sourceEvidence: (mine.sourceEvidence && mine.sourceEvidence.verified === false)
-        ? mine.sourceEvidence
-        : (remote.sourceEvidence ?? mine.sourceEvidence),
+      // Server is authoritative for needsSourceReview and sourceEvidence for server-known concepts
+      needsSourceReview: remote.needsSourceReview ?? false,
+      sourceEvidence: remote.sourceEvidence ?? mine.sourceEvidence,
     };
   });
   const unSynced = originals.filter((o) => !serverIds.has(o.id) && !migratedIds.has(o.id));
@@ -68,16 +66,24 @@ function resolveProblemQualityStatus(
     return remoteStatus;
   }
 
-  // Server re-approval overrides local reported status
+  // Server re-approval overrides local reported status and clears past warnings
   if (remoteStatus === 'reapproved') {
     return remoteStatus;
   }
 
-  // Local un-synced user reports or reviews are preserved
-  if (localStatus === 'reported' || localStatus === 'under_review' || localStatus === 'review_after_edit') {
-    return localStatus;
+  // If local has genuine un-synced reports (reports not present on server), preserve local reported status
+  const remoteReportIds = new Set((remote.reports || []).map((r) => r.id));
+  const hasUnsavedLocalReports = (mine.reports || []).some((r) => !remoteReportIds.has(r.id));
+  if (hasUnsavedLocalReports) {
+    return localStatus === 'under_review' ? 'under_review' : 'reported';
   }
 
+  // If local problem was actively revised locally (version higher than server version)
+  if ((mine.version ?? 1) > (remote.version ?? 1) && localStatus === 'review_after_edit') {
+    return 'review_after_edit';
+  }
+
+  // Otherwise, server qualityStatus is authoritative
   return remoteStatus;
 }
 
@@ -105,8 +111,9 @@ export function mergeProblems(
         ? {
             reports: mergeReports(remote.reports, mine.reports),
             qualityStatus: resolveProblemQualityStatus(remote, mine),
-            isOutdated: Boolean(remote.isOutdated || mine.isOutdated),
-            needsSourceReview: Boolean(remote.needsSourceReview || mine.needsSourceReview),
+            // Server is authoritative for freshness and source review for server-known problems
+            isOutdated: remote.isOutdated ?? false,
+            needsSourceReview: remote.needsSourceReview ?? false,
             lastReviewedAt: remote.lastReviewedAt ?? mine.lastReviewedAt,
             reviewNotes: remote.reviewNotes ?? mine.reviewNotes,
           }

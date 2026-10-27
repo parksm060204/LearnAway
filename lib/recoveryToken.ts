@@ -471,6 +471,7 @@ export function verifyTaskRecoveryToken(
     taskId: string;
     taskType: string;
     inputIdentifier: string;
+    legacyInputIdentifier?: string;
     result: unknown;
     now?: number;
   }
@@ -545,8 +546,11 @@ export function verifyTaskRecoveryToken(
     return { ok: false, error: '작업 유형이 일치하지 않습니다.', code: 'MISMATCH' };
   }
 
-  // 5. Input Identifier Check
-  if (p.inputIdentifier !== expected.inputIdentifier) {
+  // 5. Input Identifier Check (matches authoritative SHA-256 or backward-compatible legacy hash)
+  const inputMatches =
+    p.inputIdentifier === expected.inputIdentifier ||
+    (Boolean(expected.legacyInputIdentifier) && p.inputIdentifier === expected.legacyInputIdentifier);
+  if (!inputMatches) {
     return { ok: false, error: '작업 입력 식별자가 일치하지 않습니다.', code: 'MISMATCH' };
   }
 
