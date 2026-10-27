@@ -740,7 +740,7 @@ export interface UnsavedProblemRevision {
   timeStandardMinutes?: number;
   editReason: string;
   revisedAt: string;
-  syncStatus: 'pending' | 'syncing' | 'failed' | 'conflict';
+  syncStatus: 'pending' | 'syncing' | 'failed' | 'conflict' | 'synced';
   syncError?: string;
   baseSnapshot?: ProblemVersionSnapshot;
 }

@@ -1974,6 +1974,15 @@ export function editAndReviseProblem(
     editReason: trimmedReason,
   };
 
+  const existingUnsaved = getUnsavedProblemRevision(problemId);
+  const isUnsyncedEdit = Boolean(
+    existingUnsaved &&
+    (existingUnsaved.syncStatus === 'pending' || existingUnsaved.syncStatus === 'failed' || existingUnsaved.syncStatus === 'syncing')
+  );
+
+  const baseVersion = isUnsyncedEdit ? existingUnsaved!.baseVersion : currentVersion;
+  const baseSnapshot = isUnsyncedEdit && existingUnsaved?.baseSnapshot ? existingUnsaved.baseSnapshot : snapshot;
+
   const nextVersion = currentVersion + 1;
   const now = new Date().toISOString();
 
@@ -1981,7 +1990,9 @@ export function editAndReviseProblem(
     ...target,
     ...updates,
     version: nextVersion,
-    versionHistory: [snapshot, ...(target.versionHistory || [])],
+    versionHistory: isUnsyncedEdit
+      ? target.versionHistory
+      : [snapshot, ...(target.versionHistory || [])],
     qualityStatus: 'review_after_edit',
     lastReviewedAt: now,
     reviewNotes: `v${nextVersion} 수정 완료: ${trimmedReason}`,
@@ -1992,7 +2003,7 @@ export function editAndReviseProblem(
 
   saveUnsavedProblemRevision({
     problemId,
-    baseVersion: currentVersion,
+    baseVersion,
     revisionVersion: nextVersion,
     title: updatedProblem.title,
     promptText: updatedProblem.promptText,
@@ -2005,7 +2016,7 @@ export function editAndReviseProblem(
     editReason: trimmedReason,
     revisedAt: now,
     syncStatus: 'pending',
-    baseSnapshot: snapshot,
+    baseSnapshot,
   });
 
   return { success: true, updatedProblems, updatedProblem };

@@ -70,12 +70,14 @@ import {
   AttemptSaveStatus,
   resetToInitialDemoData,
   loadUnsavedProblemRevisions,
+  getUnsavedProblemRevision,
+  saveUnsavedProblemRevision,
   clearUnsavedProblemRevision,
   loadConceptScheduleAdjustments,
 } from '../lib/storage';
 import { AdminAiMetricsModal } from '../components/AdminAiMetricsModal';
 import { loadLearningLibrary } from '../lib/cloud/learningLibrary';
-import { mergeConcepts, mergeDrafts, mergeProblems } from '../lib/cloud/mergeLearning';
+import { mergeConcepts, mergeDrafts, mergeProblems, isRevisionMatchingProblem } from '../lib/cloud/mergeLearning';
 import {
   approveConceptDraft as approveConceptDraftCloud,
   approveProblemDraft as approveProblemDraftCloud,
@@ -593,7 +595,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           library.data.problemVersions,
           migratedIds,
           serverKnownIds,
-          unsavedRevisions
+          unsavedRevisions,
+          (rev) => {
+            saveUnsavedProblemRevision(rev);
+          }
         );
         const mergedConceptDrafts = mergeDrafts(library.data.conceptDrafts, originals.data.conceptDrafts, migratedIds);
         const mergedProblemDrafts = mergeDrafts(library.data.problemDrafts, originals.data.problemDrafts, migratedIds);
@@ -606,6 +611,31 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         setAllProblems(mergedProblems);
         setConceptDrafts(mergedConceptDrafts);
         setProblemDrafts(mergedProblemDrafts);
+
+        // Check for synced revisions to clean up and background auto-retry pending revisions
+        let conflictCount = 0;
+        for (const [pId, rev] of Object.entries(unsavedRevisions)) {
+          if (rev.syncStatus === 'synced') {
+            clearUnsavedProblemRevision(pId);
+          } else if (rev.syncStatus === 'conflict') {
+            conflictCount++;
+          } else if (rev.syncStatus === 'pending') {
+            const sProblem = library.data.problems.find((p) => p.id === pId);
+            if (sProblem && (sProblem.version ?? 1) === rev.baseVersion) {
+              const localProb = mergedProblems.find((p) => p.id === pId);
+              if (localProb) {
+                void reviseProblem(supabase, pId, rev.baseVersion, localProb).then((res) => {
+                  if (res.ok) {
+                    clearUnsavedProblemRevision(pId);
+                  }
+                });
+              }
+            }
+          }
+        }
+        if (conflictCount > 0) {
+          showToast(`서버 버전과 충돌한 문제 수정본 ${conflictCount}건이 안전하게 보존되었습니다.`);
+        }
 
         // Load server learning history (attempts / review events / plans / mock exams).
         const [serverAttempts, serverEvents, serverPlans, serverSettings, serverMock] =
@@ -2811,13 +2841,18 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   ): Promise<void> => {
     const problem = loadStoredProblems().find((p) => p.id === problemId);
     if (!problem) return;
+    const unsaved = getUnsavedProblemRevision(problemId);
     try {
       const supabase = createBrowserSupabaseClient();
+      if (unsaved && unsaved.syncStatus !== 'conflict') {
+        saveUnsavedProblemRevision({ ...unsaved, syncStatus: 'syncing' });
+      }
+      const targetExpectedVersion = unsaved?.baseVersion ?? opts.expectedVersion ?? Math.max(1, (problem.version ?? 1) - 1);
       const result = opts.revise
         ? await reviseProblem(
             supabase,
             problemId,
-            opts.expectedVersion ?? Math.max(1, (problem.version ?? 1) - 1),
+            targetExpectedVersion,
             problem
           )
         : await updateProblemQuality(supabase, problemId, {
@@ -2834,11 +2869,32 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           // If version conflict occurred, check if server was already updated to this version (idempotent retry / response loss)
           if (result.error && /VERSION_CONFLICT/i.test(result.error)) {
             const latestServer = await getProblemById(supabase, problemId);
-            if (latestServer.ok && latestServer.data && latestServer.data.version === problem.version) {
+            if (
+              latestServer.ok &&
+              latestServer.data &&
+              latestServer.data.version === problem.version &&
+              isRevisionMatchingProblem(problem, latestServer.data)
+            ) {
               clearUnsavedProblemRevision(problemId);
               showToast('문제 수정본이 이미 서버에 동기화되어 있습니다.');
               return;
             }
+            if (unsaved) {
+              saveUnsavedProblemRevision({
+                ...unsaved,
+                syncStatus: 'conflict',
+                syncError: `서버 버전 충돌: ${result.error}`,
+              });
+            }
+            showToast('서버 버전 충돌: 미저장 수정본이 충돌 복구 대상으로 보존되었습니다.');
+            return;
+          }
+          if (unsaved && unsaved.syncStatus !== 'conflict') {
+            saveUnsavedProblemRevision({
+              ...unsaved,
+              syncStatus: 'failed',
+              syncError: result.error,
+            });
           }
           showToast(`서버 동기화 실패: ${result.error}`);
         }
@@ -2846,6 +2902,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         if (!result.ok) showToast(`서버 동기화 실패: ${result.error}`);
       }
     } catch (e) {
+      if (unsaved && unsaved.syncStatus !== 'conflict') {
+        saveUnsavedProblemRevision({
+          ...unsaved,
+          syncStatus: 'failed',
+          syncError: e instanceof Error ? e.message : '알 수 없는 오류',
+        });
+      }
       showToast(`서버 동기화 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
     }
   };
@@ -2988,7 +3051,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     updates: Partial<Problem>,
     editReason: string
   ) => {
-    const beforeVersion = allProblems.find((p) => p.id === problemId)?.version ?? 1;
+    const unsavedBefore = getUnsavedProblemRevision(problemId);
+    const beforeVersion = unsavedBefore ? unsavedBefore.baseVersion : (allProblems.find((p) => p.id === problemId)?.version ?? 1);
     const res = editAndReviseProblem(problemId, updates, editReason);
     if (res.success) {
       const reloadedProblems = loadStoredProblems();

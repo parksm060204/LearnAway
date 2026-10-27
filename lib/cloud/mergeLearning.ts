@@ -1,5 +1,47 @@
 import type { Concept, Problem, ProblemVersionSnapshot, UnsavedProblemRevision, ConceptScheduleAdjustment } from '../types';
-import { saveUnsavedProblemRevision } from '../storage';
+
+/**
+ * Checks if unsaved revision content matches remote problem content.
+ * Prevents false conflict classification or accidental deletion when content is identical.
+ */
+export function isRevisionMatchingProblem(
+  unsaved: {
+    title?: string;
+    promptText?: string;
+    modelAnswer?: string;
+    rubric?: Problem['rubric'];
+    mathFormula?: string;
+    codeSnippet?: string;
+    hints?: string[];
+  },
+  remote: Problem
+): boolean {
+  if ((unsaved.promptText || '').trim() !== (remote.promptText || '').trim()) return false;
+  if ((unsaved.modelAnswer || '').trim() !== (remote.modelAnswer || '').trim()) return false;
+  if ((unsaved.title || '').trim() !== (remote.title || '').trim()) return false;
+  if ((unsaved.mathFormula || '').trim() !== (remote.mathFormula || '').trim()) return false;
+  if ((unsaved.codeSnippet || '').trim() !== (remote.codeSnippet || '').trim()) return false;
+
+  const uRubric = unsaved.rubric || [];
+  const rRubric = remote.rubric || [];
+  if (uRubric.length !== rRubric.length) return false;
+  for (let i = 0; i < uRubric.length; i++) {
+    const ur = uRubric[i];
+    const rr = rRubric[i];
+    if (ur.id !== rr.id || Number(ur.maxScore) !== Number(rr.maxScore) || (ur.label || '').trim() !== (rr.label || '').trim()) {
+      return false;
+    }
+  }
+
+  const uHints = unsaved.hints || [];
+  const rHints = remote.hints || [];
+  if (uHints.length !== rHints.length) return false;
+  for (let i = 0; i < uHints.length; i++) {
+    if (uHints[i] !== rHints[i]) return false;
+  }
+
+  return true;
+}
 
 /**
  * Server concepts are authoritative for content, quality, and source review.
@@ -124,7 +166,8 @@ export function mergeProblems(
   versions: Record<string, ProblemVersionSnapshot[]>,
   migratedIds: Set<string> = new Set(),
   serverKnownIds: Set<string> = new Set(),
-  unsavedRevisions: Record<string, UnsavedProblemRevision> = {}
+  unsavedRevisions: Record<string, UnsavedProblemRevision> = {},
+  onRevisionChange?: (rev: UnsavedProblemRevision) => void
 ): Problem[] {
   // Consolidate candidate problems with conflict resolution:
   // Deduplicate candidates by problem ID so duplicate entries (e.g. from live and origin) produce exactly 1 entry.
@@ -173,8 +216,19 @@ export function mergeProblems(
     let hasActiveUnsavedRevision = false;
 
     if (unsaved) {
-      if ((remote.version ?? 1) === unsaved.baseVersion) {
-        // Revision branched from current server version: apply revised content!
+      const serverVersion = remote.version ?? 1;
+      const isIdentical = isRevisionMatchingProblem(unsaved, remote);
+
+      if (serverVersion === unsaved.revisionVersion && isIdentical) {
+        // Server already has this exact revised content (idempotent retry / response loss)
+        if (unsaved.syncStatus !== 'synced') {
+          const updatedRev: UnsavedProblemRevision = { ...unsaved, syncStatus: 'synced' };
+          unsavedRevisions[remote.id] = updatedRev;
+          onRevisionChange?.(updatedRev);
+        }
+        contentToApply = remote;
+      } else if (serverVersion <= unsaved.baseVersion) {
+        // Revision branched from this or older server version, and remote hasn't advanced past base: apply revised content!
         contentToApply = {
           ...remote,
           title: unsaved.title,
@@ -191,14 +245,16 @@ export function mergeProblems(
         if (unsaved.baseSnapshot) {
           combinedHistory = [unsaved.baseSnapshot, ...(combinedHistory || [])];
         }
-      } else if ((remote.version ?? 1) === unsaved.revisionVersion) {
-        // Server already has this version
-        unsaved.syncStatus = 'pending';
-      } else if ((remote.version ?? 1) > unsaved.baseVersion) {
-        // Remote conflict!
-        unsaved.syncStatus = 'conflict';
-        unsaved.syncError = `서버 버전 충돌 (서버: v${remote.version}, 수정 기준: v${unsaved.baseVersion})`;
-        saveUnsavedProblemRevision(unsaved);
+      } else {
+        // Remote server has advanced past local baseVersion (serverVersion > unsaved.baseVersion) and content differs:
+        // Genuine remote conflict!
+        const updatedRev: UnsavedProblemRevision = {
+          ...unsaved,
+          syncStatus: 'conflict',
+          syncError: `서버 버전 충돌 (서버: v${serverVersion}, 수정 기준: v${unsaved.baseVersion})`,
+        };
+        unsavedRevisions[remote.id] = updatedRev;
+        onRevisionChange?.(updatedRev);
         contentToApply = remote;
       }
     } else if (mine && (mine.version ?? 1) > (remote.version ?? 1) && mine.qualityStatus === 'review_after_edit') {
@@ -220,20 +276,26 @@ export function mergeProblems(
       }
     }
 
+    const isConflict = unsaved?.syncStatus === 'conflict';
+    let reviewNotes = remote.reviewNotes ?? mine?.reviewNotes;
+    if (hasActiveUnsavedRevision && unsaved) {
+      reviewNotes = `v${effectiveVersion} 수정 완료: ${unsaved.editReason}`;
+    } else if (isConflict && unsaved) {
+      reviewNotes = `[충돌 대기] ${unsaved.syncError || '서버 버전과 충돌한 미저장 수정본이 보존됨'}: ${unsaved.editReason}`;
+    }
+
     return {
       ...contentToApply,
       version: effectiveVersion,
       qualityStatus: hasActiveUnsavedRevision ? 'review_after_edit' : resolveProblemQualityStatus(remote, mine),
       ...(combinedHistory ? { versionHistory: combinedHistory } : {}),
-      ...(mine
+      ...(mine || unsaved
         ? {
-            reports: mergeReports(remote.reports, mine.reports),
+            reports: mergeReports(remote.reports, mine?.reports),
             isOutdated: remote.isOutdated ?? false,
             needsSourceReview: remote.needsSourceReview ?? false,
-            lastReviewedAt: remote.lastReviewedAt ?? mine.lastReviewedAt,
-            reviewNotes: hasActiveUnsavedRevision && unsaved
-              ? `v${effectiveVersion} 수정 완료: ${unsaved.editReason}`
-              : (remote.reviewNotes ?? mine.reviewNotes),
+            lastReviewedAt: remote.lastReviewedAt ?? mine?.lastReviewedAt,
+            reviewNotes,
           }
         : {}),
     };
@@ -250,9 +312,13 @@ export function mergeProblems(
       // It was deleted on the server!
       // Do NOT resurrect deleted server cache into unSynced.
       if (unsavedRevisions[id]) {
-        unsavedRevisions[id].syncStatus = 'conflict';
-        unsavedRevisions[id].syncError = '서버에서 삭제된 문제의 미저장 수정본';
-        saveUnsavedProblemRevision(unsavedRevisions[id]);
+        const updatedRev: UnsavedProblemRevision = {
+          ...unsavedRevisions[id],
+          syncStatus: 'conflict',
+          syncError: '서버에서 삭제된 문제의 미저장 수정본',
+        };
+        unsavedRevisions[id] = updatedRev;
+        onRevisionChange?.(updatedRev);
       }
       continue;
     }

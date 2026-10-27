@@ -673,7 +673,7 @@ export async function POST(req: NextRequest) {
               settled = true;
             }
           } else {
-            persisted = true;
+            persisted = false;
             settled = true;
           }
 

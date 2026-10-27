@@ -20214,37 +20214,110 @@ exports.requireApiUser = async () => {
     assert.equal(mergedProblems[0].modelAnswer, revisedUpdates.modelAnswer, 'Revised modelAnswer is NOT wiped out by server v1');
     assert.equal(mergedProblems[0].rubric[0].description, 'Clarified rubric', 'Revised rubric is NOT wiped out by server v1');
 
-    // 3. Server changed on another device (v3) -> Conflict detected, server v3 wins for live list, but unsaved revision is preserved as conflict recovery
-    const p1ServerV3 = {
-      ...p1ServerV1,
-      version: 3,
-      promptText: 'Remote Device Changed Prompt to v3',
-      qualityStatus: 'normal',
-    };
-    const mergedConflict = cloudMerge.mergeProblems(
-      [p1ServerV3],
-      [mergedProblems[0]],
+    // 2b. Consecutive local edits before server sync: user edits again to v3
+    const editResV3 = storage.editAndReviseProblem(
+      p1ServerV1.id,
+      { promptText: 'Revised Prompt Text v3 with even more precision' },
+      'Further clarified notation'
+    );
+    assert.equal(editResV3.success, true);
+    assert.equal(editResV3.updatedProblem.version, 3);
+    const revsV3 = storage.loadUnsavedProblemRevisions();
+    const storedRevV3 = revsV3[p1ServerV1.id];
+    assert.equal(storedRevV3.baseVersion, 1, 'Consecutive edit preserves original server baseVersion 1');
+    assert.equal(storedRevV3.revisionVersion, 3, 'Consecutive edit increments revisionVersion to 3');
+    assert.equal(storedRevV3.baseSnapshot.version, 1, 'Base snapshot remains version 1');
+
+    // Merge when server is still at v1 retains v3
+    const mergedProblemsV3 = cloudMerge.mergeProblems(
+      [p1ServerV1],
+      storage.loadStoredProblems(),
       {},
       new Set([p1ServerV1.id]),
       new Set([p1ServerV1.id]),
       storage.loadUnsavedProblemRevisions()
     );
-    assert.equal(mergedConflict[0].version, 3, 'Server v3 authoritative for active list on conflict');
-    const revsAfterConflict = storage.loadUnsavedProblemRevisions();
-    assert.ok(revsAfterConflict[p1ServerV1.id], 'Unsaved revision preserved for recovery on conflict');
-    assert.equal(revsAfterConflict[p1ServerV1.id].syncStatus, 'conflict', 'Marked as conflict');
+    assert.equal(mergedProblemsV3[0].version, 3, 'Merged problem retains consecutive revision v3');
+    assert.equal(mergedProblemsV3[0].promptText, 'Revised Prompt Text v3 with even more precision');
 
-    // 4. Server problem deleted on server -> NOT resurrected in active problem list, but unsaved revision preserved as recovery target
-    const mergedDeleted = cloudMerge.mergeProblems(
-      [],
-      [mergedProblems[0]],
+    // 3. Same version number with DIFFERENT content -> genuine conflict!
+    // Device A pushed v2 with text 'A version'.
+    // Device B has unsaved v2 with text 'B version'.
+    const p1ServerV2FromA = {
+      ...p1ServerV1,
+      version: 2,
+      promptText: 'A device changed prompt to v2',
+      qualityStatus: 'normal',
+    };
+    const unsavedDeviceB = {
+      problemId: p1ServerV1.id,
+      baseVersion: 1,
+      revisionVersion: 2,
+      title: p1ServerV1.title,
+      promptText: 'B device modified prompt to v2 with different text',
+      hints: [],
+      modelAnswer: p1ServerV1.modelAnswer,
+      rubric: p1ServerV1.rubric,
+      editReason: 'Device B edit',
+      revisedAt: new Date().toISOString(),
+      syncStatus: 'pending',
+    };
+    storage.saveUnsavedProblemRevision(unsavedDeviceB);
+
+    const mergedDiffContentConflict = cloudMerge.mergeProblems(
+      [p1ServerV2FromA],
+      [p1ServerV2FromA],
       {},
       new Set([p1ServerV1.id]),
       new Set([p1ServerV1.id]),
-      storage.loadUnsavedProblemRevisions()
+      storage.loadUnsavedProblemRevisions(),
+      (rev) => storage.saveUnsavedProblemRevision(rev)
+    );
+    assert.equal(mergedDiffContentConflict[0].version, 2);
+    assert.equal(mergedDiffContentConflict[0].promptText, 'A device changed prompt to v2');
+    const revsAfterDiffConflict = storage.loadUnsavedProblemRevisions();
+    assert.equal(revsAfterDiffConflict[p1ServerV1.id].syncStatus, 'conflict', 'Different content on same version is marked as conflict');
+    assert.ok(revsAfterDiffConflict[p1ServerV1.id].syncError.includes('충돌'));
+
+    // 3b. Response loss recovery: server at v2 with IDENTICAL content -> marked synced, not conflict!
+    const unsavedDeviceMatching = {
+      ...unsavedDeviceB,
+      promptText: p1ServerV2FromA.promptText,
+      syncStatus: 'pending',
+    };
+    storage.saveUnsavedProblemRevision(unsavedDeviceMatching);
+
+    const mergedIdentical = cloudMerge.mergeProblems(
+      [p1ServerV2FromA],
+      [p1ServerV2FromA],
+      {},
+      new Set([p1ServerV1.id]),
+      new Set([p1ServerV1.id]),
+      storage.loadUnsavedProblemRevisions(),
+      (rev) => storage.saveUnsavedProblemRevision(rev)
+    );
+    assert.equal(mergedIdentical[0].version, 2);
+    const revsAfterIdentical = storage.loadUnsavedProblemRevisions();
+    assert.equal(revsAfterIdentical[p1ServerV1.id].syncStatus, 'synced', 'Identical content is marked as synced');
+
+    // 4. Server problem deleted on server -> NOT resurrected in active problem list, but unsaved revision preserved as recovery target
+    const unsavedToPreserve = {
+      ...unsavedDeviceB,
+      syncStatus: 'pending',
+    };
+    storage.saveUnsavedProblemRevision(unsavedToPreserve);
+    const mergedDeleted = cloudMerge.mergeProblems(
+      [],
+      [p1ServerV2FromA],
+      {},
+      new Set([p1ServerV1.id]),
+      new Set([p1ServerV1.id]),
+      storage.loadUnsavedProblemRevisions(),
+      (rev) => storage.saveUnsavedProblemRevision(rev)
     );
     assert.equal(mergedDeleted.length, 0, 'Deleted problem is not resurrected in active problems');
     assert.ok(storage.loadUnsavedProblemRevisions()[p1ServerV1.id], 'Unsaved revision still preserved for recovery');
+    assert.equal(storage.loadUnsavedProblemRevisions()[p1ServerV1.id].syncStatus, 'conflict');
 
     // 5. Cross-account isolation: User B cannot see User A unsaved revision
     storageScope.setStorageScope({ kind: 'user', userId: userB });
@@ -20518,6 +20591,31 @@ exports.requireApiUser = async () => {
         const cleared = taskRecoveryClient.clearTaskRecovery(testUser.id, tc.taskType, clientContextKey, data.taskId);
         assert.equal(cleared, true, `${tc.name} client recovery record cleanly cleared`);
         assert.equal(taskRecoveryClient.getTaskRecovery(testUser.id, tc.taskType, clientContextKey), null);
+
+        // Also test recovery token WITHOUT leaseToken (personal key / unreserved):
+        // Server must truthfully report persisted: false, settled: true (not false positive persisted: true)
+        const tokenWithoutLease = recoveryToken.signTaskRecoveryToken({
+          userId: testUser.id,
+          taskId: tc.legacyTaskId,
+          taskType: tc.taskType,
+          inputIdentifier: tc.legacyInputIdentifier,
+          result: tc.clientRecoveryData,
+          modelId: 'deepseek-v4.1-flash',
+        });
+        const reqWithoutLease = new Request(tc.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...tc.bodyPayload,
+            signedRecoveryToken: tokenWithoutLease,
+            recoveryData: tc.clientRecoveryData,
+          }),
+        });
+        const resWithoutLease = await tc.route(reqWithoutLease);
+        const dataWithoutLease = await resWithoutLease.json();
+        assert.equal(resWithoutLease.status, 200, `${tc.name} without leaseToken returns 200`);
+        assert.equal(dataWithoutLease.persisted, false, `${tc.name} reports persisted: false when not saved to DB`);
+        assert.equal(dataWithoutLease.settled, true, `${tc.name} reports settled: true for unreserved token`);
       });
     }
 
