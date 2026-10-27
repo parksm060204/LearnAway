@@ -13186,7 +13186,7 @@ exports.requireApiUser = async () => {
       assert.equal(validPayload.storagePath, storagePath);
 
       // Reject tampered token
-      const tampered = token.slice(0, -2) + 'aa';
+      const tampered = token.endsWith('aa') ? token.slice(0, -2) + 'bb' : token.slice(0, -2) + 'aa';
       assert.equal(verifyPdfJobToken(tampered), null);
 
       // Reject different user
@@ -20150,6 +20150,459 @@ exports.requireApiUser = async () => {
     const diffDiffInput = makeNormalizedInput({}, { difficultyLevel: 'graduate_challenging' });
     const diffDiffId = markdownUtils.computeAiTaskInputIdentifier(diffDiffInput, 'v1');
     assert.notEqual(baseId, diffDiffId, 'Changing difficulty level changes inputIdentifier');
+  });
+
+  await checkAsync('Bug 1: Server save failure preserves problem revision across refresh and merge', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user-rev-preserve' });
+    const userA = 'user-rev-preserve';
+    const userB = 'user-rev-other';
+
+    const p1ServerV1 = {
+      id: 'p-rev-1',
+      subjectId: 's-math-1',
+      title: 'Original Server Title',
+      promptText: 'Original Server Prompt v1',
+      modelAnswer: 'Original Model Answer v1',
+      rubric: [{ id: 'r1', label: 'Step 1', maxScore: 10, description: 'Base rubric' }],
+      hints: [],
+      version: 1,
+      qualityStatus: 'normal',
+      isOutdated: false,
+      needsSourceReview: false,
+      reports: [],
+    };
+
+    // 1. User revises problem locally to v2
+    const revisedUpdates = {
+      promptText: 'Revised Prompt Text v2 with clarified proof condition',
+      modelAnswer: 'Revised Model Answer v2 with formal derivation',
+      rubric: [{ id: 'r1', label: 'Step 1', maxScore: 10, description: 'Clarified rubric' }],
+    };
+    const editReason = 'Clarified proof condition and improved rubric';
+
+    storage.saveStoredProblems([p1ServerV1]);
+    const editRes = storage.editAndReviseProblem(p1ServerV1.id, revisedUpdates, editReason);
+    assert.equal(editRes.success, true);
+    assert.equal(editRes.updatedProblem.version, 2);
+    assert.equal(editRes.updatedProblem.qualityStatus, 'review_after_edit');
+
+    // Verify unsaved revision was created and stored separately
+    const unsavedRevs = storage.loadUnsavedProblemRevisions();
+    const storedRev = unsavedRevs[p1ServerV1.id];
+    assert.ok(storedRev, 'Unsaved revision exists in separate storage');
+    assert.equal(storedRev.baseVersion, 1, 'Records base server version 1');
+    assert.equal(storedRev.revisionVersion, 2, 'Records revision version 2');
+    assert.equal(storedRev.editReason, editReason);
+    assert.equal(storedRev.promptText, revisedUpdates.promptText);
+
+    // 2. Server sync fails -> on re-query / refresh, mergeProblems MUST preserve the unsaved revision!
+    // Server still returns version 1!
+    const liveProblemsAfterRefresh = storage.loadStoredProblems();
+    const mergedProblems = cloudMerge.mergeProblems(
+      [p1ServerV1],
+      liveProblemsAfterRefresh,
+      {},
+      new Set([p1ServerV1.id]),
+      new Set([p1ServerV1.id]),
+      storage.loadUnsavedProblemRevisions()
+    );
+
+    assert.equal(mergedProblems.length, 1);
+    assert.equal(mergedProblems[0].version, 2, 'Merged problem retains version 2');
+    assert.equal(mergedProblems[0].qualityStatus, 'review_after_edit', 'qualityStatus retains review_after_edit');
+    assert.equal(mergedProblems[0].promptText, revisedUpdates.promptText, 'Revised promptText is NOT wiped out by server v1');
+    assert.equal(mergedProblems[0].modelAnswer, revisedUpdates.modelAnswer, 'Revised modelAnswer is NOT wiped out by server v1');
+    assert.equal(mergedProblems[0].rubric[0].description, 'Clarified rubric', 'Revised rubric is NOT wiped out by server v1');
+
+    // 3. Server changed on another device (v3) -> Conflict detected, server v3 wins for live list, but unsaved revision is preserved as conflict recovery
+    const p1ServerV3 = {
+      ...p1ServerV1,
+      version: 3,
+      promptText: 'Remote Device Changed Prompt to v3',
+      qualityStatus: 'normal',
+    };
+    const mergedConflict = cloudMerge.mergeProblems(
+      [p1ServerV3],
+      [mergedProblems[0]],
+      {},
+      new Set([p1ServerV1.id]),
+      new Set([p1ServerV1.id]),
+      storage.loadUnsavedProblemRevisions()
+    );
+    assert.equal(mergedConflict[0].version, 3, 'Server v3 authoritative for active list on conflict');
+    const revsAfterConflict = storage.loadUnsavedProblemRevisions();
+    assert.ok(revsAfterConflict[p1ServerV1.id], 'Unsaved revision preserved for recovery on conflict');
+    assert.equal(revsAfterConflict[p1ServerV1.id].syncStatus, 'conflict', 'Marked as conflict');
+
+    // 4. Server problem deleted on server -> NOT resurrected in active problem list, but unsaved revision preserved as recovery target
+    const mergedDeleted = cloudMerge.mergeProblems(
+      [],
+      [mergedProblems[0]],
+      {},
+      new Set([p1ServerV1.id]),
+      new Set([p1ServerV1.id]),
+      storage.loadUnsavedProblemRevisions()
+    );
+    assert.equal(mergedDeleted.length, 0, 'Deleted problem is not resurrected in active problems');
+    assert.ok(storage.loadUnsavedProblemRevisions()[p1ServerV1.id], 'Unsaved revision still preserved for recovery');
+
+    // 5. Cross-account isolation: User B cannot see User A unsaved revision
+    storageScope.setStorageScope({ kind: 'user', userId: userB });
+    const userBRevs = storage.loadUnsavedProblemRevisions();
+    assert.equal(Object.keys(userBRevs).length, 0, 'User B has no access to User A unsaved revisions');
+    storageScope.setStorageScope({ kind: 'user', userId: userA });
+  });
+
+  await checkAsync('Bug 2: Cross-version AI task recovery preserves authoritative legacy taskId in routes', async () => {
+    const { POST: logicPost } = load(path.join(output, 'app/api/logic-questions/route.js'));
+    const { POST: evaluatePost } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
+    const { POST: transferPost } = load(path.join(output, 'app/api/transfer-problem/route.js'));
+    const { POST: reviewPost } = load(path.join(output, 'app/api/review-problem-quality/route.js'));
+    const taskRecoveryClient = load(path.join(output, 'lib/taskRecoveryClient.js'));
+
+    const testUser = { id: 'u-auth-legacy-task-1', email: 'legacy@example.com' };
+    const savedSecret = process.env.ANALYSIS_RECOVERY_SIGNING_SECRET;
+    process.env.ANALYSIS_RECOVERY_SIGNING_SECRET = 'recovery_secret_legacy_test_123456';
+
+    const logicLegacyHash = markdownUtils.computeMarkdownHash(
+      JSON.stringify({
+        problemTitle: '',
+        problemPrompt: 'Explain the central limit theorem',
+        rubric: [{ id: 'r1', label: 'Standardization', maxScore: 10 }],
+        modelAnswer: 'CLT states sample mean converges to normal',
+        originalAnswer: 'Sample mean converges',
+        solvingReason: '',
+        diagnosisSummary: '',
+        domain: 'math_stats',
+      })
+    );
+    const logicLegacyTaskId = `logic_${logicLegacyHash}`;
+
+    const evalLegacyHash = markdownUtils.computeMarkdownHash('p-eval-test:1:y = C e^x');
+    const evalLegacyTaskId = `eval_${evalLegacyHash}`;
+
+    const transLegacyHash = markdownUtils.computeMarkdownHash(
+      JSON.stringify({
+        problemTitle: '',
+        problemPrompt: 'Calculate eigenvalues of matrix A',
+        rubric: [{ id: 'r1', label: 'Characteristic polynomial', maxScore: 10 }],
+        concepts: [{ id: 'c1', title: '개념1' }],
+        originalAnswer: 'det(A - lambda I) = 0',
+        revisedAnswer: '',
+        problemType: 'proof_counterexample',
+        difficulty: 'advanced_college',
+        domain: 'math_stats',
+      })
+    );
+    const transLegacyTaskId = `trans_${transLegacyHash}`;
+
+    const qualLegacyHash = markdownUtils.computeMarkdownHash(
+      JSON.stringify({
+        problemId: 'p-review-test',
+        problemTitle: 'Matrix Inversion',
+        promptText: 'Find inverse of 2x2 matrix',
+        mathFormula: '',
+        codeSnippet: '',
+        modelAnswer: '1/det * adj(A)',
+        rubric: [{ id: 'r1', label: 'Determinant', maxScore: 10, description: 'det check' }],
+        reports: [{ type: 'typo', details: 'Sign error' }],
+        sourceMarkdown: '',
+      })
+    );
+    const qualLegacyTaskId = `qual_${qualLegacyHash}`;
+
+    const testCases = [
+      {
+        name: 'logic_questions',
+        route: logicPost,
+        url: 'http://localhost/api/logic-questions',
+        taskType: 'logic_questions',
+        legacyTaskId: logicLegacyTaskId,
+        legacyInputIdentifier: logicLegacyHash,
+        bodyPayload: {
+          problemId: 'p-logic-test',
+          problemPrompt: 'Explain the central limit theorem',
+          modelAnswer: 'CLT states sample mean converges to normal',
+          originalAnswer: 'Sample mean converges',
+          rubric: [{ id: 'r1', label: 'Standardization', maxScore: 10 }],
+          isSaveRetry: true,
+        },
+        clientRecoveryData: {
+          questions: [
+            { id: 'q1', type: 'premise_check', questionText: 'What is required for variance?', rationale: 'Check finite variance' }
+          ],
+          model: 'deepseek-v4.1-flash',
+        },
+      },
+      {
+        name: 'evaluate_answer',
+        route: evaluatePost,
+        url: 'http://localhost/api/evaluate-answer',
+        taskType: 'evaluate_answer',
+        legacyTaskId: evalLegacyTaskId,
+        legacyInputIdentifier: evalLegacyHash,
+        bodyPayload: {
+          problemId: 'p-eval-test',
+          isProvisionalLocal: true,
+          problemVersion: 1,
+          domain: 'math_stats',
+          problemTitle: 'Differential Equation',
+          problemPrompt: 'Solve differential equation dy/dx = y',
+          modelAnswer: 'y = Ce^x',
+          userAnswer: 'y = C e^x',
+          rubric: [{ id: 'r1', label: 'Separation', maxScore: 100, description: 'Separate variables' }],
+          revealedHintCount: 0,
+          hints: [],
+          isSaveRetry: true,
+        },
+        clientRecoveryData: {
+          evaluation: {
+            overallScore: 100,
+            rubricScores: [{ id: 'r1', score: 100, feedback: 'Correct' }],
+            detailedFeedback: 'Flawless solution',
+            needsReview: false,
+          },
+          problemId: 'p-eval-test',
+        },
+      },
+      {
+        name: 'transfer_problem',
+        route: transferPost,
+        url: 'http://localhost/api/transfer-problem',
+        taskType: 'transfer_problem',
+        legacyTaskId: transLegacyTaskId,
+        legacyInputIdentifier: transLegacyHash,
+        bodyPayload: {
+          problemId: 'p-trans-test',
+          subjectId: 'sub-p4',
+          domain: 'math_stats',
+          problemPrompt: 'Calculate eigenvalues of matrix A',
+          modelAnswer: 'det(A - lambda I) = 0',
+          originalAnswer: 'det(A - lambda I) = 0',
+          problemType: 'proof_counterexample',
+          concepts: [{ id: 'c1', title: '개념1' }],
+          vulnerableCriteria: ['r1'],
+          rubric: [{ id: 'r1', label: 'Characteristic polynomial', maxScore: 10 }],
+          isSaveRetry: true,
+        },
+        clientRecoveryData: {
+          draft: {
+            transferredProblemPrompt: 'Find eigenvalues of non-symmetric matrix B',
+            transferredModelAnswer: 'Solve det(B - lambda I) = 0 with distinct roots',
+            transferredRubric: [{ id: 'tr1', label: 'Roots', maxScore: 10, description: 'Find roots' }],
+          },
+          model: 'deepseek-v4.1-flash',
+        },
+      },
+      {
+        name: 'review_problem_quality',
+        route: reviewPost,
+        url: 'http://localhost/api/review-problem-quality',
+        taskType: 'review_problem_quality',
+        legacyTaskId: qualLegacyTaskId,
+        legacyInputIdentifier: qualLegacyHash,
+        bodyPayload: {
+          problemId: 'p-review-test',
+          problem: {
+            id: 'p-review-test',
+            title: 'Matrix Inversion',
+            promptText: 'Find inverse of 2x2 matrix',
+            modelAnswer: '1/det * adj(A)',
+            rubric: [{ id: 'r1', label: 'Determinant', maxScore: 10, description: 'det check' }],
+            reports: [{ id: 'rep1', type: 'typo', details: 'Sign error', status: 'open' }],
+          },
+          reports: [{ id: 'rep1', type: 'typo', details: 'Sign error', status: 'open' }],
+          reportId: 'rep1',
+          isSaveRetry: true,
+        },
+        clientRecoveryData: {
+          isReportJustified: true,
+          detailedCritique: 'There is indeed a typo in sign',
+          actionRecommendation: 'fix_typo',
+        },
+      },
+    ];
+
+    for (const tc of testCases) {
+      const leaseToken = `lease_${tc.name}_token_777`;
+      const recordedTasks = [];
+      const settledTasks = [];
+
+      let aiCalled = 0;
+      aiModule.callAiChat = async () => {
+        aiCalled++;
+        return { ok: true, content: '{}', model: 'mock' };
+      };
+
+      const signedToken = recoveryToken.signTaskRecoveryToken({
+        userId: testUser.id,
+        taskId: tc.legacyTaskId,
+        taskType: tc.taskType,
+        inputIdentifier: tc.legacyInputIdentifier,
+        result: tc.clientRecoveryData,
+        leaseToken,
+        modelId: 'deepseek-v4.1-flash',
+      });
+
+      // Save to client recovery storage as user would have in local session
+      const clientContextKey = tc.bodyPayload.problemId;
+      taskRecoveryClient.saveTaskRecovery(testUser.id, tc.taskType, clientContextKey, {
+        signedRecoveryToken: signedToken,
+        recoveryData: tc.clientRecoveryData,
+        taskId: tc.legacyTaskId,
+      });
+
+      const rpcSpy = (fn, args) => {
+        if (fn === 'record_trial_result_ready') {
+          recordedTasks.push({ taskId: args.p_task_id, leaseToken: args.p_lease_token });
+          return { data: { success: true, status: 'result_ready' }, error: null };
+        }
+        if (fn === 'settle_trial_credit') {
+          settledTasks.push({ taskId: args.p_task_id, leaseToken: args.p_lease_token });
+          return { data: { success: true }, error: null };
+        }
+        if (fn === 'lookup_saved_ai_task_result') {
+          return { data: { success: false, error_code: 'TASK_NOT_FOUND' }, error: null };
+        }
+        return { data: { success: true }, error: null };
+      };
+
+      const reqBody = {
+        ...tc.bodyPayload,
+        signedRecoveryToken: signedToken,
+        recoveryData: tc.clientRecoveryData,
+      };
+
+      await withFakeSupabase({
+        user: testUser,
+        problems: [{
+          id: 'p-eval-test',
+          user_id: testUser.id,
+          version: 1,
+          prompt_text: 'Solve differential equation dy/dx = y',
+          model_answer: 'y = Ce^x',
+          rubric: [{ id: 'r1', label: 'Separation', maxScore: 100, description: 'Separate variables' }],
+          payload: {
+            promptText: 'Solve differential equation dy/dx = y',
+            modelAnswer: 'y = Ce^x',
+            rubric: [{ id: 'r1', label: 'Separation', maxScore: 100, description: 'Separate variables' }],
+          },
+          concept_ids: ['c1'],
+          subject_id: 's1',
+          quality_status: 'normal',
+        }],
+        rpcImpl: rpcSpy,
+      }, async () => {
+        const req = new Request(tc.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqBody),
+        });
+        const res = await tc.route(req);
+        const data = await res.json();
+
+        assert.equal(res.status, 200, `${tc.name} returns 200 on recovery retry`);
+        assert.equal(data.success, true, `${tc.name} data.success is true`);
+        assert.equal(data.taskId, tc.legacyTaskId, `${tc.name} authoritative taskId matches legacy task ID`);
+        assert.equal(recordedTasks.length, 1, `${tc.name} record_trial_result_ready called once`);
+        assert.equal(recordedTasks[0].taskId, tc.legacyTaskId, `${tc.name} recorded with authoritative legacy taskId (not new SHA-256)`);
+        assert.equal(recordedTasks[0].leaseToken, leaseToken);
+
+        assert.equal(settledTasks.length, 1, `${tc.name} settle_trial_credit called once`);
+        assert.equal(settledTasks[0].taskId, tc.legacyTaskId, `${tc.name} settled with authoritative legacy taskId (not new SHA-256)`);
+        assert.equal(settledTasks[0].leaseToken, leaseToken);
+
+        assert.equal(aiCalled, 0, `${tc.name} AI chat called 0 times on recovery retry`);
+
+        // Client cleanup succeeds because returned taskId matches client-stored legacy taskId
+        const cleared = taskRecoveryClient.clearTaskRecovery(testUser.id, tc.taskType, clientContextKey, data.taskId);
+        assert.equal(cleared, true, `${tc.name} client recovery record cleanly cleared`);
+        assert.equal(taskRecoveryClient.getTaskRecovery(testUser.id, tc.taskType, clientContextKey), null);
+      });
+    }
+
+    process.env.ANALYSIS_RECOVERY_SIGNING_SECRET = savedSecret;
+  });
+
+  await checkAsync('Bug 3: Postpone day review persistence and isolation across re-fetch', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user-postpone-test' });
+    const userA = 'user-postpone-test';
+    const userB = 'user-postpone-other';
+
+    const c1Server = {
+      id: 'c-postpone-1',
+      subjectId: 's-math-1',
+      title: 'Linear Algebra Orthogonality',
+      domain: 'math_stats',
+      description: 'Orthogonal vectors and Gram-Schmidt process',
+      coreDefinitionFormulaOrAlgorithm: '<u, v> = 0',
+      prerequisites: [],
+      relatedConcepts: [],
+      commonMisconceptions: [],
+      examples: [],
+      baseScore: 80,
+      currentScore: 80,
+      status: 'review',
+      events: [{ id: 'e1', conceptId: 'c-postpone-1', at: new Date().toISOString(), dayOffset: 0, resultScore: 80, kind: 'attempt' }],
+      postponeDays: 0,
+      needsSourceReview: false,
+    };
+
+    // 1. Initialize local concept
+    storage.saveStoredConcepts([c1Server]);
+
+    // 2. Postpone 1 day
+    const postRes1 = storage.postponeConceptReview(c1Server.id, 1);
+    assert.ok(postRes1.postponedConcept);
+    assert.equal(postRes1.postponedConcept.postponeDays, 1);
+    assert.equal(postRes1.postponedConcept.currentScore, 80, 'Score is invariant on postpone');
+    assert.equal(postRes1.postponedConcept.events.length, 1, 'Events are invariant on postpone');
+
+    // 3. Postpone another day -> cumulative +2 days
+    const postRes2 = storage.postponeConceptReview(c1Server.id, 1);
+    assert.ok(postRes2.postponedConcept);
+    assert.equal(postRes2.postponedConcept.postponeDays, 2);
+    const expectedPostponedUntil = postRes2.postponedConcept.postponedUntil;
+
+    // Verify separate schedule adjustment storage
+    const adjMap = storage.loadConceptScheduleAdjustments();
+    assert.ok(adjMap[c1Server.id], 'Schedule adjustment stored separately');
+    assert.equal(adjMap[c1Server.id].postponeDays, 2);
+
+    // 4. Server re-fetch occurs: server library returns c1Server with postponeDays: 0 and needsSourceReview: false
+    const liveConcepts = storage.loadStoredConcepts();
+    const mergedConcepts = cloudMerge.mergeConcepts(
+      [c1Server],
+      liveConcepts,
+      new Set([c1Server.id]),
+      new Set([c1Server.id]),
+      storage.loadConceptScheduleAdjustments()
+    );
+
+    assert.equal(mergedConcepts.length, 1);
+    assert.equal(mergedConcepts[0].postponeDays, 2, 'Postpone +2 days persisted across cloud re-fetch');
+    assert.equal(mergedConcepts[0].postponedUntil, expectedPostponedUntil, 'postponedUntil date persisted across cloud re-fetch');
+    assert.equal(mergedConcepts[0].currentScore, 80, 'Score remains strictly 80');
+    assert.equal(mergedConcepts[0].events.length, 1, 'Event count remains strictly 1');
+    assert.equal(mergedConcepts[0].needsSourceReview, false, 'Server quality review authority maintained');
+
+    // 5. Explicit reset / confirmed review clears postponement and does not resurrect
+    storage.clearConceptScheduleAdjustment(c1Server.id);
+    const mergedAfterReset = cloudMerge.mergeConcepts(
+      [c1Server],
+      [c1Server],
+      new Set([c1Server.id]),
+      new Set([c1Server.id]),
+      storage.loadConceptScheduleAdjustments()
+    );
+    assert.equal(mergedAfterReset[0].postponeDays, 0, 'Does not resurrect after explicit reset');
+
+    // 6. Cross-account isolation: User A postpone does not leak to User B
+    storage.saveConceptScheduleAdjustment(c1Server.id, 3);
+    storageScope.setStorageScope({ kind: 'user', userId: userB });
+    const userBAdjs = storage.loadConceptScheduleAdjustments();
+    assert.equal(userBAdjs[c1Server.id], undefined, 'User B has no access to User A schedule adjustments');
+    storageScope.setStorageScope({ kind: 'user', userId: userA });
   });
 
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;

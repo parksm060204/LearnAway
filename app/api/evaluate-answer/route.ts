@@ -603,6 +603,7 @@ export async function POST(req: NextRequest) {
             );
           }
 
+          const authoritativeTaskId = verifyRes.payload.taskId;
           let persisted = false;
           let settled = false;
           let settlementError: string | undefined;
@@ -610,7 +611,7 @@ export async function POST(req: NextRequest) {
           if (verifyRes.payload.leaseToken) {
             const saveRes = await recordTrialResultReady(
               auth.user.id,
-              taskId,
+              authoritativeTaskId,
               recovered,
               verifyRes.payload.leaseToken
             );
@@ -633,7 +634,7 @@ export async function POST(req: NextRequest) {
               }
               const signedRecoveryToken = signTaskRecoveryToken({
                 userId: auth.user.id,
-                taskId,
+                taskId: authoritativeTaskId,
                 taskType: 'evaluate_answer',
                 inputIdentifier,
                 result: recovered,
@@ -646,7 +647,7 @@ export async function POST(req: NextRequest) {
                   error: `평가 결과 보존에 다시 실패했습니다 (${saveRes.error}). AI 재호출 없이 저장만 다시 시도할 수 있습니다.`,
                   errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
                   canRetrySave: true,
-                  taskId,
+                  taskId: authoritativeTaskId,
                   signedRecoveryToken,
                   recoveryData: recovered,
                   evaluation: recovered.evaluation,
@@ -664,7 +665,7 @@ export async function POST(req: NextRequest) {
 
             persisted = true;
 
-            const settleRes = await settleTrialCredit(auth.user.id, taskId, verifyRes.payload.leaseToken);
+            const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, verifyRes.payload.leaseToken);
             if (!settleRes.success) {
               settlementError = settleRes.error;
               settled = false;
@@ -688,7 +689,7 @@ export async function POST(req: NextRequest) {
             persisted,
             settled,
             settlementError,
-            taskId,
+            taskId: authoritativeTaskId,
           });
         }
 

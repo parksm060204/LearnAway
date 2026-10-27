@@ -247,6 +247,7 @@ export async function POST(req: NextRequest) {
           );
         }
 
+        const authoritativeTaskId = verifyRes.payload.taskId;
         const recoveryPayload = clientRecoveryData as Record<string, unknown>;
         let persisted = false;
         let settled = false;
@@ -255,7 +256,7 @@ export async function POST(req: NextRequest) {
         if (verifyRes.payload.leaseToken) {
           const saveRes = await recordTrialResultReady(
             auth.user.id,
-            taskId,
+            authoritativeTaskId,
             recoveryPayload,
             verifyRes.payload.leaseToken
           );
@@ -267,7 +268,7 @@ export async function POST(req: NextRequest) {
                 error: `복구 결과 서버 보존 재시도 실패: ${saveRes.error}`,
                 errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
                 canRetrySave: true,
-                taskId,
+                taskId: authoritativeTaskId,
                 signedRecoveryToken,
                 recoveryData: clientRecoveryData,
                 persisted: false,
@@ -279,7 +280,7 @@ export async function POST(req: NextRequest) {
 
           persisted = true;
 
-          const settleRes = await settleTrialCredit(auth.user.id, taskId, verifyRes.payload.leaseToken);
+          const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, verifyRes.payload.leaseToken);
           if (!settleRes.success) {
             settlementError = settleRes.error;
             settled = false;
@@ -304,7 +305,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({
           success: true,
           review,
-          taskId,
+          taskId: authoritativeTaskId,
           persisted,
           settled,
           settlementError,

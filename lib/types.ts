@@ -726,6 +726,32 @@ export interface ProblemVersionSnapshot {
   sourceVerificationStatus?: SourceVerificationStatus;
 }
 
+export interface UnsavedProblemRevision {
+  problemId: string;
+  baseVersion: number;
+  revisionVersion: number;
+  title: string;
+  promptText: string;
+  mathFormula?: string;
+  codeSnippet?: string;
+  hints: string[];
+  modelAnswer: string;
+  rubric: RubricCriterion[];
+  timeStandardMinutes?: number;
+  editReason: string;
+  revisedAt: string;
+  syncStatus: 'pending' | 'syncing' | 'failed' | 'conflict';
+  syncError?: string;
+  baseSnapshot?: ProblemVersionSnapshot;
+}
+
+export interface ConceptScheduleAdjustment {
+  conceptId: string;
+  postponeDays: number;
+  postponedUntil?: string;
+  updatedAt: string;
+}
+
 export type AttemptSaveStatus =
   | 'complete'           // 저장 및 모든 링크 정상 반영
   | 'retryable_failure'  // Attempt/ReviewEvent/Plan 반영 실패 -> 동일 payload 재시도 권장

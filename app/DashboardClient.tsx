@@ -69,6 +69,9 @@ import {
   buildProblemFromDraft,
   AttemptSaveStatus,
   resetToInitialDemoData,
+  loadUnsavedProblemRevisions,
+  clearUnsavedProblemRevision,
+  loadConceptScheduleAdjustments,
 } from '../lib/storage';
 import { AdminAiMetricsModal } from '../components/AdminAiMetricsModal';
 import { loadLearningLibrary } from '../lib/cloud/learningLibrary';
@@ -569,17 +572,28 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         const migratedIds = getMigratedIds(currentUser.id);
         const serverKnownIds = getServerKnownIds(currentUser.id);
 
-        // Include live problems so un-synced local reports and revisions are preserved
+        // Include live problems and concepts so un-synced local reports, revisions, and schedule adjustments are preserved
         const liveProblems = loadStoredProblems();
         const candidateProblems = [...liveProblems, ...originals.data.problems];
+        const liveConcepts = loadStoredConcepts();
+        const candidateConcepts = [...liveConcepts, ...originals.data.concepts];
+        const unsavedRevisions = loadUnsavedProblemRevisions();
+        const scheduleAdjustments = loadConceptScheduleAdjustments();
 
-        const mergedConcepts = mergeConcepts(library.data.concepts, originals.data.concepts, migratedIds, serverKnownIds);
+        const mergedConcepts = mergeConcepts(
+          library.data.concepts,
+          candidateConcepts,
+          migratedIds,
+          serverKnownIds,
+          scheduleAdjustments
+        );
         const mergedProblems = mergeProblems(
           library.data.problems,
           candidateProblems,
           library.data.problemVersions,
           migratedIds,
-          serverKnownIds
+          serverKnownIds,
+          unsavedRevisions
         );
         const mergedConceptDrafts = mergeDrafts(library.data.conceptDrafts, originals.data.conceptDrafts, migratedIds);
         const mergedProblemDrafts = mergeDrafts(library.data.problemDrafts, originals.data.problemDrafts, migratedIds);
@@ -2812,7 +2826,25 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             needsSourceReview: problem.needsSourceReview,
             payload: problem as unknown as Record<string, unknown>,
           });
-      if (!result.ok) showToast(`서버 동기화 실패: ${result.error}`);
+      if (opts.revise) {
+        if (result.ok) {
+          clearUnsavedProblemRevision(problemId);
+          showToast('문제 수정본이 서버에 안전하게 저장되었습니다.');
+        } else {
+          // If version conflict occurred, check if server was already updated to this version (idempotent retry / response loss)
+          if (result.error && /VERSION_CONFLICT/i.test(result.error)) {
+            const latestServer = await getProblemById(supabase, problemId);
+            if (latestServer.ok && latestServer.data && latestServer.data.version === problem.version) {
+              clearUnsavedProblemRevision(problemId);
+              showToast('문제 수정본이 이미 서버에 동기화되어 있습니다.');
+              return;
+            }
+          }
+          showToast(`서버 동기화 실패: ${result.error}`);
+        }
+      } else {
+        if (!result.ok) showToast(`서버 동기화 실패: ${result.error}`);
+      }
     } catch (e) {
       showToast(`서버 동기화 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
     }
@@ -2962,7 +2994,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
       void pushProblemToServer(problemId, { revise: true, expectedVersion: beforeVersion });
-      showToast('문제가 수정되어 새 버전으로 기록되었습니다. (수정 후 재검토 상태)');
+      showToast('문제가 수정되어 로컬에 기록되었습니다. 서버 저장을 시도합니다.');
     } else {
       showToast(`문제 수정 실패: ${res.error}`);
     }

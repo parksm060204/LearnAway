@@ -214,6 +214,7 @@ export async function POST(req: NextRequest) {
           );
         }
 
+        const authoritativeTaskId = verifyRes.payload.taskId;
         const recoveryPayload = clientRecoveryData as { questions?: unknown; model?: string };
         const questionsToSave = recoveryPayload.questions || clientRecoveryData;
         const modelToSave = recoveryPayload.model || 'deepseek-v4.1-flash';
@@ -225,7 +226,7 @@ export async function POST(req: NextRequest) {
         if (verifyRes.payload.leaseToken) {
           const saveRes = await recordTrialResultReady(
             auth.user.id,
-            taskId,
+            authoritativeTaskId,
             { questions: questionsToSave, model: modelToSave },
             verifyRes.payload.leaseToken
           );
@@ -237,7 +238,7 @@ export async function POST(req: NextRequest) {
                 error: `복구 결과 서버 보존 재시도 실패: ${saveRes.error}`,
                 errorCode: saveRes.errorCode || 'PERSISTENCE_FAILED',
                 canRetrySave: true,
-                taskId,
+                taskId: authoritativeTaskId,
                 signedRecoveryToken,
                 recoveryData: clientRecoveryData,
                 questions: questionsToSave,
@@ -251,7 +252,7 @@ export async function POST(req: NextRequest) {
 
           persisted = true;
 
-          const settleRes = await settleTrialCredit(auth.user.id, taskId, verifyRes.payload.leaseToken);
+          const settleRes = await settleTrialCredit(auth.user.id, authoritativeTaskId, verifyRes.payload.leaseToken);
           if (!settleRes.success) {
             settlementError = settleRes.error;
             settled = false;
@@ -267,7 +268,7 @@ export async function POST(req: NextRequest) {
           success: true,
           questions: questionsToSave,
           model: modelToSave,
-          taskId,
+          taskId: authoritativeTaskId,
           fromCache: false,
           persisted,
           settled,

@@ -1,4 +1,5 @@
-import type { Concept, Problem, ProblemVersionSnapshot } from '../types';
+import type { Concept, Problem, ProblemVersionSnapshot, UnsavedProblemRevision, ConceptScheduleAdjustment } from '../types';
+import { saveUnsavedProblemRevision } from '../storage';
 
 /**
  * Server concepts are authoritative for content, quality, and source review.
@@ -10,7 +11,8 @@ export function mergeConcepts(
   server: Concept[],
   originals: Concept[],
   migratedIds: Set<string> = new Set(),
-  serverKnownIds: Set<string> = new Set()
+  serverKnownIds: Set<string> = new Set(),
+  scheduleAdjustments: Record<string, ConceptScheduleAdjustment> = {}
 ): Concept[] {
   const originById = new Map(originals.map((c) => [c.id, c]));
   const seenIds = new Set<string>();
@@ -18,24 +20,33 @@ export function mergeConcepts(
   const merged = server.map((remote) => {
     seenIds.add(remote.id);
     const mine = originById.get(remote.id);
-    if (!mine) return remote;
+    const adjustment = scheduleAdjustments[remote.id];
+
+    const postponeDays = adjustment?.postponeDays !== undefined
+      ? adjustment.postponeDays
+      : (mine?.postponeDays ?? 0);
+
+    const postponedUntil = adjustment?.postponedUntil !== undefined
+      ? adjustment.postponedUntil
+      : mine?.postponedUntil;
+
     return {
       ...remote,
-      events: mine.events ?? [],
-      currentScore: mine.currentScore,
-      baseScore: mine.baseScore,
-      status: mine.status,
-      lastAttemptAt: mine.lastAttemptAt,
-      lastAttemptDayOffset: mine.lastAttemptDayOffset,
-      firstLearnedAt: mine.firstLearnedAt,
-      firstLearnedDayOffset: mine.firstLearnedDayOffset,
-      recommendedReviewAt: mine.recommendedReviewAt,
-      lastCalculatedAt: mine.lastCalculatedAt,
-      postponedUntil: mine.postponedUntil,
-      postponeDays: mine.postponeDays,
+      events: mine?.events ?? [],
+      currentScore: mine?.currentScore ?? remote.currentScore ?? 0,
+      baseScore: mine?.baseScore ?? remote.baseScore ?? 0,
+      status: mine?.status ?? remote.status ?? 'not_started',
+      lastAttemptAt: mine?.lastAttemptAt ?? remote.lastAttemptAt,
+      lastAttemptDayOffset: mine?.lastAttemptDayOffset ?? remote.lastAttemptDayOffset,
+      firstLearnedAt: mine?.firstLearnedAt ?? remote.firstLearnedAt,
+      firstLearnedDayOffset: mine?.firstLearnedDayOffset ?? remote.firstLearnedDayOffset,
+      recommendedReviewAt: mine?.recommendedReviewAt ?? remote.recommendedReviewAt,
+      lastCalculatedAt: mine?.lastCalculatedAt ?? remote.lastCalculatedAt,
+      postponedUntil,
+      postponeDays,
       // Server is authoritative for needsSourceReview and sourceEvidence for server-known concepts
       needsSourceReview: remote.needsSourceReview ?? false,
-      sourceEvidence: remote.sourceEvidence ?? mine.sourceEvidence,
+      sourceEvidence: remote.sourceEvidence ?? mine?.sourceEvidence,
     };
   });
   const unSynced: Concept[] = [];
@@ -112,7 +123,8 @@ export function mergeProblems(
   originals: Problem[],
   versions: Record<string, ProblemVersionSnapshot[]>,
   migratedIds: Set<string> = new Set(),
-  serverKnownIds: Set<string> = new Set()
+  serverKnownIds: Set<string> = new Set(),
+  unsavedRevisions: Record<string, UnsavedProblemRevision> = {}
 ): Problem[] {
   // Consolidate candidate problems with conflict resolution:
   // Deduplicate candidates by problem ID so duplicate entries (e.g. from live and origin) produce exactly 1 entry.
@@ -148,23 +160,80 @@ export function mergeProblems(
   const seenProblemIds = new Set<string>();
   const serverIds = new Set(server.map((p) => p.id));
 
-  // Server problems are authoritative
+  // Server problems are authoritative, with unsaved revisions preserved
   const merged = server.map((remote) => {
     seenProblemIds.add(remote.id);
     const mine = candidateMap.get(remote.id);
     const versionHistory = versions[remote.id];
+    const unsaved = unsavedRevisions[remote.id];
+
+    let contentToApply = remote;
+    let effectiveVersion = remote.version ?? 1;
+    let combinedHistory = versionHistory;
+    let hasActiveUnsavedRevision = false;
+
+    if (unsaved) {
+      if ((remote.version ?? 1) === unsaved.baseVersion) {
+        // Revision branched from current server version: apply revised content!
+        contentToApply = {
+          ...remote,
+          title: unsaved.title,
+          promptText: unsaved.promptText,
+          mathFormula: unsaved.mathFormula,
+          codeSnippet: unsaved.codeSnippet,
+          hints: unsaved.hints,
+          modelAnswer: unsaved.modelAnswer,
+          rubric: unsaved.rubric,
+          timeStandardMinutes: unsaved.timeStandardMinutes ?? remote.timeStandardMinutes,
+        };
+        effectiveVersion = unsaved.revisionVersion;
+        hasActiveUnsavedRevision = true;
+        if (unsaved.baseSnapshot) {
+          combinedHistory = [unsaved.baseSnapshot, ...(combinedHistory || [])];
+        }
+      } else if ((remote.version ?? 1) === unsaved.revisionVersion) {
+        // Server already has this version
+        unsaved.syncStatus = 'pending';
+      } else if ((remote.version ?? 1) > unsaved.baseVersion) {
+        // Remote conflict!
+        unsaved.syncStatus = 'conflict';
+        unsaved.syncError = `서버 버전 충돌 (서버: v${remote.version}, 수정 기준: v${unsaved.baseVersion})`;
+        saveUnsavedProblemRevision(unsaved);
+        contentToApply = remote;
+      }
+    } else if (mine && (mine.version ?? 1) > (remote.version ?? 1) && mine.qualityStatus === 'review_after_edit') {
+      contentToApply = {
+        ...remote,
+        title: mine.title,
+        promptText: mine.promptText,
+        mathFormula: mine.mathFormula,
+        codeSnippet: mine.codeSnippet,
+        hints: mine.hints,
+        modelAnswer: mine.modelAnswer,
+        rubric: mine.rubric,
+        timeStandardMinutes: mine.timeStandardMinutes ?? remote.timeStandardMinutes,
+      };
+      effectiveVersion = mine.version ?? (remote.version ?? 1) + 1;
+      hasActiveUnsavedRevision = true;
+      if (mine.versionHistory) {
+        combinedHistory = mine.versionHistory;
+      }
+    }
+
     return {
-      ...remote,
-      ...(versionHistory ? { versionHistory } : {}),
+      ...contentToApply,
+      version: effectiveVersion,
+      qualityStatus: hasActiveUnsavedRevision ? 'review_after_edit' : resolveProblemQualityStatus(remote, mine),
+      ...(combinedHistory ? { versionHistory: combinedHistory } : {}),
       ...(mine
         ? {
             reports: mergeReports(remote.reports, mine.reports),
-            qualityStatus: resolveProblemQualityStatus(remote, mine),
-            // Server is authoritative for freshness and source review for server-known problems
             isOutdated: remote.isOutdated ?? false,
             needsSourceReview: remote.needsSourceReview ?? false,
             lastReviewedAt: remote.lastReviewedAt ?? mine.lastReviewedAt,
-            reviewNotes: remote.reviewNotes ?? mine.reviewNotes,
+            reviewNotes: hasActiveUnsavedRevision && unsaved
+              ? `v${effectiveVersion} 수정 완료: ${unsaved.editReason}`
+              : (remote.reviewNotes ?? mine.reviewNotes),
           }
         : {}),
     };
@@ -180,6 +249,11 @@ export function mergeProblems(
       // Problem was known to the server previously, but is absent from current server list:
       // It was deleted on the server!
       // Do NOT resurrect deleted server cache into unSynced.
+      if (unsavedRevisions[id]) {
+        unsavedRevisions[id].syncStatus = 'conflict';
+        unsavedRevisions[id].syncError = '서버에서 삭제된 문제의 미저장 수정본';
+        saveUnsavedProblemRevision(unsavedRevisions[id]);
+      }
       continue;
     }
 

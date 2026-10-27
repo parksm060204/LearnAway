@@ -24,6 +24,8 @@ import {
   RubricCriterion,
   toAcademicDifficultyLevel,
   SourceVerificationStatus,
+  UnsavedProblemRevision,
+  ConceptScheduleAdjustment,
 } from './types';
 
 export type { AttemptSaveStatus } from './types';
@@ -75,6 +77,8 @@ const STORAGE_KEYS = {
   STUDY_PLAN_ITEMS: 'study_plan_items_v1',
   PERSONALIZATION_SETTINGS: 'personalization_settings_v1',
   PERSONALIZATION_STATE: 'personalization_state_v1',
+  UNSAVED_PROBLEM_REVISIONS: 'unsaved_problem_revisions_v1',
+  CONCEPT_SCHEDULE_ADJUSTMENTS: 'concept_schedule_adjustments_v1',
 } as const;
 
 const MOCK_EXAM_KEY = 'mock_exam_sessions_v1';
@@ -1985,6 +1989,25 @@ export function editAndReviseProblem(
 
   const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
   saveStoredProblems(updatedProblems);
+
+  saveUnsavedProblemRevision({
+    problemId,
+    baseVersion: currentVersion,
+    revisionVersion: nextVersion,
+    title: updatedProblem.title,
+    promptText: updatedProblem.promptText,
+    mathFormula: updatedProblem.mathFormula,
+    codeSnippet: updatedProblem.codeSnippet,
+    hints: updatedProblem.hints || [],
+    modelAnswer: updatedProblem.modelAnswer,
+    rubric: updatedProblem.rubric || [],
+    timeStandardMinutes: updatedProblem.timeStandardMinutes,
+    editReason: trimmedReason,
+    revisedAt: now,
+    syncStatus: 'pending',
+    baseSnapshot: snapshot,
+  });
+
   return { success: true, updatedProblems, updatedProblem };
 }
 
@@ -2863,11 +2886,85 @@ export function postponeConceptReview(
   });
 
   saveStoredConcepts(updatedConcepts);
+  if (postponedConcept) {
+    saveConceptScheduleAdjustment(conceptId, (postponedConcept as Concept).postponeDays || 1, (postponedConcept as Concept).postponedUntil);
+  }
   return { updatedConcepts, postponedConcept };
 }
 
 export function getAttemptById(attemptId: string): Attempt | null {
   const attempts = loadStoredAttempts();
   return attempts.find((a) => a.id === attemptId) || null;
+}
+
+// ---------------------------------------------------------------------------
+// Unsaved Problem Revisions (Bug 1)
+// ---------------------------------------------------------------------------
+
+export function loadUnsavedProblemRevisions(): Record<string, UnsavedProblemRevision> {
+  return safeGetItem<Record<string, UnsavedProblemRevision>>(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
+}
+
+export function getUnsavedProblemRevision(problemId: string): UnsavedProblemRevision | null {
+  const all = loadUnsavedProblemRevisions();
+  return all[problemId] || null;
+}
+
+export function saveUnsavedProblemRevision(revision: UnsavedProblemRevision): void {
+  const all = loadUnsavedProblemRevisions();
+  all[revision.problemId] = revision;
+  safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+}
+
+export function clearUnsavedProblemRevision(problemId: string): void {
+  const all = loadUnsavedProblemRevisions();
+  if (all[problemId]) {
+    delete all[problemId];
+    safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+  }
+}
+
+export function clearAllUnsavedProblemRevisions(): void {
+  safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
+}
+
+// ---------------------------------------------------------------------------
+// Concept Schedule Adjustments (Bug 3)
+// ---------------------------------------------------------------------------
+
+export function loadConceptScheduleAdjustments(): Record<string, ConceptScheduleAdjustment> {
+  return safeGetItem<Record<string, ConceptScheduleAdjustment>>(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, {});
+}
+
+export function getConceptScheduleAdjustment(conceptId: string): ConceptScheduleAdjustment | null {
+  const all = loadConceptScheduleAdjustments();
+  return all[conceptId] || null;
+}
+
+export function saveConceptScheduleAdjustment(
+  conceptId: string,
+  postponeDays: number,
+  postponedUntil?: string
+): void {
+  const all = loadConceptScheduleAdjustments();
+  all[conceptId] = {
+    conceptId,
+    postponeDays,
+    postponedUntil,
+    updatedAt: new Date().toISOString(),
+  };
+  safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+}
+
+export function clearConceptScheduleAdjustment(conceptId: string): void {
+  const all = loadConceptScheduleAdjustments();
+  if (all[conceptId]) {
+    delete all[conceptId];
+    safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+  }
+}
+
+export function clearAllConceptScheduleAdjustments(): void {
+  safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, {});
 }
 
