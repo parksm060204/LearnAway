@@ -169,7 +169,7 @@ export interface TrialContext {
   taskId: string;
   taskType: TrialTaskType;
   inputIdentifier: string;
-  legacyInputIdentifier?: string;
+  legacyInputIdentifier?: string | string[];
   isSaveRetry?: boolean;
 }
 
@@ -306,15 +306,22 @@ export async function resolveAiConfigForUser(
         true
       );
       if (!reg.allowed && reg.errorCode === 'TASK_INPUT_MISMATCH' && trialContext.legacyInputIdentifier) {
-        const fallbackReg = await registerAiTask(
-          userId,
-          trialContext.taskId,
-          trialContext.taskType,
-          trialContext.legacyInputIdentifier,
-          true
-        );
-        if (fallbackReg.allowed || fallbackReg.status === 'already_completed' || fallbackReg.status === 'concurrent_in_progress') {
-          reg = fallbackReg;
+        const legacyList = Array.isArray(trialContext.legacyInputIdentifier)
+          ? trialContext.legacyInputIdentifier
+          : [trialContext.legacyInputIdentifier];
+        for (const leg of legacyList) {
+          if (!leg || leg === trialContext.inputIdentifier) continue;
+          const fallbackReg = await registerAiTask(
+            userId,
+            trialContext.taskId,
+            trialContext.taskType,
+            leg,
+            true
+          );
+          if (fallbackReg.allowed || fallbackReg.status === 'already_completed' || fallbackReg.status === 'concurrent_in_progress') {
+            reg = fallbackReg;
+            break;
+          }
         }
       }
       if (!reg.allowed) {
@@ -421,15 +428,22 @@ export async function resolveAiConfigForUser(
     );
 
     if (!reservation.allowed && reservation.errorCode === 'TASK_INPUT_MISMATCH' && trialContext.legacyInputIdentifier) {
-      const fallbackReservation = await registerAiTask(
-        userId,
-        trialContext.taskId,
-        trialContext.taskType,
-        trialContext.legacyInputIdentifier,
-        false
-      );
-      if (fallbackReservation.allowed || fallbackReservation.status === 'already_completed' || fallbackReservation.status === 'concurrent_in_progress') {
-        reservation = fallbackReservation;
+      const legacyList = Array.isArray(trialContext.legacyInputIdentifier)
+        ? trialContext.legacyInputIdentifier
+        : [trialContext.legacyInputIdentifier];
+      for (const leg of legacyList) {
+        if (!leg || leg === trialContext.inputIdentifier) continue;
+        const fallbackReservation = await registerAiTask(
+          userId,
+          trialContext.taskId,
+          trialContext.taskType,
+          leg,
+          false
+        );
+        if (fallbackReservation.allowed || fallbackReservation.status === 'already_completed' || fallbackReservation.status === 'concurrent_in_progress') {
+          reservation = fallbackReservation;
+          break;
+        }
       }
     }
 

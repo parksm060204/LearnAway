@@ -9,11 +9,14 @@ import type { Concept, Problem, ProblemVersionSnapshot } from '../types';
 export function mergeConcepts(
   server: Concept[],
   originals: Concept[],
-  migratedIds: Set<string> = new Set()
+  migratedIds: Set<string> = new Set(),
+  serverKnownIds: Set<string> = new Set()
 ): Concept[] {
   const originById = new Map(originals.map((c) => [c.id, c]));
+  const seenIds = new Set<string>();
   const serverIds = new Set(server.map((c) => c.id));
   const merged = server.map((remote) => {
+    seenIds.add(remote.id);
     const mine = originById.get(remote.id);
     if (!mine) return remote;
     return {
@@ -35,7 +38,12 @@ export function mergeConcepts(
       sourceEvidence: remote.sourceEvidence ?? mine.sourceEvidence,
     };
   });
-  const unSynced = originals.filter((o) => !serverIds.has(o.id) && !migratedIds.has(o.id));
+  const unSynced: Concept[] = [];
+  for (const o of originals) {
+    if (seenIds.has(o.id) || serverIds.has(o.id) || migratedIds.has(o.id) || serverKnownIds.has(o.id)) continue;
+    seenIds.add(o.id);
+    unSynced.push(o);
+  }
   return [...merged, ...unSynced];
 }
 
@@ -90,19 +98,60 @@ function resolveProblemQualityStatus(
 /**
  * Server problems are authoritative for content, version history, quarantine,
  * isOutdated, and needsSourceReview. Local review notes, un-synced reports, and
- * un-migrated originals are preserved. Records that were migrated and deleted on
- * the server are NOT resurrected.
+ * un-migrated originals are preserved.
+ *
+ * Conflict and deduplication invariants:
+ * 1. Output problem IDs are strictly unique.
+ * 2. Candidates with identical IDs are resolved deterministically: higher version or active
+ *    local revision wins, and reports from all candidate snapshots are preserved without loss.
+ * 3. Deleted server cache (records previously known on server or migrated, but absent from
+ *    server) are NOT resurrected unless they contain genuine unpersisted local edits or reports.
  */
 export function mergeProblems(
   server: Problem[],
   originals: Problem[],
   versions: Record<string, ProblemVersionSnapshot[]>,
-  migratedIds: Set<string> = new Set()
+  migratedIds: Set<string> = new Set(),
+  serverKnownIds: Set<string> = new Set()
 ): Problem[] {
-  const originById = new Map(originals.map((p) => [p.id, p]));
+  // Consolidate candidate problems with conflict resolution:
+  // Deduplicate candidates by problem ID so duplicate entries (e.g. from live and origin) produce exactly 1 entry.
+  // When candidates collide, the one with higher version, active revision (review_after_edit), or newer reports wins,
+  // and all reports are merged so no user report is lost.
+  const candidateMap = new Map<string, Problem>();
+  for (const cand of originals) {
+    if (!cand || !cand.id) continue;
+    const existing = candidateMap.get(cand.id);
+    if (!existing) {
+      candidateMap.set(cand.id, cand);
+    } else {
+      const existingVer = existing.version ?? 1;
+      const candVer = cand.version ?? 1;
+      const mergedReports = mergeReports(existing.reports, cand.reports);
+      let chosen = existing;
+      if (candVer > existingVer) {
+        chosen = cand;
+      } else if (candVer === existingVer) {
+        if (cand.qualityStatus === 'review_after_edit' && existing.qualityStatus !== 'review_after_edit') {
+          chosen = cand;
+        } else if ((cand.reports?.length ?? 0) > (existing.reports?.length ?? 0)) {
+          chosen = cand;
+        }
+      }
+      candidateMap.set(cand.id, {
+        ...chosen,
+        reports: mergedReports,
+      });
+    }
+  }
+
+  const seenProblemIds = new Set<string>();
   const serverIds = new Set(server.map((p) => p.id));
+
+  // Server problems are authoritative
   const merged = server.map((remote) => {
-    const mine = originById.get(remote.id);
+    seenProblemIds.add(remote.id);
+    const mine = candidateMap.get(remote.id);
     const versionHistory = versions[remote.id];
     return {
       ...remote,
@@ -120,7 +169,24 @@ export function mergeProblems(
         : {}),
     };
   });
-  const unSynced = originals.filter((o) => !serverIds.has(o.id) && !migratedIds.has(o.id));
+
+  // Process unSynced problems: only pure unmigrated local problems
+  const unSynced: Problem[] = [];
+  for (const [id, cand] of candidateMap.entries()) {
+    if (seenProblemIds.has(id)) continue;
+
+    const isServerKnown = serverIds.has(id) || migratedIds.has(id) || serverKnownIds.has(id);
+    if (isServerKnown) {
+      // Problem was known to the server previously, but is absent from current server list:
+      // It was deleted on the server!
+      // Do NOT resurrect deleted server cache into unSynced.
+      continue;
+    }
+
+    seenProblemIds.add(id);
+    unSynced.push(cand);
+  }
+
   return [...merged, ...unSynced];
 }
 
@@ -131,6 +197,12 @@ export function mergeDrafts<T extends { id: string }>(
   originals: T[],
   migratedIds: Set<string> = new Set()
 ): T[] {
-  const serverIds = new Set(server.map((d) => d.id));
-  return [...server, ...originals.filter((d) => !serverIds.has(d.id) && !migratedIds.has(d.id))];
+  const seenIds = new Set(server.map((d) => d.id));
+  const unSynced: T[] = [];
+  for (const d of originals) {
+    if (seenIds.has(d.id) || migratedIds.has(d.id)) continue;
+    seenIds.add(d.id);
+    unSynced.push(d);
+  }
+  return [...server, ...unSynced];
 }

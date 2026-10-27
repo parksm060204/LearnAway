@@ -531,6 +531,14 @@ export async function POST(req: NextRequest) {
       : computeMarkdownHash(`${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`);
     const legacyJsonInputIdentifier = computeMarkdownHash(JSON.stringify(normalizedEvaluationInput));
 
+    const legacyInputIdentifiers = [legacyInputIdentifier, legacyJsonInputIdentifier];
+    const legacyTaskId = buildLegacyTaskId('eval', legacyInputIdentifier);
+    const legacyTaskIds = [
+      legacyTaskId,
+      buildUserScopedTaskId(auth.user.id, 'eval', legacyJsonInputIdentifier),
+      buildUserScopedTaskId(auth.user.id, 'eval', legacyInputIdentifier),
+    ];
+
     const rawTaskId = (typeof body?.taskId === 'string' && body.taskId.trim()) ? body.taskId.trim() : '';
     const isLegacyDefault =
       rawTaskId === `eval_${legacyInputIdentifier}` ||
@@ -540,19 +548,18 @@ export async function POST(req: NextRequest) {
       rawTaskId === `eval_${auth.user.id}_${legacyJsonInputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
     let taskId: string = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'eval', inputIdentifier);
-    const legacyTaskId = buildLegacyTaskId('eval', legacyInputIdentifier);
     const isSaveRetry = Boolean(body?.isSaveRetry || body?.action === 'retry_save');
 
     if (isSaveRetry) {
-      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifier);
+      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifiers);
       if (!saved.success && explicitTaskId) {
-        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifier);
+        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifiers);
       }
       if (!saved.success) {
-        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'evaluate_answer', legacyInputIdentifier);
+        saved = await lookupSavedTaskResult(auth.user.id, buildUserScopedTaskId(auth.user.id, 'eval', legacyJsonInputIdentifier), 'evaluate_answer', inputIdentifier, legacyInputIdentifiers);
       }
-      if (!saved.success && legacyJsonInputIdentifier !== legacyInputIdentifier) {
-        saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', legacyJsonInputIdentifier);
+      if (!saved.success) {
+        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'evaluate_answer', legacyInputIdentifier, legacyInputIdentifiers);
       }
       if (!saved.success) {
         const clientRecoveryToken = typeof body.signedRecoveryToken === 'string' ? body.signedRecoveryToken : undefined;
@@ -561,9 +568,10 @@ export async function POST(req: NextRequest) {
           const verifyRes = verifyTaskRecoveryToken(clientRecoveryToken, {
             userId: auth.user.id,
             taskId,
+            legacyTaskId: legacyTaskIds,
             taskType: 'evaluate_answer',
             inputIdentifier,
-            legacyInputIdentifier,
+            legacyInputIdentifier: legacyInputIdentifiers,
             result: clientRecoveryData,
           });
           if (!verifyRes.ok) {
@@ -751,6 +759,7 @@ export async function POST(req: NextRequest) {
         taskId,
         taskType: 'evaluate_answer',
         inputIdentifier,
+        legacyInputIdentifier: legacyInputIdentifiers,
         isSaveRetry,
       };
 

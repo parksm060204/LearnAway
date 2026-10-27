@@ -19811,6 +19811,347 @@ exports.requireApiUser = async () => {
     assert.ok(maxPageResult.error.includes('최대 페이지 한도'));
   });
 
+  await checkAsync('Bug 2: Cross-version AI task and recovery token compatibility (2a16e49 and pre-2a16e49)', async () => {
+    // 1. Task created in 2a16e49 format for logic-questions:
+    // 2a16e49 used computeMarkdownHash(JSON.stringify(normalizedInput)) with version: 'v2'
+    const normalizedInput2a16e49 = {
+      version: 'v2',
+      problemTitle: 'Bayes Theorem Proof',
+      problemPrompt: 'Derive posterior distribution',
+      rubric: [{ id: 'r1', label: 'Prior', maxScore: 50 }, { id: 'r2', label: 'Likelihood', maxScore: 50 }],
+      modelAnswer: 'P(A|B) = P(B|A)P(A)/P(B)',
+      originalAnswer: 'P(A|B)',
+      solvingReason: 'Direct formula',
+      diagnosisSummary: 'Missed denominator normalization',
+      domain: 'math_stats',
+    };
+    const hash2a16e49 = markdownUtils.computeMarkdownHash(JSON.stringify(normalizedInput2a16e49));
+    const olderHash = markdownUtils.computeMarkdownHash(
+      JSON.stringify({
+        problemTitle: normalizedInput2a16e49.problemTitle,
+        problemPrompt: normalizedInput2a16e49.problemPrompt,
+        rubric: [{ id: 'r1', label: 'Prior', maxScore: 50 }, { id: 'r2', label: 'Likelihood', maxScore: 50 }],
+        modelAnswer: normalizedInput2a16e49.modelAnswer,
+        originalAnswer: normalizedInput2a16e49.originalAnswer,
+        solvingReason: normalizedInput2a16e49.solvingReason,
+        diagnosisSummary: normalizedInput2a16e49.diagnosisSummary,
+        domain: 'math_stats',
+      })
+    );
+    const newShaHash = markdownUtils.computeAiTaskInputIdentifier(normalizedInput2a16e49, 'v1');
+
+    const sampleResult = { questions: [{ q: 'Check denominator' }], model: 'deepseek-v4.1-flash' };
+    const userId = 'u-test-cross-ver';
+    const taskId2a16e49 = `logic_${userId}_${hash2a16e49}`;
+    const newTaskId = `logic_${userId}_${newShaHash}`;
+
+    // Token signed with 2a16e49 hash and taskId
+    const token2a16e49 = recoveryToken.signTaskRecoveryToken({
+      userId,
+      taskId: taskId2a16e49,
+      taskType: 'logic_questions',
+      inputIdentifier: hash2a16e49,
+      result: sampleResult,
+    });
+
+    // Verification in new code with legacy fallback succeeds
+    const verifySuccess = recoveryToken.verifyTaskRecoveryToken(token2a16e49, {
+      userId,
+      taskId: newTaskId,
+      legacyTaskId: [taskId2a16e49, `logic_${olderHash}`],
+      taskType: 'logic_questions',
+      inputIdentifier: newShaHash,
+      legacyInputIdentifier: [hash2a16e49, olderHash],
+      result: sampleResult,
+    });
+    assert.equal(verifySuccess.ok, true, '2a16e49 recovery token verified successfully in new version');
+
+    // Mismatched user is rejected
+    const verifyWrongUser = recoveryToken.verifyTaskRecoveryToken(token2a16e49, {
+      userId: 'different-user',
+      taskId: newTaskId,
+      legacyTaskId: [taskId2a16e49],
+      taskType: 'logic_questions',
+      inputIdentifier: newShaHash,
+      legacyInputIdentifier: [hash2a16e49],
+      result: sampleResult,
+    });
+    assert.equal(verifyWrongUser.ok, false, 'Mismatched user rejected');
+
+    // Tampered result is rejected
+    const verifyTamperedResult = recoveryToken.verifyTaskRecoveryToken(token2a16e49, {
+      userId,
+      taskId: newTaskId,
+      legacyTaskId: [taskId2a16e49],
+      taskType: 'logic_questions',
+      inputIdentifier: newShaHash,
+      legacyInputIdentifier: [hash2a16e49],
+      result: { questions: [{ q: 'Tampered question' }] },
+    });
+    assert.equal(verifyTamperedResult.ok, false, 'Tampered result rejected');
+
+    // Tampered token signature is rejected
+    const tamperedToken = token2a16e49.slice(0, -4) + 'AAAA';
+    const verifyTamperedToken = recoveryToken.verifyTaskRecoveryToken(tamperedToken, {
+      userId,
+      taskId: newTaskId,
+      legacyTaskId: [taskId2a16e49],
+      taskType: 'logic_questions',
+      inputIdentifier: newShaHash,
+      legacyInputIdentifier: [hash2a16e49],
+      result: sampleResult,
+    });
+    assert.equal(verifyTamperedToken.ok, false, 'Tampered signature rejected');
+  });
+
+  await checkAsync('Bug 3: Problem merge deduplication, server deletion non-resurrection, and preservation', async () => {
+    const userId = 'merge-test-user';
+    for (const base of ['__problems_v1', '__origin_learning_snapshot_v1', '__origin_learning_problems_v1', '__learning_migrated_ids_v1', '__learning_server_known_ids_v1']) {
+      localStorage.removeItem('redcall_user_' + userId + base);
+    }
+
+    // 1. live and origin have same local problem -> deduplicated to exactly 1
+    const localProblem = {
+      id: 'prob-local-dup',
+      title: 'Local Problem 1',
+      statement: 'Local Statement 1',
+      solution: 'Local Solution 1',
+      version: 1,
+      qualityStatus: 'normal',
+    };
+    const serverList = [];
+    const candidateList = [localProblem, { ...localProblem }];
+    const merged1 = cloudMerge.mergeProblems(serverList, candidateList, {}, new Set(), new Set());
+    assert.equal(merged1.length, 1, 'Duplicate candidate problems deduplicated to 1');
+    assert.equal(merged1[0].id, 'prob-local-dup');
+
+    // 2. Server created problem -> cached -> deleted on other device -> re-query does NOT resurrect
+    const serverProb = {
+      id: 'prob-server-1',
+      title: 'Server Problem 1',
+      statement: 'Server Statement',
+      solution: 'Server Solution',
+      version: 1,
+      qualityStatus: 'normal',
+    };
+    // Simulate first sync: problem known on server
+    cloudLearningOriginals.recordServerKnownIds(userId, ['prob-server-1']);
+    cloudLearningOriginals.recordMigratedIds(userId, ['prob-server-1']);
+    // Cached in local live problems
+    localStorage.setItem('redcall_user_' + userId + '__problems_v1', JSON.stringify([serverProb]));
+
+    // Now other device deletes prob-server-1 from server (server returns empty list)
+    const serverAfterDelete = [];
+    const serverKnown = cloudLearningOriginals.getServerKnownIds(userId);
+    const migrated = cloudLearningOriginals.getMigratedIds(userId);
+    assert.ok(serverKnown.has('prob-server-1'));
+
+    // ensureLearningOriginals must NOT copy deleted server cache into origin
+    const preserveRes = cloudLearningOriginals.ensureLearningOriginals(userId, new Set());
+    assert.equal(preserveRes.ok, true);
+    const originalsAfterDelete = cloudLearningOriginals.loadLearningOriginals(userId);
+    assert.equal(originalsAfterDelete.data.problems.length, 0, 'Deleted server cache NOT copied to originals');
+
+    // mergeProblems must NOT resurrect deleted server cache
+    const mergedAfterDelete = cloudMerge.mergeProblems(
+      serverAfterDelete,
+      [serverProb],
+      {},
+      migrated,
+      serverKnown
+    );
+    assert.equal(mergedAfterDelete.length, 0, 'Server-deleted problem does NOT resurrect');
+
+    // 3. Pure local new problem IS preserved
+    const pureLocalProb = {
+      id: 'prob-pure-local-new',
+      title: 'Offline Created Problem',
+      statement: 'Created while offline',
+      solution: 'Offline Solution',
+      version: 1,
+      qualityStatus: 'normal',
+    };
+    const mergedWithLocal = cloudMerge.mergeProblems(
+      serverAfterDelete,
+      [pureLocalProb],
+      {},
+      migrated,
+      serverKnown
+    );
+    assert.equal(mergedWithLocal.length, 1, 'Pure local problem is preserved');
+    assert.equal(mergedWithLocal[0].id, 'prob-pure-local-new');
+
+    // 4. Server problem with unsaved local reports: when on server, reports are merged and preserved
+    const reportedServerProb = {
+      ...serverProb,
+      reports: [{ id: 'rep-unsaved-1', type: 'statement_error', details: 'Typo in prompt' }],
+    };
+    const mergedWithReport = cloudMerge.mergeProblems(
+      [serverProb],
+      [reportedServerProb],
+      {},
+      migrated,
+      serverKnown
+    );
+    assert.equal(mergedWithReport.length, 1, 'Server problem with unsaved reports is preserved');
+    assert.equal(mergedWithReport[0].reports.length, 1);
+    assert.equal(mergedWithReport[0].reports[0].id, 'rep-unsaved-1');
+
+    // 5. Older origin vs newer revised live candidate -> newer revision wins
+    const olderCand = {
+      id: 'prob-conflict-1',
+      title: 'Old Title',
+      statement: 'Old Statement',
+      solution: 'Old Solution',
+      version: 1,
+      qualityStatus: 'normal',
+    };
+    const newerCand = {
+      id: 'prob-conflict-1',
+      title: 'Revised Title',
+      statement: 'Revised Statement',
+      solution: 'Revised Solution',
+      version: 2,
+      qualityStatus: 'review_after_edit',
+    };
+    const resolvedMerge = cloudMerge.mergeProblems([], [olderCand, newerCand], {}, new Set(), new Set());
+    assert.equal(resolvedMerge.length, 1, 'Conflict resolved to exactly 1 problem');
+    assert.equal(resolvedMerge[0].version, 2, 'Higher version candidate won');
+    assert.equal(resolvedMerge[0].qualityStatus, 'review_after_edit');
+  });
+
+  await checkAsync('Bug 4: Problem generation input identifier normalization and missing fields', async () => {
+    const conceptBase = {
+      id: 'c-concept-1',
+      title: 'Central Limit Theorem',
+      description: 'Distribution of sample means approximates normal distribution',
+      coreDefinitionFormulaOrAlgorithm: 'sqrt(n)(X_bar - mu) -> N(0, sigma^2)',
+      prerequisites: ['Expectation', 'Variance'],
+      relatedConcepts: ['Law of Large Numbers'],
+      commonMisconceptions: ['Requires normal population'],
+      examples: ['Dice rolling experiment'],
+      sourceEvidenceQuote: 'Theorem 4.1',
+      chapterRef: 'Chapter 4',
+    };
+
+    const sources = [
+      {
+        materialId: 'mat-1',
+        title: 'Probability Textbook',
+        markdown: '# Chapter 4\nCentral Limit Theorem proof...',
+        sourceRefs: 'p. 120',
+      },
+    ];
+
+    const makeNormalizedInput = (cOverrides = {}, genOverrides = {}) => {
+      const c = { ...conceptBase, ...cOverrides };
+      const normalizedConcepts = [c]
+        .map((x) => ({
+          id: x.id,
+          title: (x.title || '').trim(),
+          description: (x.description || '').trim(),
+          coreDefinitionFormulaOrAlgorithm: (x.coreDefinitionFormulaOrAlgorithm || '').trim(),
+          prerequisites: Array.isArray(x.prerequisites) ? [...x.prerequisites].map((s) => s.trim()).sort() : [],
+          relatedConcepts: Array.isArray(x.relatedConcepts) ? [...x.relatedConcepts].map((s) => s.trim()).sort() : [],
+          commonMisconceptions: Array.isArray(x.commonMisconceptions) ? [...x.commonMisconceptions].map((s) => s.trim()).sort() : [],
+          examples: Array.isArray(x.examples) ? [...x.examples].map((s) => s.trim()).sort() : [],
+          sourceEvidenceQuote: (x.sourceEvidenceQuote || '').trim(),
+          chapterRef: (x.chapterRef || '').trim(),
+        }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+
+      const normalizedSources = sources
+        .map((s) => ({
+          materialId: s.materialId.trim(),
+          title: s.title.trim(),
+          sourceRefs: (s.sourceRefs || '').trim(),
+          contentHash: markdownUtils.computeAiTaskInputIdentifier(s.markdown, 'body_v1'),
+        }))
+        .sort((a, b) => a.materialId.localeCompare(b.materialId));
+
+      const combinedSource = sources
+        .map((s, idx) => `[자료 ${idx + 1}] ID: ${s.materialId} / 제목: ${s.title}\n${s.markdown}`)
+        .join('\n\n===== 다음 자료 =====\n\n');
+      const combinedSourceHash = markdownUtils.computeAiTaskInputIdentifier(combinedSource, 'combined_v1');
+
+      return {
+        promptVersion: 'v2',
+        subjectId: 's-math-1',
+        subjectDomain: 'math_stats',
+        problemType: 'essay_descriptive',
+        difficulty: 'advanced_college',
+        difficultyLevel: 'college_advanced',
+        count: 1,
+        concepts: normalizedConcepts,
+        sources: normalizedSources,
+        combinedSourceHash,
+        ...genOverrides,
+      };
+    };
+
+    const baseInput = makeNormalizedInput();
+    const baseId = markdownUtils.computeAiTaskInputIdentifier(baseInput, 'v1');
+
+    // 1. Concept description change produces different identifier
+    const diffDescInput = makeNormalizedInput({ description: 'Updated CLT description with Lindeberg condition' });
+    const diffDescId = markdownUtils.computeAiTaskInputIdentifier(diffDescInput, 'v1');
+    assert.notEqual(baseId, diffDescId, 'Changing concept description changes inputIdentifier');
+
+    // 2. Concept core definition change produces different identifier
+    const diffDefInput = makeNormalizedInput({ coreDefinitionFormulaOrAlgorithm: 'Different formula' });
+    const diffDefId = markdownUtils.computeAiTaskInputIdentifier(diffDefInput, 'v1');
+    assert.notEqual(baseId, diffDefId, 'Changing core definition changes inputIdentifier');
+
+    // 3. Concept examples change produces different identifier
+    const diffExamplesInput = makeNormalizedInput({ examples: ['Coin toss experiment', 'Normal approximation'] });
+    const diffExamplesId = markdownUtils.computeAiTaskInputIdentifier(diffExamplesInput, 'v1');
+    assert.notEqual(baseId, diffExamplesId, 'Changing examples changes inputIdentifier');
+
+    // 4. Object key ordering does NOT change identifier (canonical JSON)
+    const reorderedConcept = {
+      examples: ['Dice rolling experiment'],
+      chapterRef: 'Chapter 4',
+      sourceEvidenceQuote: 'Theorem 4.1',
+      commonMisconceptions: ['Requires normal population'],
+      relatedConcepts: ['Law of Large Numbers'],
+      prerequisites: ['Expectation', 'Variance'],
+      coreDefinitionFormulaOrAlgorithm: 'sqrt(n)(X_bar - mu) -> N(0, sigma^2)',
+      description: 'Distribution of sample means approximates normal distribution',
+      title: 'Central Limit Theorem',
+      id: 'c-concept-1',
+    };
+    const reorderedInput = makeNormalizedInput(reorderedConcept);
+    const reorderedId = markdownUtils.computeAiTaskInputIdentifier(reorderedInput, 'v1');
+    assert.equal(baseId, reorderedId, 'Object key reordering produces identical identifier');
+
+    // 5. Material markdown change produces different identifier
+    const sourcesChanged = [
+      {
+        materialId: 'mat-1',
+        title: 'Probability Textbook',
+        markdown: '# Chapter 4\nDifferent textbook markdown content...',
+        sourceRefs: 'p. 120',
+      },
+    ];
+    const diffMaterialInput = {
+      ...baseInput,
+      sources: sourcesChanged.map((s) => ({
+        materialId: s.materialId.trim(),
+        title: s.title.trim(),
+        sourceRefs: (s.sourceRefs || '').trim(),
+        contentHash: markdownUtils.computeAiTaskInputIdentifier(s.markdown, 'body_v1'),
+      })),
+      combinedSourceHash: markdownUtils.computeAiTaskInputIdentifier(sourcesChanged[0].markdown, 'combined_v1'),
+    };
+    const diffMaterialId = markdownUtils.computeAiTaskInputIdentifier(diffMaterialInput, 'v1');
+    assert.notEqual(baseId, diffMaterialId, 'Changing material content changes inputIdentifier');
+
+    // 6. Difficulty change produces different identifier
+    const diffDiffInput = makeNormalizedInput({}, { difficultyLevel: 'graduate_challenging' });
+    const diffDiffId = markdownUtils.computeAiTaskInputIdentifier(diffDiffInput, 'v1');
+    assert.notEqual(baseId, diffDiffId, 'Changing difficulty level changes inputIdentifier');
+  });
+
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
   else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
   AI_CONFIG.apiKey = savedApiKeyPlan03;

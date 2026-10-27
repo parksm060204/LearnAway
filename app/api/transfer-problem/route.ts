@@ -137,7 +137,8 @@ export async function POST(req: NextRequest) {
     };
 
     const inputIdentifier = computeAiTaskInputIdentifier(normalizedInput, 'v1');
-    const legacyInputIdentifier = computeMarkdownHash(
+    const legacy2a16e49InputIdentifier = computeMarkdownHash(JSON.stringify(normalizedInput));
+    const legacyOlderInputIdentifier = computeMarkdownHash(
       JSON.stringify({
         problemTitle,
         problemPrompt,
@@ -150,24 +151,36 @@ export async function POST(req: NextRequest) {
         domain,
       })
     );
+    const legacyInputIdentifiers = [legacy2a16e49InputIdentifier, legacyOlderInputIdentifier];
+    const legacy2a16e49TaskId = buildUserScopedTaskId(auth.user.id, 'trans', legacy2a16e49InputIdentifier);
+    const legacyOlderTaskId = buildLegacyTaskId('trans', legacyOlderInputIdentifier);
+    const legacyTaskIds = [legacy2a16e49TaskId, legacyOlderTaskId];
 
     const rawTaskId = asString(payload.taskId).trim();
     const isLegacyDefault =
-      rawTaskId === `trans_${legacyInputIdentifier}` ||
+      rawTaskId === `trans_${legacyOlderInputIdentifier}` ||
+      rawTaskId === `trans_${legacy2a16e49InputIdentifier}` ||
       rawTaskId === `trans_${inputIdentifier}` ||
-      rawTaskId === `trans_${auth.user.id}_${legacyInputIdentifier}`;
+      rawTaskId === `trans_${auth.user.id}_${legacyOlderInputIdentifier}` ||
+      rawTaskId === `trans_${auth.user.id}_${legacy2a16e49InputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
     const taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'trans', inputIdentifier);
-    const legacyTaskId = buildLegacyTaskId('trans', legacyInputIdentifier);
+    const legacyTaskId = legacyOlderTaskId;
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
     const signedRecoveryToken = asString(payload.signedRecoveryToken).trim();
     const clientRecoveryData = payload.recoveryData || (payload.draft ? { draft: payload.draft, model: payload.model } : null);
 
     // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved or server-signed results.
     if (isSaveRetry) {
-      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'transfer_problem', inputIdentifier, legacyInputIdentifier);
-      if (!saved.success && !explicitTaskId) {
-        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'transfer_problem', legacyInputIdentifier);
+      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'transfer_problem', inputIdentifier, legacyInputIdentifiers);
+      if (!saved.success && explicitTaskId) {
+        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'transfer_problem', inputIdentifier, legacyInputIdentifiers);
+      }
+      if (!saved.success) {
+        saved = await lookupSavedTaskResult(auth.user.id, legacy2a16e49TaskId, 'transfer_problem', inputIdentifier, legacyInputIdentifiers);
+      }
+      if (!saved.success) {
+        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'transfer_problem', legacyOlderInputIdentifier, legacyInputIdentifiers);
       }
 
       const cached = saved.cachedResult as { draft?: unknown; model?: string } | null;
@@ -203,9 +216,10 @@ export async function POST(req: NextRequest) {
         const verifyRes = verifyTaskRecoveryToken(signedRecoveryToken, {
           userId: auth.user.id,
           taskId,
+          legacyTaskId: legacyTaskIds,
           taskType: 'transfer_problem',
           inputIdentifier,
-          legacyInputIdentifier,
+          legacyInputIdentifier: legacyInputIdentifiers,
           result: clientRecoveryData,
         });
 
@@ -307,6 +321,8 @@ export async function POST(req: NextRequest) {
       taskId,
       taskType: 'transfer_problem',
       inputIdentifier,
+      legacyInputIdentifier: legacyInputIdentifiers,
+      isSaveRetry,
     });
 
     if (!cred.ok) {

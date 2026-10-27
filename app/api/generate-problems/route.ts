@@ -257,44 +257,109 @@ export async function POST(req: NextRequest) {
     const difficultyLabel = `${levelMeta.label} — ${levelMeta.description} (하위 호환: ${PROBLEM_DIFFICULTY_LABELS[difficulty]})`;
     const count = Math.min(Math.max(problemCount, 1), 3);
 
-    // Distinct material sources with their individual body hashes.
+const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
+
+    // Strict concept content normalization: captures all fields that directly influence the AI prompt
+    const normalizedConcepts = concepts
+      .map((c) => ({
+        id: c.id,
+        title: (c.title || '').trim(),
+        description: (c.description || '').trim(),
+        coreDefinitionFormulaOrAlgorithm: (c.coreDefinitionFormulaOrAlgorithm || '').trim(),
+        prerequisites: Array.isArray(c.prerequisites) ? [...c.prerequisites].map((s) => s.trim()).sort() : [],
+        relatedConcepts: Array.isArray(c.relatedConcepts) ? [...c.relatedConcepts].map((s) => s.trim()).sort() : [],
+        commonMisconceptions: Array.isArray(c.commonMisconceptions) ? [...c.commonMisconceptions].map((s) => s.trim()).sort() : [],
+        examples: Array.isArray(c.examples) ? [...c.examples].map((s) => s.trim()).sort() : [],
+        sourceEvidenceQuote: (c.sourceEvidence?.quote || '').trim(),
+        chapterRef: (c.chapterRef || '').trim(),
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+
+    // Strong content hashing: SHA-256 directly on full material bodies
+    const normalizedSources = sources
+      .map((s) => ({
+        materialId: s.materialId.trim(),
+        title: s.title.trim(),
+        sourceRefs: (s.sourceRefs || '').trim(),
+        contentHash: computeAiTaskInputIdentifier(s.markdown, 'body_v1'),
+      }))
+      .sort((a, b) => a.materialId.localeCompare(b.materialId));
+
+    const combinedSource = sources
+      .map((s, idx) => `[자료 ${idx + 1}] ID: ${s.materialId} / 제목: ${s.title}\n${s.markdown}`)
+      .join('\n\n===== 다음 자료 =====\n\n');
+    const combinedSourceHash = computeAiTaskInputIdentifier(combinedSource, 'combined_v1');
+
+    // Authoritative normalized inputIdentifier using versioned SHA-256 over entire prompt context
+    const normalizedGenerationInput = {
+      promptVersion: GENERATE_PROBLEMS_PROMPT_VERSION,
+      subjectId,
+      subjectDomain,
+      problemType,
+      difficulty,
+      difficultyLevel,
+      count,
+      concepts: normalizedConcepts,
+      sources: normalizedSources,
+      combinedSourceHash,
+    };
+    const inputIdentifier = computeAiTaskInputIdentifier(normalizedGenerationInput, 'v1');
+
+    // Backward compatibility: compute previous version hashes for lookup and recovery
+    const conceptKey = concepts.map((c) => c.id).sort().join(',');
     const sourceMaterials = sources.map((s) => ({
       materialId: s.materialId,
       title: s.title,
       markdownHash: computeMarkdownHash(s.markdown),
     }));
-    const combinedSource = sources
-      .map((s, idx) => `[자료 ${idx + 1}] ID: ${s.materialId} / 제목: ${s.title}\n${s.markdown}`)
-      .join('\n\n===== 다음 자료 =====\n\n');
     const markdownHash = computeMarkdownHash(combinedSource);
-    const conceptKey = concepts.map((c) => c.id).sort().join(',');
-    const sourceVersions = sourceMaterials.map((s) => `${s.materialId}:${s.markdownHash}`).sort().join(';');
+    const legacyMarkdownHash = markdownHash;
+    const legacySourceVersions = sourceMaterials.map((s) => `${s.materialId}:${s.markdownHash}`).sort().join(';');
 
-    // Legacy inputIdentifier for backward compatibility and recovering older tasks
-    const legacyInputIdentifier = computeMarkdownHash(`${subjectId}:${conceptKey}:${problemType}:${difficulty}:${markdownHash}`);
-
-    // Authoritative normalized inputIdentifier using versioned SHA-256
-    const normalizedGenerationInput = {
-      subjectId,
-      conceptKey,
-      problemType,
-      difficulty,
-      difficultyLevel,
-      count,
-      markdownHash,
-      sourceVersions,
-    };
-    const inputIdentifier = computeAiTaskInputIdentifier(normalizedGenerationInput, 'v1');
+    const legacyCb2bf1cInputIdentifier = computeAiTaskInputIdentifier(
+      {
+        subjectId,
+        conceptKey,
+        problemType,
+        difficulty,
+        difficultyLevel,
+        count,
+        markdownHash: legacyMarkdownHash,
+        sourceVersions: legacySourceVersions,
+      },
+      'v1'
+    );
+    const legacy2a16e49InputIdentifier = computeMarkdownHash(
+      `${subjectId}:${conceptKey}:${problemType}:${difficulty}:${difficultyLevel}:${count}:${legacyMarkdownHash}:${legacySourceVersions}`
+    );
+    const legacyOriginalInputIdentifier = computeMarkdownHash(
+      `${subjectId}:${conceptKey}:${problemType}:${difficulty}:${legacyMarkdownHash}`
+    );
+    const legacyInputIdentifiers = [
+      legacyCb2bf1cInputIdentifier,
+      legacy2a16e49InputIdentifier,
+      legacyOriginalInputIdentifier,
+    ];
 
     const isExplicitTaskId = Boolean(payload.taskId && typeof payload.taskId === 'string' && payload.taskId.trim());
     const explicitTaskId = isExplicitTaskId ? (payload.taskId as string).trim() : null;
     const isLegacyDefaultTaskId =
-      explicitTaskId === `gen_${legacyInputIdentifier}` ||
+      explicitTaskId === `gen_${legacyOriginalInputIdentifier}` ||
+      explicitTaskId === `gen_${legacy2a16e49InputIdentifier}` ||
+      explicitTaskId === `gen_${legacyCb2bf1cInputIdentifier}` ||
       explicitTaskId === `gen_${inputIdentifier}` ||
-      explicitTaskId === `gen_${auth.user.id}_${legacyInputIdentifier}`;
+      explicitTaskId === `gen_${auth.user.id}_${legacyOriginalInputIdentifier}` ||
+      explicitTaskId === `gen_${auth.user.id}_${legacy2a16e49InputIdentifier}` ||
+      explicitTaskId === `gen_${auth.user.id}_${legacyCb2bf1cInputIdentifier}`;
     const effectiveExplicitTaskId = (explicitTaskId && !isLegacyDefaultTaskId) ? explicitTaskId : null;
     let taskId = effectiveExplicitTaskId || buildUserScopedTaskId(auth.user.id, 'gen', inputIdentifier);
-    const legacyTaskId = buildLegacyTaskId('gen', legacyInputIdentifier);
+    const legacyTaskId = buildLegacyTaskId('gen', legacyOriginalInputIdentifier);
+    const legacyTaskIds = [
+      buildUserScopedTaskId(auth.user.id, 'gen', legacyCb2bf1cInputIdentifier),
+      buildUserScopedTaskId(auth.user.id, 'gen', legacy2a16e49InputIdentifier),
+      legacyTaskId,
+      buildLegacyTaskId('gen', legacy2a16e49InputIdentifier),
+    ];
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
 
     // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved results only.
@@ -304,15 +369,28 @@ export async function POST(req: NextRequest) {
         taskId,
         'generate_problems',
         inputIdentifier,
-        legacyInputIdentifier
+        legacyInputIdentifiers
       );
-      if (!saved.success && !effectiveExplicitTaskId) {
+      if (!saved.success && effectiveExplicitTaskId) {
         saved = await lookupSavedTaskResult(
           auth.user.id,
-          legacyTaskId,
+          effectiveExplicitTaskId,
           'generate_problems',
-          legacyInputIdentifier
+          inputIdentifier,
+          legacyInputIdentifiers
         );
+      }
+      if (!saved.success) {
+        for (const legTaskId of legacyTaskIds) {
+          saved = await lookupSavedTaskResult(
+            auth.user.id,
+            legTaskId,
+            'generate_problems',
+            inputIdentifier,
+            legacyInputIdentifiers
+          );
+          if (saved.success) break;
+        }
       }
       if (!saved.success) {
         const status = saved.errorCode === 'TASK_OWNERSHIP_MISMATCH' ? 403 : 400;
@@ -388,7 +466,7 @@ export async function POST(req: NextRequest) {
       taskId,
       taskType: 'generate_problems',
       inputIdentifier,
-      legacyInputIdentifier,
+      legacyInputIdentifier: legacyInputIdentifiers,
       isSaveRetry,
     });
     if (cred.taskId) {

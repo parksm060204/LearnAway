@@ -264,31 +264,64 @@ async def _async_http_download(
             total_read = 0
 
             if is_chunked:
+                received_terminal_chunk = False
                 while True:
-                    line = await reader.readline()
+                    try:
+                        line = await reader.readline()
+                    except asyncio.IncompleteReadError:
+                        raise ValueError("청크 전송 인코딩 헤더 수신 중 연결이 종료되었습니다.")
                     if not line:
                         break
-                    chunk_len_str = line.decode("latin-1").strip().split(";")[0]
+                    chunk_len_str = line.decode("latin-1").strip().split(";")[0].strip()
                     if not chunk_len_str:
                         continue
-                    chunk_len = int(chunk_len_str, 16)
+                    try:
+                        chunk_len = int(chunk_len_str, 16)
+                    except ValueError:
+                        raise ValueError(f"잘못된 청크 크기 헤더: {chunk_len_str}")
+                    if chunk_len < 0:
+                        raise ValueError(f"음수 청크 크기는 허용되지 않습니다: {chunk_len}")
+                    if chunk_len > (max_bytes - total_read):
+                        raise ValueError("SIZE_EXCEEDED")
                     if chunk_len == 0:
                         while True:
-                            trailer = await reader.readline()
+                            try:
+                                trailer = await reader.readline()
+                            except asyncio.IncompleteReadError:
+                                break
                             if not trailer or trailer in (b"\r\n", b"\n"):
                                 break
+                        received_terminal_chunk = True
                         break
-                    chunk_data = await reader.readexactly(chunk_len)
-                    await reader.readexactly(2)  # Trailing CRLF
-                    total_read += len(chunk_data)
-                    if total_read > max_bytes:
-                        raise ValueError("SIZE_EXCEEDED")
-                    body_chunks.append(chunk_data)
+
+                    bytes_left = chunk_len
+                    while bytes_left > 0:
+                        slice_size = min(bytes_left, 64 * 1024)
+                        try:
+                            slice_data = await reader.readexactly(slice_size)
+                        except asyncio.IncompleteReadError:
+                            raise ValueError("청크 데이터 수신 중 예기치 않게 연결이 종료되었습니다.")
+                        body_chunks.append(slice_data)
+                        total_read += len(slice_data)
+                        bytes_left -= len(slice_data)
+
+                    try:
+                        crlf = await reader.readexactly(2)
+                    except asyncio.IncompleteReadError:
+                        raise ValueError("청크 종료 구분자(CRLF) 수신 중 연결이 종료되었습니다.")
+                    if crlf != b"\r\n":
+                        raise ValueError(f"잘못된 청크 구분자: {crlf!r}")
+
+                if not received_terminal_chunk:
+                    raise ValueError("청크 전송 인코딩 스트림이 비정상 종료되었습니다 (종료 청크 누락).")
             else:
                 cl = int(cl_header) if cl_header and cl_header.isdigit() else None
                 while True:
                     to_read = min(64 * 1024, max_bytes - total_read + 1)
-                    data = await reader.read(to_read)
+                    try:
+                        data = await reader.read(to_read)
+                    except (ConnectionResetError, BrokenPipeError):
+                        raise ValueError("스토리지 본문 수신 중 연결이 끊어졌습니다.")
                     if not data:
                         break
                     total_read += len(data)
@@ -297,6 +330,9 @@ async def _async_http_download(
                     body_chunks.append(data)
                     if cl is not None and total_read >= cl:
                         break
+
+                if cl is not None and total_read < cl:
+                    raise ValueError(f"스토리지 응답 본문이 Content-Length보다 일찍 종료되었습니다 (수신: {total_read}바이트, 예상: {cl}바이트).")
 
             return b"".join(body_chunks)
         finally:

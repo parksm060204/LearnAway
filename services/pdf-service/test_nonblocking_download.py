@@ -94,6 +94,66 @@ class MockStorageHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.flush()
                 except Exception:
                     break
+        elif self.path == "/giant-chunk.pdf":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            # Huge declared chunk (256MB) which exceeds 500KB limit immediately
+            self.wfile.write(b"10000000\r\n")
+            self.wfile.flush()
+        elif self.path == "/incomplete-cl.pdf":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", "50000")
+            self.end_headers()
+            self.wfile.write(b"%PDF-1.4 header only...")
+            self.wfile.flush()
+            # Close connection early without completing 50000 bytes
+        elif self.path == "/truncated-chunk.pdf":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            chunk = b"%PDF-1.4 chunk data"
+            self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+            self.wfile.flush()
+            # Close connection early without sending terminal chunk (0\r\n\r\n)
+        elif self.path == "/malformed-crlf-chunk.pdf":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            chunk = b"some data"
+            self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"XX")
+            self.wfile.flush()
+        elif self.path == "/valid-chunked.pdf":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            p1 = MINIMAL_PDF[:100]
+            p2 = MINIMAL_PDF[100:]
+            self.wfile.write(f"{len(p1):X}\r\n".encode() + p1 + b"\r\n")
+            self.wfile.write(f"{len(p2):X}\r\n".encode() + p2 + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        elif self.path == "/exact-limit.pdf":
+            pad = b"% " + b"X" * (500000 - len(MINIMAL_PDF) - 3) + b"\n"
+            content = MINIMAL_PDF.replace(b"%%EOF", pad + b"%%EOF")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        elif self.path == "/limit-plus-one.pdf":
+            pad = b"% " + b"X" * (500001 - len(MINIMAL_PDF) - 3) + b"\n"
+            content = MINIMAL_PDF.replace(b"%%EOF", pad + b"%%EOF")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
         elif self.path == "/redirect-to-normal":
             self.send_response(302)
             self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/normal.pdf")
@@ -353,6 +413,63 @@ def run_tests():
             data = json.loads(resp.read().decode("utf-8"))
             assert data.get("success") is True
             print("  Safe redirect converted successfully")
+
+        # Helper for testing convert endpoint expecting errors
+        def post_convert(endpoint_path: str):
+            body = json.dumps({
+                "signedUrl": f"http://127.0.0.1:{storage_port}{endpoint_path}",
+                "userId": "u-test",
+                "jobId": f"j-{endpoint_path.strip('/')}",
+            }).encode("utf-8")
+            req = urllib.request.Request(convert_url, data=body, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as he:
+                return he.code, he.read()
+
+        # Test 7A: Giant chunk declaration rejected before reading
+        print("[TEST 7A] Verifying giant chunk declaration rejection before reading (413)...")
+        status_7a, _ = post_convert("/giant-chunk.pdf")
+        assert status_7a == 413, f"Expected 413 for giant chunk declaration, got {status_7a}"
+        print("  Giant chunk declaration rejected before reading with 413")
+
+        # Test 7B: Incomplete Content-Length failure
+        print("[TEST 7B] Verifying Content-Length shortfall failure (502)...")
+        status_7b, body_7b = post_convert("/incomplete-cl.pdf")
+        assert status_7b == 502, f"Expected 502 for incomplete content-length, got {status_7b} ({body_7b})"
+        print("  Incomplete Content-Length correctly rejected with 502")
+
+        # Test 7C: Truncated chunked stream (missing terminal chunk)
+        print("[TEST 7C] Verifying missing terminal chunk failure (502)...")
+        status_7c, body_7c = post_convert("/truncated-chunk.pdf")
+        assert status_7c == 502, f"Expected 502 for missing terminal chunk, got {status_7c} ({body_7c})"
+        print("  Missing terminal chunk correctly rejected with 502")
+
+        # Test 7D: Malformed chunk CRLF delimiter
+        print("[TEST 7D] Verifying malformed chunk CRLF failure (502)...")
+        status_7d, body_7d = post_convert("/malformed-crlf-chunk.pdf")
+        assert status_7d == 502, f"Expected 502 for malformed CRLF, got {status_7d} ({body_7d})"
+        print("  Malformed CRLF delimiter correctly rejected with 502")
+
+        # Test 7E: Exact size limit boundary and limit + 1 byte
+        print("[TEST 7E] Verifying exact size boundary (200) vs limit + 1 byte (413)...")
+        status_exact, _ = post_convert("/exact-limit.pdf")
+        assert status_exact == 200, f"Expected 200 for exact limit, got {status_exact}"
+        status_plus1, _ = post_convert("/limit-plus-one.pdf")
+        assert status_plus1 == 413, f"Expected 413 for limit + 1 byte, got {status_plus1}"
+        print("  Exact limit (200) and limit + 1 byte (413) handled properly")
+
+        # Test 7F: Normal chunked download succeeds
+        print("[TEST 7F] Verifying normal chunked download succeeds (200)...")
+        status_chunked, _ = post_convert("/valid-chunked.pdf")
+        assert status_chunked == 200, f"Expected 200 for valid chunked download, got {status_chunked}"
+        print("  Normal chunked download succeeded with 200")
+
+        # Test 7G: Verify active downloads cleaned up to 0 and service fully healthy
+        h_final, _ = get_health()
+        assert h_final["activeDownloads"] == 0, f"Expected activeDownloads 0, got {h_final['activeDownloads']}"
+        print(f"  Final active downloads confirmed 0: {h_final['activeDownloads']}")
 
         print("\nALL PDF SERVICE TESTS PASSED!")
 

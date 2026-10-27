@@ -13,6 +13,7 @@ const USER_PREFIX = 'redcall_user_';
 const ORIGIN_MARKER = 'origin_learning_snapshot_v1';
 const SERVER_CACHE = 'learning_server_cache_v1';
 const MIGRATED_IDS = 'learning_migrated_ids_v1';
+const SERVER_KNOWN_IDS = 'learning_server_known_ids_v1';
 
 const CATEGORIES = [
   { live: 'concepts_v1', origin: 'origin_learning_concepts_v1' },
@@ -110,11 +111,30 @@ export function recordMigratedIds(userId: string, ids: string[]): void {
   }
 }
 
+export function getServerKnownIds(userId: string): Set<string> {
+  const storage = getStorage();
+  if (!storage) return new Set();
+  const read = readArrayKey(storage, userBaseKey(userId, SERVER_KNOWN_IDS));
+  if (!read.ok) return new Set();
+  return new Set(read.value.filter((v): v is string => typeof v === 'string'));
+}
+
+export function recordServerKnownIds(userId: string, ids: string[]): void {
+  const storage = getStorage();
+  if (!storage || ids.length === 0) return;
+  const existing = getServerKnownIds(userId);
+  for (const id of ids) existing.add(id);
+  try {
+    storage.setItem(userBaseKey(userId, SERVER_KNOWN_IDS), JSON.stringify(Array.from(existing)));
+  } catch {
+    // best effort
+  }
+}
+
 /**
- * Merges the live records that are NOT on the server and NOT already migrated
- * into the originals (existing originals win). Must run BEFORE the server cache
- * overwrites the live scope. Read-back verified; failure means the caller must
- * not mirror.
+ * Merges the live records that are NOT on the server, NOT already migrated,
+ * and NOT deleted server cache into the originals (existing originals win).
+ * Must run BEFORE the server cache overwrites the live scope.
  */
 export function ensureLearningOriginals(
   userId: string,
@@ -123,6 +143,7 @@ export function ensureLearningOriginals(
   const storage = getStorage();
   if (!storage) return { ok: false, error: '브라우저 로컬 저장소를 사용할 수 없습니다.' };
   const migrated = getMigratedIds(userId);
+  const serverKnown = getServerKnownIds(userId);
 
   for (const category of CATEGORIES) {
     const live = readArrayKey(storage, userBaseKey(userId, category.live));
@@ -133,14 +154,14 @@ export function ensureLearningOriginals(
     const byId = new Map<string, unknown>();
     for (const record of origin.value) {
       const id = idOf(record);
-      if (id && !serverIds.has(id) && !migrated.has(id)) {
+      if (id && !serverIds.has(id) && !migrated.has(id) && !serverKnown.has(id)) {
         byId.set(id, record);
       }
     }
     for (const record of live.value) {
       const id = idOf(record);
       if (!id) continue;
-      if (serverIds.has(id) || migrated.has(id)) continue;
+      if (serverIds.has(id) || migrated.has(id) || serverKnown.has(id)) continue;
       if (!byId.has(id)) byId.set(id, record);
     }
 

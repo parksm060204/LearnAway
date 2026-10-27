@@ -132,8 +132,8 @@ export async function POST(req: NextRequest) {
       sourceMarkdown: sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '',
     };
     const inputIdentifier = computeAiTaskInputIdentifier(normalizedInput, 'v1');
-
-    const legacyInputIdentifier = computeMarkdownHash(
+    const legacy2a16e49InputIdentifier = computeMarkdownHash(JSON.stringify(normalizedInput));
+    const legacyOlderInputIdentifier = computeMarkdownHash(
       JSON.stringify({
         problemId: problem.id,
         problemTitle: problem.title,
@@ -146,24 +146,36 @@ export async function POST(req: NextRequest) {
         sourceMarkdown: sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '',
       })
     );
+    const legacyInputIdentifiers = [legacy2a16e49InputIdentifier, legacyOlderInputIdentifier];
+    const legacy2a16e49TaskId = buildUserScopedTaskId(auth.user.id, 'qual', legacy2a16e49InputIdentifier);
+    const legacyOlderTaskId = buildLegacyTaskId('qual', legacyOlderInputIdentifier);
+    const legacyTaskIds = [legacy2a16e49TaskId, legacyOlderTaskId];
 
     const rawTaskId = (typeof payload.taskId === 'string' && payload.taskId.trim()) ? payload.taskId.trim() : '';
     const isLegacyDefault =
-      rawTaskId === `qual_${legacyInputIdentifier}` ||
+      rawTaskId === `qual_${legacyOlderInputIdentifier}` ||
+      rawTaskId === `qual_${legacy2a16e49InputIdentifier}` ||
       rawTaskId === `qual_${inputIdentifier}` ||
-      rawTaskId === `qual_${auth.user.id}_${legacyInputIdentifier}`;
+      rawTaskId === `qual_${auth.user.id}_${legacyOlderInputIdentifier}` ||
+      rawTaskId === `qual_${auth.user.id}_${legacy2a16e49InputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
     let taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'qual', inputIdentifier);
-    const legacyTaskId = buildLegacyTaskId('qual', legacyInputIdentifier);
+    const legacyTaskId = legacyOlderTaskId;
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
     const signedRecoveryToken = (typeof payload.signedRecoveryToken === 'string' && payload.signedRecoveryToken.trim()) ? payload.signedRecoveryToken.trim() : '';
     const clientRecoveryData = payload.recoveryData || payload.review || null;
 
     // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved or server-signed results.
     if (isSaveRetry) {
-      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'review_problem_quality', inputIdentifier, legacyInputIdentifier);
-      if (!saved.success && !explicitTaskId) {
-        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'review_problem_quality', legacyInputIdentifier);
+      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'review_problem_quality', inputIdentifier, legacyInputIdentifiers);
+      if (!saved.success && explicitTaskId) {
+        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'review_problem_quality', inputIdentifier, legacyInputIdentifiers);
+      }
+      if (!saved.success) {
+        saved = await lookupSavedTaskResult(auth.user.id, legacy2a16e49TaskId, 'review_problem_quality', inputIdentifier, legacyInputIdentifiers);
+      }
+      if (!saved.success) {
+        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'review_problem_quality', legacyOlderInputIdentifier, legacyInputIdentifiers);
       }
 
       const cached = saved.cachedResult as {
@@ -217,9 +229,10 @@ export async function POST(req: NextRequest) {
         const verifyRes = verifyTaskRecoveryToken(signedRecoveryToken, {
           userId: auth.user.id,
           taskId,
+          legacyTaskId: legacyTaskIds,
           taskType: 'review_problem_quality',
           inputIdentifier,
-          legacyInputIdentifier,
+          legacyInputIdentifier: legacyInputIdentifiers,
           result: clientRecoveryData,
         });
 
@@ -328,7 +341,7 @@ export async function POST(req: NextRequest) {
       taskId,
       taskType: 'review_problem_quality',
       inputIdentifier,
-      legacyInputIdentifier,
+      legacyInputIdentifier: legacyInputIdentifiers,
       isSaveRetry,
     });
 

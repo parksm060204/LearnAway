@@ -92,6 +92,9 @@ import {
   ensureLearningOriginals,
   loadLearningOriginals,
   getMigratedIds,
+  getServerKnownIds,
+  recordServerKnownIds,
+  recordMigratedIds,
   markLearningServerCache,
 } from '../lib/cloud/learningOriginals';
 import {
@@ -549,6 +552,8 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           ...library.data.problems.map((p) => p.id),
           ...library.data.problemDrafts.map((d) => d.id),
         ]);
+        recordServerKnownIds(currentUser.id, Array.from(serverIds));
+        recordMigratedIds(currentUser.id, Array.from(serverIds));
         const preserved = ensureLearningOriginals(currentUser.id, serverIds);
         if (!preserved.ok) {
           setCloudStatus('error');
@@ -562,17 +567,19 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           return;
         }
         const migratedIds = getMigratedIds(currentUser.id);
+        const serverKnownIds = getServerKnownIds(currentUser.id);
 
         // Include live problems so un-synced local reports and revisions are preserved
         const liveProblems = loadStoredProblems();
         const candidateProblems = [...liveProblems, ...originals.data.problems];
 
-        const mergedConcepts = mergeConcepts(library.data.concepts, originals.data.concepts, migratedIds);
+        const mergedConcepts = mergeConcepts(library.data.concepts, originals.data.concepts, migratedIds, serverKnownIds);
         const mergedProblems = mergeProblems(
           library.data.problems,
           candidateProblems,
           library.data.problemVersions,
-          migratedIds
+          migratedIds,
+          serverKnownIds
         );
         const mergedConceptDrafts = mergeDrafts(library.data.conceptDrafts, originals.data.conceptDrafts, migratedIds);
         const mergedProblemDrafts = mergeDrafts(library.data.problemDrafts, originals.data.problemDrafts, migratedIds);

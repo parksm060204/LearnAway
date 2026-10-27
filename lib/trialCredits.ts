@@ -462,7 +462,7 @@ export async function lookupSavedTaskResult(
   taskId: string,
   taskType?: TrialTaskType,
   inputIdentifier?: string,
-  legacyInputIdentifier?: string
+  legacyInputIdentifier?: string | string[]
 ): Promise<SavedTaskLookupResult> {
   if (!taskId || !userId) {
     return {
@@ -582,10 +582,15 @@ export async function lookupSavedTaskResult(
   };
 
   const primary = await doLookup(inputIdentifier);
-  if (!primary.success && primary.errorCode === 'TASK_INPUT_MISMATCH' && legacyInputIdentifier && legacyInputIdentifier !== inputIdentifier) {
-    const secondary = await doLookup(legacyInputIdentifier);
-    if (secondary.success) {
-      return secondary;
+  if (!primary.success && primary.errorCode === 'TASK_INPUT_MISMATCH' && legacyInputIdentifier) {
+    const legacyList = Array.isArray(legacyInputIdentifier) ? legacyInputIdentifier : [legacyInputIdentifier];
+    for (const leg of legacyList) {
+      if (leg && leg !== inputIdentifier) {
+        const secondary = await doLookup(leg);
+        if (secondary.success) {
+          return secondary;
+        }
+      }
     }
   }
   return primary;

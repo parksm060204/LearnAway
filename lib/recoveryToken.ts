@@ -469,9 +469,10 @@ export function verifyTaskRecoveryToken(
   expected: {
     userId: string;
     taskId: string;
+    legacyTaskId?: string | string[];
     taskType: string;
     inputIdentifier: string;
-    legacyInputIdentifier?: string;
+    legacyInputIdentifier?: string | string[];
     result: unknown;
     now?: number;
   }
@@ -538,7 +539,13 @@ export function verifyTaskRecoveryToken(
   }
 
   // 4. Task ID & Task Type Check
-  if (p.taskId !== expected.taskId) {
+  const allowedTaskIds = [
+    expected.taskId,
+    ...(expected.legacyTaskId
+      ? (Array.isArray(expected.legacyTaskId) ? expected.legacyTaskId : [expected.legacyTaskId])
+      : []),
+  ];
+  if (!allowedTaskIds.includes(p.taskId)) {
     return { ok: false, error: '작업 식별자가 일치하지 않습니다.', code: 'MISMATCH' };
   }
 
@@ -547,9 +554,12 @@ export function verifyTaskRecoveryToken(
   }
 
   // 5. Input Identifier Check (matches authoritative SHA-256 or backward-compatible legacy hash)
+  const legacyList = expected.legacyInputIdentifier
+    ? (Array.isArray(expected.legacyInputIdentifier) ? expected.legacyInputIdentifier : [expected.legacyInputIdentifier])
+    : [];
   const inputMatches =
     p.inputIdentifier === expected.inputIdentifier ||
-    (Boolean(expected.legacyInputIdentifier) && p.inputIdentifier === expected.legacyInputIdentifier);
+    legacyList.some((leg) => leg && p.inputIdentifier === leg);
   if (!inputMatches) {
     return { ok: false, error: '작업 입력 식별자가 일치하지 않습니다.', code: 'MISMATCH' };
   }
