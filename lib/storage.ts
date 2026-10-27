@@ -1985,6 +1985,8 @@ export function editAndReviseProblem(
 
   const nextVersion = currentVersion + 1;
   const now = new Date().toISOString();
+  const nextGen = (existingUnsaved?.generation ?? (existingUnsaved ? 1 : 0)) + 1;
+  const newRevisionId = `rev-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 
   const updatedProblem: Problem = {
     ...target,
@@ -2003,6 +2005,8 @@ export function editAndReviseProblem(
 
   saveUnsavedProblemRevision({
     problemId,
+    revisionId: newRevisionId,
+    generation: nextGen,
     baseVersion,
     revisionVersion: nextVersion,
     title: updatedProblem.title,
@@ -2231,6 +2235,8 @@ export function resetToInitialDemoData(): void {
   safeRemoveItem(STORAGE_KEYS.PERSONALIZATION_STATE);
   safeRemoveItem(LOGIC_SESSIONS_KEY);
   safeRemoveItem(REC_HALLENGE_KEY);
+  safeRemoveItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS);
+  safeRemoveItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS);
   // Demo data is now loaded only through this explicit reset action.
   saveStoredSubjects(INITIAL_SUBJECTS);
   saveStoredMaterials(INITIAL_MATERIALS);
@@ -2502,6 +2508,15 @@ export function recordAttemptAndUpdateConcept(
         skippedReason: 'CORE_RECORD_NOT_PERSISTED',
       },
     };
+  }
+
+  // 4b. Core records verified: Clear any postponement schedule adjustment set prior to or for this review attempt.
+  // Only clear on the initial confirmed recording (!alreadyEventStored) so that retry attempts do NOT
+  // repeat the reset and do NOT wipe out any new postponement the user configured afterwards.
+  if (!alreadyEventStored) {
+    clearConceptScheduleAdjustment(effectiveAttempt.conceptId, {
+      onlyIfUpdatedBefore: effectiveAttempt.at || new Date().toISOString(),
+    });
   }
 
   // 5. Core records verified. Now proceed to link the StudyPlanItem for THIS review round only.
@@ -2921,18 +2936,61 @@ export function getUnsavedProblemRevision(problemId: string): UnsavedProblemRevi
   return all[problemId] || null;
 }
 
-export function saveUnsavedProblemRevision(revision: UnsavedProblemRevision): void {
+export function saveUnsavedProblemRevision(
+  revision: UnsavedProblemRevision,
+  options?: { onlyIfRevisionId?: string; onlyIfGeneration?: number }
+): boolean {
   const all = loadUnsavedProblemRevisions();
+  const existing = all[revision.problemId];
+  if (existing) {
+    if (options?.onlyIfRevisionId && existing.revisionId !== options.onlyIfRevisionId) {
+      return false;
+    }
+    if (options?.onlyIfGeneration !== undefined && existing.generation !== options.onlyIfGeneration) {
+      return false;
+    }
+    // Prevent an older revision or stale failure from overwriting a newer generation
+    if (
+      revision.generation !== undefined &&
+      existing.generation !== undefined &&
+      revision.generation < existing.generation
+    ) {
+      return false;
+    }
+    // If different revisionId and existing is newer by timestamp or generation, do not overwrite
+    if (
+      revision.revisionId &&
+      existing.revisionId &&
+      revision.revisionId !== existing.revisionId &&
+      (existing.generation ?? 0) >= (revision.generation ?? 0) &&
+      new Date(existing.revisedAt).getTime() > new Date(revision.revisedAt).getTime()
+    ) {
+      return false;
+    }
+  }
   all[revision.problemId] = revision;
   safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+  return true;
 }
 
-export function clearUnsavedProblemRevision(problemId: string): void {
+export function clearUnsavedProblemRevision(
+  problemId: string,
+  expected?: { revisionId?: string; generation?: number }
+): boolean {
   const all = loadUnsavedProblemRevisions();
-  if (all[problemId]) {
-    delete all[problemId];
-    safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+  const existing = all[problemId];
+  if (!existing) return false;
+  if (expected) {
+    if (expected.revisionId && existing.revisionId && existing.revisionId !== expected.revisionId) {
+      return false; // Newer or different revision present, do not delete!
+    }
+    if (expected.generation !== undefined && existing.generation !== undefined && existing.generation > expected.generation) {
+      return false; // Newer generation present, do not delete!
+    }
   }
+  delete all[problemId];
+  safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+  return true;
 }
 
 export function clearAllUnsavedProblemRevisions(): void {
@@ -2967,12 +3025,21 @@ export function saveConceptScheduleAdjustment(
   safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
 }
 
-export function clearConceptScheduleAdjustment(conceptId: string): void {
+export function clearConceptScheduleAdjustment(
+  conceptId: string,
+  options?: { onlyIfUpdatedBefore?: string }
+): boolean {
   const all = loadConceptScheduleAdjustments();
-  if (all[conceptId]) {
-    delete all[conceptId];
-    safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+  const existing = all[conceptId];
+  if (!existing) return false;
+  if (options?.onlyIfUpdatedBefore) {
+    if (existing.updatedAt && new Date(existing.updatedAt).getTime() > new Date(options.onlyIfUpdatedBefore).getTime()) {
+      return false; // A newer adjustment was set after this timestamp! Do not clear!
+    }
   }
+  delete all[conceptId];
+  safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+  return true;
 }
 
 export function clearAllConceptScheduleAdjustments(): void {

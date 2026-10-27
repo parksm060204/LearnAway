@@ -20703,6 +20703,333 @@ exports.requireApiUser = async () => {
     storageScope.setStorageScope({ kind: 'user', userId: userA });
   });
 
+  await checkAsync('Bug 1: Late save response and consecutive edits preserve latest revision without overwrite or accidental deletion', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user-late-save' });
+    const userA = 'user-late-save';
+    const userB = 'user-late-other';
+
+    const pServerV1 = {
+      id: 'p-late-1',
+      subjectId: 's-math-1',
+      title: 'Server Problem v1',
+      promptText: 'Original Prompt v1',
+      modelAnswer: 'Original Model Answer v1',
+      rubric: [{ id: 'r1', label: 'Rubric 1', maxScore: 100, weight: 1, description: 'Original Rubric' }],
+      timeStandardMinutes: 30,
+      hints: ['hint 1'],
+      version: 1,
+      qualityStatus: 'normal',
+      isOutdated: false,
+      needsSourceReview: false,
+      reports: [],
+    };
+    storage.saveStoredProblems([pServerV1]);
+
+    // 1. User performs Edit 1 -> creates revision 1 (generation 1, version 2)
+    const edit1Res = storage.editAndReviseProblem(
+      pServerV1.id,
+      { promptText: 'Edit 1 Prompt' },
+      'Reason 1'
+    );
+    assert.equal(edit1Res.success, true);
+    const rev1 = storage.getUnsavedProblemRevision(pServerV1.id);
+    assert.ok(rev1, 'Revision 1 stored');
+    assert.equal(rev1.generation, 1, 'Revision 1 has generation 1');
+    assert.ok(rev1.revisionId, 'Revision 1 has revisionId');
+    assert.equal(rev1.revisionVersion, 2);
+
+    // Snapshot captured when starting save request 1
+    const snapshotRev1Id = rev1.revisionId;
+    const snapshotRev1Gen = rev1.generation;
+
+    // 2. While request 1 is in-flight, User performs Edit 2 -> creates revision 2 (generation 2, version 3)
+    const edit2Res = storage.editAndReviseProblem(
+      pServerV1.id,
+      { promptText: 'Edit 2 Prompt' },
+      'Reason 2'
+    );
+    assert.equal(edit2Res.success, true);
+    const rev2 = storage.getUnsavedProblemRevision(pServerV1.id);
+    assert.ok(rev2, 'Revision 2 stored');
+    assert.equal(rev2.generation, 2, 'Revision 2 has generation 2');
+    assert.notEqual(rev2.revisionId, snapshotRev1Id, 'Revision 2 has new revisionId');
+    assert.equal(rev2.revisionVersion, 3);
+    assert.equal(rev2.promptText, 'Edit 2 Prompt');
+
+    // 3. Save request 1 finishes with SUCCESS:
+    // Conditional clear by revisionId/generation of Request 1 MUST NOT clear Revision 2!
+    const clearResult = storage.clearUnsavedProblemRevision(pServerV1.id, {
+      revisionId: snapshotRev1Id,
+      generation: snapshotRev1Gen,
+    });
+    assert.equal(clearResult, false, 'Conditional clear refused to delete newer revision 2');
+    const revStillPresent = storage.getUnsavedProblemRevision(pServerV1.id);
+    assert.ok(revStillPresent, 'Revision 2 preserved in storage');
+    assert.equal(revStillPresent.promptText, 'Edit 2 Prompt', 'Latest edit preserved');
+
+    // 4. Save request 1 failure / conflict response must NOT overwrite Revision 2 with stale revision 1!
+    const staleFailedRev1 = {
+      ...rev1,
+      syncStatus: 'failed',
+      syncError: 'Network timeout',
+    };
+    const saveStaleRes = storage.saveUnsavedProblemRevision(staleFailedRev1);
+    assert.equal(saveStaleRes, false, 'saveUnsavedProblemRevision refused to overwrite newer generation');
+    const revAfterStaleAttempt = storage.getUnsavedProblemRevision(pServerV1.id);
+    assert.equal(revAfterStaleAttempt.generation, 2, 'Still generation 2');
+    assert.equal(revAfterStaleAttempt.promptText, 'Edit 2 Prompt', 'Prompt unchanged by stale failure');
+
+    // 4b. Base version advance: when server save of request 1 succeeds (server advances to v2),
+    // local Revision 2's baseVersion advances to 2, and baseSnapshot reflects revision 1
+    const pServerV2FromRev1 = {
+      ...pServerV1,
+      version: 2,
+      promptText: 'Edit 1 Prompt',
+    };
+    storage.saveUnsavedProblemRevision({
+      ...rev2,
+      baseVersion: 2,
+      baseSnapshot: {
+        version: 2,
+        title: rev1.title,
+        promptText: rev1.promptText,
+        modelAnswer: rev1.modelAnswer,
+        rubric: rev1.rubric,
+        hints: rev1.hints,
+        editedAt: new Date().toISOString(),
+      },
+    });
+    const rev2Advanced = storage.getUnsavedProblemRevision(pServerV1.id);
+    assert.equal(rev2Advanced.baseVersion, 2, 'Base version advanced to 2');
+    assert.equal(rev2Advanced.revisionVersion, 3, 'Revision version remains 3');
+
+    // Merge when server is at v2 cleanly applies Revision 2 without conflict
+    const mergedP = cloudMerge.mergeProblems(
+      [pServerV2FromRev1],
+      [pServerV2FromRev1],
+      {},
+      new Set([pServerV1.id]),
+      new Set([pServerV1.id]),
+      storage.loadUnsavedProblemRevisions()
+    );
+    assert.equal(mergedP[0].version, 3);
+    assert.equal(mergedP[0].promptText, 'Edit 2 Prompt');
+
+    // 5. Account switching isolation:
+    storageScope.setStorageScope({ kind: 'user', userId: userB });
+    const userBRevs = storage.loadUnsavedProblemRevisions();
+    assert.equal(userBRevs[pServerV1.id], undefined, 'User B has no access to User A revision');
+    storageScope.setStorageScope({ kind: 'user', userId: userA });
+  });
+
+  await checkAsync('Bug 2: Revision content equality comparison comprehensively covers rubric description, time standard, and indentation', async () => {
+    const baseProblem = {
+      id: 'p-comp-1',
+      subjectId: 's-math-1',
+      title: 'Math Theorem',
+      promptText: 'Prove that sqrt(2) is irrational.',
+      modelAnswer: 'Assume sqrt(2) = a/b in lowest terms...',
+      mathFormula: '\\sqrt{2} = \\frac{a}{b}',
+      codeSnippet: 'def is_irrational(n):\n    return True',
+      timeStandardMinutes: 30,
+      hints: ['Consider prime factorization'],
+      rubric: [
+        { id: 'r1', label: 'Premise', maxScore: 50, weight: 1, description: 'Correct setup of contradiction' },
+        { id: 'r2', label: 'Algebra', maxScore: 50, weight: 1, description: 'Parity argument' },
+      ],
+      version: 2,
+    };
+
+    // 1. Identical content -> returns true
+    assert.equal(cloudMerge.isRevisionMatchingProblem(baseProblem, baseProblem), true, 'Identical content matches');
+
+    // 2. Differing rubric description ONLY -> must return false!
+    const diffRubricDesc = {
+      ...baseProblem,
+      rubric: [
+        { id: 'r1', label: 'Premise', maxScore: 50, weight: 1, description: 'MODIFIED rubric description' },
+        { id: 'r2', label: 'Algebra', maxScore: 50, weight: 1, description: 'Parity argument' },
+      ],
+    };
+    assert.equal(cloudMerge.isRevisionMatchingProblem(diffRubricDesc, baseProblem), false, 'Differing rubric description detected as mismatch');
+
+    // 3. Differing timeStandardMinutes ONLY -> must return false!
+    const diffTime = {
+      ...baseProblem,
+      timeStandardMinutes: 45,
+    };
+    assert.equal(cloudMerge.isRevisionMatchingProblem(diffTime, baseProblem), false, 'Differing timeStandardMinutes detected as mismatch');
+
+    // 4. Differing code indentation inside snippet -> must return false!
+    const diffCodeIndent = {
+      ...baseProblem,
+      codeSnippet: 'def is_irrational(n):\n  return True', // 2 spaces instead of 4
+    };
+    assert.equal(cloudMerge.isRevisionMatchingProblem(diffCodeIndent, baseProblem), false, 'Differing code indentation detected as mismatch');
+
+    // 5. mergeProblems synced vs conflict behavior:
+    // When server is at v2, but local unsaved has different rubric description on v2:
+    // It must be marked CONFLICT, NOT synced!
+    storageScope.setStorageScope({ kind: 'user', userId: 'user-merge-comp' });
+    const unsavedWithDiffDesc = {
+      problemId: baseProblem.id,
+      baseVersion: 1,
+      revisionVersion: 2,
+      ...diffRubricDesc,
+      editReason: 'Rubric clarification',
+      revisedAt: new Date().toISOString(),
+      syncStatus: 'pending',
+    };
+    storage.saveUnsavedProblemRevision(unsavedWithDiffDesc);
+
+    const merged = cloudMerge.mergeProblems(
+      [baseProblem],
+      [baseProblem],
+      {},
+      new Set([baseProblem.id]),
+      new Set([baseProblem.id]),
+      storage.loadUnsavedProblemRevisions(),
+      (rev) => storage.saveUnsavedProblemRevision(rev)
+    );
+    assert.equal(merged.length, 1);
+    const revAfterMerge = storage.getUnsavedProblemRevision(baseProblem.id);
+    assert.equal(revAfterMerge.syncStatus, 'conflict', 'Different rubric description at same version is conflict, NOT synced');
+
+    // When unsaved has identical content, it is marked synced
+    const unsavedMatching = {
+      ...unsavedWithDiffDesc,
+      rubric: baseProblem.rubric,
+      syncStatus: 'pending',
+    };
+    storage.saveUnsavedProblemRevision(unsavedMatching);
+    cloudMerge.mergeProblems(
+      [baseProblem],
+      [baseProblem],
+      {},
+      new Set([baseProblem.id]),
+      new Set([baseProblem.id]),
+      storage.loadUnsavedProblemRevisions(),
+      (rev) => storage.saveUnsavedProblemRevision(rev)
+    );
+    const revAfterMatching = storage.getUnsavedProblemRevision(baseProblem.id);
+    assert.equal(revAfterMatching.syncStatus, 'synced', 'Identical content at same version is marked synced');
+  });
+
+  await checkAsync('Bug 3: Review attempt completion clears schedule postponement without resurrecting on merge or retry', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user-postpone-clear' });
+
+    const testConcept = {
+      id: 'c-post-1',
+      subjectId: 's-math-1',
+      name: 'Eigenvalues',
+      chapterRef: 'Ch 5.1',
+      events: [],
+      baseScore: 70,
+      currentScore: 70,
+      retentionScore: 70,
+      status: 'review_needed',
+      exerciseCount: 1,
+      postponeDays: 0,
+    };
+    storage.saveStoredConcepts([testConcept]);
+
+    // 0. Test premature clearing prevention: failed attempt recording must NOT clear postponement!
+    storage.postponeConceptReview(testConcept.id, 5);
+    assert.equal(storage.getConceptScheduleAdjustment(testConcept.id).postponeDays, 5);
+    // Attempt pointing to mismatched subject -> throws/fails
+    assert.throws(() => {
+      storage.recordAttemptAndUpdateConcept({
+        id: 'att-mismatch',
+        problemId: 'p1',
+        conceptId: testConcept.id,
+        subjectId: 'wrong-subject',
+        userAnswer: 'ans',
+        calculatedScore: 100,
+        confidence: 'high',
+        hintCount: 0,
+        at: new Date().toISOString(),
+        rubricResults: [],
+      });
+    });
+    // Postponement remains 5!
+    assert.equal(storage.getConceptScheduleAdjustment(testConcept.id).postponeDays, 5, 'Postponement preserved on save failure');
+
+    // Reset concept for normal review flow
+    storage.saveStoredConcepts([testConcept]);
+
+    // 1. Postpone concept by 3 days
+    const postRes = storage.postponeConceptReview(testConcept.id, 3);
+    assert.equal(postRes.postponedConcept.postponeDays, 3);
+    const storedAdj = storage.getConceptScheduleAdjustment(testConcept.id);
+    assert.ok(storedAdj, 'Schedule adjustment stored');
+    assert.equal(storedAdj.postponeDays, 3);
+
+    // 2. Submit confirmed review attempt
+    const attemptTime = new Date().toISOString();
+    const reviewAttempt = {
+      id: 'att-post-1',
+      problemId: 'p-fake-1',
+      conceptId: testConcept.id,
+      subjectId: 's-math-1',
+      userAnswer: 'Det(A - lambda I) = 0',
+      calculatedScore: 90,
+      confidence: 'high',
+      hintCount: 0,
+      at: attemptTime,
+      rubricResults: [{ criterionId: 'r1', label: 'Char Poly', score: 90, maxScore: 100 }],
+    };
+
+    const attemptRes = storage.recordAttemptAndUpdateConcept(reviewAttempt);
+    assert.equal(attemptRes.status, 'complete');
+    assert.equal(attemptRes.attemptPersisted, true);
+    assert.equal(attemptRes.eventPersisted, true);
+
+    // Concept in memory & storage now has postponeDays: 0
+    const conceptsAfterAttempt = storage.loadStoredConcepts();
+    const updatedC = conceptsAfterAttempt.find((c) => c.id === testConcept.id);
+    assert.equal(updatedC.postponeDays, 0, 'postponeDays is 0 after confirmed review');
+    assert.equal(updatedC.exerciseCount, 2, 'exerciseCount incremented once');
+    assert.equal(updatedC.events.length, 1, '1 review event added');
+
+    // Schedule adjustment in concept_schedule_adjustments_v1 MUST BE CLEARED!
+    const adjAfterReview = storage.getConceptScheduleAdjustment(testConcept.id);
+    assert.equal(adjAfterReview, null, 'Schedule adjustment record cleared upon confirmed review');
+
+    // Next mergeConcepts (simulating cloud sync / refresh) must KEEP postponeDays: 0!
+    const mergedConcepts = cloudMerge.mergeConcepts(
+      [testConcept],
+      conceptsAfterAttempt,
+      new Set([testConcept.id]),
+      new Set([testConcept.id]),
+      storage.loadConceptScheduleAdjustments()
+    );
+    assert.equal(mergedConcepts[0].postponeDays, 0, 'postponeDays remains 0 after cloud merge');
+
+    // 3. User sets a NEW postponement after this review at a later time
+    const newPostponeRes = storage.postponeConceptReview(testConcept.id, 2);
+    assert.equal(newPostponeRes.postponedConcept.postponeDays, 2);
+    const newAdj = storage.getConceptScheduleAdjustment(testConcept.id);
+    assert.ok(newAdj, 'New schedule adjustment stored');
+    assert.equal(newAdj.postponeDays, 2);
+
+    // 4. An idempotent retry / late response of the PAST attempt (attemptTime) arrives:
+    // It must NOT clear the newly set postponement, and must NOT duplicate exercise count or events!
+    const retryRes = storage.recordAttemptAndUpdateConcept(reviewAttempt);
+    assert.equal(retryRes.status, 'already_completed');
+    const conceptsAfterRetry = storage.loadStoredConcepts();
+    const retryC = conceptsAfterRetry.find((c) => c.id === testConcept.id);
+    assert.equal(retryC.exerciseCount, 2, 'exerciseCount NOT duplicated on retry');
+    assert.equal(retryC.events.length, 1, 'Event count NOT duplicated on retry');
+
+    const adjAfterRetry = storage.getConceptScheduleAdjustment(testConcept.id);
+    assert.ok(adjAfterRetry, 'New schedule adjustment preserved despite retry of past attempt');
+    assert.equal(adjAfterRetry.postponeDays, 2, 'New postponement of 2 days remains intact');
+
+    // 5. Reset to initial demo data clears schedule adjustments
+    storage.resetToInitialDemoData();
+    assert.equal(storage.getConceptScheduleAdjustment(testConcept.id), null, 'Reset clears schedule adjustments');
+  });
+
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
   else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
   AI_CONFIG.apiKey = savedApiKeyPlan03;

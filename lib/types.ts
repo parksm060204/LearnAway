@@ -728,6 +728,8 @@ export interface ProblemVersionSnapshot {
 
 export interface UnsavedProblemRevision {
   problemId: string;
+  revisionId?: string;
+  generation?: number;
   baseVersion: number;
   revisionVersion: number;
   title: string;

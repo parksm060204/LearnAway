@@ -1,8 +1,22 @@
 import type { Concept, Problem, ProblemVersionSnapshot, UnsavedProblemRevision, ConceptScheduleAdjustment } from '../types';
 
+function normalizeText(val?: string | null): string {
+  if (val === undefined || val === null) return '';
+  return val.replace(/\r\n/g, '\n').trim();
+}
+
+function normalizeCode(val?: string | null): string {
+  if (val === undefined || val === null) return '';
+  // Normalize Windows CRLF to LF and strip only leading/trailing newlines.
+  // CRITICAL: Preserve all indentation spaces, tabs, and intra-line spacing.
+  return val.replace(/\r\n/g, '\n').replace(/^\n+|\n+$/g, '');
+}
+
 /**
  * Checks if unsaved revision content matches remote problem content.
- * Prevents false conflict classification or accidental deletion when content is identical.
+ * Comprehensively compares all meaningful stored fields: prompt, answer, title,
+ * formula, code (preserving indentation), hints, full rubric (including description & weight),
+ * time standard, and applied conditions.
  */
 export function isRevisionMatchingProblem(
   unsaved: {
@@ -13,31 +27,49 @@ export function isRevisionMatchingProblem(
     mathFormula?: string;
     codeSnippet?: string;
     hints?: string[];
+    timeStandardMinutes?: number;
+    appliedConditionNote?: string;
   },
   remote: Problem
 ): boolean {
-  if ((unsaved.promptText || '').trim() !== (remote.promptText || '').trim()) return false;
-  if ((unsaved.modelAnswer || '').trim() !== (remote.modelAnswer || '').trim()) return false;
-  if ((unsaved.title || '').trim() !== (remote.title || '').trim()) return false;
-  if ((unsaved.mathFormula || '').trim() !== (remote.mathFormula || '').trim()) return false;
-  if ((unsaved.codeSnippet || '').trim() !== (remote.codeSnippet || '').trim()) return false;
+  if (normalizeText(unsaved.promptText) !== normalizeText(remote.promptText)) return false;
+  if (normalizeText(unsaved.modelAnswer) !== normalizeText(remote.modelAnswer)) return false;
+  if (normalizeText(unsaved.title) !== normalizeText(remote.title)) return false;
+  if (normalizeText(unsaved.mathFormula) !== normalizeText(remote.mathFormula)) return false;
+  if (normalizeCode(unsaved.codeSnippet) !== normalizeCode(remote.codeSnippet)) return false;
+  if (normalizeText(unsaved.appliedConditionNote) !== normalizeText(remote.appliedConditionNote)) return false;
 
+  // Time standard comparison
+  if (unsaved.timeStandardMinutes !== undefined || remote.timeStandardMinutes !== undefined) {
+    const uTime = unsaved.timeStandardMinutes !== undefined ? Number(unsaved.timeStandardMinutes) : undefined;
+    const rTime = remote.timeStandardMinutes !== undefined ? Number(remote.timeStandardMinutes) : undefined;
+    if (uTime !== rTime) return false;
+  }
+
+  // Full rubric comparison (id, label, maxScore, weight, description)
   const uRubric = unsaved.rubric || [];
   const rRubric = remote.rubric || [];
   if (uRubric.length !== rRubric.length) return false;
   for (let i = 0; i < uRubric.length; i++) {
     const ur = uRubric[i];
     const rr = rRubric[i];
-    if (ur.id !== rr.id || Number(ur.maxScore) !== Number(rr.maxScore) || (ur.label || '').trim() !== (rr.label || '').trim()) {
+    if (
+      ur.id !== rr.id ||
+      Number(ur.maxScore ?? 0) !== Number(rr.maxScore ?? 0) ||
+      Number(ur.weight ?? 0) !== Number(rr.weight ?? 0) ||
+      normalizeText(ur.label) !== normalizeText(rr.label) ||
+      normalizeText(ur.description) !== normalizeText(rr.description)
+    ) {
       return false;
     }
   }
 
+  // Hints comparison
   const uHints = unsaved.hints || [];
   const rHints = remote.hints || [];
   if (uHints.length !== rHints.length) return false;
   for (let i = 0; i < uHints.length; i++) {
-    if (uHints[i] !== rHints[i]) return false;
+    if (normalizeText(uHints[i]) !== normalizeText(rHints[i])) return false;
   }
 
   return true;
@@ -64,12 +96,22 @@ export function mergeConcepts(
     const mine = originById.get(remote.id);
     const adjustment = scheduleAdjustments[remote.id];
 
-    const postponeDays = adjustment?.postponeDays !== undefined
-      ? adjustment.postponeDays
+    // Bug 3: If the adjustment was set before the concept's latest confirmed review attempt,
+    // it is an obsolete adjustment from a prior review round and must NOT be resurrected.
+    const isObsoleteAdjustment = Boolean(
+      adjustment?.updatedAt &&
+      mine?.lastAttemptAt &&
+      new Date(adjustment.updatedAt).getTime() <= new Date(mine.lastAttemptAt).getTime()
+    );
+
+    const activeAdjustment = isObsoleteAdjustment ? undefined : adjustment;
+
+    const postponeDays = activeAdjustment?.postponeDays !== undefined
+      ? activeAdjustment.postponeDays
       : (mine?.postponeDays ?? 0);
 
-    const postponedUntil = adjustment?.postponedUntil !== undefined
-      ? adjustment.postponedUntil
+    const postponedUntil = activeAdjustment?.postponedUntil !== undefined
+      ? activeAdjustment.postponedUntil
       : mine?.postponedUntil;
 
     return {

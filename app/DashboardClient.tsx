@@ -341,6 +341,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     error: string;
   } | null>(null);
   const recoveryRequestSeqRef = useRef<number>(0);
+  const pushProblemToServerRef = useRef<(problemId: string, opts?: { revise?: boolean; expectedVersion?: number; silent?: boolean }) => Promise<void>>(() => Promise.resolve());
 
   const recoveryDbStatus = useMemo(() => {
     if (itemRecoveryError) return itemRecoveryError;
@@ -616,20 +617,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         let conflictCount = 0;
         for (const [pId, rev] of Object.entries(unsavedRevisions)) {
           if (rev.syncStatus === 'synced') {
-            clearUnsavedProblemRevision(pId);
+            clearUnsavedProblemRevision(pId, { revisionId: rev.revisionId, generation: rev.generation });
           } else if (rev.syncStatus === 'conflict') {
             conflictCount++;
           } else if (rev.syncStatus === 'pending') {
             const sProblem = library.data.problems.find((p) => p.id === pId);
             if (sProblem && (sProblem.version ?? 1) === rev.baseVersion) {
-              const localProb = mergedProblems.find((p) => p.id === pId);
-              if (localProb) {
-                void reviseProblem(supabase, pId, rev.baseVersion, localProb).then((res) => {
-                  if (res.ok) {
-                    clearUnsavedProblemRevision(pId);
-                  }
-                });
-              }
+              void pushProblemToServerRef.current(pId, { revise: true, expectedVersion: rev.baseVersion, silent: true });
             }
           }
         }
@@ -2837,15 +2831,23 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   // warning (never a false success) when the server rejects the change.
   const pushProblemToServer = async (
     problemId: string,
-    opts: { revise?: boolean; expectedVersion?: number } = {}
+    opts: { revise?: boolean; expectedVersion?: number; silent?: boolean } = {}
   ): Promise<void> => {
+    const pinnedScopeId = getStorageScopeId();
     const problem = loadStoredProblems().find((p) => p.id === problemId);
     if (!problem) return;
     const unsaved = getUnsavedProblemRevision(problemId);
+    const targetRevisionId = unsaved?.revisionId;
+    const targetGeneration = unsaved?.generation;
+    const snapshotProblem = { ...problem };
+
     try {
       const supabase = createBrowserSupabaseClient();
       if (unsaved && unsaved.syncStatus !== 'conflict') {
-        saveUnsavedProblemRevision({ ...unsaved, syncStatus: 'syncing' });
+        saveUnsavedProblemRevision(
+          { ...unsaved, syncStatus: 'syncing' },
+          { onlyIfRevisionId: targetRevisionId }
+        );
       }
       const targetExpectedVersion = unsaved?.baseVersion ?? opts.expectedVersion ?? Math.max(1, (problem.version ?? 1) - 1);
       const result = opts.revise
@@ -2861,57 +2863,156 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             needsSourceReview: problem.needsSourceReview,
             payload: problem as unknown as Record<string, unknown>,
           });
+
+      if (getStorageScopeId() !== pinnedScopeId) return;
+
       if (opts.revise) {
         if (result.ok) {
-          clearUnsavedProblemRevision(problemId);
-          showToast('문제 수정본이 서버에 안전하게 저장되었습니다.');
+          const currentUnsaved = getUnsavedProblemRevision(problemId);
+          if (
+            currentUnsaved &&
+            targetRevisionId &&
+            currentUnsaved.revisionId !== targetRevisionId &&
+            (currentUnsaved.generation ?? 0) > (targetGeneration ?? 0)
+          ) {
+            // Consecutive edit occurred while this save was in flight!
+            // Server just confirmed the previous revision. Advance baseVersion of the newer edit to server confirmed version.
+            const confirmedVersion = result.data?.version ?? (targetExpectedVersion + 1);
+            saveUnsavedProblemRevision({
+              ...currentUnsaved,
+              baseVersion: confirmedVersion,
+              baseSnapshot: {
+                version: confirmedVersion,
+                title: snapshotProblem.title,
+                promptText: snapshotProblem.promptText,
+                mathFormula: snapshotProblem.mathFormula,
+                codeSnippet: snapshotProblem.codeSnippet,
+                timeStandardMinutes: snapshotProblem.timeStandardMinutes,
+                hints: [...(snapshotProblem.hints || [])],
+                modelAnswer: snapshotProblem.modelAnswer,
+                rubric: [...(snapshotProblem.rubric || [])],
+                editedAt: new Date().toISOString(),
+                editReason: unsaved?.editReason ?? '서버 동기화 완료 버전',
+              },
+            });
+            if (!opts.silent) {
+              showToast('이전 수정본이 서버에 저장되었으며, 최신 로컬 편집 내용이 보존되었습니다.');
+            }
+          } else {
+            clearUnsavedProblemRevision(problemId, {
+              revisionId: targetRevisionId,
+              generation: targetGeneration,
+            });
+            if (!opts.silent) {
+              showToast('문제 수정본이 서버에 안전하게 저장되었습니다.');
+            }
+          }
         } else {
           // If version conflict occurred, check if server was already updated to this version (idempotent retry / response loss)
           if (result.error && /VERSION_CONFLICT/i.test(result.error)) {
             const latestServer = await getProblemById(supabase, problemId);
+            if (getStorageScopeId() !== pinnedScopeId) return;
             if (
               latestServer.ok &&
               latestServer.data &&
               latestServer.data.version === problem.version &&
               isRevisionMatchingProblem(problem, latestServer.data)
             ) {
-              clearUnsavedProblemRevision(problemId);
-              showToast('문제 수정본이 이미 서버에 동기화되어 있습니다.');
+              const currentUnsaved = getUnsavedProblemRevision(problemId);
+              if (
+                currentUnsaved &&
+                targetRevisionId &&
+                currentUnsaved.revisionId !== targetRevisionId &&
+                (currentUnsaved.generation ?? 0) > (targetGeneration ?? 0)
+              ) {
+                const serverVer = latestServer.data.version ?? 1;
+                saveUnsavedProblemRevision({
+                  ...currentUnsaved,
+                  baseVersion: serverVer,
+                  baseSnapshot: {
+                    version: serverVer,
+                    title: snapshotProblem.title,
+                    promptText: snapshotProblem.promptText,
+                    mathFormula: snapshotProblem.mathFormula,
+                    codeSnippet: snapshotProblem.codeSnippet,
+                    timeStandardMinutes: snapshotProblem.timeStandardMinutes,
+                    hints: [...(snapshotProblem.hints || [])],
+                    modelAnswer: snapshotProblem.modelAnswer,
+                    rubric: [...(snapshotProblem.rubric || [])],
+                    editedAt: new Date().toISOString(),
+                    editReason: unsaved?.editReason ?? '서버 동기화 완료 버전',
+                  },
+                });
+              } else {
+                clearUnsavedProblemRevision(problemId, {
+                  revisionId: targetRevisionId,
+                  generation: targetGeneration,
+                });
+              }
+              if (!opts.silent) {
+                showToast('문제 수정본이 이미 서버에 동기화되어 있습니다.');
+              }
               return;
             }
-            if (unsaved) {
-              saveUnsavedProblemRevision({
-                ...unsaved,
-                syncStatus: 'conflict',
-                syncError: `서버 버전 충돌: ${result.error}`,
-              });
+            const currentUnsaved = getUnsavedProblemRevision(problemId);
+            if (currentUnsaved && (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId)) {
+              saveUnsavedProblemRevision(
+                {
+                  ...currentUnsaved,
+                  syncStatus: 'conflict',
+                  syncError: `서버 버전 충돌: ${result.error}`,
+                },
+                { onlyIfRevisionId: targetRevisionId }
+              );
+              showToast('서버 버전 충돌: 미저장 수정본이 충돌 복구 대상으로 보존되었습니다.');
             }
-            showToast('서버 버전 충돌: 미저장 수정본이 충돌 복구 대상으로 보존되었습니다.');
             return;
           }
-          if (unsaved && unsaved.syncStatus !== 'conflict') {
-            saveUnsavedProblemRevision({
-              ...unsaved,
-              syncStatus: 'failed',
-              syncError: result.error,
-            });
+          const currentUnsaved = getUnsavedProblemRevision(problemId);
+          if (
+            currentUnsaved &&
+            currentUnsaved.syncStatus !== 'conflict' &&
+            (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId)
+          ) {
+            saveUnsavedProblemRevision(
+              {
+                ...currentUnsaved,
+                syncStatus: 'failed',
+                syncError: result.error,
+              },
+              { onlyIfRevisionId: targetRevisionId }
+            );
           }
-          showToast(`서버 동기화 실패: ${result.error}`);
+          if (!opts.silent) {
+            showToast(`서버 동기화 실패: ${result.error}`);
+          }
         }
       } else {
-        if (!result.ok) showToast(`서버 동기화 실패: ${result.error}`);
+        if (!result.ok && !opts.silent) showToast(`서버 동기화 실패: ${result.error}`);
       }
     } catch (e) {
-      if (unsaved && unsaved.syncStatus !== 'conflict') {
-        saveUnsavedProblemRevision({
-          ...unsaved,
-          syncStatus: 'failed',
-          syncError: e instanceof Error ? e.message : '알 수 없는 오류',
-        });
+      if (getStorageScopeId() !== pinnedScopeId) return;
+      const currentUnsaved = getUnsavedProblemRevision(problemId);
+      if (
+        currentUnsaved &&
+        currentUnsaved.syncStatus !== 'conflict' &&
+        (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId)
+      ) {
+        saveUnsavedProblemRevision(
+          {
+            ...currentUnsaved,
+            syncStatus: 'failed',
+            syncError: e instanceof Error ? e.message : '알 수 없는 오류',
+          },
+          { onlyIfRevisionId: targetRevisionId }
+        );
       }
-      showToast(`서버 동기화 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+      if (!opts.silent) {
+        showToast(`서버 동기화 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+      }
     }
   };
+  pushProblemToServerRef.current = pushProblemToServer;
 
   const handleUpdateProblemDraft = async (updatedDraft: ProblemDraft) => {
     // Drafts loaded from the server carry contentVersion; local-only drafts do not.
