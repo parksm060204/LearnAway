@@ -3,8 +3,8 @@
 import { createClient } from '../supabase/client';
 import type { Subject } from '../types';
 import { rowToSubject, subjectToUpsert } from './mappers';
-import type { RepoResult, SubjectRow } from './types';
-import { repoError, repoOk } from './types';
+import type { ListPage, RepoResult, SubjectRow } from './types';
+import { fetchAllPages, repoError, repoOk } from './types';
 
 function toMessage(error: unknown, fallback: string): string {
   if (
@@ -18,13 +18,18 @@ function toMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-export async function listSubjects(): Promise<RepoResult<Subject[]>> {
+export async function listSubjects(page?: ListPage): Promise<RepoResult<Subject[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listSubjects(p));
+  }
   try {
     const supabase = createClient();
     const { data, error } = await supabase
       .from('subjects')
       .select('*')
-      .order('updated_at', { ascending: false });
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk((data as SubjectRow[]).map(rowToSubject));
   } catch (error) {

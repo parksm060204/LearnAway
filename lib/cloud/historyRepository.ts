@@ -41,21 +41,25 @@ export interface AttemptSubmitOutcome {
 // Reads
 // ---------------------------------------------------------------------------
 
-/** Optional PostgREST range for paginated reads. */
-export interface ListPage {
-  from: number;
-  to: number;
-}
+import type { ListPage } from './types';
+export type { ListPage } from './types';
+import { fetchAllPages } from './types';
 
 export async function listAttempts(
   supabase: SupabaseClient,
   page?: ListPage
 ): Promise<RepoResult<Attempt[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listAttempts(supabase, p));
+  }
   try {
     // Stable order (primary + id) so range pagination is deterministic.
-    let query = supabase.from('attempts').select('*').order('at', { ascending: false }).order('id', { ascending: true });
-    if (page) query = query.range(page.from, page.to);
-    const { data, error } = await query;
+    const { data, error } = await supabase
+      .from('attempts')
+      .select('*')
+      .order('at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk(((data as AttemptRow[]) ?? []).map(rowToAttempt));
   } catch (error) {
@@ -67,10 +71,16 @@ export async function listReviewEvents(
   supabase: SupabaseClient,
   page?: ListPage
 ): Promise<RepoResult<ReviewEvent[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listReviewEvents(supabase, p));
+  }
   try {
-    let query = supabase.from('review_events').select('*').order('at', { ascending: false }).order('id', { ascending: true });
-    if (page) query = query.range(page.from, page.to);
-    const { data, error } = await query;
+    const { data, error } = await supabase
+      .from('review_events')
+      .select('*')
+      .order('at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk(((data as ReviewEventRow[]) ?? []).map(rowToReviewEvent));
   } catch (error) {
@@ -82,10 +92,15 @@ export async function listStudyPlanItems(
   supabase: SupabaseClient,
   page?: ListPage
 ): Promise<RepoResult<StudyPlanItem[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listStudyPlanItems(supabase, p));
+  }
   try {
-    let query = supabase.from('study_plan_items').select('*').order('id', { ascending: true });
-    if (page) query = query.range(page.from, page.to);
-    const { data, error } = await query;
+    const { data, error } = await supabase
+      .from('study_plan_items')
+      .select('*')
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk(((data as StudyPlanItemRow[]) ?? []).map(rowToStudyPlanItem));
   } catch (error) {
@@ -110,14 +125,16 @@ export async function listMockExamSessions(
   supabase: SupabaseClient,
   page?: ListPage
 ): Promise<RepoResult<MockExamSession[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listMockExamSessions(supabase, p));
+  }
   try {
-    let query = supabase
+    const { data, error } = await supabase
       .from('mock_exam_sessions')
       .select('*')
       .order('updated_at', { ascending: false })
-      .order('id', { ascending: true });
-    if (page) query = query.range(page.from, page.to);
-    const { data, error } = await query;
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk(((data as MockExamSessionRow[]) ?? []).map(rowToMockExamSession));
   } catch (error) {

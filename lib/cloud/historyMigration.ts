@@ -278,6 +278,8 @@ function readOrigin(storage: Storage, userId: string): OriginResult {
   return { ok: true, snapshot: fresh };
 }
 
+import { fetchAllPages } from './types';
+
 type PageResult<T> = { ok: true; data: T[] } | { ok: false; error: string };
 
 /**
@@ -289,20 +291,7 @@ type PageResult<T> = { ok: true; data: T[] } | { ok: false; error: string };
 export async function collectAllPages<T extends { id: string }>(
   fetchPage: (page: ListPage) => Promise<PageResult<T>>
 ): Promise<PageResult<T>> {
-  const seen = new Set<string>();
-  const all: T[] = [];
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const from = page * PAGE_SIZE;
-    const result = await fetchPage({ from, to: from + PAGE_SIZE - 1 });
-    if (!result.ok) return result;
-    for (const row of result.data) {
-      if (row.id && seen.has(row.id)) continue;
-      if (row.id) seen.add(row.id);
-      all.push(row);
-    }
-    if (result.data.length < PAGE_SIZE) break;
-  }
-  return { ok: true, data: all };
+  return fetchAllPages(fetchPage, PAGE_SIZE, MAX_PAGES);
 }
 
 const MOCK_STATUS_RANK: Record<string, number> = {

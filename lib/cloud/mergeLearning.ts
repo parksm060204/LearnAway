@@ -1,10 +1,10 @@
 import type { Concept, Problem, ProblemVersionSnapshot } from '../types';
 
 /**
- * Server concepts are authoritative. Locally-derived review state (events,
- * scores, schedule) stays local and is merged by id; un-migrated originals
- * (never on the server, never migrated) are kept as un-synced. Records that were
- * migrated and then deleted on the server are NOT resurrected.
+ * Server concepts are authoritative for content, quality, and source review.
+ * Locally-derived review state (events, scores, schedule) stays local and is merged by id;
+ * un-migrated originals (never on the server, never migrated) are kept as un-synced.
+ * Records that were migrated and then deleted on the server are NOT resurrected.
  */
 export function mergeConcepts(
   server: Concept[],
@@ -30,16 +30,63 @@ export function mergeConcepts(
       lastCalculatedAt: mine.lastCalculatedAt,
       postponedUntil: mine.postponedUntil,
       postponeDays: mine.postponeDays,
-      needsSourceReview: mine.needsSourceReview ?? remote.needsSourceReview,
-      sourceEvidence: mine.sourceEvidence ?? remote.sourceEvidence,
+      // Either remote or local flagging needsSourceReview keeps it flagged
+      needsSourceReview: Boolean(remote.needsSourceReview || mine.needsSourceReview),
+      sourceEvidence: (mine.sourceEvidence && mine.sourceEvidence.verified === false)
+        ? mine.sourceEvidence
+        : (remote.sourceEvidence ?? mine.sourceEvidence),
     };
   });
   const unSynced = originals.filter((o) => !serverIds.has(o.id) && !migratedIds.has(o.id));
   return [...merged, ...unSynced];
 }
 
-/** Server problems are authoritative; version history + local quality metadata
- *  and un-migrated originals are preserved. */
+function mergeReports(remoteReports?: Problem['reports'], localReports?: Problem['reports']) {
+  const rList = remoteReports ?? [];
+  const lList = localReports ?? [];
+  const seenIds = new Set(rList.map((r) => r.id));
+  const combined = [...rList];
+  for (const lr of lList) {
+    if (!seenIds.has(lr.id)) {
+      combined.push(lr);
+      seenIds.add(lr.id);
+    }
+  }
+  return combined;
+}
+
+function resolveProblemQualityStatus(
+  remote: Problem,
+  mine?: Problem
+): Problem['qualityStatus'] {
+  const remoteStatus = remote.qualityStatus ?? 'normal';
+  if (!mine) return remoteStatus;
+  const localStatus = mine.qualityStatus ?? 'normal';
+
+  // Server quarantine or suspension is authoritative and cannot be overwritten by stale local state
+  if (remoteStatus === 'suspended' || (remoteStatus as string) === 'quarantined') {
+    return remoteStatus;
+  }
+
+  // Server re-approval overrides local reported status
+  if (remoteStatus === 'reapproved') {
+    return remoteStatus;
+  }
+
+  // Local un-synced user reports or reviews are preserved
+  if (localStatus === 'reported' || localStatus === 'under_review' || localStatus === 'review_after_edit') {
+    return localStatus;
+  }
+
+  return remoteStatus;
+}
+
+/**
+ * Server problems are authoritative for content, version history, quarantine,
+ * isOutdated, and needsSourceReview. Local review notes, un-synced reports, and
+ * un-migrated originals are preserved. Records that were migrated and deleted on
+ * the server are NOT resurrected.
+ */
 export function mergeProblems(
   server: Problem[],
   originals: Problem[],
@@ -56,12 +103,12 @@ export function mergeProblems(
       ...(versionHistory ? { versionHistory } : {}),
       ...(mine
         ? {
-            reports: mine.reports ?? remote.reports ?? [],
-            qualityStatus: mine.qualityStatus ?? remote.qualityStatus,
-            isOutdated: mine.isOutdated ?? remote.isOutdated,
-            needsSourceReview: mine.needsSourceReview ?? remote.needsSourceReview,
-            lastReviewedAt: mine.lastReviewedAt,
-            reviewNotes: mine.reviewNotes,
+            reports: mergeReports(remote.reports, mine.reports),
+            qualityStatus: resolveProblemQualityStatus(remote, mine),
+            isOutdated: Boolean(remote.isOutdated || mine.isOutdated),
+            needsSourceReview: Boolean(remote.needsSourceReview || mine.needsSourceReview),
+            lastReviewedAt: remote.lastReviewedAt ?? mine.lastReviewedAt,
+            reviewNotes: remote.reviewNotes ?? mine.reviewNotes,
           }
         : {}),
     };

@@ -19,7 +19,7 @@ const compile = spawnSync(process.execPath, [path.join(root, 'node_modules/types
   'lib/personalization.ts', 'lib/logicSession.ts', 'lib/logicValidation.ts', 'lib/logicAsync.ts',
   'lib/academicProofing.ts', 'lib/aiConfig.ts', 'lib/aiClient.ts', 'lib/aiCredentials.ts', 'lib/asyncRequestTracker.ts', 'lib/learningAnalytics.ts', 'lib/transferValidation.ts',
   'lib/storageScope.ts', 'lib/auth/redirects.ts', 'lib/legacyImport.ts', 'lib/appReadiness.ts',
-  'lib/cloud/hash.ts', 'lib/cloud/mappers.ts', 'lib/cloud/plan.ts',
+  'lib/cloud/types.ts', 'lib/cloud/hash.ts', 'lib/cloud/mappers.ts', 'lib/cloud/plan.ts',
   'lib/cloud/subjectsRepository.ts', 'lib/cloud/materialsRepository.ts', 'lib/cloud/library.ts',
   'lib/cloud/migrationOriginals.ts', 'lib/cloud/localMigration.ts',
   'lib/cloud/learningMappers.ts', 'lib/cloud/learningPlan.ts', 'lib/cloud/learningRepository.ts',
@@ -104,6 +104,7 @@ exports.requireApiUser = async () => {
   const legacyImport = load(path.join(output, 'lib/legacyImport.js'));
   const appReadiness = load(path.join(output, 'lib/appReadiness.js'));
   const storageScope = load(path.join(output, 'lib/storageScope.js'));
+  const cloudTypes = load(path.join(output, 'lib/cloud/types.js'));
   const cloudHash = load(path.join(output, 'lib/cloud/hash.js'));
   const cloudMappers = load(path.join(output, 'lib/cloud/mappers.js'));
   const cloudPlan = load(path.join(output, 'lib/cloud/plan.js'));
@@ -19098,7 +19099,7 @@ exports.requireApiUser = async () => {
     const { resolveEvaluatedProblemSnapshot, extractProblemProvenance } = load(path.join(output, 'components/ProblemSessionModal.js'));
     const { POST: evaluatePost } = load(path.join(output, 'app/api/evaluate-answer/route.js'));
     const { recordAttemptAndUpdateConcept, loadStoredAttempts, saveStoredAttempts, loadStoredConcepts, saveStoredConcepts } = load(path.join(output, 'lib/storage.js'));
-    const { saveTaskRecovery, getTaskRecovery, clearTaskRecovery } = load(path.join(output, 'lib/taskRecoveryClient.js'));
+    const { saveTaskRecovery, getTaskRecovery } = load(path.join(output, 'lib/taskRecoveryClient.js'));
 
     const testUser = { id: 'user-snap-iso-01', email: 'snap-iso@example.com' };
     const prevApiKey = AI_CONFIG.apiKey;
@@ -19520,6 +19521,201 @@ exports.requireApiUser = async () => {
     mountedRef.current = false;
     const isUnmountedValid = mountedRef.current && req3_2 === reviewRequestId;
     assert.equal(isUnmountedValid, false, '언마운트 시 응답 차단');
+  });
+
+  await checkAsync('Problem 1: registerAiTask hardened to require admin client and disallow authenticated bypass', async () => {
+    globalThis.__disableFakeAdminClient = true;
+    const prevSupabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const prevServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    try {
+      delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+      const res = await trialCredits.registerAiTask(
+        'tampering-user',
+        'task-tamper-1',
+        'analyze_concepts',
+        'input-hash-1'
+      );
+      assert.equal(res.allowed, false);
+      assert.equal(res.errorCode, 'ADMIN_CONFIG_REQUIRED');
+
+      const lookupRes = await trialCredits.lookupSavedTaskResult(
+        'tampering-user',
+        'task-tamper-1',
+        'analyze_concepts',
+        'input-hash-1'
+      );
+      assert.equal(lookupRes.success, false);
+      assert.equal(lookupRes.errorCode, 'ADMIN_CONFIG_REQUIRED');
+    } finally {
+      delete globalThis.__disableFakeAdminClient;
+      if (prevSupabaseUrl) process.env.NEXT_PUBLIC_SUPABASE_URL = prevSupabaseUrl;
+      if (prevServiceKey) process.env.SUPABASE_SERVICE_ROLE_KEY = prevServiceKey;
+    }
+  });
+
+  await checkAsync('Problem 2: Material deletion race condition preserves concurrently added materials and checks storage scope', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'scope-user-1' });
+    storage.saveStoredMaterials([
+      { id: 'mat-1', title: 'Material 1', subjectId: 's1', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+      { id: 'mat-2', title: 'Material 2', subjectId: 's1', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+    ]);
+
+    let uiMaterials = storage.loadStoredMaterials();
+    const scopeAtStart = storageScope.getStorageScopeId();
+
+    storage.saveStoredMaterials([
+      ...storage.loadStoredMaterials(),
+      { id: 'mat-3', title: 'Material 3', subjectId: 's1', createdAt: '2026-01-01T00:01:00Z', updatedAt: '2026-01-01T00:01:00Z' },
+    ]);
+
+    assert.equal(storageScope.getStorageScopeId(), scopeAtStart);
+    const remainingMaterials = storage.loadStoredMaterials().filter((m) => m.id !== 'mat-1');
+    storage.saveStoredMaterials(remainingMaterials);
+    uiMaterials = uiMaterials.filter((m) => m.id !== 'mat-1');
+    assert.equal(uiMaterials.some((m) => m.id === 'mat-1'), false);
+
+    const finalMaterials = storage.loadStoredMaterials();
+    assert.equal(finalMaterials.some((m) => m.id === 'mat-1'), false, 'mat-1 is deleted');
+    assert.equal(finalMaterials.some((m) => m.id === 'mat-2'), true, 'mat-2 is preserved');
+    assert.equal(finalMaterials.some((m) => m.id === 'mat-3'), true, 'concurrently added mat-3 is preserved');
+
+    storageScope.setStorageScope({ kind: 'user', userId: 'scope-user-2' });
+    assert.notEqual(storageScope.getStorageScopeId(), scopeAtStart, 'Scope changed, delete callback aborts');
+    assert.deepEqual(storage.loadStoredMaterials(), []);
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('Problem 3: mergeLearning respects server-authoritative status (quarantine, outdated, needsSourceReview)', async () => {
+    const localConcept = {
+      id: 'c-1',
+      subjectId: 's-1',
+      name: 'Concept 1',
+      description: 'Desc',
+      keyPoints: [],
+      prerequisites: [],
+      events: [],
+      exerciseCount: 1,
+      retentionRate: 1,
+      needsSourceReview: false,
+    };
+    const remoteConcept = {
+      ...localConcept,
+      needsSourceReview: true,
+      updatedAt: '2026-01-01T12:00:00Z',
+    };
+
+    const mergedConcepts = cloudMerge.mergeConcepts([remoteConcept], [localConcept], new Set());
+    assert.equal(mergedConcepts.length, 1);
+    assert.equal(mergedConcepts[0].needsSourceReview, true, 'Server needsSourceReview: true is preserved');
+
+    const remoteVerifiedConcept = { ...remoteConcept, needsSourceReview: false };
+    const mergedConcepts2 = cloudMerge.mergeConcepts([remoteVerifiedConcept], [{ ...localConcept, needsSourceReview: false }], new Set());
+    assert.equal(mergedConcepts2[0].needsSourceReview, false, 'Server re-verified needsSourceReview: false is preserved when local is clear');
+
+    const localProblem = {
+      id: 'p-1',
+      subjectId: 's-1',
+      conceptIds: ['c-1'],
+      type: 'essay_descriptive',
+      question: 'Question',
+      modelAnswer: 'Answer',
+      qualityStatus: 'normal',
+      isOutdated: false,
+      needsSourceReview: false,
+      isApproved: true,
+      reports: [],
+    };
+    const remoteProblem = {
+      ...localProblem,
+      qualityStatus: 'suspended',
+      isOutdated: true,
+      needsSourceReview: true,
+      reports: [{ reason: 'Error in formulation', reportedAt: '2026-01-01T10:00:00Z' }],
+      updatedAt: '2026-01-01T12:00:00Z',
+    };
+
+    const mergedProblems = cloudMerge.mergeProblems([remoteProblem], [localProblem], {}, new Set());
+    assert.equal(mergedProblems.length, 1);
+    assert.equal(mergedProblems[0].qualityStatus, 'suspended', 'Server suspended qualityStatus is preserved');
+    assert.equal(mergedProblems[0].isOutdated, true, 'Server isOutdated: true is preserved');
+    assert.equal(mergedProblems[0].needsSourceReview, true, 'Server needsSourceReview: true is preserved');
+    assert.equal(mergedProblems[0].reports.length, 1, 'Server reports preserved');
+
+    const remoteApprovedProblem = {
+      ...remoteProblem,
+      qualityStatus: 'reapproved',
+      isOutdated: false,
+    };
+    const localReportedProblem = {
+      ...localProblem,
+      qualityStatus: 'reported',
+      isOutdated: false,
+    };
+    const mergedProblems2 = cloudMerge.mergeProblems([remoteApprovedProblem], [localReportedProblem], {}, new Set());
+    assert.equal(mergedProblems2[0].qualityStatus, 'reapproved', 'Server approved qualityStatus is preserved');
+    assert.equal(mergedProblems2[0].isOutdated, false, 'Server re-validated freshness is preserved');
+
+    const mergedDeleted = cloudMerge.mergeProblems([], [localProblem], {}, new Set([localProblem.id]));
+    assert.equal(mergedDeleted.length, 0, 'Server deleted item recorded in migratedIds is not resurrected');
+
+    const unmigratedLocal = { ...localProblem, id: 'p-new-local' };
+    const mergedNew = cloudMerge.mergeProblems([remoteProblem], [unmigratedLocal], {}, new Set());
+    assert.equal(mergedNew.some((p) => p.id === 'p-new-local'), true, 'New local problem not yet on server is preserved');
+  });
+
+  await checkAsync('Problem 4: fetchAllPages collects large datasets deterministically and fails safe on error', async () => {
+    // 1. Collect 2500 items across 3 pages
+    const allItems = Array.from({ length: 2500 }, (_, i) => ({
+      id: `item-${String(i).padStart(5, '0')}`,
+      value: i,
+    }));
+
+    const mockFetcher = async ({ from, to }) => {
+      const page = allItems.slice(from, to + 1);
+      return cloudTypes.repoOk(page);
+    };
+
+    const result = await cloudTypes.fetchAllPages(mockFetcher, 1000, 5);
+    assert.equal(result.ok, true);
+    assert.equal(result.data.length, 2500, 'All 2500 items collected across pages');
+    assert.equal(result.data[0].id, 'item-00000');
+    assert.equal(result.data[2499].id, 'item-02499');
+
+    // 2. Deduplication across concurrent shifts
+    const mockDuplicatingFetcher = async ({ from }) => {
+      if (from === 0) {
+        return cloudTypes.repoOk([{ id: 'dup-1' }, { id: 'dup-2' }]);
+      } else if (from === 2) {
+        return cloudTypes.repoOk([{ id: 'dup-2' }, { id: 'dup-3' }]);
+      } else {
+        return cloudTypes.repoOk([]);
+      }
+    };
+    const dupResult = await cloudTypes.fetchAllPages(mockDuplicatingFetcher, 2);
+    assert.equal(dupResult.ok, true);
+    assert.equal(dupResult.data.length, 3, 'Duplicate IDs across pages are deduplicated');
+    assert.deepEqual(dupResult.data.map((d) => d.id), ['dup-1', 'dup-2', 'dup-3']);
+
+    // 3. Fail-safe abort on error (never return partial data)
+    let pageCount = 0;
+    const mockFailingFetcher = async () => {
+      pageCount++;
+      if (pageCount === 2) {
+        return cloudTypes.repoError('Network timeout');
+      }
+      return cloudTypes.repoOk([{ id: 'ok-1' }]);
+    };
+    const failResult = await cloudTypes.fetchAllPages(mockFailingFetcher, 1);
+    assert.equal(failResult.ok, false, 'Error results in ok: false');
+    assert.equal(failResult.error, 'Network timeout');
+
+    // 4. Exceeding maxPages returns explicit error
+    const infiniteFetcher = async ({ from }) => {
+      return cloudTypes.repoOk([{ id: `inf-${from}` }]);
+    };
+    const maxPageResult = await cloudTypes.fetchAllPages(infiniteFetcher, 1, 3);
+    assert.equal(maxPageResult.ok, false);
+    assert.ok(maxPageResult.error.includes('최대 페이지 한도'));
   });
 
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;

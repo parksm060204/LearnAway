@@ -1051,6 +1051,54 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     return true;
   };
 
+  const handleDeleteMaterial = async (materialId: string) => {
+    const scopeAtStart = getStorageScopeId();
+    const isLocalOnly = isLocalOnlyMaterial(materialId);
+
+    // Server-known materials must be deleted on the server first; never hide server delete failures.
+    // Local-only materials (e.g. restored from backup) do not require server success.
+    if (!isLocalOnly) {
+      const result = await deleteMaterial(materialId);
+      if (!result.ok) {
+        showToast(`자료 삭제 실패: ${result.error}`);
+        return;
+      }
+    }
+
+    // Account / storage scope guard: If the account switched while waiting for server deletion,
+    // do not mutate the storage or UI state of the new account.
+    if (getStorageScopeId() !== scopeAtStart) {
+      return;
+    }
+
+    // Ledger the explicit deletion BEFORE local save, so no later wholesale save can resurrect it.
+    markMaterialDeleted(materialId);
+    clearLocalOnlyMaterialMarker(materialId);
+    removeStoredMaterialBodyHash(materialId);
+
+    // Read the LATEST stored materials from persistence at completion time,
+    // and remove ONLY the target materialId. This preserves any materials that were
+    // added, edited, or restored while the server deletion was in flight.
+    const latestStored = loadStoredMaterials();
+    const updatedStored = latestStored.filter((m) => m.id !== materialId);
+    saveStoredMaterials(updatedStored);
+
+    // Apply the exact same deletion to active React state using a functional updater.
+    // (Notice: saveStoredMaterials side effect is NOT placed inside the updater!)
+    setMaterials((prev) => prev.filter((m) => m.id !== materialId));
+
+    // Local body + original removal is separate from the metadata delete.
+    const bodyCleanup = await deleteMaterialContent(materialId);
+    const originalCleanup = await deleteMaterialOriginal(materialId);
+    const localCleanupOk = bodyCleanup.deleted && originalCleanup.deleted;
+
+    showToast(
+      localCleanupOk
+        ? '자료와 이 기기에 저장된 본문·원본이 삭제되었습니다.'
+        : `자료 메타데이터는 삭제되었으나 로컬 파일 정리에 일부 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '다시 시도 가능'})`
+    );
+  };
+
   // Hydration-safe flag: false during SSR/first hydration commit, true after.
   const isHydrated = useSyncExternalStore(hydrationSubscribe, () => true, () => false);
 
@@ -3791,30 +3839,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 ? handleReconnectOriginal(material, file)
                 : handleReconnectBody(material, file)
             }
-            onDeleteMaterial={async (materialId) => {
-              const isLocalOnly = isLocalOnlyMaterial(materialId);
-              if (!isLocalOnly) {
-                const result = await deleteMaterial(materialId);
-                if (!result.ok) {
-                  showToast(`자료 삭제 실패: ${result.error}`);
-                  return;
-                }
-              }
-              markMaterialDeleted(materialId);
-              clearLocalOnlyMaterialMarker(materialId);
-              const updated = materials.filter((m) => m.id !== materialId);
-              setMaterials(updated);
-              saveStoredMaterials(updated);
-              removeStoredMaterialBodyHash(materialId);
-              const bodyCleanup = await deleteMaterialContent(materialId);
-              const originalCleanup = await deleteMaterialOriginal(materialId);
-              const localCleanupOk = bodyCleanup.deleted && originalCleanup.deleted;
-              showToast(
-                localCleanupOk
-                  ? '자료와 이 기기에 저장된 본문·원본이 삭제되었습니다.'
-                  : `자료 메타데이터는 삭제되었으나 로컬 파일 정리에 일부 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '다시 시도 가능'})`
-              );
-            }}
+            onDeleteMaterial={handleDeleteMaterial}
           />
         )}
 
@@ -4094,35 +4119,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               ? handleReconnectOriginal(material, file)
               : handleReconnectBody(material, file)
           }
-          onDeleteMaterial={async (materialId) => {
-            const isLocalOnly = isLocalOnlyMaterial(materialId);
-            // Server-known materials must be deleted on the server first; never hide server delete failures.
-            // Local-only materials (e.g. restored from backup) do not require server success.
-            if (!isLocalOnly) {
-              const result = await deleteMaterial(materialId);
-              if (!result.ok) {
-                showToast(`자료 삭제 실패: ${result.error}`);
-                return;
-              }
-            }
-            // Ledger the explicit deletion BEFORE any local save, so no later
-            // wholesale list save (or stale snapshot) can resurrect this material.
-            markMaterialDeleted(materialId);
-            clearLocalOnlyMaterialMarker(materialId);
-            const updated = materials.filter((m) => m.id !== materialId);
-            setMaterials(updated);
-            saveStoredMaterials(updated);
-            removeStoredMaterialBodyHash(materialId);
-            // Local body + original removal is separate from the metadata delete.
-            const bodyCleanup = await deleteMaterialContent(materialId);
-            const originalCleanup = await deleteMaterialOriginal(materialId);
-            const localCleanupOk = bodyCleanup.deleted && originalCleanup.deleted;
-            showToast(
-              localCleanupOk
-                ? '자료와 이 기기에 저장된 본문·원본이 삭제되었습니다.'
-                : `자료 메타데이터는 삭제되었으나 로컬 파일 정리에 일부 실패했습니다. (${bodyCleanup.error || originalCleanup.error || '다시 시도 가능'})`
-            );
-          }}
+          onDeleteMaterial={handleDeleteMaterial}
           onOpenConceptReview={(mat) => {
             setIsMaterialsListOpen(false);
             setConceptReviewMaterial(mat || null);

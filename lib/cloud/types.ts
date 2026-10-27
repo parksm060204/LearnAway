@@ -101,3 +101,52 @@ export function repoError<T = never>(error: string): RepoResult<T> {
 export function repoOk<T>(data: T): RepoResult<T> {
   return { ok: true, data };
 }
+
+/** Range pagination parameters for PostgREST queries. */
+export interface ListPage {
+  from: number;
+  to: number;
+}
+
+export const CLOUD_PAGE_SIZE = 1000;
+export const CLOUD_MAX_PAGES = 100; // supports up to 100,000 items
+
+/**
+ * Robust paginated collector that retrieves every page from the server.
+ * - Deduplicates rows by `id` so concurrent inserts shifting offsets never double-count.
+ * - Aborts with error if any intermediate page fails; NEVER treats partial reads as complete.
+ * - Explicitly returns error if the safety limit (maxPages) is exceeded with remaining records.
+ */
+export async function fetchAllPages<T extends { id: string }>(
+  fetchPage: (page: ListPage) => Promise<RepoResult<T[]>>,
+  pageSize = CLOUD_PAGE_SIZE,
+  maxPages = CLOUD_MAX_PAGES
+): Promise<RepoResult<T[]>> {
+  const seen = new Set<string>();
+  const all: T[] = [];
+
+  for (let page = 0; page < maxPages; page++) {
+    const from = page * pageSize;
+    const to = from + pageSize - 1;
+    const result = await fetchPage({ from, to });
+    if (!result.ok) {
+      return result;
+    }
+
+    for (const row of result.data) {
+      if (row.id && seen.has(row.id)) continue;
+      if (row.id) seen.add(row.id);
+      all.push(row);
+    }
+
+    if (result.data.length < pageSize) {
+      return repoOk(all);
+    }
+
+    if (page === maxPages - 1) {
+      return repoError(`데이터가 최대 페이지 한도(${maxPages * pageSize}건)를 초과하여 전체 목록을 수집할 수 없습니다.`);
+    }
+  }
+
+  return repoOk(all);
+}

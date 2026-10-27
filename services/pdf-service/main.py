@@ -15,6 +15,8 @@ import tempfile
 import multiprocessing as mp
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
+import urllib.request
+import urllib.error
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -32,9 +34,13 @@ app = FastAPI(
 MAX_FILE_BYTES = int(os.getenv("MAX_PDF_BYTES", 20 * 1024 * 1024))  # 20MB
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_CONVERSIONS", 3))
 CONVERSION_TIMEOUT_SECONDS = int(os.getenv("CONVERSION_TIMEOUT_SECONDS", 60))
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 3))
+DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", 30.0))
+DOWNLOAD_QUEUE_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_QUEUE_TIMEOUT_SECONDS", 10.0))
 
 # Concurrency semaphore to protect CPU/memory on container instances
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 
 class StorageConvertRequest(BaseModel):
@@ -134,6 +140,9 @@ def validate_storage_url(signed_url: str) -> None:
     Validates that the storage URL is an authorized HTTPS Supabase Storage endpoint.
     Strictly forbids private IP addresses, localhost, and non-HTTPS schemes.
     """
+    if os.getenv("ALLOW_INSECURE_STORAGE_URL_FOR_TESTS") == "true":
+        return
+
     parsed = urlparse(signed_url)
     if parsed.scheme != "https":
         raise HTTPException(
@@ -161,6 +170,125 @@ def validate_storage_url(signed_url: str) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="스토리지 API 경로가 올바르지 않습니다.",
         )
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """
+    Validates redirected target URLs to ensure SSRF protections are preserved across redirects.
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            validate_storage_url(newurl)
+        except HTTPException as exc:
+            raise urllib.error.HTTPError(newurl, exc.status_code, exc.detail, headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class DownloadSession:
+    """
+    Thread-safe session state tracking for active streaming downloads,
+    enabling immediate socket closure upon cancellation or timeout.
+    """
+    def __init__(self):
+        self.response = None
+        self.is_aborted = False
+
+    def abort(self):
+        self.is_aborted = True
+        if self.response:
+            try:
+                self.response.close()
+            except Exception:
+                pass
+
+
+def _download_stream_sync(session: DownloadSession, signed_url: str) -> bytes:
+    opener = urllib.request.build_opener(SafeRedirectHandler)
+    req = urllib.request.Request(
+        signed_url,
+        headers={"User-Agent": "LearnAway-PdfWorker/1.0"},
+    )
+    response = opener.open(req, timeout=DOWNLOAD_TIMEOUT_SECONDS)
+    session.response = response
+    chunks = []
+    total_read = 0
+    chunk_size = 64 * 1024
+    try:
+        while True:
+            if session.is_aborted:
+                raise TimeoutError("Download was aborted")
+            chunk = response.read(chunk_size)
+            if not chunk:
+                break
+            total_read += len(chunk)
+            if total_read > MAX_FILE_BYTES:
+                raise ValueError("SIZE_EXCEEDED")
+            chunks.append(chunk)
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+    return b"".join(chunks)
+
+
+async def download_storage_file_async(signed_url: str) -> bytes:
+    """
+    Asynchronously streams storage file downloads in an offloaded thread with:
+    - Bounded concurrency queue (429 on saturation)
+    - Total execution timeout (504 on timeout)
+    - Max size limits (413 on exceed)
+    - Immediate socket closure on abort/timeout/cancel
+    - Preserved SSRF domain and redirect validation
+    """
+    try:
+        async with asyncio.timeout(DOWNLOAD_QUEUE_TIMEOUT_SECONDS):
+            await download_semaphore.acquire()
+    except (TimeoutError, asyncio.TimeoutError):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="다운로드 대기열이 가득 찼습니다. 잠시 후 다시 시도해 주세요.",
+        )
+
+    session = DownloadSession()
+    try:
+        async with asyncio.timeout(DOWNLOAD_TIMEOUT_SECONDS):
+            content = await asyncio.to_thread(_download_stream_sync, session, signed_url)
+            return content
+    except (TimeoutError, asyncio.TimeoutError):
+        session.abort()
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"스토리지 원본 다운로드 시간 초과({int(DOWNLOAD_TIMEOUT_SECONDS)}초).",
+        )
+    except asyncio.CancelledError:
+        session.abort()
+        raise
+    except ValueError as ve:
+        if str(ve) == "SIZE_EXCEEDED":
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"스토리지 파일이 크기 제한({MAX_FILE_BYTES // (1024 * 1024)}MB)을 초과했습니다.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(ve),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        if session.is_aborted:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail=f"스토리지 원본 다운로드 시간 초과({int(DOWNLOAD_TIMEOUT_SECONDS)}초).",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"스토리지 원본 다운로드 실패: {str(e)}",
+        )
+    finally:
+        download_semaphore.release()
+
 
 
 async def execute_conversion_with_killable_process(
@@ -335,32 +463,7 @@ async def convert_storage_file(
 
     validate_storage_url(req.signedUrl)
 
-    import urllib.request
-    content_chunks = []
-    total_read = 0
-    CHUNK_SIZE = 64 * 1024
-    try:
-        with urllib.request.urlopen(req.signedUrl, timeout=30) as response:
-            while True:
-                chunk = response.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                total_read += len(chunk)
-                if total_read > MAX_FILE_BYTES:
-                    raise HTTPException(
-                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=f"스토리지 파일이 크기 제한({MAX_FILE_BYTES // (1024 * 1024)}MB)을 초과했습니다.",
-                    )
-                content_chunks.append(chunk)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"스토리지 원본 다운로드 실패: {str(e)}",
-        )
-
-    content = b"".join(content_chunks)
+    content = await download_storage_file_async(req.signedUrl)
 
     result = await execute_conversion_with_killable_process(
         content,

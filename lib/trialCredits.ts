@@ -1,5 +1,17 @@
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { createClient } from './supabase/server';
 import { createAdminClient, hasAdminClientConfig } from './supabase/admin';
+
+function getAdminOrMockClient(): SupabaseClient | null {
+  if (hasAdminClientConfig()) {
+    return createAdminClient();
+  }
+  const defaultTestClient = (globalThis as unknown as { __defaultFakeSupabaseClient?: SupabaseClient }).__defaultFakeSupabaseClient;
+  if (defaultTestClient && (globalThis as unknown as { __disableFakeAdminClient?: boolean }).__disableFakeAdminClient !== true) {
+    return defaultTestClient;
+  }
+  return null;
+}
 
 export type TrialTaskType =
   | 'analyze_concepts'
@@ -165,7 +177,14 @@ export async function reserveTrialCredit(
   }
 
   try {
-    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const client = getAdminOrMockClient();
+    if (!client) {
+      return {
+        allowed: false,
+        errorCode: 'ADMIN_CONFIG_REQUIRED',
+        message: '서버 관리자 설정(SUPABASE_SERVICE_ROLE_KEY)이 필요합니다.',
+      };
+    }
     const { data, error } = await client.rpc('reserve_trial_credit', {
       p_task_id: taskId,
       p_task_type: taskType,
@@ -283,7 +302,14 @@ export async function registerAiTask(
   }
 
   try {
-    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const client = getAdminOrMockClient();
+    if (!client) {
+      return {
+        allowed: false,
+        errorCode: 'ADMIN_CONFIG_REQUIRED',
+        message: '서버 관리자 설정(SUPABASE_SERVICE_ROLE_KEY)이 필요합니다.',
+      };
+    }
     const { data, error } = await client.rpc('register_ai_task', {
       p_task_id: taskId,
       p_task_type: taskType,
@@ -401,7 +427,8 @@ export async function registerAiTask(
  */
 export async function checkOperatorDailyUsage(dailyCap = getOperatorDailyCap()): Promise<boolean> {
   try {
-    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const client = getAdminOrMockClient();
+    if (!client) return false;
     const today = new Date().toISOString().slice(0, 10);
     const { data, error } = await client
       .from('operator_ai_daily_usage')
@@ -447,7 +474,14 @@ export async function lookupSavedTaskResult(
 
   const doLookup = async (identifier?: string): Promise<SavedTaskLookupResult> => {
     try {
-      const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+      const client = getAdminOrMockClient();
+      if (!client) {
+        return {
+          success: false,
+          errorCode: 'ADMIN_CONFIG_REQUIRED',
+          message: '서버 관리자 설정(SUPABASE_SERVICE_ROLE_KEY)이 필요합니다.',
+        };
+      }
       const { data, error } = await client.rpc('lookup_saved_ai_task_result', {
         p_task_id: taskId,
         p_user_id: userId,
@@ -577,7 +611,14 @@ export async function recordTrialResultReady(
   }
 
   try {
-    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const client = getAdminOrMockClient();
+    if (!client) {
+      return {
+        success: false,
+        errorCode: 'ADMIN_CONFIG_REQUIRED',
+        error: '서버 관리자 설정(SUPABASE_SERVICE_ROLE_KEY)이 필요합니다.',
+      };
+    }
     const { data, error } = await client.rpc('record_trial_result_ready', {
       p_task_id: taskId,
       p_result: result,
@@ -628,7 +669,14 @@ export async function settleTrialCredit(
   }
 
   try {
-    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const client = getAdminOrMockClient();
+    if (!client) {
+      return {
+        success: false,
+        errorCode: 'ADMIN_CONFIG_REQUIRED',
+        error: '서버 관리자 설정(SUPABASE_SERVICE_ROLE_KEY)이 필요합니다.',
+      };
+    }
     const { data, error } = await client.rpc('settle_trial_credit', {
       p_task_id: taskId,
       p_user_id: userId,
@@ -679,7 +727,14 @@ export async function releaseTrialCredit(
   }
 
   try {
-    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const client = getAdminOrMockClient();
+    if (!client) {
+      return {
+        success: false,
+        errorCode: 'ADMIN_CONFIG_REQUIRED',
+        error: '서버 관리자 설정(SUPABASE_SERVICE_ROLE_KEY)이 필요합니다.',
+      };
+    }
     const { data, error } = await client.rpc('release_trial_credit', {
       p_task_id: taskId,
       p_reason: reason || 'cancelled_or_failed',
@@ -730,7 +785,14 @@ export async function clearAiTaskLease(
   }
 
   try {
-    const client = hasAdminClientConfig() ? createAdminClient() : await createClient();
+    const client = getAdminOrMockClient();
+    if (!client) {
+      return {
+        success: false,
+        errorCode: 'ADMIN_CONFIG_REQUIRED',
+        error: '서버 관리자 설정(SUPABASE_SERVICE_ROLE_KEY)이 필요합니다.',
+      };
+    }
     const { data, error } = await client.rpc('clear_ai_task_lease', {
       p_task_id: taskId,
       p_user_id: userId,

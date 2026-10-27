@@ -4,8 +4,8 @@ import { createClient } from '../supabase/client';
 import type { Material, MaterialKind, MaterialStoragePolicy } from '../types';
 import { materialContentHash } from './hash';
 import { materialBaseUpsert, materialObjectPaths } from './mappers';
-import type { CloudMaterialContent, MaterialRow, RepoResult } from './types';
-import { repoError, repoOk } from './types';
+import type { CloudMaterialContent, ListPage, MaterialRow, RepoResult } from './types';
+import { fetchAllPages, repoError, repoOk } from './types';
 
 export const MATERIALS_BUCKET = 'materials';
 export const SIGNED_URL_TTL_SECONDS = 300;
@@ -127,13 +127,18 @@ export function generateJobId(): string {  try {
 // Reads
 // ---------------------------------------------------------------------------
 
-export async function listMaterialRows(): Promise<RepoResult<MaterialRow[]>> {
+export async function listMaterialRows(page?: ListPage): Promise<RepoResult<MaterialRow[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listMaterialRows(p));
+  }
   try {
     const supabase = createClient();
     const { data, error } = await supabase
       .from('materials')
       .select('*')
-      .order('updated_at', { ascending: false });
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk((data as MaterialRow[]) ?? []);
   } catch (error) {

@@ -19,8 +19,8 @@ import type {
   ProblemRow,
   ProblemVersionRow,
 } from './learningTypes';
-import type { RepoResult } from './types';
-import { repoError, repoOk } from './types';
+import type { ListPage, RepoResult } from './types';
+import { fetchAllPages, repoError, repoOk } from './types';
 
 function message(error: unknown, fallback: string): string {
   if (error && typeof error === 'object' && 'message' in error) {
@@ -34,12 +34,20 @@ function message(error: unknown, fallback: string): string {
 // Reads
 // ---------------------------------------------------------------------------
 
-export async function listConcepts(supabase: SupabaseClient): Promise<RepoResult<Concept[]>> {
+export async function listConcepts(
+  supabase: SupabaseClient,
+  page?: ListPage
+): Promise<RepoResult<Concept[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listConcepts(supabase, p));
+  }
   try {
     const { data, error } = await supabase
       .from('concepts')
       .select('*')
-      .order('order_index', { ascending: true });
+      .order('order_index', { ascending: true })
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk(((data as ConceptRow[]) ?? []).map(rowToConcept));
   } catch (error) {
@@ -47,12 +55,20 @@ export async function listConcepts(supabase: SupabaseClient): Promise<RepoResult
   }
 }
 
-export async function listConceptDrafts(supabase: SupabaseClient): Promise<RepoResult<ConceptDraft[]>> {
+export async function listConceptDrafts(
+  supabase: SupabaseClient,
+  page?: ListPage
+): Promise<RepoResult<ConceptDraft[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listConceptDrafts(supabase, p));
+  }
   try {
     const { data, error } = await supabase
       .from('concept_drafts')
       .select('*')
-      .order('updated_at', { ascending: false });
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk(((data as ConceptDraftRow[]) ?? []).map(rowToConceptDraft));
   } catch (error) {
@@ -60,12 +76,20 @@ export async function listConceptDrafts(supabase: SupabaseClient): Promise<RepoR
   }
 }
 
-export async function listProblems(supabase: SupabaseClient): Promise<RepoResult<Problem[]>> {
+export async function listProblems(
+  supabase: SupabaseClient,
+  page?: ListPage
+): Promise<RepoResult<Problem[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listProblems(supabase, p));
+  }
   try {
     const { data, error } = await supabase
       .from('problems')
       .select('*')
-      .order('updated_at', { ascending: false });
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk(((data as ProblemRow[]) ?? []).map(rowToProblem));
   } catch (error) {
@@ -73,12 +97,20 @@ export async function listProblems(supabase: SupabaseClient): Promise<RepoResult
   }
 }
 
-export async function listProblemDrafts(supabase: SupabaseClient): Promise<RepoResult<ProblemDraft[]>> {
+export async function listProblemDrafts(
+  supabase: SupabaseClient,
+  page?: ListPage
+): Promise<RepoResult<ProblemDraft[]>> {
+  if (!page) {
+    return fetchAllPages((p) => listProblemDrafts(supabase, p));
+  }
   try {
     const { data, error } = await supabase
       .from('problem_drafts')
       .select('*')
-      .order('updated_at', { ascending: false });
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(page.from, page.to);
     if (error) return repoError(error.message);
     return repoOk(((data as ProblemDraftRow[]) ?? []).map(rowToProblemDraft));
   } catch (error) {

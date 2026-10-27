@@ -1075,11 +1075,102 @@ async function testUpgradePath() {
   }
   console.log(`✓ register_ai_task correctly returns db_status='settled' after settlement`);
 
-  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33, 34 & 35) Passed Successfully! ===\n');
+  // --------------------------------------------------------------------------
+  // Apply Migration 36
+  // --------------------------------------------------------------------------
+  console.log('=== Applying Migration 36: Harden register_ai_task and AI Task RPCs for Service Role Only ===');
+  const migration36File = '20260101000036_harden_register_ai_task_service_role.sql';
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, migration36File));
+  console.log('✓ Migration 36 executed cleanly!');
+
+  // --------------------------------------------------------------------------
+  // Scenario R: Service-role only lockdown & impersonation defense (Migration 36)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario R: Service-role only lockdown & impersonation defense (Migration 36) ---');
+
+  // Test 1: Actual SET ROLE authenticated must fail at SQL permission level
+  await db.exec(`
+    select set_config('request.jwt.claim.sub', '${userIdA}', false);
+    select set_config('request.jwt.claim.role', 'authenticated', false);
+    set role authenticated;
+  `);
+
+  let authDirectBlocked = false;
+  try {
+    await db.query(`
+      select public.register_ai_task('malicious_task', 'logic_questions', 'input_val', $1, false, 500);
+    `, [userIdB]);
+  } catch (err) {
+    authDirectBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  if (!authDirectBlocked) {
+    throw new Error('Expected register_ai_task to fail with permission denied for authenticated role');
+  }
+  console.log('✓ register_ai_task execution directly rejected for authenticated role (SQLSTATE 42501)');
+
+  // Test 2: Actual SET ROLE anon must fail at SQL permission level
+  await db.exec(`
+    select set_config('request.jwt.claim.sub', '', false);
+    select set_config('request.jwt.claim.role', 'anon', false);
+    set role anon;
+  `);
+
+  let anonDirectBlocked = false;
+  try {
+    await db.query(`
+      select public.register_ai_task('malicious_task_anon', 'logic_questions', 'input_val', $1, false, 500);
+    `, [userIdA]);
+  } catch (err) {
+    anonDirectBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  if (!anonDirectBlocked) {
+    throw new Error('Expected register_ai_task to fail with permission denied for anon role');
+  }
+  console.log('✓ register_ai_task execution directly rejected for anon role (SQLSTATE 42501)');
+
+  // Test 3: Reset role to service_role with non-service_role JWT claim -> internal defense-in-depth check
+  await db.exec(`
+    reset role;
+    select set_config('request.jwt.claim.sub', '${userIdA}', false);
+    select set_config('request.jwt.claim.role', 'authenticated', false);
+  `);
+
+  const internalBlockRes = (await db.query(`
+    select public.register_ai_task('task_claim_check', 'logic_questions', 'input_val', $1, false, 500) as r;
+  `, [userIdB])).rows[0].r;
+
+  if (internalBlockRes.allowed !== false || internalBlockRes.error_code !== 'FORBIDDEN') {
+    throw new Error(`Expected internal check FORBIDDEN, got: ${JSON.stringify(internalBlockRes)}`);
+  }
+  console.log('✓ Internal function defense-in-depth rejects non-service_role JWT claims with FORBIDDEN');
+
+  // Test 4: Genuine service_role call succeeds normally
+  await db.exec(`
+    reset role;
+    set role service_role;
+    select set_config('request.jwt.claim.sub', '', false);
+    select set_config('request.jwt.claim.role', 'service_role', false);
+  `);
+
+  const taskSceneR = 'legit_service_task_r1';
+  const inputR = 'legit_service_input_r1';
+  const legitRes = (await db.query(`
+    select public.register_ai_task($1, 'generate_problems', $2, $3, false, 500) as r;
+  `, [taskSceneR, inputR, userIdA])).rows[0].r;
+
+  if (!legitRes.allowed || legitRes.task_id !== taskSceneR) {
+    throw new Error(`Expected legit service_role call to succeed, got: ${JSON.stringify(legitRes)}`);
+  }
+  console.log('✓ Genuine service_role call succeeds normally with active lease_token');
+
+  // Reset session role back to default
+  await db.exec(`reset role;`);
+
+  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33, 34, 35 & 36) Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~35) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~36) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -1087,7 +1178,24 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 35 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 36 on clean database`);
+
+  // Verify permissions on fresh install DB
+  await db.exec(`
+    select set_config('request.jwt.claim.role', 'authenticated', false);
+    set role authenticated;
+  `);
+
+  let freshBlocked = false;
+  try {
+    await db.query(`select public.register_ai_task('fresh_t', 'logic_questions', 'inp', gen_random_uuid(), false, 500);`);
+  } catch (err) {
+    freshBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  if (!freshBlocked) {
+    throw new Error('Fresh install must deny register_ai_task to authenticated role');
+  }
+  console.log('✓ Fresh database correctly denies register_ai_task to authenticated role');
 }
 
 async function main() {
