@@ -87,11 +87,26 @@ const REC_HALLENGE_KEY = 'rechallenge_reservations_v1';
 
 const inMemoryStore: Record<string, string> = {};
 
-function safeGetItem<T>(baseKey: string, fallback: T): T {
-  const key = scopedStorageKey(baseKey);
+function getLocalStorage(): Storage | null {
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      const raw = localStorage.getItem(key);
+      return window.localStorage;
+    }
+    if (typeof localStorage !== 'undefined') {
+      return localStorage;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function safeGetItem<T>(baseKey: string, fallback: T): T {
+  const key = scopedStorageKey(baseKey);
+  const storage = getLocalStorage();
+  try {
+    if (storage) {
+      const raw = storage.getItem(key);
       if (!raw) return fallback;
       return JSON.parse(raw) as T;
     } else {
@@ -107,35 +122,44 @@ function safeGetItem<T>(baseKey: string, fallback: T): T {
 
 function safeSetItem<T>(baseKey: string, val: T): boolean {
   const key = scopedStorageKey(baseKey);
+  const storage = getLocalStorage();
   try {
     const serialized = JSON.stringify(val);
-    if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.setItem(key, serialized);
+    if (storage) {
+      storage.setItem(key, serialized);
+      const readBack = storage.getItem(key);
+      if (readBack !== serialized) {
+        console.error(`Read-after-write verification failed for ${key}`);
+        return false;
+      }
     } else {
       inMemoryStore[key] = serialized;
     }
     return true;
   } catch (e) {
     console.error(`Failed to write localStorage key ${key}`, e);
-    try {
-      inMemoryStore[key] = JSON.stringify(val);
-    } catch {
-      // ignore
-    }
     return false;
   }
 }
 
-function safeRemoveItem(baseKey: string): void {
+function safeRemoveItem(baseKey: string): boolean {
   const key = scopedStorageKey(baseKey);
+  const storage = getLocalStorage();
   try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.removeItem(key);
+    if (storage) {
+      storage.removeItem(key);
+      const readBack = storage.getItem(key);
+      if (readBack !== null) {
+        console.error(`Read-after-delete verification failed for ${key}`);
+        return false;
+      }
     } else {
       delete inMemoryStore[key];
     }
+    return true;
   } catch (e) {
     console.error(`Failed to remove localStorage key ${key}`, e);
+    return false;
   }
 }
 
@@ -1366,8 +1390,8 @@ export function loadStoredProblems(): Problem[] {
   });
 }
 
-export function saveStoredProblems(problems: Problem[]): void {
-  safeSetItem(STORAGE_KEYS.PROBLEMS, problems);
+export function saveStoredProblems(problems: Problem[]): boolean {
+  return safeSetItem(STORAGE_KEYS.PROBLEMS, problems);
 }
 
 export function loadStoredProblemDrafts(): ProblemDraft[] {
@@ -1947,16 +1971,23 @@ export function editAndReviseProblem(
   problemId: string,
   updates: Partial<Problem>,
   editReason: string
-): { success: boolean; updatedProblems: Problem[]; updatedProblem: Problem | null; error?: string } {
+): {
+  success: boolean;
+  persisted?: boolean;
+  partialFailure?: boolean;
+  updatedProblems: Problem[];
+  updatedProblem: Problem | null;
+  error?: string;
+} {
   const problems = loadStoredProblems();
   const target = problems.find((p) => p.id === problemId);
   if (!target) {
-    return { success: false, updatedProblems: problems, updatedProblem: null, error: '문제를 찾을 수 없습니다.' };
+    return { success: false, persisted: false, updatedProblems: problems, updatedProblem: null, error: '문제를 찾을 수 없습니다.' };
   }
 
   const trimmedReason = editReason.trim();
   if (!trimmedReason) {
-    return { success: false, updatedProblems: problems, updatedProblem: null, error: '수정 사유 및 변경 내용을 입력해 주세요.' };
+    return { success: false, persisted: false, updatedProblems: problems, updatedProblem: null, error: '수정 사유 및 변경 내용을 입력해 주세요.' };
   }
 
   const currentVersion = target.version || 1;
@@ -1967,6 +1998,7 @@ export function editAndReviseProblem(
     mathFormula: target.mathFormula,
     codeSnippet: target.codeSnippet,
     timeStandardMinutes: target.timeStandardMinutes,
+    appliedConditionNote: target.appliedConditionNote,
     hints: [...target.hints],
     modelAnswer: target.modelAnswer,
     rubric: [...target.rubric],
@@ -2000,10 +2032,7 @@ export function editAndReviseProblem(
     reviewNotes: `v${nextVersion} 수정 완료: ${trimmedReason}`,
   };
 
-  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
-  saveStoredProblems(updatedProblems);
-
-  saveUnsavedProblemRevision({
+  const newRevision: UnsavedProblemRevision = {
     problemId,
     revisionId: newRevisionId,
     generation: nextGen,
@@ -2017,13 +2046,37 @@ export function editAndReviseProblem(
     modelAnswer: updatedProblem.modelAnswer,
     rubric: updatedProblem.rubric || [],
     timeStandardMinutes: updatedProblem.timeStandardMinutes,
+    appliedConditionNote: updatedProblem.appliedConditionNote,
     editReason: trimmedReason,
     revisedAt: now,
     syncStatus: 'pending',
     baseSnapshot,
-  });
+  };
 
-  return { success: true, updatedProblems, updatedProblem };
+  // Protect revisions: persist the protected revision record first
+  const revisionPersisted = saveUnsavedProblemRevision(newRevision);
+
+  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  let problemsPersisted = false;
+  if (revisionPersisted) {
+    problemsPersisted = saveStoredProblems(updatedProblems);
+  }
+
+  const allPersisted = revisionPersisted && problemsPersisted;
+  const partialFailure = (revisionPersisted && !problemsPersisted) || (!revisionPersisted && problemsPersisted);
+
+  return {
+    success: true,
+    persisted: allPersisted,
+    partialFailure,
+    updatedProblems,
+    updatedProblem,
+    error: allPersisted
+      ? undefined
+      : partialFailure
+        ? '문제 수정본이 보호 기록에 저장되었으나 본문 저장소 동기화 중 용량 오류가 발생했습니다. (메모리 보관 중)'
+        : '브라우저 저장 공간 부족 (QuotaExceededError)으로 로컬 영속화에 실패했습니다. (메모리 임시 보관 중)',
+  };
 }
 
 /**
@@ -2969,8 +3022,7 @@ export function saveUnsavedProblemRevision(
     }
   }
   all[revision.problemId] = revision;
-  safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
-  return true;
+  return safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
 }
 
 export function clearUnsavedProblemRevision(
@@ -2989,12 +3041,11 @@ export function clearUnsavedProblemRevision(
     }
   }
   delete all[problemId];
-  safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
-  return true;
+  return safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
 }
 
-export function clearAllUnsavedProblemRevisions(): void {
-  safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
+export function clearAllUnsavedProblemRevisions(): boolean {
+  return safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
 }
 
 // ---------------------------------------------------------------------------
@@ -3014,7 +3065,7 @@ export function saveConceptScheduleAdjustment(
   conceptId: string,
   postponeDays: number,
   postponedUntil?: string
-): void {
+): boolean {
   const all = loadConceptScheduleAdjustments();
   all[conceptId] = {
     conceptId,
@@ -3022,7 +3073,7 @@ export function saveConceptScheduleAdjustment(
     postponedUntil,
     updatedAt: new Date().toISOString(),
   };
-  safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+  return safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
 }
 
 export function clearConceptScheduleAdjustment(
@@ -3038,8 +3089,7 @@ export function clearConceptScheduleAdjustment(
     }
   }
   delete all[conceptId];
-  safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
-  return true;
+  return safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
 }
 
 export function clearAllConceptScheduleAdjustments(): void {

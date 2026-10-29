@@ -1166,11 +1166,156 @@ async function testUpgradePath() {
   // Reset session role back to default
   await db.exec(`reset role;`);
 
-  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33, 34, 35 & 36) Passed Successfully! ===\n');
+  // --------------------------------------------------------------------------
+  // Apply Migration 37
+  // --------------------------------------------------------------------------
+  console.log('=== Applying Migration 37: Revise Problem Fields and Version Consistency ===');
+  const migration37File = '20260101000037_revise_problem_fields_and_version_consistency.sql';
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, migration37File));
+  console.log('✓ Migration 37 executed cleanly!');
+
+  // --------------------------------------------------------------------------
+  // Scenario S: revise_problem version criteria, consistency and idempotency (Bug 1)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Scenario S: revise_problem version criteria, consistency and idempotency (Bug 1) ---');
+
+  const subjectIdS = 'subject_scene_s';
+  const conceptIdS = 'concept_scene_s';
+  const problemIdS = 'problem_scene_s';
+
+  await db.query(`
+    insert into public.subjects (id, user_id, name)
+    values ($1, $2, 'Subject S')
+    on conflict (id, user_id) do nothing;
+  `, [subjectIdS, userIdA]);
+
+  await db.query(`
+    insert into public.concepts (id, user_id, subject_id, title)
+    values ($1, $2, $3, 'Concept S')
+    on conflict (id, user_id) do nothing;
+  `, [conceptIdS, userIdA, subjectIdS]);
+
+  const initialPayloadS = {
+    id: problemIdS,
+    subjectId: subjectIdS,
+    title: 'Initial Problem Title',
+    type: 'essay',
+    promptText: 'Original Prompt for S',
+    modelAnswer: 'Original Model Answer for S',
+    mathFormula: 'E=mc^2',
+    codeSnippet: 'def original(): pass',
+    timeStandardMinutes: 15,
+    rubric: [{ id: 'r1', label: 'R1', maxScore: 100, weight: 1 }],
+    hints: ['hint 1'],
+    conceptIds: [conceptIdS],
+    appliedConditionNote: 'Original Condition Note',
+    version: 1,
+  };
+
+  await db.query(`
+    insert into public.problems (id, user_id, subject_id, version, title, type, payload)
+    values ($1, $2, $3, 1, $4, 'essay', $5)
+    on conflict (id, user_id) do update set version = 1, payload = $5;
+  `, [problemIdS, userIdA, subjectIdS, initialPayloadS.title, JSON.stringify(initialPayloadS)]);
+
+  await db.query(`
+    insert into public.problem_versions (user_id, problem_id, subject_id, version, snapshot)
+    values ($1, $2, $3, 1, $4)
+    on conflict (problem_id, version, user_id) do nothing;
+  `, [userIdA, problemIdS, subjectIdS, JSON.stringify(initialPayloadS)]);
+
+  // Set auth context to userIdA
+  await setAuthContext(db, { uid: userIdA, role: 'authenticated' });
+
+  // 1. Modifying ONLY codeSnippet must increment version to 2
+  const codeChange = {
+    ...initialPayloadS,
+    codeSnippet: 'def revised_code(): return 42',
+  };
+  const v2 = (await db.query(`
+    select public.revise_problem($1, 1, $2) as v;
+  `, [problemIdS, JSON.stringify(codeChange)])).rows[0].v;
+  if (v2 !== 2) {
+    throw new Error(`Expected revise_problem with codeSnippet change to return version 2, got ${v2}`);
+  }
+  console.log('✓ Changing only codeSnippet creates new version 2');
+
+  // 2. Modifying ONLY mathFormula must increment version to 3
+  const mathChange = {
+    ...codeChange,
+    version: 2,
+    mathFormula: '\\int_0^1 x^2 dx',
+  };
+  const v3 = (await db.query(`
+    select public.revise_problem($1, 2, $2) as v;
+  `, [problemIdS, JSON.stringify(mathChange)])).rows[0].v;
+  if (v3 !== 3) {
+    throw new Error(`Expected revise_problem with mathFormula change to return version 3, got ${v3}`);
+  }
+  console.log('✓ Changing only mathFormula creates new version 3');
+
+  // 3. Modifying ONLY timeStandardMinutes must increment version to 4
+  const timeChange = {
+    ...mathChange,
+    version: 3,
+    timeStandardMinutes: 25,
+  };
+  const v4 = (await db.query(`
+    select public.revise_problem($1, 3, $2) as v;
+  `, [problemIdS, JSON.stringify(timeChange)])).rows[0].v;
+  if (v4 !== 4) {
+    throw new Error(`Expected revise_problem with timeStandardMinutes change to return version 4, got ${v4}`);
+  }
+  console.log('✓ Changing only timeStandardMinutes creates new version 4');
+
+  // 4. Verify version consistency: row version, payload version, and snapshot version must match exactly
+  const rowCheck = (await db.query(`
+    select version, payload from public.problems where id = $1;
+  `, [problemIdS])).rows[0];
+  const snapCheck = (await db.query(`
+    select version, snapshot from public.problem_versions where problem_id = $1 and version = 4;
+  `, [problemIdS])).rows[0];
+
+  if (rowCheck.version !== 4 || rowCheck.payload.version !== 4) {
+    throw new Error(`Problems row version mismatch: row.version=${rowCheck.version}, payload.version=${rowCheck.payload.version}`);
+  }
+  if (!snapCheck || snapCheck.version !== 4 || snapCheck.snapshot.version !== 4) {
+    throw new Error(`Snapshot version mismatch: snap.version=${snapCheck?.version}, snapshot.version=${snapCheck?.snapshot?.version}`);
+  }
+  console.log('✓ Current row version, payload version, and history snapshot version match consistently (v4)');
+
+  // 5. Verify previous version snapshots (v1, v2, v3) are preserved intact
+  const v1Snap = (await db.query(`
+    select snapshot from public.problem_versions where problem_id = $1 and version = 1;
+  `, [problemIdS])).rows[0];
+  if (!v1Snap || v1Snap.snapshot.codeSnippet !== 'def original(): pass' || v1Snap.snapshot.mathFormula !== 'E=mc^2') {
+    throw new Error('Historical snapshot v1 was unexpectedly modified or missing');
+  }
+  console.log('✓ Historical version snapshots (v1) remain unmodified and preserved');
+
+  // 6. Idempotent retry with identical content must NOT create a new version
+  const retrySame = (await db.query(`
+    select public.revise_problem($1, 4, $2) as v;
+  `, [problemIdS, JSON.stringify(timeChange)])).rows[0].v;
+  if (retrySame !== 4) {
+    throw new Error(`Expected idempotent retry to return version 4, got ${retrySame}`);
+  }
+  const countVersions = (await db.query(`
+    select count(*) as c from public.problem_versions where problem_id = $1;
+  `, [problemIdS])).rows[0].c;
+  if (Number(countVersions) !== 4) {
+    throw new Error(`Expected exactly 4 version records, got ${countVersions}`);
+  }
+  console.log('✓ Idempotent retry with identical content returns existing version 4 without duplicate version records');
+
+  // Reset session role back to default
+  await db.exec(`reset role;`);
+
+  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33, 34, 35, 36 & 37) Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~36) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~37) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -1178,7 +1323,7 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 36 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 37 on clean database`);
 
   // Verify permissions on fresh install DB
   await db.exec(`

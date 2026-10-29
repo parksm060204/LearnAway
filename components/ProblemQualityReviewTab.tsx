@@ -60,7 +60,7 @@ interface ProblemQualityReviewTabProps {
   materials?: Material[];
   onUpdateQualityStatus?: (problemId: string, newStatus: ProblemQualityStatus, note?: string) => void;
   onDismissReport?: (problemId: string, reportId: string, dismissReason: string) => { success: boolean; error?: string };
-  onReviseProblem?: (problemId: string, updates: Partial<Problem>, editReason: string) => { success: boolean; error?: string };
+  onReviseProblem?: (problemId: string, updates: Partial<Problem>, editReason: string) => { success: boolean; persisted?: boolean; error?: string };
   onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
 }
@@ -526,6 +526,13 @@ export function ProblemQualityReviewTab({
 
       if (!res.success) {
         setEditValidationError(res.error || '수정 저장에 실패했습니다.');
+        return;
+      }
+
+      if (res.persisted === false) {
+        setEditValidationError(
+          res.error || '브라우저 저장 공간 부족(QuotaExceededError)으로 로컬 영속화에 실패했습니다. (메모리에 임시 보관 중이므로 입력을 유지한 채 다시 시도해 주세요.)'
+        );
         return;
       }
 

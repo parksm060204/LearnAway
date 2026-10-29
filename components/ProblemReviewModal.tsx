@@ -51,7 +51,7 @@ interface ProblemReviewModalProps {
   // Stage 6 Problem Quality:
   onUpdateProblemQualityStatus?: (problemId: string, newStatus: ProblemQualityStatus, note?: string) => void;
   onDismissReport?: (problemId: string, reportId: string, dismissReason: string) => { success: boolean; error?: string };
-  onReviseProblem?: (problemId: string, updates: Partial<Problem>, editReason: string) => { success: boolean; error?: string };
+  onReviseProblem?: (problemId: string, updates: Partial<Problem>, editReason: string) => { success: boolean; persisted?: boolean; error?: string };
   onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
   initialMode?: 'drafts' | 'quality_reports';

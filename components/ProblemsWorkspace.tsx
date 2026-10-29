@@ -48,7 +48,7 @@ export interface ProblemsWorkspaceProps {
   onDeleteDraft: (draftId: string) => void;
   onUpdateProblemQualityStatus?: (problemId: string, status: ProblemQualityStatus, note?: string) => void;
   onDismissReport?: (problemId: string, reportId: string, reason: string) => { success: boolean; error?: string };
-  onReviseProblem?: (problemId: string, updates: Partial<Problem>, reason: string) => { success: boolean; error?: string };
+  onReviseProblem?: (problemId: string, updates: Partial<Problem>, reason: string) => { success: boolean; persisted?: boolean; error?: string };
   onReapproveProblem?: (problemId: string, note?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, reason?: string) => void;
 }

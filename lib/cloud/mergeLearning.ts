@@ -29,6 +29,7 @@ export function isRevisionMatchingProblem(
     hints?: string[];
     timeStandardMinutes?: number;
     appliedConditionNote?: string;
+    baseSnapshot?: ProblemVersionSnapshot;
   },
   remote: Problem
 ): boolean {
@@ -37,12 +38,25 @@ export function isRevisionMatchingProblem(
   if (normalizeText(unsaved.title) !== normalizeText(remote.title)) return false;
   if (normalizeText(unsaved.mathFormula) !== normalizeText(remote.mathFormula)) return false;
   if (normalizeCode(unsaved.codeSnippet) !== normalizeCode(remote.codeSnippet)) return false;
-  if (normalizeText(unsaved.appliedConditionNote) !== normalizeText(remote.appliedConditionNote)) return false;
+
+  // Applied condition note comparison with backward compatibility for legacy revisions
+  if ('appliedConditionNote' in unsaved && unsaved.appliedConditionNote !== undefined) {
+    if (normalizeText(unsaved.appliedConditionNote) !== normalizeText(remote.appliedConditionNote)) {
+      return false;
+    }
+  } else if (unsaved.baseSnapshot && 'appliedConditionNote' in unsaved.baseSnapshot) {
+    if (normalizeText(unsaved.baseSnapshot.appliedConditionNote) !== normalizeText(remote.appliedConditionNote)) {
+      return false;
+    }
+  } else if (normalizeText(remote.appliedConditionNote) !== '') {
+    // Legacy revision lacks condition note and snapshot condition note, but remote has non-empty: cannot verify equivalence
+    return false;
+  }
 
   // Time standard comparison
   if (unsaved.timeStandardMinutes !== undefined || remote.timeStandardMinutes !== undefined) {
-    const uTime = unsaved.timeStandardMinutes !== undefined ? Number(unsaved.timeStandardMinutes) : undefined;
-    const rTime = remote.timeStandardMinutes !== undefined ? Number(remote.timeStandardMinutes) : undefined;
+    const uTime = unsaved.timeStandardMinutes !== undefined ? Number(unsaved.timeStandardMinutes) : 0;
+    const rTime = remote.timeStandardMinutes !== undefined ? Number(remote.timeStandardMinutes) : 0;
     if (uTime !== rTime) return false;
   }
 
@@ -281,6 +295,7 @@ export function mergeProblems(
           modelAnswer: unsaved.modelAnswer,
           rubric: unsaved.rubric,
           timeStandardMinutes: unsaved.timeStandardMinutes ?? remote.timeStandardMinutes,
+          appliedConditionNote: unsaved.appliedConditionNote !== undefined ? unsaved.appliedConditionNote : remote.appliedConditionNote,
         };
         effectiveVersion = unsaved.revisionVersion;
         hasActiveUnsavedRevision = true;
@@ -310,6 +325,7 @@ export function mergeProblems(
         modelAnswer: mine.modelAnswer,
         rubric: mine.rubric,
         timeStandardMinutes: mine.timeStandardMinutes ?? remote.timeStandardMinutes,
+        appliedConditionNote: mine.appliedConditionNote !== undefined ? mine.appliedConditionNote : remote.appliedConditionNote,
       };
       effectiveVersion = mine.version ?? (remote.version ?? 1) + 1;
       hasActiveUnsavedRevision = true;

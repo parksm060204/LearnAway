@@ -740,6 +740,7 @@ export interface UnsavedProblemRevision {
   modelAnswer: string;
   rubric: RubricCriterion[];
   timeStandardMinutes?: number;
+  appliedConditionNote?: string;
   editReason: string;
   revisedAt: string;
   syncStatus: 'pending' | 'syncing' | 'failed' | 'conflict' | 'synced';

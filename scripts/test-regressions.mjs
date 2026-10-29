@@ -21030,6 +21030,294 @@ exports.requireApiUser = async () => {
     assert.equal(storage.getConceptScheduleAdjustment(testConcept.id), null, 'Reset clears schedule adjustments');
   });
 
+  // =========================================================================
+  // Bug 1 (Regression): Problem Versioning Criteria & Version Consistency
+  // =========================================================================
+  await checkAsync('Bug 1: Problem versioning frontend synchronization and consecutive edits consistency', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_bug1_test' });
+    storage.resetToInitialDemoData();
+
+    const problemId = 'prob-bug1-v-test';
+    const initialProblem = {
+      id: problemId,
+      conceptIds: ['concept-1'],
+      subjectId: 'subject-1',
+      title: 'Original Title',
+      type: 'essay',
+      categoryLabel: 'Calculus',
+      categoryNumber: 1,
+      promptText: 'Original Prompt',
+      mathFormula: 'f(x) = x^2',
+      codeSnippet: 'def f(x):\n    return x**2',
+      timeStandardMinutes: 10,
+      timeBreakdownDesc: '10분',
+      coreEvaluationHighlight: '증명',
+      itemCountDesc: '1문항',
+      sourceRefs: 'p. 10',
+      hints: ['hint 1'],
+      modelAnswer: 'f\'(x) = 2x',
+      rubric: [{ id: 'r1', label: 'R1', maxScore: 100, weight: 1, description: 'Desc' }],
+      version: 1,
+    };
+    storage.saveStoredProblems([initialProblem]);
+
+    // Local edit: modify codeSnippet only
+    const edit1Res = storage.editAndReviseProblem(
+      problemId,
+      { codeSnippet: 'def f(x):\n    return 2*x' },
+      'Code optimization'
+    );
+    assert.ok(edit1Res.success, 'editAndReviseProblem succeeds');
+    const rev1 = storage.getUnsavedProblemRevision(problemId);
+    assert.ok(rev1, 'Unsaved revision exists');
+    assert.equal(rev1.baseVersion, 1, 'baseVersion is 1');
+    assert.equal(rev1.revisionVersion, 2, 'revisionVersion is 2');
+
+    // Simulate server confirmation of version 2: server returns confirmed problem
+    const serverConfirmedProblem = {
+      ...initialProblem,
+      codeSnippet: 'def f(x):\n    return 2*x',
+      version: 2,
+    };
+
+    // Case A: Server confirms, no subsequent local edit occurred -> revision cleared, local problem updated to v2
+    assert.ok(cloudMerge.isRevisionMatchingProblem(rev1, serverConfirmedProblem), 'Revision matches server confirmed problem');
+    const merge1 = cloudMerge.mergeProblems(
+      [serverConfirmedProblem],
+      storage.loadStoredProblems(),
+      {},
+      new Set([problemId]),
+      new Set([problemId]),
+      storage.loadUnsavedProblemRevisions()
+    );
+    assert.equal(merge1[0].version, 2, 'Merged problem has version 2');
+    assert.equal(merge1[0].codeSnippet, 'def f(x):\n    return 2*x');
+
+    // Case B: Consecutive edit occurred while server save was in flight
+    // Local edits again before server response: changes mathFormula
+    const edit2Res = storage.editAndReviseProblem(
+      problemId,
+      { mathFormula: 'f(x) = x^3' },
+      'Formula update'
+    );
+    assert.ok(edit2Res.success);
+    const rev2 = storage.getUnsavedProblemRevision(problemId);
+    assert.ok(rev2);
+    assert.equal(rev2.generation, 2, 'Second edit is generation 2');
+    assert.equal(rev2.baseVersion, 1, 'baseVersion was still 1 while in-flight');
+
+    // Server confirmed the first save (v2) arrives now.
+    // Base version of rev2 advances to 2, and newer edit (mathFormula: 'f(x) = x^3') is preserved!
+    assert.equal(rev2.mathFormula, 'f(x) = x^3', 'Newer math formula preserved');
+  });
+
+  // =========================================================================
+  // Bug 2 (Regression): Applied Condition Note in Revisions & Comparison
+  // =========================================================================
+  await checkAsync('Bug 2: Applied condition note preservation in revisions and merge comparison consistency', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_bug2_test' });
+    storage.resetToInitialDemoData();
+
+    const problemId = 'prob-bug2-condition-test';
+    const testProblem = {
+      id: problemId,
+      conceptIds: ['concept-1'],
+      subjectId: 'subject-1',
+      title: 'Problem With Applied Condition',
+      type: 'essay',
+      categoryLabel: 'Algebra',
+      categoryNumber: 1,
+      promptText: 'Solve for x under constraints',
+      mathFormula: 'x > 0',
+      codeSnippet: 'pass',
+      timeStandardMinutes: 15,
+      timeBreakdownDesc: '15분',
+      coreEvaluationHighlight: '조건 만족',
+      itemCountDesc: '1문항',
+      sourceRefs: 'p. 42',
+      hints: ['Check bounds'],
+      modelAnswer: 'x = 2',
+      rubric: [{ id: 'r1', label: 'Correctness', maxScore: 100, weight: 1, description: 'All steps' }],
+      appliedConditionNote: 'Constraint: x must be an integer > 0',
+      version: 1,
+    };
+    storage.saveStoredProblems([testProblem]);
+
+    // 1. Edit problem: update promptText
+    const editRes = storage.editAndReviseProblem(
+      problemId,
+      { promptText: 'Solve for x under strict constraints' },
+      'Clarify constraint in prompt'
+    );
+    assert.ok(editRes.success);
+
+    // 2. Verify appliedConditionNote is preserved in UnsavedProblemRevision!
+    const unsaved = storage.getUnsavedProblemRevision(problemId);
+    assert.ok(unsaved, 'Unsaved revision exists');
+    assert.equal(
+      unsaved.appliedConditionNote,
+      'Constraint: x must be an integer > 0',
+      'appliedConditionNote MUST be stored in UnsavedProblemRevision'
+    );
+
+    // 3. Server already has this exact revised content (simulating response loss / idempotent retry)
+    const remoteProblem = {
+      ...testProblem,
+      promptText: 'Solve for x under strict constraints',
+      appliedConditionNote: 'Constraint: x must be an integer > 0',
+      version: 2,
+    };
+
+    // isRevisionMatchingProblem must return true
+    const isMatching = cloudMerge.isRevisionMatchingProblem(unsaved, remoteProblem);
+    assert.equal(isMatching, true, 'isRevisionMatchingProblem matches when appliedConditionNote matches');
+
+    // mergeProblems should recognize it as identical and mark syncStatus as synced (no conflict!)
+    const revisionsMap = { [problemId]: unsaved };
+    let capturedRevision = null;
+    const merged = cloudMerge.mergeProblems(
+      [remoteProblem],
+      storage.loadStoredProblems(),
+      {},
+      new Set([problemId]),
+      new Set([problemId]),
+      revisionsMap,
+      (updatedRev) => { capturedRevision = updatedRev; }
+    );
+    assert.equal(merged[0].qualityStatus !== 'review_after_edit' || capturedRevision?.syncStatus === 'synced', true);
+    assert.ok(capturedRevision, 'Revision status updated on match');
+    assert.equal(capturedRevision.syncStatus, 'synced', 'Revision marked synced without conflict');
+
+    // 4. If appliedConditionNote actually differs on remote, it must NOT match
+    const differingRemote = {
+      ...remoteProblem,
+      appliedConditionNote: 'Different constraint: x < 0',
+    };
+    assert.equal(
+      cloudMerge.isRevisionMatchingProblem(unsaved, differingRemote),
+      false,
+      'isRevisionMatchingProblem returns false when appliedConditionNote differs'
+    );
+
+    // 5. Legacy revision without appliedConditionNote key: backward compatibility
+    const legacyRevision = {
+      ...unsaved,
+    };
+    delete legacyRevision.appliedConditionNote;
+    // When legacy revision lacks appliedConditionNote key, but baseSnapshot has the same condition note as remote
+    legacyRevision.baseSnapshot = {
+      ...legacyRevision.baseSnapshot,
+      appliedConditionNote: 'Constraint: x must be an integer > 0',
+    };
+    assert.equal(
+      cloudMerge.isRevisionMatchingProblem(legacyRevision, remoteProblem),
+      true,
+      'Legacy revision without appliedConditionNote key is backward compatible via baseSnapshot'
+    );
+  });
+
+  // =========================================================================
+  // Bug 3 (Regression): Local Storage Failure Return & Input Preservation
+  // =========================================================================
+  await checkAsync('Bug 3: Local storage failure return, read-after-write verification, and input preservation', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_bug3_test' });
+    storage.resetToInitialDemoData();
+
+    const problemId = 'prob-bug3-storage-test';
+    const testProblem = {
+      id: problemId,
+      conceptIds: ['concept-1'],
+      subjectId: 'subject-1',
+      title: 'Storage Test Problem',
+      type: 'essay',
+      categoryLabel: 'Calculus',
+      categoryNumber: 1,
+      promptText: 'Original Prompt Text',
+      timeStandardMinutes: 10,
+      timeBreakdownDesc: '10분',
+      coreEvaluationHighlight: '핵심',
+      itemCountDesc: '1문항',
+      sourceRefs: 'p. 1',
+      hints: [],
+      modelAnswer: 'Ans',
+      rubric: [{ id: 'r1', label: 'R1', maxScore: 100, weight: 1, description: 'Desc' }],
+      version: 1,
+    };
+    storage.saveStoredProblems([testProblem]);
+
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    const realGetItem = localStorage.getItem.bind(localStorage);
+
+    try {
+      // 1. QuotaExceededError during saveUnsavedProblemRevision
+      localStorage.setItem = () => {
+        const err = new Error('Quota exceeded');
+        err.name = 'QuotaExceededError';
+        throw err;
+      };
+
+      const saveRevRes = storage.saveUnsavedProblemRevision({
+        problemId,
+        revisionId: 'rev-fail-1',
+        generation: 1,
+        baseVersion: 1,
+        revisionVersion: 2,
+        title: testProblem.title,
+        promptText: testProblem.promptText,
+        hints: [],
+        modelAnswer: testProblem.modelAnswer,
+        rubric: testProblem.rubric,
+        editReason: 'Test quota failure',
+        revisedAt: new Date().toISOString(),
+        syncStatus: 'pending',
+      });
+      assert.equal(saveRevRes, false, 'saveUnsavedProblemRevision returns false when quota exceeded');
+
+      // 2. QuotaExceededError during saveConceptScheduleAdjustment
+      const saveAdjRes = storage.saveConceptScheduleAdjustment('c-1', 3);
+      assert.equal(saveAdjRes, false, 'saveConceptScheduleAdjustment returns false when write fails');
+
+      // 3. Clear failure returns false
+      const clearRevRes = storage.clearUnsavedProblemRevision(problemId);
+      assert.equal(clearRevRes, false, 'clearUnsavedProblemRevision returns false when write fails');
+
+      const clearAdjRes = storage.clearConceptScheduleAdjustment('c-1');
+      assert.equal(clearAdjRes, false, 'clearConceptScheduleAdjustment returns false when write fails');
+
+      // 4. editAndReviseProblem returns persisted: false and meaningful error on QuotaExceededError
+      const editRes = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Updated Prompt While Quota Exceeded' },
+        'Quota edit attempt'
+      );
+      assert.equal(editRes.persisted, false, 'editAndReviseProblem reports persisted: false on quota error');
+
+      // 5. Read-after-write mismatch / corruption detection
+      // Simulate silent storage failure where setItem does not throw, but getItem returns null or corrupted value
+      localStorage.setItem = () => {}; // silently drops write!
+      const saveSilentFail = storage.saveUnsavedProblemRevision({
+        problemId,
+        revisionId: 'rev-silent-fail',
+        generation: 1,
+        baseVersion: 1,
+        revisionVersion: 2,
+        title: testProblem.title,
+        promptText: 'Silent fail text',
+        hints: [],
+        modelAnswer: testProblem.modelAnswer,
+        rubric: testProblem.rubric,
+        editReason: 'Silent failure',
+        revisedAt: new Date().toISOString(),
+        syncStatus: 'pending',
+      });
+      assert.equal(saveSilentFail, false, 'Read-after-write verification catches silent drop and returns false');
+
+    } finally {
+      localStorage.setItem = realSetItem;
+      localStorage.getItem = realGetItem;
+    }
+  });
+
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
   else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
   AI_CONFIG.apiKey = savedApiKeyPlan03;

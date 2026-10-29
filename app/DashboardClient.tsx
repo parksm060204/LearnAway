@@ -2888,6 +2888,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 mathFormula: snapshotProblem.mathFormula,
                 codeSnippet: snapshotProblem.codeSnippet,
                 timeStandardMinutes: snapshotProblem.timeStandardMinutes,
+                appliedConditionNote: snapshotProblem.appliedConditionNote,
                 hints: [...(snapshotProblem.hints || [])],
                 modelAnswer: snapshotProblem.modelAnswer,
                 rubric: [...(snapshotProblem.rubric || [])],
@@ -2936,6 +2937,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                     mathFormula: snapshotProblem.mathFormula,
                     codeSnippet: snapshotProblem.codeSnippet,
                     timeStandardMinutes: snapshotProblem.timeStandardMinutes,
+                    appliedConditionNote: snapshotProblem.appliedConditionNote,
                     hints: [...(snapshotProblem.hints || [])],
                     modelAnswer: snapshotProblem.modelAnswer,
                     rubric: [...(snapshotProblem.rubric || [])],
@@ -3159,7 +3161,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
       void pushProblemToServer(problemId, { revise: true, expectedVersion: beforeVersion });
-      showToast('문제가 수정되어 로컬에 기록되었습니다. 서버 저장을 시도합니다.');
+      if (res.persisted === false) {
+        showToast(res.error || '로컬 영속 저장에 실패했습니다. (메모리 임시 보관) 서버 저장을 시도합니다.');
+      } else {
+        showToast('문제가 수정되어 로컬에 기록되었습니다. 서버 저장을 시도합니다.');
+      }
     } else {
       showToast(`문제 수정 실패: ${res.error}`);
     }
