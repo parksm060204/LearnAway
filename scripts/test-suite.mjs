@@ -50,6 +50,10 @@ if (compile.status !== 0) {
   window.localStorage = localStorage;
 
   try {
+    const storageMod = load(path.join(output, 'lib', 'storage.js'));
+    if (typeof storageMod.setStorageAdapterForTest === 'function') {
+      storageMod.setStorageAdapterForTest(localStorage);
+    }
     load(path.join(output, 'lib', 'testSuite.js'));
     // The suite is asynchronous; give pending microtasks/dispatches time to run.
     setTimeout(() => {

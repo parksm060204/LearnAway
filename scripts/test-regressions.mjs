@@ -148,6 +148,7 @@ exports.requireApiUser = async () => {
   const cloudDraftPersistence = load(path.join(output, 'lib/cloud/draftPersistence.js'));
 
   const storage = load(path.join(output, 'lib/storage.js'));
+  storage.setStorageAdapterForTest(localStorage);
   const exams = load(path.join(output, 'lib/mockExam.js'));
   const validation = load(path.join(output, 'lib/evaluationValidation.js'));
   const matStorage = load(path.join(output, 'lib/materialStorage.js'));
@@ -21610,6 +21611,555 @@ exports.requireApiUser = async () => {
     } finally {
       localStorage.setItem = realSetItem;
       localStorage.getItem = realGetItem;
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+  });
+
+  // =========================================================================
+  // Bug 2 (Follow-up Regression): baseVersion after Normal Sync vs Partial Failure
+  // =========================================================================
+  await checkAsync('Bug 2 (Follow-up): v1 -> edit 1 -> server v2 -> clear revision -> edit 2 -> server v3 (in-session, after reload, in-flight edits, legacy recovery, and historical snapshot immutability)', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_bug2_basever_test' });
+    storage.resetToInitialDemoData();
+
+    const subjectId = 'subj-bug2-seq';
+    const conceptId = 'conc-bug2-seq';
+    const problemId = 'prob-bug2-seq';
+
+    storage.saveStoredSubjects([
+      {
+        id: subjectId,
+        name: 'Mathematical Statistics',
+        code: 'STAT-301',
+        timezone: 'Asia/Seoul',
+      },
+    ]);
+    storage.saveStoredConcepts([
+      {
+        id: conceptId,
+        subjectId,
+        materialIds: [],
+        title: 'Sufficient Statistics',
+        chapterRef: 'Ch. 4',
+        baseScore: 80,
+        currentScore: 80,
+        status: 'review_needed',
+        order: 1,
+        events: [],
+        exerciseCount: 0,
+      },
+    ]);
+
+    const v1Problem = {
+      id: problemId,
+      conceptIds: [conceptId],
+      subjectId,
+      title: 'Neyman Factorization v1',
+      type: 'essay',
+      categoryLabel: 'Inference',
+      categoryNumber: 1,
+      promptText: 'State and prove Neyman Factorization Theorem (v1).',
+      mathFormula: 'f(x;\\theta) = g(T(x),\\theta)h(x)',
+      codeSnippet: 'def factorize(x): return x',
+      appliedConditionNote: 'Condition v1: discrete sample space',
+      timeStandardMinutes: 15,
+      timeBreakdownDesc: '15분',
+      coreEvaluationHighlight: '증명 완결성',
+      itemCountDesc: '1문항',
+      sourceRefs: 'p. 10',
+      hints: ['Hint v1'],
+      modelAnswer: 'Answer v1',
+      rubric: [{ id: 'r1', label: 'Factorization step', maxScore: 100, weight: 1, description: 'v1 rubric' }],
+      version: 1,
+      qualityStatus: 'normal',
+    };
+    storage.saveStoredProblems([v1Problem]);
+
+    // Record a historical Attempt at v1 to verify historical snapshot immutability across v1 -> v2 -> v3
+    const attemptV1 = {
+      id: 'att-bug2-v1-immutable',
+      problemId,
+      problemVersion: 1,
+      problemSnapshot: {
+        version: 1,
+        title: v1Problem.title,
+        promptText: v1Problem.promptText,
+        modelAnswer: v1Problem.modelAnswer,
+        rubric: structuredClone(v1Problem.rubric),
+        hints: [...v1Problem.hints],
+        editedAt: '2026-01-01T00:00:00.000Z',
+      },
+      conceptId,
+      subjectId,
+      at: '2026-01-02T00:00:00.000Z',
+      answerText: 'Student v1 proof answer',
+      calculatedScore: 90,
+      confidence: 4,
+      hintCount: 0,
+      rubricResults: [{ criterionId: 'r1', label: 'Factorization step', score: 90, maxScore: 100 }],
+      evaluatorFeedback: 'Good v1 proof',
+    };
+    storage.recordAttemptAndUpdateConcept(attemptV1);
+
+    // 1. First edit: v1 -> v2
+    const edit1 = storage.editAndReviseProblem(
+      problemId,
+      {
+        promptText: 'State and prove Neyman Factorization Theorem for continuous densities (v2).',
+        appliedConditionNote: 'Condition v2: regular continuous family',
+      },
+      'Extend v1 to continuous family'
+    );
+    assert.equal(edit1.success, true);
+    assert.equal(edit1.persisted, true);
+    assert.equal(edit1.status, 'complete');
+    const rev1 = storage.getUnsavedProblemRevision(problemId);
+    assert.ok(rev1);
+    assert.equal(rev1.baseVersion, 1, 'First edit starts from baseVersion=1');
+    assert.equal(rev1.revisionVersion, 2, 'First edit targets revisionVersion=2');
+
+    // 2. Server confirms v2 and unsaved revision is cleaned up
+    //    Test both direct clearUnsavedProblemRevision AND confirmProblemRevisionSynced:
+    //    Notice qualityStatus remains 'review_after_edit'!
+    const serverV2Problem = {
+      ...edit1.updatedProblem,
+      version: 2,
+      qualityStatus: 'review_after_edit',
+    };
+    const syncV2 = storage.confirmProblemRevisionSynced(
+      problemId,
+      serverV2Problem,
+      { revisionId: rev1.revisionId, generation: rev1.generation, snapshotProblem: edit1.updatedProblem, editReason: rev1.editReason }
+    );
+    assert.equal(syncV2.reconciled, true);
+    assert.equal(syncV2.localPersisted, true);
+    assert.equal(syncV2.revisionCleared, true);
+    assert.equal(storage.getUnsavedProblemRevision(problemId), null, 'Unsaved revision cleared after v2 server sync');
+    assert.equal(storage.getInMemoryProblemRevision(problemId), null, 'In-memory revision cleared after v2 server sync');
+
+    const storedAfterV2Sync = storage.loadStoredProblems().find((p) => p.id === problemId);
+    assert.equal(storedAfterV2Sync.version, 2);
+    assert.equal(storedAfterV2Sync.qualityStatus, 'review_after_edit', 'qualityStatus stays review_after_edit until reapproved');
+
+    // 3. Second edit in same session: v2 -> v3
+    //    CRITICAL: Must start with baseVersion=2 and revisionVersion=3 (must NOT regress to baseVersion=1!)
+    const edit2 = storage.editAndReviseProblem(
+      problemId,
+      {
+        promptText: 'State and prove Neyman Factorization Theorem for measure-theoretic dominated families (v3).',
+        mathFormula: '\\frac{dP_\\theta}{d\\mu}(x) = g_\\theta(T(x))h(x)',
+      },
+      'Generalize v2 to Radon-Nikodym derivative'
+    );
+    assert.equal(edit2.success, true);
+    assert.equal(edit2.persisted, true);
+    const rev2 = storage.getUnsavedProblemRevision(problemId);
+    assert.ok(rev2, 'Second edit created unsaved revision');
+    assert.equal(rev2.baseVersion, 2, 'Second edit after normal v2 sync MUST have baseVersion=2 (not 1)');
+    assert.equal(rev2.revisionVersion, 3, 'Second edit after normal v2 sync MUST have revisionVersion=3');
+    assert.equal(edit2.updatedProblem.version, 3, 'Problem version is 3');
+    assert.equal(edit2.updatedProblem.versionHistory.length, 2, 'versionHistory has both v2 and v1 snapshots');
+    assert.equal(edit2.updatedProblem.versionHistory[0].version, 2, 'Latest history snapshot is v2');
+    assert.equal(edit2.updatedProblem.versionHistory[1].version, 1, 'Previous history snapshot is v1');
+
+    // Also verify when caller only used clearUnsavedProblemRevision(problemId) (without confirmProblemRevisionSynced):
+    // Reset to v2 with qualityStatus='review_after_edit' and versionHistory=[v1] and no localUnrecordedBaseVersion
+    storage.clearAllUnsavedProblemRevisions();
+    storage.saveStoredProblems([
+      {
+        ...serverV2Problem,
+        serverConfirmedVersion: undefined,
+        localUnrecordedBaseVersion: undefined,
+        versionHistory: [edit2.updatedProblem.versionHistory[1]], // [v1]
+      },
+    ]);
+    const edit2WithoutConfirmHelper = storage.editAndReviseProblem(
+      problemId,
+      {
+        promptText: 'State and prove Neyman Factorization Theorem for measure-theoretic dominated families (v3).',
+        mathFormula: '\\frac{dP_\\theta}{d\\mu}(x) = g_\\theta(T(x))h(x)',
+      },
+      'Generalize v2 to Radon-Nikodym derivative'
+    );
+    assert.equal(edit2WithoutConfirmHelper.memoryRevision.baseVersion, 2, 'Even without serverConfirmedVersion, qualityStatus=review_after_edit never causes baseVersion=1 regression');
+    assert.equal(edit2WithoutConfirmHelper.memoryRevision.revisionVersion, 3);
+
+    // 4. Verify the same v1 -> v2 -> reload (mergeProblems) -> edit 2 -> server v3 flow after page reload!
+    storage.clearAllUnsavedProblemRevisions();
+    const v1SnapForServer = edit2WithoutConfirmHelper.updatedProblem.versionHistory[1];
+    storage.saveStoredProblems([{ ...serverV2Problem, versionHistory: [v1SnapForServer] }]);
+    const mergedAfterReloadV2 = cloudMerge.mergeProblems(
+      [serverV2Problem],
+      storage.loadStoredProblems(),
+      { [problemId]: [v1SnapForServer] },
+      new Set([problemId]),
+      new Set([problemId]),
+      {}
+    );
+    storage.saveStoredProblems(mergedAfterReloadV2);
+    assert.equal(mergedAfterReloadV2[0].version, 2);
+    assert.equal(mergedAfterReloadV2[0].qualityStatus, 'review_after_edit');
+    assert.equal(mergedAfterReloadV2[0].serverConfirmedVersion, 2);
+    assert.equal(mergedAfterReloadV2[0].localUnrecordedBaseVersion, undefined);
+
+    const edit2AfterReload = storage.editAndReviseProblem(
+      problemId,
+      {
+        promptText: 'Post-reload v3 edit on top of v2',
+      },
+      'Second edit after reload'
+    );
+    assert.equal(edit2AfterReload.success, true);
+    const rev2AfterReload = storage.getUnsavedProblemRevision(problemId);
+    assert.equal(rev2AfterReload.baseVersion, 2, 'After reload, second edit on v2 starts at baseVersion=2');
+    assert.equal(rev2AfterReload.revisionVersion, 3, 'After reload, second edit on v2 targets revisionVersion=3');
+
+    // Confirm v3 on server
+    const syncV3 = storage.confirmProblemRevisionSynced(
+      problemId,
+      { ...edit2AfterReload.updatedProblem, version: 3 },
+      { revisionId: rev2AfterReload.revisionId, generation: rev2AfterReload.generation }
+    );
+    assert.equal(syncV3.reconciled, true);
+    assert.equal(syncV3.localPersisted, true);
+    assert.equal(storage.loadStoredProblems().find((p) => p.id === problemId).version, 3);
+
+    // 5. Actual partial_problem_only failure on v3 -> v4 must preserve baseVersion=3 on retry
+    const revisionsKeyBug2 = 'redcall_user_user_bug2_basever_test__unsaved_problem_revisions_v1';
+    const realSetItemBug2 = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = (k, v) => {
+      if (k === revisionsKeyBug2) {
+        const err = new Error('Quota on revisions');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+      realSetItemBug2(k, v);
+    };
+    const partialOnV3 = storage.editAndReviseProblem(
+      problemId,
+      { promptText: 'v4 partial problem only text' },
+      'Try v4 edit with revision quota fail'
+    );
+    assert.equal(partialOnV3.status, 'partial_problem_only');
+    assert.equal(partialOnV3.persisted, false);
+    assert.equal(
+      storage.loadStoredProblems().find((p) => p.id === problemId).localUnrecordedBaseVersion,
+      3,
+      'partial_problem_only explicitly records localUnrecordedBaseVersion=3'
+    );
+
+    // Even if in-memory revision is cleared (simulating page reload after partial_problem_only), retry keeps baseVersion=3!
+    storage.clearInMemoryProblemRevision(problemId);
+    localStorage.setItem = realSetItemBug2;
+    const retryV4 = storage.editAndReviseProblem(
+      problemId,
+      { promptText: 'v4 partial problem only text (retried)' },
+      'Try v4 edit with revision quota fail'
+    );
+    assert.equal(retryV4.success, true);
+    assert.equal(retryV4.persisted, true);
+    assert.equal(retryV4.status, 'complete');
+    const revV4 = storage.getUnsavedProblemRevision(problemId);
+    assert.equal(revV4.baseVersion, 3, 'Retry after partial_problem_only preserves original server baseVersion=3');
+    assert.equal(revV4.revisionVersion, 4, 'Retry after partial_problem_only stays at revisionVersion=4');
+    assert.equal(
+      storage.loadStoredProblems().find((p) => p.id === problemId).localUnrecordedBaseVersion,
+      undefined,
+      'localUnrecordedBaseVersion is cleared once revision persists'
+    );
+
+    // 6. Consecutive edit while v4 save is in flight + late success / failure responses
+    const inFlightRevV4 = storage.getUnsavedProblemRevision(problemId);
+    const editV5WhileV4InFlight = storage.editAndReviseProblem(
+      problemId,
+      { promptText: 'v5 edited while v4 request in flight' },
+      'Additional edit during v4 sync'
+    );
+    assert.equal(editV5WhileV4InFlight.success, true);
+    const revV5BeforeV4Return = storage.getUnsavedProblemRevision(problemId);
+    assert.equal(revV5BeforeV4Return.baseVersion, 3, 'Before v4 returns, in-flight consecutive edit still references last confirmed baseVersion=3');
+    assert.equal(revV5BeforeV4Return.revisionVersion, 5);
+    assert.ok(revV5BeforeV4Return.generation > inFlightRevV4.generation);
+
+    // Late FAILURE response for v4 arrives: must NOT overwrite v5!
+    const staleFailSaved = storage.saveUnsavedProblemRevision(
+      { ...inFlightRevV4, syncStatus: 'failed', syncError: 'Network timeout on v4' },
+      { onlyIfRevisionId: inFlightRevV4.revisionId, onlyIfGeneration: inFlightRevV4.generation }
+    );
+    assert.equal(staleFailSaved, false, 'Late failure for v4 is rejected by generation/revisionId guard');
+    assert.equal(storage.getUnsavedProblemRevision(problemId).promptText, 'v5 edited while v4 request in flight');
+
+    // Late SUCCESS response for v4 arrives via confirmProblemRevisionSynced:
+    // Must NOT overwrite v5's promptText, and MUST advance v5's baseVersion from 3 -> 4!
+    const lateV4Success = storage.confirmProblemRevisionSynced(
+      problemId,
+      { ...retryV4.updatedProblem, version: 4 },
+      {
+        revisionId: inFlightRevV4.revisionId,
+        generation: inFlightRevV4.generation,
+        snapshotProblem: retryV4.updatedProblem,
+        editReason: inFlightRevV4.editReason,
+      }
+    );
+    assert.equal(lateV4Success.advancedInFlightRevision, true, 'Late v4 success advances in-flight v5 baseVersion');
+    const revV5AfterV4Return = storage.getUnsavedProblemRevision(problemId);
+    assert.ok(revV5AfterV4Return, 'v5 unsaved revision is preserved');
+    assert.equal(revV5AfterV4Return.baseVersion, 4, 'v5 baseVersion advanced to confirmed v4');
+    assert.equal(revV5AfterV4Return.revisionVersion, 5, 'v5 revisionVersion remains 5');
+    assert.equal(revV5AfterV4Return.promptText, 'v5 edited while v4 request in flight', 'v5 edited content preserved intact');
+
+    // 7. Legacy ambiguous baseVersion recovery in mergeProblems:
+    //    Suppose a legacy client saved a revision with baseVersion=1 on top of server v4 (baseSnapshot matches server v4)
+    const serverV4Problem = {
+      ...retryV4.updatedProblem,
+      version: 4,
+    };
+    const legacyAmbiguousRev = {
+      ...revV5AfterV4Return,
+      baseVersion: 1, // legacy bug!
+      revisionVersion: 2,
+      baseSnapshot: {
+        version: 1,
+        title: serverV4Problem.title,
+        promptText: serverV4Problem.promptText,
+        type: serverV4Problem.type,
+        conceptIds: serverV4Problem.conceptIds,
+        mathFormula: serverV4Problem.mathFormula,
+        codeSnippet: serverV4Problem.codeSnippet,
+        timeStandardMinutes: serverV4Problem.timeStandardMinutes,
+        appliedConditionNote: serverV4Problem.appliedConditionNote,
+        hints: serverV4Problem.hints,
+        modelAnswer: serverV4Problem.modelAnswer,
+        rubric: serverV4Problem.rubric,
+        editedAt: new Date().toISOString(),
+      },
+      syncStatus: 'pending',
+    };
+    let repairedCallbackRev = null;
+    const mergedFromLegacyAmbiguous = cloudMerge.mergeProblems(
+      [serverV4Problem],
+      storage.loadStoredProblems(),
+      {},
+      new Set([problemId]),
+      new Set([problemId]),
+      { [problemId]: legacyAmbiguousRev },
+      (r) => { repairedCallbackRev = r; }
+    );
+    assert.ok(repairedCallbackRev, 'Legacy ambiguous revision was rebased after server verification');
+    assert.equal(repairedCallbackRev.syncStatus, 'pending', 'Rebased revision remains pending (not false conflict)');
+    assert.equal(repairedCallbackRev.baseVersion, 4, 'Rebased revision baseVersion updated to server v4');
+    assert.equal(repairedCallbackRev.revisionVersion, 5, 'Rebased revision revisionVersion updated to 5');
+    assert.equal(mergedFromLegacyAmbiguous[0].promptText, 'v5 edited while v4 request in flight', 'User edit preserved');
+
+    // 8. Verify historical attempt snapshot (v1) and historical problem snapshots (v1, v2, v3) are completely immutable!
+    const storedAttempt = storage.getAttemptById('att-bug2-v1-immutable');
+    assert.ok(storedAttempt);
+    assert.equal(storedAttempt.problemVersion, 1);
+    assert.equal(storedAttempt.problemSnapshot.promptText, 'State and prove Neyman Factorization Theorem (v1).');
+    assert.equal(storedAttempt.answerText, 'Student v1 proof answer');
+    assert.equal(storedAttempt.calculatedScore, 90);
+
+    const finalProblem = storage.loadStoredProblems().find((p) => p.id === problemId);
+    const snapV1InHist = finalProblem.versionHistory.find((s) => s.version === 1);
+    const snapV2InHist = finalProblem.versionHistory.find((s) => s.version === 2);
+    assert.equal(snapV1InHist.promptText, 'State and prove Neyman Factorization Theorem (v1).');
+    assert.equal(snapV2InHist.promptText, 'State and prove Neyman Factorization Theorem for continuous densities (v2).');
+
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  // =========================================================================
+  // Bug 3 (Follow-up Regression): Distinguish In-Memory Fallback vs Persistent Storage
+  // =========================================================================
+  await checkAsync('Bug 3 (Follow-up): SecurityError on localStorage getter, memory vs persistent distinction, combined server+storage failure, account switch, and module restart verification', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_bug3_security_err' });
+    storage.setStorageAdapterForTest(localStorage);
+    storage.resetToInitialDemoData();
+
+    const problemId = 'prob-bug3-sec-1';
+    const initialProblem = {
+      id: problemId,
+      conceptIds: ['concept-sec-1'],
+      subjectId: 'subj-sec-1',
+      title: 'SecurityError Persistence Test',
+      type: 'essay',
+      categoryLabel: 'Analysis',
+      categoryNumber: 1,
+      promptText: 'Initial Persisted Prompt v1',
+      timeStandardMinutes: 20,
+      timeBreakdownDesc: '20분',
+      coreEvaluationHighlight: '정확성',
+      itemCountDesc: '1문항',
+      sourceRefs: 'p. 5',
+      hints: ['Hint 1'],
+      modelAnswer: 'Model Answer v1',
+      rubric: [{ id: 'r1', label: 'Proof', maxScore: 100, weight: 1, description: 'Full proof' }],
+      version: 1,
+    };
+    assert.equal(storage.saveStoredProblems([initialProblem]), true);
+    assert.equal(storage.loadStoredProblems().length, 1);
+
+    const realWindowDesc = Object.getOwnPropertyDescriptor(global.window, 'localStorage');
+    const realGlobalDesc = Object.getOwnPropertyDescriptor(global, 'localStorage');
+
+    try {
+      // Remove explicit test adapter so getLocalStorage() exercises the real window.localStorage getter
+      storage.setStorageAdapterForTest(undefined);
+
+      // 1. Simulate SecurityError thrown by window.localStorage getter (e.g. blocked third-party cookies / sandboxed iframe)
+      const throwSecurityError = () => {
+        const err = new Error('The operation is insecure.');
+        err.name = 'SecurityError';
+        throw err;
+      };
+      Object.defineProperty(global.window, 'localStorage', {
+        configurable: true,
+        get: throwSecurityError,
+      });
+      Object.defineProperty(global, 'localStorage', {
+        configurable: true,
+        get: throwSecurityError,
+      });
+
+      // checkStoredDataIntegrity must catch SecurityError and report ok: false without throwing
+      const integrityOnBlocked = storage.checkStoredDataIntegrity();
+      assert.equal(integrityOnBlocked.ok, false, 'checkStoredDataIntegrity reports ok: false when localStorage getter throws SecurityError');
+      assert.deepEqual(integrityOnBlocked.failedKeys, ['localStorage']);
+
+      // editAndReviseProblem during SecurityError MUST NOT return persisted: true or status: 'complete'!
+      const secFailEdit = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Volatile Memory Edit During SecurityError' },
+        'Edit while storage getter throws SecurityError'
+      );
+      assert.equal(secFailEdit.success, false, 'editAndReviseProblem must return success: false when localStorage throws SecurityError');
+      assert.equal(secFailEdit.persisted, false, 'editAndReviseProblem must NEVER return persisted: true for memory-only storage');
+      assert.equal(secFailEdit.status, 'failed', 'status must be failed (not complete)');
+      assert.equal(secFailEdit.problemPersisted, false);
+      assert.equal(secFailEdit.revisionPersisted, false);
+      assert.ok(secFailEdit.error && secFailEdit.error.includes('SecurityError'), 'Error message explains storage failure');
+
+      // Yet memoryProblem and memoryRevision MUST preserve the user's edit in memory for recovery!
+      assert.ok(secFailEdit.memoryProblem, 'memoryProblem is returned for UI/recovery');
+      assert.equal(secFailEdit.memoryProblem.promptText, 'Volatile Memory Edit During SecurityError');
+      assert.equal(secFailEdit.memoryProblem.version, 2);
+      assert.ok(secFailEdit.memoryRevision, 'memoryRevision is returned for UI/recovery');
+      assert.equal(secFailEdit.memoryRevision.baseVersion, 1);
+      assert.equal(secFailEdit.memoryRevision.revisionVersion, 2);
+      assert.equal(
+        storage.getInMemoryProblemRevision(problemId)?.promptText,
+        'Volatile Memory Edit During SecurityError',
+        'getInMemoryProblemRevision holds the memory-only revision'
+      );
+      assert.equal(
+        storage.getUnsavedProblemRevision(problemId),
+        null,
+        'getUnsavedProblemRevision returns null because persistent storage is inaccessible'
+      );
+
+      // 2. Simulate combined storage block + server failure:
+      //    In-memory revision transitions to syncStatus: 'failed' while remaining unpersisted
+      const memRevBeforeServerFail = storage.getInMemoryProblemRevision(problemId);
+      storage.setInMemoryProblemRevision({
+        ...memRevBeforeServerFail,
+        syncStatus: 'failed',
+        syncError: '503 Service Unavailable',
+      });
+      assert.equal(storage.getInMemoryProblemRevision(problemId)?.syncStatus, 'failed');
+
+      // 3. Simulate server save succeeding while localStorage is STILL blocked by SecurityError:
+      //    confirmProblemRevisionSynced must report reconciled: true, localPersisted: false!
+      const serverSuccessWhileStorageBlocked = storage.confirmProblemRevisionSynced(
+        problemId,
+        {
+          ...secFailEdit.memoryProblem,
+          version: 2,
+        },
+        {
+          revisionId: secFailEdit.memoryRevision.revisionId,
+          generation: secFailEdit.memoryRevision.generation,
+        }
+      );
+      assert.equal(serverSuccessWhileStorageBlocked.reconciled, true);
+      assert.equal(
+        serverSuccessWhileStorageBlocked.localPersisted,
+        false,
+        'confirmProblemRevisionSynced reports localPersisted: false when localStorage is blocked'
+      );
+      assert.ok(
+        serverSuccessWhileStorageBlocked.message.includes('로컬 영속 저장소 기록에는 실패'),
+        'Message explicitly distinguishes server save success from local persistent storage failure'
+      );
+
+      // Re-create a memory-only edit before testing module restart
+      const memOnlyEdit2 = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Unpersisted Memory Edit Before Module Restart' },
+        'Memory only edit before restart'
+      );
+      assert.equal(memOnlyEdit2.persisted, false);
+      assert.equal(storage.getInMemoryProblemRevision(problemId)?.promptText, 'Unpersisted Memory Edit Before Module Restart');
+
+      // 4. Account switch while storage is blocked: in-memory fallback must be strictly isolated per account
+      storageScope.setStorageScope({ kind: 'user', userId: 'user_bug3_other_sec' });
+      assert.equal(storage.getInMemoryProblemRevision(problemId), null, 'Other account cannot access memory revision');
+      assert.equal(storage.getInMemoryProblem(problemId), null, 'Other account cannot access memory problem');
+      storageScope.setStorageScope({ kind: 'user', userId: 'user_bug3_security_err' });
+      assert.equal(storage.getInMemoryProblemRevision(problemId)?.promptText, 'Unpersisted Memory Edit Before Module Restart');
+
+      // 5. Restore localStorage getter, then simulate module restart (clearing require cache of storage.js)
+      //    to prove that memory-only writes were NEVER persisted to localStorage!
+      if (realWindowDesc) Object.defineProperty(global.window, 'localStorage', realWindowDesc);
+      if (realGlobalDesc) Object.defineProperty(global, 'localStorage', realGlobalDesc);
+
+      const storageModulePath = path.join(output, 'lib', 'storage.js');
+      delete load.cache[storageModulePath];
+      const freshStorageAfterRestart = load(storageModulePath);
+      freshStorageAfterRestart.setStorageAdapterForTest(global.localStorage);
+
+      // After module restart, in-memory fallback is gone and localStorage still has the original v1 problem!
+      assert.equal(
+        freshStorageAfterRestart.getInMemoryProblemRevision(problemId),
+        null,
+        'After module restart, volatile in-memory revision is empty'
+      );
+      assert.equal(
+        freshStorageAfterRestart.getUnsavedProblemRevision(problemId),
+        null,
+        'Persistent unsaved revision was never written during SecurityError'
+      );
+      const persistedAfterRestart = freshStorageAfterRestart.loadStoredProblems().find((p) => p.id === problemId);
+      assert.ok(persistedAfterRestart);
+      assert.equal(
+        persistedAfterRestart.version,
+        1,
+        'Persisted problem in localStorage remained at v1 because SecurityError writes were only in memory'
+      );
+      assert.equal(
+        persistedAfterRestart.promptText,
+        'Initial Persisted Prompt v1',
+        'Persisted problem promptText in localStorage remained at v1'
+      );
+
+      // 6. Now that localStorage is restored, retrying the edit persists cleanly with persisted: true, status: 'complete'
+      const retryAfterRestore = freshStorageAfterRestart.editAndReviseProblem(
+        problemId,
+        { promptText: 'Persisted Edit After Storage Restored' },
+        'Retry after storage restored'
+      );
+      assert.equal(retryAfterRestore.success, true);
+      assert.equal(retryAfterRestore.persisted, true);
+      assert.equal(retryAfterRestore.status, 'complete');
+      assert.equal(retryAfterRestore.problemPersisted, true);
+      assert.equal(retryAfterRestore.revisionPersisted, true);
+      assert.equal(
+        freshStorageAfterRestart.loadStoredProblems().find((p) => p.id === problemId).promptText,
+        'Persisted Edit After Storage Restored'
+      );
+    } finally {
+      if (realWindowDesc) Object.defineProperty(global.window, 'localStorage', realWindowDesc);
+      if (realGlobalDesc) Object.defineProperty(global, 'localStorage', realGlobalDesc);
+      storage.setStorageAdapterForTest(global.localStorage);
       storageScope.setStorageScope({ kind: 'legacy' });
     }
   });

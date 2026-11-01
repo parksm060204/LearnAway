@@ -358,6 +358,7 @@ export function mergeProblems(
     let effectiveVersion = remote.version ?? 1;
     let combinedHistory = versionHistory;
     let hasActiveUnsavedRevision = false;
+    let unrecordedBaseVersion: number | undefined = undefined;
 
     if (unsaved) {
       const serverVersion = remote.version ?? 1;
@@ -398,28 +399,90 @@ export function mergeProblems(
           combinedHistory = alreadyHasBase ? existingHist : [unsaved.baseSnapshot, ...existingHist];
         }
       } else {
-        // Remote server has advanced past local baseVersion (serverVersion > unsaved.baseVersion) and content differs
-        // (or legacy revision lacks verifiable condition snapshot): preserve revision and inform user!
+        // serverVersion > unsaved.baseVersion and content differs:
+        // Check if this is a legacy ambiguous baseVersion where the user actually edited on top of `remote`
+        // (e.g. baseSnapshot matches `remote`, or local problem already confirmed `serverVersion`).
         const condCheck = hasVerifiableConditionNote(unsaved, referenceSnapshots);
-        const matchesWithoutCondition =
-          !condCheck.verifiable &&
-          normalizeText(remote.appliedConditionNote) !== '' &&
-          isRevisionMatchingProblem(
-            { ...unsaved, appliedConditionNote: remote.appliedConditionNote },
-            remote,
-            referenceSnapshots
-          );
-        const conflictReason = matchesWithoutCondition
-          ? `기존 형식 수정본의 적용 조건(appliedConditionNote) 기준 스냅샷을 확인할 수 없어 수정본을 보존했습니다 (서버: v${serverVersion})`
-          : `서버 버전 충돌 (서버: v${serverVersion}, 수정 기준: v${unsaved.baseVersion})`;
-        const updatedRev: UnsavedProblemRevision = {
-          ...unsaved,
-          syncStatus: 'conflict',
-          syncError: conflictReason,
-        };
-        unsavedRevisions[remote.id] = updatedRev;
-        onRevisionChange?.(updatedRev);
-        contentToApply = remote;
+        const isVerifiableLegacyBaseOnRemote = Boolean(
+          condCheck.verifiable &&
+          ((unsaved.baseSnapshot && isRevisionMatchingProblem(unsaved.baseSnapshot, remote, referenceSnapshots)) ||
+            mine?.serverConfirmedVersion === serverVersion ||
+            mine?.versionHistory?.some(
+              (s) => s.version === serverVersion && isRevisionMatchingProblem(s, remote, referenceSnapshots)
+            ))
+        );
+
+        if (isVerifiableLegacyBaseOnRemote) {
+          const rebasedSnapshot: ProblemVersionSnapshot = {
+            version: serverVersion,
+            title: remote.title,
+            promptText: remote.promptText,
+            type: remote.type,
+            conceptIds: [...(remote.conceptIds || [])],
+            mathFormula: remote.mathFormula,
+            codeSnippet: remote.codeSnippet,
+            timeStandardMinutes: remote.timeStandardMinutes,
+            appliedConditionNote: remote.appliedConditionNote,
+            hints: [...(remote.hints || [])],
+            modelAnswer: remote.modelAnswer,
+            rubric: [...(remote.rubric || [])],
+            editedAt: remote.lastReviewedAt || unsaved.revisedAt,
+            editReason: '서버 확인 기준 스냅샷',
+          };
+          const rebasedRevVer = Math.max(unsaved.revisionVersion, serverVersion + 1);
+          const repairedRev: UnsavedProblemRevision = {
+            ...unsaved,
+            baseVersion: serverVersion,
+            revisionVersion: rebasedRevVer,
+            baseSnapshot: rebasedSnapshot,
+            syncStatus: unsaved.syncStatus === 'conflict' ? 'pending' : unsaved.syncStatus,
+            syncError: undefined,
+          };
+          unsavedRevisions[remote.id] = repairedRev;
+          onRevisionChange?.(repairedRev);
+
+          contentToApply = {
+            ...remote,
+            title: unsaved.title,
+            promptText: unsaved.promptText,
+            type: unsaved.type ?? remote.type,
+            conceptIds: unsaved.conceptIds ?? remote.conceptIds,
+            mathFormula: unsaved.mathFormula,
+            codeSnippet: unsaved.codeSnippet,
+            hints: unsaved.hints,
+            modelAnswer: unsaved.modelAnswer,
+            rubric: unsaved.rubric,
+            timeStandardMinutes: unsaved.timeStandardMinutes ?? remote.timeStandardMinutes,
+            appliedConditionNote: condCheck.value,
+          };
+          effectiveVersion = rebasedRevVer;
+          hasActiveUnsavedRevision = true;
+          const existingHist = combinedHistory || [];
+          const alreadyHasBase = existingHist.some((s) => s.version === serverVersion);
+          combinedHistory = alreadyHasBase ? existingHist : [rebasedSnapshot, ...existingHist];
+        } else {
+          // Remote server has advanced past local baseVersion and cannot be verified as the edit's base:
+          // preserve revision and inform user!
+          const matchesWithoutCondition =
+            !condCheck.verifiable &&
+            normalizeText(remote.appliedConditionNote) !== '' &&
+            isRevisionMatchingProblem(
+              { ...unsaved, appliedConditionNote: remote.appliedConditionNote },
+              remote,
+              referenceSnapshots
+            );
+          const conflictReason = matchesWithoutCondition
+            ? `기존 형식 수정본의 적용 조건(appliedConditionNote) 기준 스냅샷을 확인할 수 없어 수정본을 보존했습니다 (서버: v${serverVersion})`
+            : `서버 버전 충돌 (서버: v${serverVersion}, 수정 기준: v${unsaved.baseVersion})`;
+          const updatedRev: UnsavedProblemRevision = {
+            ...unsaved,
+            syncStatus: 'conflict',
+            syncError: conflictReason,
+          };
+          unsavedRevisions[remote.id] = updatedRev;
+          onRevisionChange?.(updatedRev);
+          contentToApply = remote;
+        }
       }
     } else if (mine && (mine.version ?? 1) > (remote.version ?? 1) && mine.qualityStatus === 'review_after_edit') {
       contentToApply = {
@@ -438,25 +501,29 @@ export function mergeProblems(
       };
       effectiveVersion = mine.version ?? (remote.version ?? 1) + 1;
       hasActiveUnsavedRevision = true;
+      unrecordedBaseVersion = mine.localUnrecordedBaseVersion ?? (remote.version ?? 1);
       if (mine.versionHistory) {
         combinedHistory = mine.versionHistory;
       }
     }
 
-    const isConflict = unsaved?.syncStatus === 'conflict';
+    const activeRev = unsavedRevisions[remote.id] ?? unsaved;
+    const isConflict = activeRev?.syncStatus === 'conflict';
     let reviewNotes = remote.reviewNotes ?? mine?.reviewNotes;
-    if (hasActiveUnsavedRevision && unsaved) {
-      reviewNotes = `v${effectiveVersion} 수정 완료: ${unsaved.editReason}`;
-    } else if (isConflict && unsaved) {
-      reviewNotes = `[충돌 대기] ${unsaved.syncError || '서버 버전과 충돌한 미저장 수정본이 보존됨'}: ${unsaved.editReason}`;
+    if (hasActiveUnsavedRevision && activeRev) {
+      reviewNotes = `v${effectiveVersion} 수정 완료: ${activeRev.editReason}`;
+    } else if (isConflict && activeRev) {
+      reviewNotes = `[충돌 대기] ${activeRev.syncError || '서버 버전과 충돌한 미저장 수정본이 보존됨'}: ${activeRev.editReason}`;
     }
 
     return {
       ...contentToApply,
       version: effectiveVersion,
+      serverConfirmedVersion: remote.version ?? 1,
+      localUnrecordedBaseVersion: unrecordedBaseVersion,
       qualityStatus: hasActiveUnsavedRevision ? 'review_after_edit' : resolveProblemQualityStatus(remote, mine),
       ...(combinedHistory ? { versionHistory: combinedHistory } : {}),
-      ...(mine || unsaved
+      ...(mine || activeRev
         ? {
             reports: mergeReports(remote.reports, mine?.reports),
             isOutdated: remote.isOutdated ?? false,

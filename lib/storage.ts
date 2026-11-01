@@ -85,14 +85,25 @@ const MOCK_EXAM_KEY = 'mock_exam_sessions_v1';
 const LOGIC_SESSIONS_KEY = 'logic_sessions_v1';
 const REC_HALLENGE_KEY = 'rechallenge_reservations_v1';
 
-const inMemoryStore: Record<string, string> = {};
+let testStorageAdapterOverride: Storage | null | undefined = undefined;
+
+/**
+ * Explicitly configures a Storage adapter for Node/unit tests (or resets to default browser lookup when undefined).
+ * Passing `null` forces storage unavailability (simulating blocked/disabled persistent storage).
+ */
+export function setStorageAdapterForTest(adapter: Storage | null | undefined): void {
+  testStorageAdapterOverride = adapter;
+}
 
 function getLocalStorage(): Storage | null {
+  if (testStorageAdapterOverride !== undefined) {
+    return testStorageAdapterOverride;
+  }
   try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return window.localStorage;
+    if (typeof window !== 'undefined' && 'localStorage' in window) {
+      return window.localStorage || null;
     }
-    if (typeof localStorage !== 'undefined') {
+    if (typeof localStorage !== 'undefined' && localStorage) {
       return localStorage;
     }
   } catch {
@@ -104,16 +115,11 @@ function getLocalStorage(): Storage | null {
 function safeGetItem<T>(baseKey: string, fallback: T): T {
   const key = scopedStorageKey(baseKey);
   const storage = getLocalStorage();
+  if (!storage) return fallback;
   try {
-    if (storage) {
-      const raw = storage.getItem(key);
-      if (!raw) return fallback;
-      return JSON.parse(raw) as T;
-    } else {
-      const raw = inMemoryStore[key];
-      if (!raw) return fallback;
-      return JSON.parse(raw) as T;
-    }
+    const raw = storage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
   } catch (e) {
     console.warn(`Failed to parse localStorage key ${key}`, e);
     return fallback;
@@ -123,17 +129,14 @@ function safeGetItem<T>(baseKey: string, fallback: T): T {
 function safeSetItem<T>(baseKey: string, val: T): boolean {
   const key = scopedStorageKey(baseKey);
   const storage = getLocalStorage();
+  if (!storage) return false;
   try {
     const serialized = JSON.stringify(val);
-    if (storage) {
-      storage.setItem(key, serialized);
-      const readBack = storage.getItem(key);
-      if (readBack !== serialized) {
-        console.error(`Read-after-write verification failed for ${key}`);
-        return false;
-      }
-    } else {
-      inMemoryStore[key] = serialized;
+    storage.setItem(key, serialized);
+    const readBack = storage.getItem(key);
+    if (readBack !== serialized) {
+      console.error(`Read-after-write verification failed for ${key}`);
+      return false;
     }
     return true;
   } catch (e) {
@@ -145,16 +148,13 @@ function safeSetItem<T>(baseKey: string, val: T): boolean {
 function safeRemoveItem(baseKey: string): boolean {
   const key = scopedStorageKey(baseKey);
   const storage = getLocalStorage();
+  if (!storage) return false;
   try {
-    if (storage) {
-      storage.removeItem(key);
-      const readBack = storage.getItem(key);
-      if (readBack !== null) {
-        console.error(`Read-after-delete verification failed for ${key}`);
-        return false;
-      }
-    } else {
-      delete inMemoryStore[key];
+    storage.removeItem(key);
+    const readBack = storage.getItem(key);
+    if (readBack !== null) {
+      console.error(`Read-after-delete verification failed for ${key}`);
+      return false;
     }
     return true;
   } catch (e) {
@@ -236,18 +236,22 @@ function matchesStoredShape(baseKey: string, parsed: unknown): boolean {
  * demo data.
  */
 export function checkStoredDataIntegrity(): StoredDataIntegrity {
-  if (typeof window === 'undefined' || !window.localStorage) {
+  if (typeof window === 'undefined' && testStorageAdapterOverride === undefined) {
     return { ok: true, failedKeys: [] };
   }
 
   const failedKeys: string[] = [];
   try {
-    for (let i = 0; i < localStorage.length; i += 1) {
-      const key = localStorage.key(i);
+    const storage = testStorageAdapterOverride !== undefined ? testStorageAdapterOverride : window.localStorage;
+    if (!storage) {
+      return { ok: false, failedKeys: ['localStorage'] };
+    }
+    for (let i = 0; i < storage.length; i += 1) {
+      const key = storage.key(i);
       if (!key) continue;
       const baseKey = baseKeyForActiveScope(key);
       if (baseKey === null) continue;
-      const raw = localStorage.getItem(key);
+      const raw = storage.getItem(key);
       if (raw === null || raw === '') continue;
       let parsed: unknown;
       try {
@@ -1042,25 +1046,24 @@ export async function migrateStoredMaterialBodies(
 }
 
 function safeGetRaw(key: string): string | null {
+  const storage = getLocalStorage();
+  if (!storage) return null;
   try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return localStorage.getItem(key);
-    }
-    return inMemoryStore[key] ?? null;
+    return storage.getItem(key);
   } catch {
     return null;
   }
 }
 
-function safeSetItemRaw(key: string, value: string): void {
+function safeSetItemRaw(key: string, value: string): boolean {
+  const storage = getLocalStorage();
+  if (!storage) return false;
   try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.setItem(key, value);
-    } else {
-      inMemoryStore[key] = value;
-    }
+    storage.setItem(key, value);
+    return storage.getItem(key) === value;
   } catch (e) {
     console.error(`Failed to write localStorage key ${key}`, e);
+    return false;
   }
 }
 
@@ -1356,6 +1359,63 @@ export function markConceptAsLearned(
   return { updatedConcepts: updated, learnedConcept: targetLearned };
 }
 
+// Scoped cache of the last verified persisted problem list, used strictly as a
+// read-only baseline when localStorage access later fails with SecurityError
+// so editAndReviseProblem can preserve the user's edit in memory without
+// claiming persistent storage succeeded.
+const lastKnownProblemsByScope: Record<string, Record<string, Problem>> = {};
+
+// Separate in-memory problem buffer keyed by scoped storage key,
+// strictly distinguished from browser localStorage persistence.
+const inMemoryProblemFallback: Record<string, Record<string, Problem>> = {};
+
+function getScopedLastKnownProblemsMap(): Record<string, Problem> {
+  const key = scopedStorageKey(STORAGE_KEYS.PROBLEMS);
+  if (!lastKnownProblemsByScope[key]) {
+    lastKnownProblemsByScope[key] = {};
+  }
+  return lastKnownProblemsByScope[key];
+}
+
+function recordLastKnownProblems(problems: Problem[]): void {
+  const key = scopedStorageKey(STORAGE_KEYS.PROBLEMS);
+  const nextMap: Record<string, Problem> = {};
+  for (const p of problems) {
+    if (p && p.id) {
+      nextMap[p.id] = { ...p };
+    }
+  }
+  lastKnownProblemsByScope[key] = nextMap;
+}
+
+function getLastKnownProblem(problemId: string): Problem | null {
+  const map = getScopedLastKnownProblemsMap();
+  return map[problemId] ? { ...map[problemId] } : null;
+}
+
+function getScopedInMemoryProblemMap(): Record<string, Problem> {
+  const key = scopedStorageKey(STORAGE_KEYS.PROBLEMS);
+  if (!inMemoryProblemFallback[key]) {
+    inMemoryProblemFallback[key] = {};
+  }
+  return inMemoryProblemFallback[key];
+}
+
+export function setInMemoryProblem(problem: Problem): void {
+  const map = getScopedInMemoryProblemMap();
+  map[problem.id] = { ...problem };
+}
+
+export function getInMemoryProblem(problemId: string): Problem | null {
+  const map = getScopedInMemoryProblemMap();
+  return map[problemId] ? { ...map[problemId] } : null;
+}
+
+export function clearInMemoryProblem(problemId: string): void {
+  const map = getScopedInMemoryProblemMap();
+  delete map[problemId];
+}
+
 export function loadStoredProblems(): Problem[] {
   const raw = safeGetItem<Problem[]>(STORAGE_KEYS.PROBLEMS, []);
   // Legacy migration: recover transfer linkage ONLY when the original draft can
@@ -1363,7 +1423,7 @@ export function loadStoredProblems(): Problem[] {
   const drafts = loadStoredProblemDrafts();
   const draftById = new Map(drafts.map((d) => [d.id, d]));
 
-  return raw.map((p) => {
+  const loaded = raw.map((p) => {
     const base: Problem = {
       ...p,
       isDemo: p.isDemo ?? true,
@@ -1388,10 +1448,18 @@ export function loadStoredProblems(): Problem[] {
     }
     return base;
   });
+  if (getLocalStorage() !== null && loaded.length > 0) {
+    recordLastKnownProblems(loaded);
+  }
+  return loaded;
 }
 
 export function saveStoredProblems(problems: Problem[]): boolean {
-  return safeSetItem(STORAGE_KEYS.PROBLEMS, problems);
+  const ok = safeSetItem(STORAGE_KEYS.PROBLEMS, problems);
+  if (ok) {
+    recordLastKnownProblems(problems);
+  }
+  return ok;
 }
 
 export function loadStoredProblemDrafts(): ProblemDraft[] {
@@ -1991,7 +2059,10 @@ export function editAndReviseProblem(
   error?: string;
 } {
   const problems = loadStoredProblems();
-  const target = problems.find((p) => p.id === problemId);
+  const persistedTarget = problems.find((p) => p.id === problemId);
+  const lastKnownTarget = getLastKnownProblem(problemId);
+  const memoryTarget = getInMemoryProblem(problemId);
+  const target = persistedTarget ?? lastKnownTarget ?? memoryTarget;
   if (!target) {
     return {
       success: false,
@@ -2051,20 +2122,24 @@ export function editAndReviseProblem(
     sourceVerificationStatus: target.sourceVerificationStatus,
   };
 
-  const existingUnsaved = getUnsavedProblemRevision(problemId);
+  const persistedUnsaved = getUnsavedProblemRevision(problemId);
+  const memoryUnsaved = getInMemoryProblemRevision(problemId);
+  const existingUnsaved = persistedUnsaved ?? memoryUnsaved;
   const isUnsyncedEdit = Boolean(
     existingUnsaved &&
     (existingUnsaved.syncStatus === 'pending' || existingUnsaved.syncStatus === 'failed' || existingUnsaved.syncStatus === 'syncing')
   );
 
-  // Detect if previous attempt was a partial_problem_only save (problem body updated in storage, but unsaved revision failed)
+  // Detect if previous attempt was an explicit partial_problem_only save
+  // (problem body updated in storage with localUnrecordedBaseVersion, while unsaved revision failed to persist).
+  // Never infer partial failure from qualityStatus ('review_after_edit') alone!
   const hasUnrecordedLocalEdit = Boolean(
     !isUnsyncedEdit &&
-    target.qualityStatus === 'review_after_edit' &&
-    currentVersion > 1 &&
+    typeof target.localUnrecordedBaseVersion === 'number' &&
+    target.localUnrecordedBaseVersion < currentVersion &&
+    target.serverConfirmedVersion !== currentVersion &&
     target.versionHistory &&
-    target.versionHistory.length > 0 &&
-    target.versionHistory[0].version === currentVersion - 1
+    target.versionHistory.length > 0
   );
 
   let baseVersion: number;
@@ -2083,8 +2158,14 @@ export function editAndReviseProblem(
     baseVersion = existingUnsaved!.baseVersion;
     baseSnapshot = existingUnsaved!.baseSnapshot ?? snapshot;
 
-    // Check if previous attempt was partial_revision_only (target in problems_v1 is still at baseVersion)
-    const isRetryAfterPartialRevisionOnly = currentVersion <= existingUnsaved!.baseVersion;
+    // Check if previous attempt did not persist problem body (partial_revision_only or total failed)
+    // or did not persist revision (partial_problem_only with localUnrecordedBaseVersion)
+    const isRetryAfterUnpersistedProblem = currentVersion <= existingUnsaved!.baseVersion;
+    const isRetryAfterUnpersistedRevision =
+      !persistedUnsaved &&
+      typeof target.localUnrecordedBaseVersion === 'number' &&
+      target.localUnrecordedBaseVersion === existingUnsaved!.baseVersion;
+
     const existingRevAsProblem: Problem = {
       ...target,
       title: existingUnsaved!.title,
@@ -2105,7 +2186,7 @@ export function editAndReviseProblem(
       getProblemEvaluationSignature(candidateMerged) === getProblemEvaluationSignature(existingRevAsProblem) &&
       existingUnsaved!.editReason === trimmedReason;
 
-    if (isRetryAfterPartialRevisionOnly) {
+    if (isRetryAfterUnpersistedProblem || isRetryAfterUnpersistedRevision || isSameAsExistingUnsaved) {
       nextVersion = existingUnsaved!.revisionVersion;
       nextGen = isSameAsExistingUnsaved
         ? (existingUnsaved!.generation ?? 1)
@@ -2123,12 +2204,14 @@ export function editAndReviseProblem(
     const hasBaseSnap = existingHist.some((s) => s.version === baseSnapshot.version);
     nextVersionHistory = hasBaseSnap ? existingHist : [baseSnapshot, ...existingHist];
   } else if (hasUnrecordedLocalEdit) {
-    // Recovering from partial_problem_only state where problem body was already bumped to currentVersion
-    baseSnapshot = target.versionHistory![0];
-    baseVersion = baseSnapshot.version;
-    const isSameAsTarget =
-      getProblemEvaluationSignature(candidateMerged) === getProblemEvaluationSignature(target);
-    nextVersion = isSameAsTarget ? currentVersion : currentVersion + 1;
+    // Recovering from partial_problem_only state where problem body was bumped to currentVersion
+    // but unsaved_problem_revisions_v1 failed to persist (and in-memory revision was cleared/reloaded).
+    const recordedBaseVer = target.localUnrecordedBaseVersion!;
+    baseSnapshot =
+      target.versionHistory!.find((s) => s.version === recordedBaseVer) ??
+      target.versionHistory![0];
+    baseVersion = recordedBaseVer;
+    nextVersion = currentVersion;
     nextGen = (existingUnsaved?.generation ?? 0) + 1;
     newRevisionId = `rev-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     nextVersionHistory = target.versionHistory!;
@@ -2149,6 +2232,7 @@ export function editAndReviseProblem(
     qualityStatus: 'review_after_edit',
     lastReviewedAt: now,
     reviewNotes: `v${nextVersion} 수정 완료: ${trimmedReason}`,
+    localUnrecordedBaseVersion: undefined,
   };
 
   const newRevision: UnsavedProblemRevision = {
@@ -2188,16 +2272,33 @@ export function editAndReviseProblem(
     verifiedRev.baseVersion === newRevision.baseVersion
   );
 
-  const candidateProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  // If the revision failed to persist, mark localUnrecordedBaseVersion on the problem record
+  // so that if the problem body DOES persist (partial_problem_only), a subsequent retry
+  // knows the exact unrecorded baseVersion without relying on qualityStatus.
+  const problemToPersist: Problem = revisionPersisted
+    ? { ...updatedProblem, localUnrecordedBaseVersion: undefined }
+    : { ...updatedProblem, localUnrecordedBaseVersion: baseVersion };
+
+  const baseProblemsList =
+    problems.length > 0 ? problems : Object.values(getScopedLastKnownProblemsMap());
+  const candidateProblems = baseProblemsList.some((p) => p.id === problemId)
+    ? baseProblemsList.map((p) => (p.id === problemId ? problemToPersist : p))
+    : [...baseProblemsList, problemToPersist];
   const probWriteOk = saveStoredProblems(candidateProblems);
   const reloadedProblems = loadStoredProblems();
   const verifiedProb = reloadedProblems.find((p) => p.id === problemId);
   const problemPersisted = Boolean(
     probWriteOk &&
     verifiedProb &&
-    verifiedProb.version === updatedProblem.version &&
-    problemContentMatches(verifiedProb, updatedProblem)
+    verifiedProb.version === problemToPersist.version &&
+    problemContentMatches(verifiedProb, problemToPersist)
   );
+
+  if (problemPersisted) {
+    clearInMemoryProblem(problemId);
+  } else {
+    setInMemoryProblem(problemToPersist);
+  }
 
   const allPersisted = revisionPersisted && problemPersisted;
   const partialFailure = (revisionPersisted && !problemPersisted) || (!revisionPersisted && problemPersisted);
@@ -2217,8 +2318,8 @@ export function editAndReviseProblem(
     problemPersisted,
     revisionPersisted,
     updatedProblems: reloadedProblems,
-    updatedProblem: problemPersisted ? (verifiedProb ?? updatedProblem) : null,
-    memoryProblem: updatedProblem,
+    updatedProblem: problemPersisted ? (verifiedProb ?? problemToPersist) : null,
+    memoryProblem: problemToPersist,
     memoryRevision: newRevision,
     error: allPersisted
       ? undefined
@@ -2226,7 +2327,7 @@ export function editAndReviseProblem(
         ? '부분 완료: 보호 수정본은 저장되었으나 문제 본문 저장소 동기화에 실패했습니다. 편집기 입력과 마지막 정상 원본은 유지되었으니 다시 시도해 주세요.'
         : status === 'partial_problem_only'
           ? '부분 완료: 문제 본문은 저장되었으나 미동기화 보호 수정본 기록에 실패했습니다. 편집기 입력은 유지되었으니 다시 시도해 주세요.'
-          : '브라우저 저장 공간 부족(QuotaExceededError) 또는 쓰기 오류로 로컬 영속 저장에 실패했습니다. 편집기 입력과 마지막 정상 원본은 유지되었으니 다시 시도해 주세요.',
+          : '브라우저 저장 공간 부족(QuotaExceededError) 또는 접근 제한(SecurityError)으로 로컬 영속 저장에 실패했습니다. 메모리에는 임시 보존되었으며 편집기 입력과 마지막 정상 원본은 유지되었으니 다시 시도해 주세요.',
   };
 }
 
@@ -2416,7 +2517,7 @@ export function saveStoredSettings(settings: RetentionModelSettings): void {
  * Resets all user changes back to original academic demo dataset
  */
 export function resetToInitialDemoData(): void {
-  if (typeof window === 'undefined') return;
+  if (typeof window === 'undefined' && !getLocalStorage()) return;
   safeRemoveItem(STORAGE_KEYS.CURRENT_SUBJECT_ID);
   safeRemoveItem(STORAGE_KEYS.SUBJECTS);
   safeRemoveItem(STORAGE_KEYS.MATERIALS);
@@ -2441,6 +2542,11 @@ export function resetToInitialDemoData(): void {
   safeRemoveItem(REC_HALLENGE_KEY);
   safeRemoveItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS);
   safeRemoveItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS);
+  const revKey = scopedStorageKey(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS);
+  delete inMemoryRevisionFallback[revKey];
+  const probKey = scopedStorageKey(STORAGE_KEYS.PROBLEMS);
+  delete inMemoryProblemFallback[probKey];
+  delete lastKnownProblemsByScope[probKey];
   // Demo data is now loaded only through this explicit reset action.
   saveStoredSubjects(INITIAL_SUBJECTS);
   saveStoredMaterials(INITIAL_MATERIALS);
@@ -3261,6 +3367,157 @@ export function clearAllUnsavedProblemRevisions(): boolean {
   const key = scopedStorageKey(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS);
   delete inMemoryRevisionFallback[key];
   return true;
+}
+
+/**
+ * Reconciles local problem state and unsaved revision records after the server
+ * confirms a problem revision at `confirmedVersion`.
+ * - Explicitly separates server save success from local persistent storage (`localPersisted`).
+ * - Protects newer in-flight consecutive edits (`generation` / `revisionId` guard) by
+ *   advancing their `baseVersion` to `confirmedVersion` instead of overwriting or deleting them.
+ * - Clears `localUnrecordedBaseVersion` and records `serverConfirmedVersion`.
+ */
+export function confirmProblemRevisionSynced(
+  problemId: string,
+  serverProblem: Partial<Problem> & { version: number },
+  expected?: { revisionId?: string; generation?: number; snapshotProblem?: Problem; editReason?: string }
+): {
+  reconciled: boolean;
+  advancedInFlightRevision: boolean;
+  localPersisted: boolean;
+  revisionCleared: boolean;
+  updatedProblems: Problem[];
+  message: string;
+} {
+  const confirmedVersion = serverProblem.version;
+  const persistedUnsaved = getUnsavedProblemRevision(problemId);
+  const memoryUnsaved = getInMemoryProblemRevision(problemId);
+  const currentUnsaved = persistedUnsaved ?? memoryUnsaved;
+  const targetRevisionId = expected?.revisionId;
+  const targetGeneration = expected?.generation;
+
+  // Check if a newer consecutive edit occurred while this server request was in flight
+  if (
+    currentUnsaved &&
+    targetRevisionId &&
+    currentUnsaved.revisionId !== targetRevisionId &&
+    (currentUnsaved.generation ?? 0) > (targetGeneration ?? 0)
+  ) {
+    const baseSource = expected?.snapshotProblem ?? (serverProblem as Problem);
+    const confirmedSnapshot: ProblemVersionSnapshot = {
+      version: confirmedVersion,
+      title: baseSource.title ?? currentUnsaved.title,
+      promptText: baseSource.promptText ?? currentUnsaved.promptText,
+      type: baseSource.type ?? currentUnsaved.type,
+      conceptIds: [...(baseSource.conceptIds ?? currentUnsaved.conceptIds ?? [])],
+      mathFormula: baseSource.mathFormula,
+      codeSnippet: baseSource.codeSnippet,
+      timeStandardMinutes: baseSource.timeStandardMinutes,
+      appliedConditionNote: baseSource.appliedConditionNote,
+      hints: [...(baseSource.hints ?? [])],
+      modelAnswer: baseSource.modelAnswer ?? currentUnsaved.modelAnswer,
+      rubric: [...(baseSource.rubric ?? currentUnsaved.rubric ?? [])],
+      editedAt: new Date().toISOString(),
+      editReason: expected?.editReason ?? '서버 동기화 완료 버전',
+    };
+    const nextRevVer = Math.max(currentUnsaved.revisionVersion, confirmedVersion + 1);
+    const updatedInFlightRev: UnsavedProblemRevision = {
+      ...currentUnsaved,
+      baseVersion: confirmedVersion,
+      revisionVersion: nextRevVer,
+      baseSnapshot: confirmedSnapshot,
+    };
+    setInMemoryProblemRevision(updatedInFlightRev);
+    const revSaved = saveUnsavedProblemRevision(updatedInFlightRev, {
+      onlyIfRevisionId: currentUnsaved.revisionId,
+      onlyIfGeneration: currentUnsaved.generation,
+    });
+
+    const currentStored = loadStoredProblems();
+    const baseList =
+      currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
+    const reconciledWithInFlight = baseList.map((p) => {
+      if (p.id !== problemId) return p;
+      const existingHist = p.versionHistory || [];
+      const hasConfirmedSnap = existingHist.some((s) => s.version === confirmedVersion);
+      return {
+        ...p,
+        version: nextRevVer,
+        serverConfirmedVersion: confirmedVersion,
+        localUnrecordedBaseVersion: undefined,
+        versionHistory: hasConfirmedSnap ? existingHist : [confirmedSnapshot, ...existingHist],
+      };
+    });
+    const probSaved = saveStoredProblems(reconciledWithInFlight);
+    const localPersisted = revSaved && probSaved;
+    return {
+      reconciled: true,
+      advancedInFlightRevision: true,
+      localPersisted,
+      revisionCleared: false,
+      updatedProblems: probSaved ? loadStoredProblems() : reconciledWithInFlight,
+      message: localPersisted
+        ? '이전 수정본이 서버에 저장되었으며, 최신 로컬 편집 내용이 보존되었습니다.'
+        : '이전 수정본이 서버에 저장되었고 최신 편집은 메모리에 보존되었으나, 브라우저 로컬 영속 저장소 갱신에는 실패했습니다.',
+    };
+  }
+
+  // Normal completion of the active revision
+  const currentStored = loadStoredProblems();
+  const baseList =
+    currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
+  const reconciledProblems = baseList.map((p) =>
+    p.id === problemId
+      ? {
+          ...p,
+          ...serverProblem,
+          version: confirmedVersion,
+          serverConfirmedVersion: confirmedVersion,
+          localUnrecordedBaseVersion: undefined,
+          reports: p.reports ?? serverProblem.reports ?? [],
+          versionHistory: p.versionHistory ?? serverProblem.versionHistory ?? [],
+          reviewNotes: p.reviewNotes ?? serverProblem.reviewNotes,
+        }
+      : p
+  );
+  const probSaved = saveStoredProblems(reconciledProblems);
+  if (probSaved) {
+    clearInMemoryProblem(problemId);
+  } else {
+    const memProb = reconciledProblems.find((p) => p.id === problemId);
+    if (memProb) setInMemoryProblem(memProb);
+  }
+
+  const hadTargetPersistedUnsaved = Boolean(
+    persistedUnsaved && (!targetRevisionId || persistedUnsaved.revisionId === targetRevisionId)
+  );
+  const hadTargetMemoryUnsaved = Boolean(
+    memoryUnsaved && (!targetRevisionId || memoryUnsaved.revisionId === targetRevisionId)
+  );
+
+  let cleared = true;
+  if (hadTargetPersistedUnsaved) {
+    cleared = clearUnsavedProblemRevision(problemId, {
+      revisionId: targetRevisionId,
+      generation: targetGeneration,
+    });
+  } else if (hadTargetMemoryUnsaved) {
+    clearInMemoryProblemRevision(problemId);
+  }
+
+  const localPersisted = probSaved && (!hadTargetPersistedUnsaved || cleared);
+  return {
+    reconciled: true,
+    advancedInFlightRevision: false,
+    localPersisted,
+    revisionCleared: cleared,
+    updatedProblems: probSaved ? loadStoredProblems() : reconciledProblems,
+    message: !probSaved
+      ? '서버에는 수정본이 저장되었으나 브라우저 로컬 영속 저장소 기록에는 실패했습니다. (메모리 상태만 유지됨)'
+      : hadTargetPersistedUnsaved && !cleared
+        ? '서버에는 저장되었으나 로컬 수정본 임시 기록 정리에 실패했습니다.'
+        : '문제 수정본이 서버에 안전하게 저장되었습니다.',
+  };
 }
 
 export interface LocalProblemVersionInconsistency {

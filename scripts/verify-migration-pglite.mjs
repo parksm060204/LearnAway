@@ -95,6 +95,9 @@ async function setupSupabaseMocks(db) {
       created_at timestamptz default now(),
       updated_at timestamptz default now()
     );
+
+    grant usage on schema public, auth to anon, authenticated, service_role;
+    grant execute on all functions in schema auth to anon, authenticated, service_role;
   `);
 }
 
@@ -1424,11 +1427,146 @@ async function testUpgradePath() {
   // Reset session role back to default
   await db.exec(`reset role;`);
 
-  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33, 34, 35, 36 & 37) Passed Successfully! ===\n');
+  // =========================================================================
+  // SCENARIO T: Migration 38 — Lockdown detect_problem_version_inconsistencies()
+  //             Permissions (revoke PUBLIC/anon/authenticated, allow service_role)
+  //             and User-Scoped detect_my_problem_version_inconsistencies()
+  // =========================================================================
+  console.log('\n--- Scenario T: Migration 38 Lockdown of Diagnostic RPC Permissions & SET ROLE Verification ---');
+
+  // 1. Reproduce pre-38 vulnerability on Migration 37: anon had EXECUTE via PUBLIC default grant
+  const pre38AnonHasPriv = (await db.query(`
+    select has_function_privilege('anon', 'public.detect_problem_version_inconsistencies()', 'EXECUTE') as allowed;
+  `)).rows[0].allowed;
+  if (!pre38AnonHasPriv) {
+    throw new Error('Expected pre-38 Migration 37 to have PUBLIC/anon execute privilege before applying Migration 38');
+  }
+
+  // Apply Migration 38
+  const mig38Path = path.join(MIGRATIONS_DIR, '20260101000038_lockdown_version_diagnostics_permissions.sql');
+  await runSqlFile(db, mig38Path);
+  console.log('✓ Applied Migration 38 (20260101000038_lockdown_version_diagnostics_permissions.sql) cleanly');
+
+  // 2. Verify has_function_privilege on detect_problem_version_inconsistencies()
+  const diagPrivs = (await db.query(`
+    select
+      has_function_privilege('anon', 'public.detect_problem_version_inconsistencies()', 'EXECUTE') as anon_exec,
+      has_function_privilege('authenticated', 'public.detect_problem_version_inconsistencies()', 'EXECUTE') as auth_exec,
+      has_function_privilege('service_role', 'public.detect_problem_version_inconsistencies()', 'EXECUTE') as service_exec
+  `)).rows[0];
+  if (diagPrivs.anon_exec !== false || diagPrivs.auth_exec !== false || diagPrivs.service_exec !== true) {
+    throw new Error(`Unexpected privileges on detect_problem_version_inconsistencies: ${JSON.stringify(diagPrivs)}`);
+  }
+
+  // Also verify PUBLIC has no execute grant in pg_proc.proacl
+  const publicAclCheck = (await db.query(`
+    select coalesce(array_to_string(proacl, ','), '') as acl
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname = 'detect_problem_version_inconsistencies';
+  `)).rows[0].acl;
+  if (/(^|,)=X\//.test(publicAclCheck) || publicAclCheck.includes('anon=X') || publicAclCheck.includes('authenticated=X')) {
+    throw new Error(`PUBLIC/anon/authenticated execute still present in proacl: ${publicAclCheck}`);
+  }
+  console.log('✓ has_function_privilege & pg_proc.proacl confirm PUBLIC, anon, and authenticated are revoked on detect_problem_version_inconsistencies()');
+
+  // 3. Verify has_function_privilege on detect_my_problem_version_inconsistencies()
+  const myDiagPrivs = (await db.query(`
+    select
+      has_function_privilege('anon', 'public.detect_my_problem_version_inconsistencies()', 'EXECUTE') as anon_exec,
+      has_function_privilege('authenticated', 'public.detect_my_problem_version_inconsistencies()', 'EXECUTE') as auth_exec,
+      has_function_privilege('service_role', 'public.detect_my_problem_version_inconsistencies()', 'EXECUTE') as service_exec
+  `)).rows[0];
+  if (myDiagPrivs.anon_exec !== false || myDiagPrivs.auth_exec !== true || myDiagPrivs.service_exec !== true) {
+    throw new Error(`Unexpected privileges on detect_my_problem_version_inconsistencies: ${JSON.stringify(myDiagPrivs)}`);
+  }
+  console.log('✓ has_function_privilege confirms detect_my_problem_version_inconsistencies() is revoked from anon and granted to authenticated/service_role');
+
+  // 4. Actual SET ROLE anon execution test -> must fail with 42501 for both functions
+  await setAuthContext(db, { uid: null, role: 'anon' });
+  await db.exec(`set role anon;`);
+  let anonGlobalBlocked = false;
+  try {
+    await db.query(`select * from public.detect_problem_version_inconsistencies();`);
+  } catch (err) {
+    anonGlobalBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  if (!anonGlobalBlocked) {
+    throw new Error('SET ROLE anon must be denied execution of detect_problem_version_inconsistencies()');
+  }
+
+  let anonMyBlocked = false;
+  try {
+    await db.query(`select * from public.detect_my_problem_version_inconsistencies();`);
+  } catch (err) {
+    anonMyBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  if (!anonMyBlocked) {
+    throw new Error('SET ROLE anon must be denied execution of detect_my_problem_version_inconsistencies()');
+  }
+  await db.exec(`reset role;`);
+  console.log('✓ SET ROLE anon execution is strictly rejected (42501) on both diagnostic RPCs');
+
+  // 5. Actual SET ROLE authenticated execution test -> must fail with 42501 on global RPC,
+  //    and strictly isolate rows by auth.uid() on detect_my_problem_version_inconsistencies()
+  await setAuthContext(db, { uid: userIdB, role: 'authenticated' });
+  await db.exec(`set role authenticated;`);
+  let authGlobalBlocked = false;
+  try {
+    await db.query(`select * from public.detect_problem_version_inconsistencies();`);
+  } catch (err) {
+    authGlobalBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  if (!authGlobalBlocked) {
+    throw new Error('SET ROLE authenticated must be denied execution of detect_problem_version_inconsistencies()');
+  }
+
+  // User B calling detect_my_problem_version_inconsistencies() must NOT see User A's inconsistent problem
+  const userBMyDiag = (await db.query(`
+    select * from public.detect_my_problem_version_inconsistencies();
+  `)).rows;
+  if (userBMyDiag.some(r => r.user_id === userIdA || r.problem_id === legacyInconsistentId)) {
+    throw new Error(`User B saw User A's problem in detect_my_problem_version_inconsistencies: ${JSON.stringify(userBMyDiag)}`);
+  }
+  await db.exec(`reset role;`);
+
+  // User A calling detect_my_problem_version_inconsistencies() with SET ROLE authenticated sees own row only
+  await setAuthContext(db, { uid: userIdA, role: 'authenticated' });
+  await db.exec(`set role authenticated;`);
+  const userAMyDiag = (await db.query(`
+    select * from public.detect_my_problem_version_inconsistencies() where problem_id = $1;
+  `, [legacyInconsistentId])).rows;
+  if (
+    userAMyDiag.length !== 1 ||
+    userAMyDiag[0].user_id !== userIdA ||
+    userAMyDiag[0].issue_type !== 'CURRENT_SNAPSHOT_CONTENT_MISMATCH'
+  ) {
+    throw new Error(`User A expected own inconsistency from detect_my_problem_version_inconsistencies, got: ${JSON.stringify(userAMyDiag)}`);
+  }
+  await db.exec(`reset role;`);
+  console.log('✓ SET ROLE authenticated is denied on operator RPC and strictly scoped to auth.uid() on detect_my_problem_version_inconsistencies()');
+
+  // 6. Actual SET ROLE service_role execution test -> must succeed and remain read-only
+  await setAuthContext(db, { uid: null, role: 'service_role' });
+  await db.exec(`set role service_role;`);
+  const serviceDiag = (await db.query(`
+    select * from public.detect_problem_version_inconsistencies() where problem_id = $1;
+  `, [legacyInconsistentId])).rows;
+  if (
+    serviceDiag.length !== 1 ||
+    serviceDiag[0].user_id !== userIdA ||
+    serviceDiag[0].issue_type !== 'CURRENT_SNAPSHOT_CONTENT_MISMATCH'
+  ) {
+    throw new Error(`SET ROLE service_role expected to detect legacyInconsistentId, got: ${JSON.stringify(serviceDiag)}`);
+  }
+  await db.exec(`reset role;`);
+  console.log('✓ SET ROLE service_role succeeds on detect_problem_version_inconsistencies() and remains read-only');
+
+  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33, 34, 35, 36, 37 & 38) Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~37) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~38) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -1436,9 +1574,44 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 37 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 38 on clean database`);
 
   // Verify permissions on fresh install DB
+  const freshPrivs = (await db.query(`
+    select
+      has_function_privilege('anon', 'public.detect_problem_version_inconsistencies()', 'EXECUTE') as anon_diag,
+      has_function_privilege('authenticated', 'public.detect_problem_version_inconsistencies()', 'EXECUTE') as auth_diag,
+      has_function_privilege('service_role', 'public.detect_problem_version_inconsistencies()', 'EXECUTE') as service_diag,
+      has_function_privilege('anon', 'public.detect_my_problem_version_inconsistencies()', 'EXECUTE') as anon_my_diag,
+      has_function_privilege('authenticated', 'public.detect_my_problem_version_inconsistencies()', 'EXECUTE') as auth_my_diag
+  `)).rows[0];
+  if (
+    freshPrivs.anon_diag !== false ||
+    freshPrivs.auth_diag !== false ||
+    freshPrivs.service_diag !== true ||
+    freshPrivs.anon_my_diag !== false ||
+    freshPrivs.auth_my_diag !== true
+  ) {
+    throw new Error(`Fresh install diagnostic RPC privileges mismatch: ${JSON.stringify(freshPrivs)}`);
+  }
+
+  // Test SET ROLE anon on fresh DB
+  await db.exec(`
+    select set_config('request.jwt.claim.role', 'anon', false);
+    set role anon;
+  `);
+  let freshAnonDiagBlocked = false;
+  try {
+    await db.query(`select * from public.detect_problem_version_inconsistencies();`);
+  } catch (err) {
+    freshAnonDiagBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  if (!freshAnonDiagBlocked) {
+    throw new Error('Fresh install must deny detect_problem_version_inconsistencies to anon role');
+  }
+  await db.exec(`reset role;`);
+
+  // Test SET ROLE authenticated on fresh DB
   await db.exec(`
     select set_config('request.jwt.claim.role', 'authenticated', false);
     set role authenticated;
@@ -1453,7 +1626,29 @@ async function testFreshInstallPath() {
   if (!freshBlocked) {
     throw new Error('Fresh install must deny register_ai_task to authenticated role');
   }
-  console.log('✓ Fresh database correctly denies register_ai_task to authenticated role');
+
+  let freshAuthDiagBlocked = false;
+  try {
+    await db.query(`select * from public.detect_problem_version_inconsistencies();`);
+  } catch (err) {
+    freshAuthDiagBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  if (!freshAuthDiagBlocked) {
+    throw new Error('Fresh install must deny detect_problem_version_inconsistencies to authenticated role');
+  }
+  await db.exec(`reset role;`);
+
+  // Test SET ROLE service_role on fresh DB
+  await db.exec(`
+    select set_config('request.jwt.claim.role', 'service_role', false);
+    set role service_role;
+  `);
+  const freshServiceRes = await db.query(`select * from public.detect_problem_version_inconsistencies();`);
+  if (!Array.isArray(freshServiceRes.rows)) {
+    throw new Error('Fresh install must allow detect_problem_version_inconsistencies to service_role');
+  }
+  await db.exec(`reset role;`);
+  console.log('✓ Fresh database correctly enforces role permissions on register_ai_task and diagnostic RPCs via has_function_privilege and SET ROLE');
 }
 
 async function main() {
