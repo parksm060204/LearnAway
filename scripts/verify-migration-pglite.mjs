@@ -1288,10 +1288,27 @@ async function testUpgradePath() {
   const v1Snap = (await db.query(`
     select snapshot from public.problem_versions where problem_id = $1 and version = 1;
   `, [problemIdS])).rows[0];
-  if (!v1Snap || v1Snap.snapshot.codeSnippet !== 'def original(): pass' || v1Snap.snapshot.mathFormula !== 'E=mc^2') {
+  const v2Snap = (await db.query(`
+    select snapshot from public.problem_versions where problem_id = $1 and version = 2;
+  `, [problemIdS])).rows[0];
+  const v3Snap = (await db.query(`
+    select snapshot from public.problem_versions where problem_id = $1 and version = 3;
+  `, [problemIdS])).rows[0];
+  if (
+    !v1Snap ||
+    v1Snap.snapshot.codeSnippet !== 'def original(): pass' ||
+    v1Snap.snapshot.mathFormula !== 'E=mc^2' ||
+    v1Snap.snapshot.timeStandardMinutes !== 15
+  ) {
     throw new Error('Historical snapshot v1 was unexpectedly modified or missing');
   }
-  console.log('✓ Historical version snapshots (v1) remain unmodified and preserved');
+  if (!v2Snap || v2Snap.snapshot.codeSnippet !== 'def revised_code(): return 42' || v2Snap.snapshot.mathFormula !== 'E=mc^2') {
+    throw new Error('Historical snapshot v2 was unexpectedly modified or missing');
+  }
+  if (!v3Snap || v3Snap.snapshot.mathFormula !== '\\int_0^1 x^2 dx' || v3Snap.snapshot.timeStandardMinutes !== 15) {
+    throw new Error('Historical snapshot v3 was unexpectedly modified or missing');
+  }
+  console.log('✓ Historical version snapshots (v1, v2, v3) remain unmodified and preserved');
 
   // 6. Idempotent retry with identical content must NOT create a new version
   const retrySame = (await db.query(`
@@ -1307,6 +1324,102 @@ async function testUpgradePath() {
     throw new Error(`Expected exactly 4 version records, got ${countVersions}`);
   }
   console.log('✓ Idempotent retry with identical content returns existing version 4 without duplicate version records');
+
+  // 7. Modifying ONLY appliedConditionNote, type, or conceptIds must also create new versions (v5, v6, v7)
+  const conditionChange = {
+    ...timeChange,
+    version: 4,
+    appliedConditionNote: 'Updated Condition Note: assume i.i.d. normal distribution',
+  };
+  const v5 = (await db.query(`
+    select public.revise_problem($1, 4, $2) as v;
+  `, [problemIdS, JSON.stringify(conditionChange)])).rows[0].v;
+  if (v5 !== 5) {
+    throw new Error(`Expected revise_problem with appliedConditionNote change to return version 5, got ${v5}`);
+  }
+
+  const typeChange = {
+    ...conditionChange,
+    version: 5,
+    type: 'proof',
+  };
+  const v6 = (await db.query(`
+    select public.revise_problem($1, 5, $2) as v;
+  `, [problemIdS, JSON.stringify(typeChange)])).rows[0].v;
+  if (v6 !== 6) {
+    throw new Error(`Expected revise_problem with type change to return version 6, got ${v6}`);
+  }
+
+  const conceptIdS2 = 'concept_scene_s2';
+  await db.exec(`reset role;`);
+  await db.query(`
+    insert into public.concepts (id, user_id, subject_id, title)
+    values ($1, $2, $3, 'Concept S2')
+    on conflict (id, user_id) do nothing;
+  `, [conceptIdS2, userIdA, subjectIdS]);
+  await setAuthContext(db, { uid: userIdA, role: 'authenticated' });
+
+  const conceptIdsChange = {
+    ...typeChange,
+    version: 6,
+    conceptIds: [conceptIdS, conceptIdS2],
+  };
+  const v7 = (await db.query(`
+    select public.revise_problem($1, 6, $2) as v;
+  `, [problemIdS, JSON.stringify(conceptIdsChange)])).rows[0].v;
+  if (v7 !== 7) {
+    throw new Error(`Expected revise_problem with conceptIds change to return version 7, got ${v7}`);
+  }
+  console.log('✓ Changing only appliedConditionNote (v5), type (v6), or conceptIds (v7) each creates a new version');
+
+  // 8. Verify read-only inconsistency detection RPC public.detect_problem_version_inconsistencies()
+  const cleanDiag = (await db.query(`
+    select * from public.detect_problem_version_inconsistencies() where problem_id = $1;
+  `, [problemIdS])).rows;
+  if (cleanDiag.length !== 0) {
+    throw new Error(`Expected 0 inconsistencies for clean problem S, got: ${JSON.stringify(cleanDiag)}`);
+  }
+
+  // Seed legacy pre-fix inconsistent problem (where codeSnippet changed in problems.payload without bumping version or updating snapshot)
+  const legacyInconsistentId = 'problem_scene_s_legacy_drift';
+  await db.exec(`reset role;`);
+  const legacySnapV1 = {
+    ...initialPayloadS,
+    id: legacyInconsistentId,
+    codeSnippet: 'def old_v1(): return 1',
+    version: 1,
+  };
+  const driftedCurrentPayloadV1 = {
+    ...legacySnapV1,
+    codeSnippet: 'def mutated_without_version_bump(): return 999',
+    version: 1,
+  };
+  await db.query(`
+    insert into public.problems (id, user_id, subject_id, version, title, type, payload)
+    values ($1, $2, $3, 1, 'Legacy Drift Problem', 'essay', $4)
+    on conflict (id, user_id) do update set version = 1, payload = $4;
+  `, [legacyInconsistentId, userIdA, subjectIdS, JSON.stringify(driftedCurrentPayloadV1)]);
+  await db.query(`
+    insert into public.problem_versions (user_id, problem_id, subject_id, version, snapshot)
+    values ($1, $2, $3, 1, $4)
+    on conflict (problem_id, version, user_id) do update set snapshot = $4;
+  `, [userIdA, legacyInconsistentId, subjectIdS, JSON.stringify(legacySnapV1)]);
+
+  await setAuthContext(db, { uid: userIdA, role: 'authenticated' });
+  const driftDiag = (await db.query(`
+    select * from public.detect_problem_version_inconsistencies() where problem_id = $1;
+  `, [legacyInconsistentId])).rows;
+  if (!driftDiag.some(r => r.issue_type === 'CURRENT_SNAPSHOT_CONTENT_MISMATCH')) {
+    throw new Error(`Expected detect_problem_version_inconsistencies to flag CURRENT_SNAPSHOT_CONTENT_MISMATCH, got: ${JSON.stringify(driftDiag)}`);
+  }
+  // Confirm read-only: historical snapshot v1 was NOT overwritten by detection
+  const verifyUntouchedSnap = (await db.query(`
+    select snapshot from public.problem_versions where problem_id = $1 and version = 1;
+  `, [legacyInconsistentId])).rows[0];
+  if (verifyUntouchedSnap.snapshot.codeSnippet !== 'def old_v1(): return 1') {
+    throw new Error('detect_problem_version_inconsistencies must be strictly read-only and never overwrite history');
+  }
+  console.log('✓ Read-only RPC detect_problem_version_inconsistencies() accurately detects legacy drift without overwriting history');
 
   // Reset session role back to default
   await db.exec(`reset role;`);

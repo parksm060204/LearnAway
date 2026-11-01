@@ -21109,6 +21109,75 @@ exports.requireApiUser = async () => {
     // Server confirmed the first save (v2) arrives now.
     // Base version of rev2 advances to 2, and newer edit (mathFormula: 'f(x) = x^3') is preserved!
     assert.equal(rev2.mathFormula, 'f(x) = x^3', 'Newer math formula preserved');
+
+    // Case C: Past attempt snapshots remain immutable when problem is revised to v2
+    const attemptOnV1 = {
+      id: 'att-bug1-v1',
+      problemId,
+      subjectId: 'subject-1',
+      problemVersion: 1,
+      problemSnapshot: {
+        version: 1,
+        promptText: initialProblem.promptText,
+        mathFormula: initialProblem.mathFormula,
+        codeSnippet: initialProblem.codeSnippet,
+        timeStandardMinutes: initialProblem.timeStandardMinutes,
+        modelAnswer: initialProblem.modelAnswer,
+        rubric: initialProblem.rubric,
+        hints: initialProblem.hints,
+        editedAt: '2026-01-01T00:00:00.000Z',
+      },
+      userAnswer: 'f\'(x) = 2x',
+      score: 95,
+      status: 'completed',
+      attemptedAt: '2026-01-02T00:00:00.000Z',
+    };
+    storage.saveStoredAttempts([attemptOnV1]);
+    storage.editAndReviseProblem(
+      problemId,
+      { timeStandardMinutes: 30, modelAnswer: 'Updated answer for v2' },
+      'Time limit and answer update'
+    );
+    const loadedAttemptAfterRevise = storage.loadStoredAttempts().find((a) => a.id === 'att-bug1-v1');
+    assert.ok(loadedAttemptAfterRevise, 'Past attempt still exists');
+    assert.equal(loadedAttemptAfterRevise.problemVersion, 1, 'Past attempt problemVersion remains 1');
+    assert.equal(loadedAttemptAfterRevise.score, 95, 'Past attempt score remains 95');
+    assert.equal(
+      loadedAttemptAfterRevise.problemSnapshot.codeSnippet,
+      'def f(x):\n    return x**2',
+      'Past attempt snapshot codeSnippet is untouched'
+    );
+
+    // Case D: Read-only local version inconsistency detector flags anomalous history without mutating data
+    const cleanAudit = storage.detectLocalProblemVersionInconsistencies();
+    assert.equal(cleanAudit.length, 0, 'Clean problem has 0 local version inconsistencies');
+
+    const corruptedProblem = {
+      ...initialProblem,
+      id: 'prob-bug1-corrupt',
+      version: 2,
+      versionHistory: [
+        {
+          version: 3, // >= currentVersion (2)!
+          promptText: 'Bad snapshot version',
+          modelAnswer: 'Ans',
+          rubric: initialProblem.rubric,
+          hints: [],
+          editedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+    };
+    storage.saveStoredProblems([...storage.loadStoredProblems(), corruptedProblem]);
+    const auditIssues = storage.detectLocalProblemVersionInconsistencies();
+    assert.ok(
+      auditIssues.some((i) => i.problemId === 'prob-bug1-corrupt' && i.issueType === 'HISTORY_VERSION_GTE_CURRENT'),
+      'detectLocalProblemVersionInconsistencies detects snapshot version >= current version'
+    );
+    assert.equal(
+      storage.loadStoredProblems().find((p) => p.id === 'prob-bug1-corrupt').versionHistory[0].version,
+      3,
+      'Read-only detector never mutates stored problem history'
+    );
   });
 
   // =========================================================================
@@ -21143,28 +21212,34 @@ exports.requireApiUser = async () => {
     };
     storage.saveStoredProblems([testProblem]);
 
-    // 1. Edit problem: update promptText
+    // 1. Edit problem: update promptText and appliedConditionNote
     const editRes = storage.editAndReviseProblem(
       problemId,
-      { promptText: 'Solve for x under strict constraints' },
-      'Clarify constraint in prompt'
+      {
+        promptText: 'Solve for x under strict constraints',
+        appliedConditionNote: 'Constraint: x must be a prime integer > 2',
+      },
+      'Clarify constraint in prompt and condition note'
     );
     assert.ok(editRes.success);
+    assert.equal(editRes.persisted, true);
 
-    // 2. Verify appliedConditionNote is preserved in UnsavedProblemRevision!
+    // 2. Verify appliedConditionNote, type, conceptIds are preserved in UnsavedProblemRevision!
     const unsaved = storage.getUnsavedProblemRevision(problemId);
     assert.ok(unsaved, 'Unsaved revision exists');
     assert.equal(
       unsaved.appliedConditionNote,
-      'Constraint: x must be an integer > 0',
+      'Constraint: x must be a prime integer > 2',
       'appliedConditionNote MUST be stored in UnsavedProblemRevision'
     );
+    assert.equal(unsaved.type, 'essay', 'type is stored in UnsavedProblemRevision');
+    assert.deepEqual(unsaved.conceptIds, ['concept-1'], 'conceptIds is stored in UnsavedProblemRevision');
 
     // 3. Server already has this exact revised content (simulating response loss / idempotent retry)
     const remoteProblem = {
       ...testProblem,
       promptText: 'Solve for x under strict constraints',
-      appliedConditionNote: 'Constraint: x must be an integer > 0',
+      appliedConditionNote: 'Constraint: x must be a prime integer > 2',
       version: 2,
     };
 
@@ -21178,7 +21253,7 @@ exports.requireApiUser = async () => {
     const merged = cloudMerge.mergeProblems(
       [remoteProblem],
       storage.loadStoredProblems(),
-      {},
+      { [problemId]: [unsaved.baseSnapshot] },
       new Set([problemId]),
       new Set([problemId]),
       revisionsMap,
@@ -21187,8 +21262,9 @@ exports.requireApiUser = async () => {
     assert.equal(merged[0].qualityStatus !== 'review_after_edit' || capturedRevision?.syncStatus === 'synced', true);
     assert.ok(capturedRevision, 'Revision status updated on match');
     assert.equal(capturedRevision.syncStatus, 'synced', 'Revision marked synced without conflict');
+    assert.equal(merged[0].versionHistory.length, 1, 'No duplicate baseSnapshot in versionHistory after merge');
 
-    // 4. If appliedConditionNote actually differs on remote, it must NOT match
+    // 4. If appliedConditionNote, type, or conceptIds actually differs on remote, it must NOT match
     const differingRemote = {
       ...remoteProblem,
       appliedConditionNote: 'Different constraint: x < 0',
@@ -21198,28 +21274,95 @@ exports.requireApiUser = async () => {
       false,
       'isRevisionMatchingProblem returns false when appliedConditionNote differs'
     );
+    assert.equal(
+      cloudMerge.isRevisionMatchingProblem(unsaved, { ...remoteProblem, type: 'proof' }),
+      false,
+      'isRevisionMatchingProblem returns false when type differs'
+    );
+    assert.equal(
+      cloudMerge.isRevisionMatchingProblem(unsaved, { ...remoteProblem, conceptIds: ['concept-1', 'concept-2'] }),
+      false,
+      'isRevisionMatchingProblem returns false when conceptIds differs'
+    );
 
     // 5. Legacy revision without appliedConditionNote key: backward compatibility
     const legacyRevision = {
       ...unsaved,
     };
     delete legacyRevision.appliedConditionNote;
-    // When legacy revision lacks appliedConditionNote key, but baseSnapshot has the same condition note as remote
+    // 5a. When legacy revision lacks appliedConditionNote key, but baseSnapshot has the same condition note as remote
     legacyRevision.baseSnapshot = {
       ...legacyRevision.baseSnapshot,
-      appliedConditionNote: 'Constraint: x must be an integer > 0',
+      appliedConditionNote: 'Constraint: x must be a prime integer > 2',
     };
     assert.equal(
       cloudMerge.isRevisionMatchingProblem(legacyRevision, remoteProblem),
       true,
       'Legacy revision without appliedConditionNote key is backward compatible via baseSnapshot'
     );
+
+    // 5b. When legacy revision lacks baseSnapshot.appliedConditionNote, but referenceSnapshots (versions table) has it
+    const legacyRevViaHistory = {
+      ...legacyRevision,
+      baseSnapshot: {
+        ...legacyRevision.baseSnapshot,
+      },
+    };
+    delete legacyRevViaHistory.baseSnapshot.appliedConditionNote;
+    assert.equal(
+      cloudMerge.isRevisionMatchingProblem(legacyRevViaHistory, remoteProblem, [
+        {
+          version: 1,
+          promptText: testProblem.promptText,
+          modelAnswer: testProblem.modelAnswer,
+          rubric: testProblem.rubric,
+          hints: testProblem.hints,
+          appliedConditionNote: 'Constraint: x must be a prime integer > 2',
+          editedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ]),
+      true,
+      'Legacy revision without appliedConditionNote is backward compatible via referenceSnapshots (problem_versions)'
+    );
+
+    // 5c. When legacy revision has NO verifiable reference snapshot and remote has non-empty appliedConditionNote:
+    // Must NOT loosely match; must preserve revision and provide Korean guidance
+    assert.equal(
+      cloudMerge.isRevisionMatchingProblem(legacyRevViaHistory, remoteProblem, []),
+      false,
+      'Unverifiable legacy revision does NOT loosely match non-empty remote appliedConditionNote'
+    );
+    let capturedUnverifiableRev = null;
+    const legacyOriginalWithoutSnapCond = storage.loadStoredProblems().map((p) => ({
+      ...p,
+      versionHistory: [],
+    }));
+    cloudMerge.mergeProblems(
+      [remoteProblem],
+      legacyOriginalWithoutSnapCond,
+      {},
+      new Set([problemId]),
+      new Set([problemId]),
+      { [problemId]: { ...legacyRevViaHistory, syncStatus: 'pending' } },
+      (updatedRev) => { capturedUnverifiableRev = updatedRev; }
+    );
+    assert.ok(capturedUnverifiableRev, 'Unverifiable legacy revision is updated to conflict status');
+    assert.equal(capturedUnverifiableRev.syncStatus, 'conflict', 'Unverifiable legacy revision preserved as conflict');
+    assert.ok(
+      capturedUnverifiableRev.syncError && capturedUnverifiableRev.syncError.includes('적용 조건'),
+      'Unverifiable legacy revision provides Korean guidance about appliedConditionNote'
+    );
+    assert.equal(
+      capturedUnverifiableRev.promptText,
+      'Solve for x under strict constraints',
+      'Local revision content is preserved intact in unsavedRevisions'
+    );
   });
 
   // =========================================================================
   // Bug 3 (Regression): Local Storage Failure Return & Input Preservation
   // =========================================================================
-  await checkAsync('Bug 3: Local storage failure return, read-after-write verification, and input preservation', async () => {
+  await checkAsync('Bug 3: Local storage failure return, read-after-write verification, partial failure, retry, and input preservation', async () => {
     storageScope.setStorageScope({ kind: 'user', userId: 'user_bug3_test' });
     storage.resetToInitialDemoData();
 
@@ -21244,7 +21387,10 @@ exports.requireApiUser = async () => {
       version: 1,
     };
     storage.saveStoredProblems([testProblem]);
+    storage.clearInMemoryProblemRevision(problemId);
 
+    const problemsStorageKey = 'redcall_user_user_bug3_test__problems_v1';
+    const revisionsStorageKey = 'redcall_user_user_bug3_test__unsaved_problem_revisions_v1';
     const realSetItem = localStorage.setItem.bind(localStorage);
     const realGetItem = localStorage.getItem.bind(localStorage);
 
@@ -21280,20 +21426,37 @@ exports.requireApiUser = async () => {
       // 3. Clear failure returns false
       const clearRevRes = storage.clearUnsavedProblemRevision(problemId);
       assert.equal(clearRevRes, false, 'clearUnsavedProblemRevision returns false when write fails');
+      const clearAllRevRes = storage.clearAllUnsavedProblemRevisions();
+      assert.equal(clearAllRevRes, false, 'clearAllUnsavedProblemRevisions returns false when write fails');
 
       const clearAdjRes = storage.clearConceptScheduleAdjustment('c-1');
       assert.equal(clearAdjRes, false, 'clearConceptScheduleAdjustment returns false when write fails');
 
-      // 4. editAndReviseProblem returns persisted: false and meaningful error on QuotaExceededError
-      const editRes = storage.editAndReviseProblem(
+      // 4. Total failure in editAndReviseProblem (QuotaExceededError):
+      // Must return success: false, persisted: false, status: 'failed', keep last normal original in localStorage, and keep edit in memory!
+      const editTotalFail = storage.editAndReviseProblem(
         problemId,
         { promptText: 'Updated Prompt While Quota Exceeded' },
         'Quota edit attempt'
       );
-      assert.equal(editRes.persisted, false, 'editAndReviseProblem reports persisted: false on quota error');
+      assert.equal(editTotalFail.success, false, 'editAndReviseProblem returns success: false on total failure');
+      assert.equal(editTotalFail.persisted, false, 'editAndReviseProblem reports persisted: false on quota error');
+      assert.equal(editTotalFail.status, 'failed', 'status is failed');
+      assert.equal(editTotalFail.problemPersisted, false);
+      assert.equal(editTotalFail.revisionPersisted, false);
+      assert.ok(editTotalFail.error && editTotalFail.error.includes('실패'), 'Korean error returned');
+      assert.equal(
+        storage.loadStoredProblems().find((p) => p.id === problemId).promptText,
+        'Original Prompt Text',
+        'Last normal original in localStorage is preserved untouched on total failure'
+      );
+      assert.equal(
+        storage.getInMemoryProblemRevision(problemId)?.promptText,
+        'Updated Prompt While Quota Exceeded',
+        'In-memory fallback holds the unsaved revision separately from persistent storage'
+      );
 
       // 5. Read-after-write mismatch / corruption detection
-      // Simulate silent storage failure where setItem does not throw, but getItem returns null or corrupted value
       localStorage.setItem = () => {}; // silently drops write!
       const saveSilentFail = storage.saveUnsavedProblemRevision({
         problemId,
@@ -21312,9 +21475,142 @@ exports.requireApiUser = async () => {
       });
       assert.equal(saveSilentFail, false, 'Read-after-write verification catches silent drop and returns false');
 
+      // 6. Partial failure A: 본문만 성공 (problems_v1 succeeds, unsaved_problem_revisions_v1 fails)
+      storage.clearInMemoryProblemRevision(problemId);
+      localStorage.setItem = (key, value) => {
+        if (key === revisionsStorageKey) {
+          const err = new Error('Quota exceeded on revisions');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+        realSetItem(key, value);
+      };
+      const partialProblemOnly = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Prompt Body Saved Only' },
+        'Partial body only'
+      );
+      assert.equal(partialProblemOnly.success, false, 'Partial failure (problem only) is NOT reported as full success');
+      assert.equal(partialProblemOnly.persisted, false, 'persisted is false on partial failure');
+      assert.equal(partialProblemOnly.partialFailure, true, 'partialFailure flag is true');
+      assert.equal(partialProblemOnly.status, 'partial_problem_only');
+      assert.equal(partialProblemOnly.problemPersisted, true);
+      assert.equal(partialProblemOnly.revisionPersisted, false);
+      assert.ok(partialProblemOnly.error && partialProblemOnly.error.includes('부분 완료'), 'Korean partial completion message');
+
+      // Retry after partial_problem_only when storage is restored: must NOT bump to v3!
+      localStorage.setItem = realSetItem;
+      const retryAfterProblemOnly = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Prompt Body Saved Only' },
+        'Partial body only'
+      );
+      assert.equal(retryAfterProblemOnly.success, true, 'Retry after partial_problem_only succeeds');
+      assert.equal(retryAfterProblemOnly.persisted, true);
+      assert.equal(retryAfterProblemOnly.status, 'complete');
+      const storedAfterRetryA = storage.loadStoredProblems().find((p) => p.id === problemId);
+      const revAfterRetryA = storage.getUnsavedProblemRevision(problemId);
+      assert.equal(storedAfterRetryA.version, 2, 'Retry after partial_problem_only stays at v2 (does not skip to v3)');
+      assert.equal(storedAfterRetryA.versionHistory.length, 1, 'v1 snapshot preserved in versionHistory');
+      assert.equal(revAfterRetryA.baseVersion, 1, 'baseVersion preserved as 1');
+      assert.equal(revAfterRetryA.revisionVersion, 2, 'revisionVersion preserved as 2');
+
+      // 7. Partial failure B: 수정본만 성공 (unsaved_problem_revisions_v1 succeeds, problems_v1 fails)
+      // Reset to clean v1 first
+      storage.clearAllUnsavedProblemRevisions();
+      storage.saveStoredProblems([testProblem]);
+      localStorage.setItem = (key, value) => {
+        if (key === problemsStorageKey) {
+          const err = new Error('Quota exceeded on problems');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+        realSetItem(key, value);
+      };
+      const partialRevisionOnly = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Revision Saved Only' },
+        'Partial revision only'
+      );
+      assert.equal(partialRevisionOnly.success, false, 'Partial failure (revision only) is NOT reported as full success');
+      assert.equal(partialRevisionOnly.persisted, false);
+      assert.equal(partialRevisionOnly.partialFailure, true);
+      assert.equal(partialRevisionOnly.status, 'partial_revision_only');
+      assert.equal(partialRevisionOnly.problemPersisted, false);
+      assert.equal(partialRevisionOnly.revisionPersisted, true);
+      assert.equal(
+        storage.loadStoredProblems().find((p) => p.id === problemId).version,
+        1,
+        'Stored problem in problems_v1 remains at last normal original (v1)'
+      );
+
+      // Retry after partial_revision_only when storage is restored: must persist problems_v1 at v2 WITH v1 versionHistory!
+      localStorage.setItem = realSetItem;
+      const retryAfterRevisionOnly = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Revision Saved Only' },
+        'Partial revision only'
+      );
+      assert.equal(retryAfterRevisionOnly.success, true, 'Retry after partial_revision_only succeeds');
+      assert.equal(retryAfterRevisionOnly.persisted, true);
+      assert.equal(retryAfterRevisionOnly.status, 'complete');
+      const storedAfterRetryB = storage.loadStoredProblems().find((p) => p.id === problemId);
+      const revAfterRetryB = storage.getUnsavedProblemRevision(problemId);
+      assert.equal(storedAfterRetryB.version, 2, 'Retry after partial_revision_only converges to v2');
+      assert.equal(storedAfterRetryB.versionHistory.length, 1, 'v1 snapshot is NOT lost on retry after partial_revision_only');
+      assert.equal(storedAfterRetryB.versionHistory[0].promptText, 'Original Prompt Text');
+      assert.equal(revAfterRetryB.baseVersion, 1);
+      assert.equal(revAfterRetryB.revisionVersion, 2);
+
+      // 8. Late response / stale generation & revisionId guard + account scope isolation
+      const gen1Id = revAfterRetryB.revisionId;
+      const gen1Num = revAfterRetryB.generation;
+      const secondEdit = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Newer Edit Gen 2' },
+        'Second consecutive edit'
+      );
+      assert.equal(secondEdit.success, true);
+      const revGen2 = storage.getUnsavedProblemRevision(problemId);
+      assert.equal(revGen2.generation, gen1Num + 1);
+
+      // Late server response for Gen 1 tries to clear or update using Gen 1 revisionId/generation: must be rejected!
+      assert.equal(
+        storage.clearUnsavedProblemRevision(problemId, { revisionId: gen1Id, generation: gen1Num }),
+        false,
+        'Late response with stale revisionId/generation must NOT delete newer revision'
+      );
+      assert.equal(
+        storage.saveUnsavedProblemRevision(
+          { ...revAfterRetryB, syncStatus: 'synced' },
+          { onlyIfRevisionId: gen1Id, onlyIfGeneration: gen1Num }
+        ),
+        false,
+        'Late response with stale revisionId/generation must NOT overwrite newer revision status'
+      );
+      assert.equal(
+        storage.getUnsavedProblemRevision(problemId)?.promptText,
+        'Newer Edit Gen 2',
+        'Newer revision remains intact after late response'
+      );
+
+      // Account scope isolation
+      storageScope.setStorageScope({ kind: 'user', userId: 'user_bug3_other_account' });
+      assert.equal(
+        storage.getUnsavedProblemRevision(problemId),
+        null,
+        'Another account cannot see user_bug3_test unsaved revision'
+      );
+      assert.equal(
+        storage.getInMemoryProblemRevision(problemId),
+        null,
+        'Another account cannot see user_bug3_test in-memory revision'
+      );
+      storageScope.setStorageScope({ kind: 'user', userId: 'user_bug3_test' });
     } finally {
       localStorage.setItem = realSetItem;
       localStorage.getItem = realGetItem;
+      storageScope.setStorageScope({ kind: 'legacy' });
     }
   });
 

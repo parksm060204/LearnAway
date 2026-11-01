@@ -76,7 +76,7 @@ begin
     raise exception 'NO_CONCEPT_LINK' using errcode = 'P0001';
   end if;
 
-  -- Comprehensive semantic equality check including codeSnippet, mathFormula, and timeStandardMinutes
+  -- Comprehensive semantic equality check including codeSnippet, mathFormula, timeStandardMinutes, type, and condition fields
   v_same :=
     coalesce(p_problem->>'title', '') = coalesce(pr.payload->>'title', '')
     and coalesce(p_problem->>'promptText', '') = coalesce(pr.payload->>'promptText', '')
@@ -87,8 +87,12 @@ begin
     and coalesce(p_problem->>'appliedConditionNote', '') = coalesce(pr.payload->>'appliedConditionNote', '')
     and coalesce(p_problem->>'mathFormula', '') = coalesce(pr.payload->>'mathFormula', '')
     and coalesce(p_problem->>'codeSnippet', '') = coalesce(pr.payload->>'codeSnippet', '')
-    and coalesce((p_problem->>'timeStandardMinutes')::numeric, 0) = coalesce((pr.payload->>'timeStandardMinutes')::numeric, 0)
-    and coalesce(p_problem->>'type', '') = coalesce(pr.payload->>'type', pr.type, '');
+    and coalesce(nullif(trim(p_problem->>'timeStandardMinutes'), '')::numeric, 0) = coalesce(nullif(trim(pr.payload->>'timeStandardMinutes'), '')::numeric, 0)
+    and coalesce(p_problem->>'type', '') = coalesce(pr.payload->>'type', pr.type, '')
+    and coalesce(p_problem->>'designIntent', '') = coalesce(pr.payload->>'designIntent', '')
+    and coalesce(p_problem->>'originalCondition', '') = coalesce(pr.payload->>'originalCondition', '')
+    and coalesce(p_problem->>'newCondition', '') = coalesce(pr.payload->>'newCondition', '')
+    and coalesce(p_problem->>'transferChanges', '') = coalesce(pr.payload->>'transferChanges', '');
 
   if v_same then
     -- Idempotent retry: align payload version to existing pr.version
@@ -100,6 +104,11 @@ begin
       quality_status = coalesce(p_problem->>'qualityStatus', quality_status),
       updated_at = now()
     where id = p_problem_id and user_id = auth.uid();
+
+    insert into public.problem_versions (user_id, problem_id, subject_id, version, snapshot)
+    values (auth.uid(), p_problem_id, pr.subject_id, pr.version, v_payload)
+    on conflict (problem_id, version, user_id) do nothing;
+
     return pr.version;
   end if;
 
@@ -155,19 +164,80 @@ language sql
 security definer
 set search_path = public
 as $$
+  -- 1. Row version vs payload.version mismatch or missing payload.version
   select
     p.id as problem_id,
     p.user_id,
     p.version as row_version,
-    (p.payload->>'version')::integer as payload_version,
+    nullif(trim(p.payload->>'version'), '')::integer as payload_version,
     case
       when p.payload->>'version' is null then 'PAYLOAD_VERSION_MISSING'
-      when p.version <> (p.payload->>'version')::integer then 'ROW_PAYLOAD_VERSION_MISMATCH'
+      when p.version <> nullif(trim(p.payload->>'version'), '')::integer then 'ROW_PAYLOAD_VERSION_MISMATCH'
       else 'OK'
     end as issue_type
   from public.problems p
   where p.payload->>'version' is null
-     or p.version <> (p.payload->>'version')::integer;
+     or p.version <> nullif(trim(p.payload->>'version'), '')::integer
+
+  union all
+
+  -- 2. Current problem payload differs from its matching version snapshot in problem_versions
+  --    (e.g. caused by legacy revise_problem mutating codeSnippet, mathFormula, or timeStandardMinutes in-place)
+  select
+    p.id as problem_id,
+    p.user_id,
+    p.version as row_version,
+    nullif(trim(pv.snapshot->>'version'), '')::integer as payload_version,
+    'CURRENT_SNAPSHOT_CONTENT_MISMATCH' as issue_type
+  from public.problems p
+  join public.problem_versions pv
+    on pv.problem_id = p.id
+   and pv.user_id = p.user_id
+   and pv.version = p.version
+  where
+    coalesce(p.payload->>'title', '') <> coalesce(pv.snapshot->>'title', '')
+    or coalesce(p.payload->>'promptText', '') <> coalesce(pv.snapshot->>'promptText', '')
+    or coalesce(p.payload->>'modelAnswer', '') <> coalesce(pv.snapshot->>'modelAnswer', '')
+    or coalesce(p.payload->'rubric', '[]'::jsonb) <> coalesce(pv.snapshot->'rubric', '[]'::jsonb)
+    or coalesce(p.payload->'hints', '[]'::jsonb) <> coalesce(pv.snapshot->'hints', '[]'::jsonb)
+    or coalesce(p.payload->'conceptIds', '[]'::jsonb) <> coalesce(pv.snapshot->'conceptIds', '[]'::jsonb)
+    or coalesce(p.payload->>'appliedConditionNote', '') <> coalesce(pv.snapshot->>'appliedConditionNote', '')
+    or coalesce(p.payload->>'mathFormula', '') <> coalesce(pv.snapshot->>'mathFormula', '')
+    or coalesce(p.payload->>'codeSnippet', '') <> coalesce(pv.snapshot->>'codeSnippet', '')
+    or coalesce(nullif(trim(p.payload->>'timeStandardMinutes'), '')::numeric, 0) <> coalesce(nullif(trim(pv.snapshot->>'timeStandardMinutes'), '')::numeric, 0)
+    or coalesce(p.payload->>'type', p.type, '') <> coalesce(pv.snapshot->>'type', '')
+
+  union all
+
+  -- 3. Snapshot row version disagrees with snapshot->>'version'
+  select
+    pv.problem_id,
+    pv.user_id,
+    pv.version as row_version,
+    nullif(trim(pv.snapshot->>'version'), '')::integer as payload_version,
+    'SNAPSHOT_VERSION_MISMATCH' as issue_type
+  from public.problem_versions pv
+  where pv.snapshot->>'version' is not null
+    and pv.version <> nullif(trim(pv.snapshot->>'version'), '')::integer
+
+  union all
+
+  -- 4. Problem at version > 1 missing its current version snapshot in problem_versions
+  select
+    p.id as problem_id,
+    p.user_id,
+    p.version as row_version,
+    nullif(trim(p.payload->>'version'), '')::integer as payload_version,
+    'MISSING_CURRENT_VERSION_SNAPSHOT' as issue_type
+  from public.problems p
+  where p.version > 1
+    and not exists (
+      select 1
+      from public.problem_versions pv
+      where pv.problem_id = p.id
+        and pv.user_id = p.user_id
+        and pv.version = p.version
+    );
 $$;
 
 -- Grant execution to authenticated users for revise_problem and service_role for diagnostics

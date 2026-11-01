@@ -734,6 +734,8 @@ export interface UnsavedProblemRevision {
   revisionVersion: number;
   title: string;
   promptText: string;
+  type?: ProblemType;
+  conceptIds?: string[];
   mathFormula?: string;
   codeSnippet?: string;
   hints: string[];

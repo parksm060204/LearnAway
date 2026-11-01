@@ -1967,43 +1967,88 @@ export function dismissProblemReport(
  * Edits problem content, archiving current version into versionHistory and incrementing version number.
  * Sets qualityStatus to 'review_after_edit' pending re-approval.
  */
+export type ReviseProblemSaveStatus =
+  | 'complete'
+  | 'partial_revision_only'
+  | 'partial_problem_only'
+  | 'failed';
+
 export function editAndReviseProblem(
   problemId: string,
   updates: Partial<Problem>,
   editReason: string
 ): {
   success: boolean;
-  persisted?: boolean;
-  partialFailure?: boolean;
+  status: ReviseProblemSaveStatus;
+  persisted: boolean;
+  partialFailure: boolean;
+  problemPersisted: boolean;
+  revisionPersisted: boolean;
   updatedProblems: Problem[];
   updatedProblem: Problem | null;
+  memoryProblem: Problem | null;
+  memoryRevision: UnsavedProblemRevision | null;
   error?: string;
 } {
   const problems = loadStoredProblems();
   const target = problems.find((p) => p.id === problemId);
   if (!target) {
-    return { success: false, persisted: false, updatedProblems: problems, updatedProblem: null, error: '문제를 찾을 수 없습니다.' };
+    return {
+      success: false,
+      status: 'failed',
+      persisted: false,
+      partialFailure: false,
+      problemPersisted: false,
+      revisionPersisted: false,
+      updatedProblems: problems,
+      updatedProblem: null,
+      memoryProblem: null,
+      memoryRevision: null,
+      error: '문제를 찾을 수 없습니다.',
+    };
   }
 
   const trimmedReason = editReason.trim();
   if (!trimmedReason) {
-    return { success: false, persisted: false, updatedProblems: problems, updatedProblem: null, error: '수정 사유 및 변경 내용을 입력해 주세요.' };
+    return {
+      success: false,
+      status: 'failed',
+      persisted: false,
+      partialFailure: false,
+      problemPersisted: false,
+      revisionPersisted: false,
+      updatedProblems: problems,
+      updatedProblem: null,
+      memoryProblem: null,
+      memoryRevision: null,
+      error: '수정 사유 및 변경 내용을 입력해 주세요.',
+    };
   }
 
+  const now = new Date().toISOString();
   const currentVersion = target.version || 1;
   const snapshot: ProblemVersionSnapshot = {
     version: currentVersion,
     title: target.title,
     promptText: target.promptText,
+    type: target.type,
+    conceptIds: [...(target.conceptIds || [])],
     mathFormula: target.mathFormula,
     codeSnippet: target.codeSnippet,
     timeStandardMinutes: target.timeStandardMinutes,
     appliedConditionNote: target.appliedConditionNote,
-    hints: [...target.hints],
+    hints: [...(target.hints || [])],
     modelAnswer: target.modelAnswer,
-    rubric: [...target.rubric],
-    editedAt: new Date().toISOString(),
+    rubric: [...(target.rubric || [])],
+    editedAt: now,
     editReason: trimmedReason,
+    difficultyLevel: target.difficultyLevel ?? (target.difficulty ? toAcademicDifficultyLevel(target.difficulty) : undefined),
+    sourceMaterialId: target.sourceMaterialId,
+    sourceConceptIds: target.sourceConceptIds ? [...target.sourceConceptIds] : undefined,
+    sourceExcerpt: target.sourceExcerpt,
+    sourcePage: target.sourcePage,
+    sourceContentVersion: target.sourceContentVersion,
+    sourceVerificationStatus: target.sourceVerificationStatus,
   };
 
   const existingUnsaved = getUnsavedProblemRevision(problemId);
@@ -2012,21 +2057,95 @@ export function editAndReviseProblem(
     (existingUnsaved.syncStatus === 'pending' || existingUnsaved.syncStatus === 'failed' || existingUnsaved.syncStatus === 'syncing')
   );
 
-  const baseVersion = isUnsyncedEdit ? existingUnsaved!.baseVersion : currentVersion;
-  const baseSnapshot = isUnsyncedEdit && existingUnsaved?.baseSnapshot ? existingUnsaved.baseSnapshot : snapshot;
+  // Detect if previous attempt was a partial_problem_only save (problem body updated in storage, but unsaved revision failed)
+  const hasUnrecordedLocalEdit = Boolean(
+    !isUnsyncedEdit &&
+    target.qualityStatus === 'review_after_edit' &&
+    currentVersion > 1 &&
+    target.versionHistory &&
+    target.versionHistory.length > 0 &&
+    target.versionHistory[0].version === currentVersion - 1
+  );
 
-  const nextVersion = currentVersion + 1;
-  const now = new Date().toISOString();
-  const nextGen = (existingUnsaved?.generation ?? (existingUnsaved ? 1 : 0)) + 1;
-  const newRevisionId = `rev-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  let baseVersion: number;
+  let baseSnapshot: ProblemVersionSnapshot;
+  let nextVersion: number;
+  let nextGen: number;
+  let newRevisionId: string;
+  let nextVersionHistory: ProblemVersionSnapshot[];
+
+  const candidateMerged: Problem = {
+    ...target,
+    ...updates,
+  };
+
+  if (isUnsyncedEdit) {
+    baseVersion = existingUnsaved!.baseVersion;
+    baseSnapshot = existingUnsaved!.baseSnapshot ?? snapshot;
+
+    // Check if previous attempt was partial_revision_only (target in problems_v1 is still at baseVersion)
+    const isRetryAfterPartialRevisionOnly = currentVersion <= existingUnsaved!.baseVersion;
+    const existingRevAsProblem: Problem = {
+      ...target,
+      title: existingUnsaved!.title,
+      promptText: existingUnsaved!.promptText,
+      type: existingUnsaved!.type ?? target.type,
+      conceptIds: existingUnsaved!.conceptIds ?? target.conceptIds,
+      mathFormula: existingUnsaved!.mathFormula,
+      codeSnippet: existingUnsaved!.codeSnippet,
+      hints: existingUnsaved!.hints,
+      modelAnswer: existingUnsaved!.modelAnswer,
+      rubric: existingUnsaved!.rubric,
+      timeStandardMinutes: existingUnsaved!.timeStandardMinutes ?? target.timeStandardMinutes,
+      appliedConditionNote: existingUnsaved!.appliedConditionNote !== undefined
+        ? existingUnsaved!.appliedConditionNote
+        : target.appliedConditionNote,
+    };
+    const isSameAsExistingUnsaved =
+      getProblemEvaluationSignature(candidateMerged) === getProblemEvaluationSignature(existingRevAsProblem) &&
+      existingUnsaved!.editReason === trimmedReason;
+
+    if (isRetryAfterPartialRevisionOnly) {
+      nextVersion = existingUnsaved!.revisionVersion;
+      nextGen = isSameAsExistingUnsaved
+        ? (existingUnsaved!.generation ?? 1)
+        : (existingUnsaved!.generation ?? 1) + 1;
+      newRevisionId = isSameAsExistingUnsaved && existingUnsaved!.revisionId
+        ? existingUnsaved!.revisionId
+        : `rev-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    } else {
+      nextVersion = currentVersion + 1;
+      nextGen = (existingUnsaved!.generation ?? 1) + 1;
+      newRevisionId = `rev-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    }
+
+    const existingHist = target.versionHistory || [];
+    const hasBaseSnap = existingHist.some((s) => s.version === baseSnapshot.version);
+    nextVersionHistory = hasBaseSnap ? existingHist : [baseSnapshot, ...existingHist];
+  } else if (hasUnrecordedLocalEdit) {
+    // Recovering from partial_problem_only state where problem body was already bumped to currentVersion
+    baseSnapshot = target.versionHistory![0];
+    baseVersion = baseSnapshot.version;
+    const isSameAsTarget =
+      getProblemEvaluationSignature(candidateMerged) === getProblemEvaluationSignature(target);
+    nextVersion = isSameAsTarget ? currentVersion : currentVersion + 1;
+    nextGen = (existingUnsaved?.generation ?? 0) + 1;
+    newRevisionId = `rev-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    nextVersionHistory = target.versionHistory!;
+  } else {
+    baseVersion = currentVersion;
+    baseSnapshot = snapshot;
+    nextVersion = currentVersion + 1;
+    nextGen = (existingUnsaved?.generation ?? (existingUnsaved ? 1 : 0)) + 1;
+    newRevisionId = `rev-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    nextVersionHistory = [snapshot, ...(target.versionHistory || [])];
+  }
 
   const updatedProblem: Problem = {
     ...target,
     ...updates,
     version: nextVersion,
-    versionHistory: isUnsyncedEdit
-      ? target.versionHistory
-      : [snapshot, ...(target.versionHistory || [])],
+    versionHistory: nextVersionHistory,
     qualityStatus: 'review_after_edit',
     lastReviewedAt: now,
     reviewNotes: `v${nextVersion} 수정 완료: ${trimmedReason}`,
@@ -2040,11 +2159,13 @@ export function editAndReviseProblem(
     revisionVersion: nextVersion,
     title: updatedProblem.title,
     promptText: updatedProblem.promptText,
+    type: updatedProblem.type,
+    conceptIds: [...(updatedProblem.conceptIds || [])],
     mathFormula: updatedProblem.mathFormula,
     codeSnippet: updatedProblem.codeSnippet,
-    hints: updatedProblem.hints || [],
+    hints: [...(updatedProblem.hints || [])],
     modelAnswer: updatedProblem.modelAnswer,
-    rubric: updatedProblem.rubric || [],
+    rubric: [...(updatedProblem.rubric || [])],
     timeStandardMinutes: updatedProblem.timeStandardMinutes,
     appliedConditionNote: updatedProblem.appliedConditionNote,
     editReason: trimmedReason,
@@ -2053,29 +2174,59 @@ export function editAndReviseProblem(
     baseSnapshot,
   };
 
-  // Protect revisions: persist the protected revision record first
-  const revisionPersisted = saveUnsavedProblemRevision(newRevision);
+  // Record in-memory fallback separately from browser persistence
+  setInMemoryProblemRevision(newRevision);
 
-  const updatedProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
-  let problemsPersisted = false;
-  if (revisionPersisted) {
-    problemsPersisted = saveStoredProblems(updatedProblems);
-  }
+  // Attempt both persistent writes and verify each via read-after-write re-query
+  const revWriteOk = saveUnsavedProblemRevision(newRevision);
+  const verifiedRev = getUnsavedProblemRevision(problemId);
+  const revisionPersisted = Boolean(
+    revWriteOk &&
+    verifiedRev &&
+    verifiedRev.revisionId === newRevision.revisionId &&
+    verifiedRev.revisionVersion === newRevision.revisionVersion &&
+    verifiedRev.baseVersion === newRevision.baseVersion
+  );
 
-  const allPersisted = revisionPersisted && problemsPersisted;
-  const partialFailure = (revisionPersisted && !problemsPersisted) || (!revisionPersisted && problemsPersisted);
+  const candidateProblems = problems.map((p) => (p.id === problemId ? updatedProblem : p));
+  const probWriteOk = saveStoredProblems(candidateProblems);
+  const reloadedProblems = loadStoredProblems();
+  const verifiedProb = reloadedProblems.find((p) => p.id === problemId);
+  const problemPersisted = Boolean(
+    probWriteOk &&
+    verifiedProb &&
+    verifiedProb.version === updatedProblem.version &&
+    problemContentMatches(verifiedProb, updatedProblem)
+  );
+
+  const allPersisted = revisionPersisted && problemPersisted;
+  const partialFailure = (revisionPersisted && !problemPersisted) || (!revisionPersisted && problemPersisted);
+  const status: ReviseProblemSaveStatus = allPersisted
+    ? 'complete'
+    : revisionPersisted
+      ? 'partial_revision_only'
+      : problemPersisted
+        ? 'partial_problem_only'
+        : 'failed';
 
   return {
-    success: true,
+    success: allPersisted,
+    status,
     persisted: allPersisted,
     partialFailure,
-    updatedProblems,
-    updatedProblem,
+    problemPersisted,
+    revisionPersisted,
+    updatedProblems: reloadedProblems,
+    updatedProblem: problemPersisted ? (verifiedProb ?? updatedProblem) : null,
+    memoryProblem: updatedProblem,
+    memoryRevision: newRevision,
     error: allPersisted
       ? undefined
-      : partialFailure
-        ? '문제 수정본이 보호 기록에 저장되었으나 본문 저장소 동기화 중 용량 오류가 발생했습니다. (메모리 보관 중)'
-        : '브라우저 저장 공간 부족 (QuotaExceededError)으로 로컬 영속화에 실패했습니다. (메모리 임시 보관 중)',
+      : status === 'partial_revision_only'
+        ? '부분 완료: 보호 수정본은 저장되었으나 문제 본문 저장소 동기화에 실패했습니다. 편집기 입력과 마지막 정상 원본은 유지되었으니 다시 시도해 주세요.'
+        : status === 'partial_problem_only'
+          ? '부분 완료: 문제 본문은 저장되었으나 미동기화 보호 수정본 기록에 실패했습니다. 편집기 입력은 유지되었으니 다시 시도해 주세요.'
+          : '브라우저 저장 공간 부족(QuotaExceededError) 또는 쓰기 오류로 로컬 영속 저장에 실패했습니다. 편집기 입력과 마지막 정상 원본은 유지되었으니 다시 시도해 주세요.',
   };
 }
 
@@ -2977,8 +3128,53 @@ export function getAttemptById(attemptId: string): Attempt | null {
 }
 
 // ---------------------------------------------------------------------------
-// Unsaved Problem Revisions (Bug 1)
+// Unsaved Problem Revisions (Bug 1, Bug 2 & Bug 3)
 // ---------------------------------------------------------------------------
+
+// Separate in-memory revision buffer keyed by scoped storage key,
+// strictly distinguished from browser localStorage persistence.
+const inMemoryRevisionFallback: Record<string, Record<string, UnsavedProblemRevision>> = {};
+
+function getScopedInMemoryRevisionMap(): Record<string, UnsavedProblemRevision> {
+  const key = scopedStorageKey(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS);
+  if (!inMemoryRevisionFallback[key]) {
+    inMemoryRevisionFallback[key] = {};
+  }
+  return inMemoryRevisionFallback[key];
+}
+
+export function setInMemoryProblemRevision(revision: UnsavedProblemRevision): void {
+  const map = getScopedInMemoryRevisionMap();
+  map[revision.problemId] = revision;
+}
+
+export function getInMemoryProblemRevision(problemId: string): UnsavedProblemRevision | null {
+  const map = getScopedInMemoryRevisionMap();
+  return map[problemId] || null;
+}
+
+export function clearInMemoryProblemRevision(problemId: string): void {
+  const map = getScopedInMemoryRevisionMap();
+  delete map[problemId];
+}
+
+function revisionRecordMatches(a: UnsavedProblemRevision, b: UnsavedProblemRevision): boolean {
+  return (
+    a.problemId === b.problemId &&
+    (a.revisionId ?? '') === (b.revisionId ?? '') &&
+    (a.generation ?? 0) === (b.generation ?? 0) &&
+    a.baseVersion === b.baseVersion &&
+    a.revisionVersion === b.revisionVersion &&
+    a.syncStatus === b.syncStatus &&
+    a.title === b.title &&
+    a.promptText === b.promptText &&
+    a.modelAnswer === b.modelAnswer &&
+    (a.appliedConditionNote ?? '') === (b.appliedConditionNote ?? '') &&
+    (a.mathFormula ?? '') === (b.mathFormula ?? '') &&
+    (a.codeSnippet ?? '') === (b.codeSnippet ?? '') &&
+    (a.timeStandardMinutes ?? 0) === (b.timeStandardMinutes ?? 0)
+  );
+}
 
 export function loadUnsavedProblemRevisions(): Record<string, UnsavedProblemRevision> {
   return safeGetItem<Record<string, UnsavedProblemRevision>>(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
@@ -3022,7 +3218,14 @@ export function saveUnsavedProblemRevision(
     }
   }
   all[revision.problemId] = revision;
-  return safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+  const wrote = safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+  if (!wrote) return false;
+  const readBack = getUnsavedProblemRevision(revision.problemId);
+  if (!readBack || !revisionRecordMatches(readBack, revision)) {
+    return false;
+  }
+  setInMemoryProblemRevision(revision);
+  return true;
 }
 
 export function clearUnsavedProblemRevision(
@@ -3041,11 +3244,101 @@ export function clearUnsavedProblemRevision(
     }
   }
   delete all[problemId];
-  return safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+  const wrote = safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+  if (!wrote) return false;
+  if (getUnsavedProblemRevision(problemId) !== null) {
+    return false;
+  }
+  clearInMemoryProblemRevision(problemId);
+  return true;
 }
 
 export function clearAllUnsavedProblemRevisions(): boolean {
-  return safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
+  const wrote = safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
+  if (!wrote) return false;
+  const remaining = loadUnsavedProblemRevisions();
+  if (Object.keys(remaining).length > 0) return false;
+  const key = scopedStorageKey(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS);
+  delete inMemoryRevisionFallback[key];
+  return true;
+}
+
+export interface LocalProblemVersionInconsistency {
+  problemId: string;
+  rowVersion: number;
+  snapshotVersion?: number;
+  issueType:
+    | 'CURRENT_SNAPSHOT_CONTENT_MISMATCH'
+    | 'DUPLICATE_HISTORY_VERSION'
+    | 'HISTORY_VERSION_GTE_CURRENT';
+  details: string;
+}
+
+/**
+ * Read-only diagnostic helper to detect version/snapshot inconsistencies in local or merged problems
+ * without mutating any historical snapshots or problem records.
+ */
+export function detectLocalProblemVersionInconsistencies(
+  problems: Problem[] = loadStoredProblems(),
+  serverSnapshots: Record<string, ProblemVersionSnapshot[]> = {}
+): LocalProblemVersionInconsistency[] {
+  const issues: LocalProblemVersionInconsistency[] = [];
+  for (const p of problems) {
+    const ver = p.version ?? 1;
+    const history = p.versionHistory || [];
+    const seenVersions = new Set<number>();
+    for (const snap of history) {
+      if (seenVersions.has(snap.version)) {
+        issues.push({
+          problemId: p.id,
+          rowVersion: ver,
+          snapshotVersion: snap.version,
+          issueType: 'DUPLICATE_HISTORY_VERSION',
+          details: `문제 ${p.id}의 versionHistory에 v${snap.version} 스냅샷이 중복 존재합니다.`,
+        });
+      }
+      seenVersions.add(snap.version);
+      if (snap.version >= ver) {
+        issues.push({
+          problemId: p.id,
+          rowVersion: ver,
+          snapshotVersion: snap.version,
+          issueType: 'HISTORY_VERSION_GTE_CURRENT',
+          details: `문제 ${p.id}(현재 v${ver})의 과거 이력에 현재 버전 이상인 v${snap.version} 스냅샷이 포함되어 있습니다.`,
+        });
+      }
+    }
+
+    const remoteSnaps = serverSnapshots[p.id] || [];
+    const matchingSnap = remoteSnaps.find((s) => s.version === ver);
+    if (matchingSnap) {
+      const snapSig = getProblemEvaluationSignature({
+        type: matchingSnap.type ?? p.type,
+        conceptIds: matchingSnap.conceptIds ?? p.conceptIds,
+        title: matchingSnap.title,
+        promptText: matchingSnap.promptText,
+        appliedConditionNote: matchingSnap.appliedConditionNote,
+        mathFormula: matchingSnap.mathFormula,
+        codeSnippet: matchingSnap.codeSnippet,
+        modelAnswer: matchingSnap.modelAnswer,
+        hints: matchingSnap.hints || [],
+        rubric: matchingSnap.rubric || [],
+        timeStandardMinutes: matchingSnap.timeStandardMinutes ?? p.timeStandardMinutes,
+        designIntent: p.designIntent,
+      });
+      const curSig = getProblemEvaluationSignature(p);
+      if (snapSig !== curSig) {
+        issues.push({
+          problemId: p.id,
+          rowVersion: ver,
+          snapshotVersion: matchingSnap.version,
+          issueType: 'CURRENT_SNAPSHOT_CONTENT_MISMATCH',
+          details: `문제 ${p.id}(v${ver})의 현재 본문과 v${matchingSnap.version} 버전 스냅샷의 평가 필드가 불일치합니다.`,
+        });
+      }
+    }
+  }
+  return issues;
 }
 
 // ---------------------------------------------------------------------------
@@ -3067,13 +3360,22 @@ export function saveConceptScheduleAdjustment(
   postponedUntil?: string
 ): boolean {
   const all = loadConceptScheduleAdjustments();
-  all[conceptId] = {
+  const nextRecord: ConceptScheduleAdjustment = {
     conceptId,
     postponeDays,
     postponedUntil,
     updatedAt: new Date().toISOString(),
   };
-  return safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+  all[conceptId] = nextRecord;
+  const wrote = safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+  if (!wrote) return false;
+  const verified = getConceptScheduleAdjustment(conceptId);
+  return Boolean(
+    verified &&
+    verified.conceptId === conceptId &&
+    verified.postponeDays === postponeDays &&
+    (verified.postponedUntil ?? '') === (postponedUntil ?? '')
+  );
 }
 
 export function clearConceptScheduleAdjustment(
@@ -3089,10 +3391,12 @@ export function clearConceptScheduleAdjustment(
     }
   }
   delete all[conceptId];
-  return safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+  const wrote = safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, all);
+  if (!wrote) return false;
+  return getConceptScheduleAdjustment(conceptId) === null;
 }
 
-export function clearAllConceptScheduleAdjustments(): void {
-  safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, {});
+export function clearAllConceptScheduleAdjustments(): boolean {
+  return safeSetItem(STORAGE_KEYS.CONCEPT_SCHEDULE_ADJUSTMENTS, {});
 }
 

@@ -12,16 +12,80 @@ function normalizeCode(val?: string | null): string {
   return val.replace(/\r\n/g, '\n').replace(/^\n+|\n+$/g, '');
 }
 
+function findMatchingHistorySnapshot(
+  unsaved: {
+    baseVersion?: number;
+    revisionVersion?: number;
+  },
+  referenceSnapshots?: ProblemVersionSnapshot[]
+): ProblemVersionSnapshot | undefined {
+  if (!referenceSnapshots || referenceSnapshots.length === 0) return undefined;
+  if (unsaved.baseVersion !== undefined) {
+    const byBase = referenceSnapshots.find((s) => s && s.version === unsaved.baseVersion);
+    if (byBase) return byBase;
+  }
+  if (unsaved.revisionVersion !== undefined) {
+    const byRev = referenceSnapshots.find((s) => s && s.version === unsaved.revisionVersion);
+    if (byRev) return byRev;
+  }
+  return undefined;
+}
+
+function resolveReferenceSnapshot(
+  unsaved: {
+    baseVersion?: number;
+    revisionVersion?: number;
+    baseSnapshot?: ProblemVersionSnapshot;
+  },
+  referenceSnapshots?: ProblemVersionSnapshot[]
+): ProblemVersionSnapshot | undefined {
+  const fromHistory = findMatchingHistorySnapshot(unsaved, referenceSnapshots);
+  if (unsaved.baseSnapshot && fromHistory) {
+    return {
+      ...fromHistory,
+      ...unsaved.baseSnapshot,
+      type: unsaved.baseSnapshot.type ?? fromHistory.type,
+      conceptIds: unsaved.baseSnapshot.conceptIds ?? fromHistory.conceptIds,
+      appliedConditionNote: unsaved.baseSnapshot.appliedConditionNote ?? fromHistory.appliedConditionNote,
+    };
+  }
+  return unsaved.baseSnapshot ?? fromHistory;
+}
+
+function hasVerifiableConditionNote(
+  unsaved: {
+    appliedConditionNote?: string;
+    baseVersion?: number;
+    revisionVersion?: number;
+    baseSnapshot?: ProblemVersionSnapshot;
+  },
+  referenceSnapshots?: ProblemVersionSnapshot[]
+): { verifiable: boolean; value?: string } {
+  if ('appliedConditionNote' in unsaved && unsaved.appliedConditionNote !== undefined) {
+    return { verifiable: true, value: unsaved.appliedConditionNote };
+  }
+  if (unsaved.baseSnapshot && 'appliedConditionNote' in unsaved.baseSnapshot && unsaved.baseSnapshot.appliedConditionNote !== undefined) {
+    return { verifiable: true, value: unsaved.baseSnapshot.appliedConditionNote };
+  }
+  const refSnap = findMatchingHistorySnapshot(unsaved, referenceSnapshots);
+  if (refSnap && 'appliedConditionNote' in refSnap && refSnap.appliedConditionNote !== undefined) {
+    return { verifiable: true, value: refSnap.appliedConditionNote };
+  }
+  return { verifiable: false };
+}
+
 /**
  * Checks if unsaved revision content matches remote problem content.
  * Comprehensively compares all meaningful stored fields: prompt, answer, title,
  * formula, code (preserving indentation), hints, full rubric (including description & weight),
- * time standard, and applied conditions.
+ * time standard, type, conceptIds, and applied conditions.
  */
 export function isRevisionMatchingProblem(
   unsaved: {
     title?: string;
     promptText?: string;
+    type?: Problem['type'];
+    conceptIds?: string[];
     modelAnswer?: string;
     rubric?: Problem['rubric'];
     mathFormula?: string;
@@ -29,9 +93,12 @@ export function isRevisionMatchingProblem(
     hints?: string[];
     timeStandardMinutes?: number;
     appliedConditionNote?: string;
+    baseVersion?: number;
+    revisionVersion?: number;
     baseSnapshot?: ProblemVersionSnapshot;
   },
-  remote: Problem
+  remote: Problem,
+  referenceSnapshots?: ProblemVersionSnapshot[]
 ): boolean {
   if (normalizeText(unsaved.promptText) !== normalizeText(remote.promptText)) return false;
   if (normalizeText(unsaved.modelAnswer) !== normalizeText(remote.modelAnswer)) return false;
@@ -39,17 +106,38 @@ export function isRevisionMatchingProblem(
   if (normalizeText(unsaved.mathFormula) !== normalizeText(remote.mathFormula)) return false;
   if (normalizeCode(unsaved.codeSnippet) !== normalizeCode(remote.codeSnippet)) return false;
 
-  // Applied condition note comparison with backward compatibility for legacy revisions
-  if ('appliedConditionNote' in unsaved && unsaved.appliedConditionNote !== undefined) {
-    if (normalizeText(unsaved.appliedConditionNote) !== normalizeText(remote.appliedConditionNote)) {
-      return false;
+  const refSnap = resolveReferenceSnapshot(unsaved, referenceSnapshots);
+
+  // Problem type comparison (with fallback to reference snapshot for legacy revisions)
+  const expectedType = unsaved.type !== undefined ? unsaved.type : refSnap?.type;
+  if (expectedType !== undefined && remote.type !== undefined) {
+    if (normalizeText(expectedType) !== normalizeText(remote.type)) return false;
+  }
+
+  // Concept IDs comparison (with fallback to reference snapshot for legacy revisions)
+  const expectedConcepts = Array.isArray(unsaved.conceptIds)
+    ? unsaved.conceptIds
+    : Array.isArray(refSnap?.conceptIds)
+      ? refSnap.conceptIds
+      : undefined;
+  if (expectedConcepts !== undefined && Array.isArray(remote.conceptIds)) {
+    const uConcepts = [...expectedConcepts].sort();
+    const rConcepts = [...remote.conceptIds].sort();
+    if (uConcepts.length !== rConcepts.length) return false;
+    for (let i = 0; i < uConcepts.length; i++) {
+      if (uConcepts[i] !== rConcepts[i]) return false;
     }
-  } else if (unsaved.baseSnapshot && 'appliedConditionNote' in unsaved.baseSnapshot) {
-    if (normalizeText(unsaved.baseSnapshot.appliedConditionNote) !== normalizeText(remote.appliedConditionNote)) {
+  }
+
+  // Applied condition note comparison with backward compatibility for legacy revisions
+  const condCheck = hasVerifiableConditionNote(unsaved, referenceSnapshots);
+  if (condCheck.verifiable) {
+    if (normalizeText(condCheck.value) !== normalizeText(remote.appliedConditionNote)) {
       return false;
     }
   } else if (normalizeText(remote.appliedConditionNote) !== '') {
-    // Legacy revision lacks condition note and snapshot condition note, but remote has non-empty: cannot verify equivalence
+    // Legacy revision lacks condition note and no reference snapshot has condition note,
+    // while remote has a non-empty condition note: cannot verify equivalence without loosening comparison.
     return false;
   }
 
@@ -273,9 +361,10 @@ export function mergeProblems(
 
     if (unsaved) {
       const serverVersion = remote.version ?? 1;
-      const isIdentical = isRevisionMatchingProblem(unsaved, remote);
+      const referenceSnapshots = [...(versionHistory || []), ...(mine?.versionHistory || [])];
+      const isIdentical = isRevisionMatchingProblem(unsaved, remote, referenceSnapshots);
 
-      if (serverVersion === unsaved.revisionVersion && isIdentical) {
+      if (serverVersion >= unsaved.baseVersion && isIdentical) {
         // Server already has this exact revised content (idempotent retry / response loss)
         if (unsaved.syncStatus !== 'synced') {
           const updatedRev: UnsavedProblemRevision = { ...unsaved, syncStatus: 'synced' };
@@ -283,32 +372,50 @@ export function mergeProblems(
           onRevisionChange?.(updatedRev);
         }
         contentToApply = remote;
+        effectiveVersion = serverVersion;
       } else if (serverVersion <= unsaved.baseVersion) {
         // Revision branched from this or older server version, and remote hasn't advanced past base: apply revised content!
+        const condCheck = hasVerifiableConditionNote(unsaved, referenceSnapshots);
         contentToApply = {
           ...remote,
           title: unsaved.title,
           promptText: unsaved.promptText,
+          type: unsaved.type ?? remote.type,
+          conceptIds: unsaved.conceptIds ?? remote.conceptIds,
           mathFormula: unsaved.mathFormula,
           codeSnippet: unsaved.codeSnippet,
           hints: unsaved.hints,
           modelAnswer: unsaved.modelAnswer,
           rubric: unsaved.rubric,
           timeStandardMinutes: unsaved.timeStandardMinutes ?? remote.timeStandardMinutes,
-          appliedConditionNote: unsaved.appliedConditionNote !== undefined ? unsaved.appliedConditionNote : remote.appliedConditionNote,
+          appliedConditionNote: condCheck.verifiable ? condCheck.value : remote.appliedConditionNote,
         };
         effectiveVersion = unsaved.revisionVersion;
         hasActiveUnsavedRevision = true;
         if (unsaved.baseSnapshot) {
-          combinedHistory = [unsaved.baseSnapshot, ...(combinedHistory || [])];
+          const existingHist = combinedHistory || [];
+          const alreadyHasBase = existingHist.some((s) => s.version === unsaved.baseSnapshot!.version);
+          combinedHistory = alreadyHasBase ? existingHist : [unsaved.baseSnapshot, ...existingHist];
         }
       } else {
-        // Remote server has advanced past local baseVersion (serverVersion > unsaved.baseVersion) and content differs:
-        // Genuine remote conflict!
+        // Remote server has advanced past local baseVersion (serverVersion > unsaved.baseVersion) and content differs
+        // (or legacy revision lacks verifiable condition snapshot): preserve revision and inform user!
+        const condCheck = hasVerifiableConditionNote(unsaved, referenceSnapshots);
+        const matchesWithoutCondition =
+          !condCheck.verifiable &&
+          normalizeText(remote.appliedConditionNote) !== '' &&
+          isRevisionMatchingProblem(
+            { ...unsaved, appliedConditionNote: remote.appliedConditionNote },
+            remote,
+            referenceSnapshots
+          );
+        const conflictReason = matchesWithoutCondition
+          ? `기존 형식 수정본의 적용 조건(appliedConditionNote) 기준 스냅샷을 확인할 수 없어 수정본을 보존했습니다 (서버: v${serverVersion})`
+          : `서버 버전 충돌 (서버: v${serverVersion}, 수정 기준: v${unsaved.baseVersion})`;
         const updatedRev: UnsavedProblemRevision = {
           ...unsaved,
           syncStatus: 'conflict',
-          syncError: `서버 버전 충돌 (서버: v${serverVersion}, 수정 기준: v${unsaved.baseVersion})`,
+          syncError: conflictReason,
         };
         unsavedRevisions[remote.id] = updatedRev;
         onRevisionChange?.(updatedRev);
@@ -319,6 +426,8 @@ export function mergeProblems(
         ...remote,
         title: mine.title,
         promptText: mine.promptText,
+        type: mine.type ?? remote.type,
+        conceptIds: mine.conceptIds ?? remote.conceptIds,
         mathFormula: mine.mathFormula,
         codeSnippet: mine.codeSnippet,
         hints: mine.hints,

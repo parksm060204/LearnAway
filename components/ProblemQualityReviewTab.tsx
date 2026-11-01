@@ -60,7 +60,18 @@ interface ProblemQualityReviewTabProps {
   materials?: Material[];
   onUpdateQualityStatus?: (problemId: string, newStatus: ProblemQualityStatus, note?: string) => void;
   onDismissReport?: (problemId: string, reportId: string, dismissReason: string) => { success: boolean; error?: string };
-  onReviseProblem?: (problemId: string, updates: Partial<Problem>, editReason: string) => { success: boolean; persisted?: boolean; error?: string };
+  onReviseProblem?: (
+    problemId: string,
+    updates: Partial<Problem>,
+    editReason: string
+  ) => {
+    success: boolean;
+    persisted?: boolean;
+    partialFailure?: boolean;
+    problemPersisted?: boolean;
+    revisionPersisted?: boolean;
+    error?: string;
+  };
   onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
 }
@@ -93,12 +104,14 @@ export function ProblemQualityReviewTab({
   const [editPrompt, setEditPrompt] = useState('');
   const [editFormula, setEditFormula] = useState('');
   const [editCodeSnippet, setEditCodeSnippet] = useState('');
+  const [editAppliedConditionNote, setEditAppliedConditionNote] = useState('');
   const [editHints, setEditHints] = useState<string[]>([]);
   const [editModelAnswer, setEditModelAnswer] = useState('');
   const [editRubric, setEditRubric] = useState<RubricCriterion[]>([]);
   const [editTimeMinutes, setEditTimeMinutes] = useState(20);
   const [editReasonText, setEditReasonText] = useState('');
   const [editValidationError, setEditValidationError] = useState<string | null>(null);
+  const [editPartialFailure, setEditPartialFailure] = useState(false);
 
   // AI Re-review state
   const [isAiReviewing, setIsAiReviewing] = useState(false);
@@ -183,7 +196,8 @@ export function ProblemQualityReviewTab({
     };
   });
 
-  const syncedKey = `${activeProblem?.id || ''}:v${activeProblem?.version || 1}:${activeSubject?.id || ''}:${effectiveUserId}`;
+  const problemIdentityKey = `${activeProblem?.id || ''}:${activeSubject?.id || ''}:${effectiveUserId}`;
+  const syncedKey = `${problemIdentityKey}:v${activeProblem?.version || 1}`;
 
   // Invalidate any in-flight review requests whenever problem, version, subject, or user changes
   useEffect(() => {
@@ -191,27 +205,36 @@ export function ProblemQualityReviewTab({
   }, [syncedKey]);
 
   // Reset the edit/review form and recovery state when the active problem changes (render-phase, hydration-safe).
+  const [syncedIdentityKey, setSyncedIdentityKey] = useState<string | null>(null);
   const [syncedProblemKey, setSyncedProblemKey] = useState<string | null>(null);
   if (activeProblem && syncedProblemKey !== syncedKey) {
+    const isIdentityChanged = syncedIdentityKey !== problemIdentityKey;
+    setSyncedIdentityKey(problemIdentityKey);
     setSyncedProblemKey(syncedKey);
     setIsAiReviewing(false);
     setIsRetryingSaveReview(false);
     setAiReviewError(null);
     setAiReviewNotice(null);
-    setEditTitle(activeProblem.title);
-    setEditPrompt(activeProblem.promptText);
-    setEditFormula(activeProblem.mathFormula || '');
-    setEditCodeSnippet(activeProblem.codeSnippet || '');
-    setEditHints([...activeProblem.hints]);
-    setEditModelAnswer(activeProblem.modelAnswer || '');
-    setEditRubric([...activeProblem.rubric]);
-    setEditTimeMinutes(activeProblem.timeStandardMinutes || 20);
-    setEditReasonText('');
-    setEditValidationError(null);
-    setIsEditing(false);
-    setAiReviewResult(null);
-    setReviewedProblemVersion(null);
-    setExpandedVersionNum(null);
+    if (isIdentityChanged || !isEditing) {
+      setEditTitle(activeProblem.title);
+      setEditPrompt(activeProblem.promptText);
+      setEditFormula(activeProblem.mathFormula || '');
+      setEditCodeSnippet(activeProblem.codeSnippet || '');
+      setEditAppliedConditionNote(activeProblem.appliedConditionNote || '');
+      setEditHints([...activeProblem.hints]);
+      setEditModelAnswer(activeProblem.modelAnswer || '');
+      setEditRubric([...activeProblem.rubric]);
+      setEditTimeMinutes(activeProblem.timeStandardMinutes || 20);
+      setEditReasonText('');
+      setEditValidationError(null);
+      setEditPartialFailure(false);
+      setIsEditing(false);
+    }
+    if (isIdentityChanged) {
+      setAiReviewResult(null);
+      setReviewedProblemVersion(null);
+      setExpandedVersionNum(null);
+    }
     setQualityRecovery(
       effectiveUserId ? getTaskRecovery(effectiveUserId, 'review_problem_quality', activeProblem.id) : null
     );
@@ -508,34 +531,47 @@ export function ProblemQualityReviewTab({
     }
 
     if (onReviseProblem) {
+      const normalizedCodeSnippet =
+        editCodeSnippet.trim().length > 0
+          ? editCodeSnippet.replace(/\r\n/g, '\n').replace(/^\n+|\n+$/g, '')
+          : undefined;
+      const normalizedTimeMinutes = Math.max(1, Number(editTimeMinutes) || activeProblem.timeStandardMinutes || 20);
       const res = onReviseProblem(
         activeProblem.id,
         {
           title: editTitle.trim() || activeProblem.title,
           promptText: editPrompt.trim(),
           mathFormula: editFormula.trim() || undefined,
-          codeSnippet: editCodeSnippet.trim() || undefined,
+          codeSnippet: normalizedCodeSnippet,
+          appliedConditionNote: editAppliedConditionNote.trim() || undefined,
           hints: editHints.filter((h) => h.trim().length > 0),
           modelAnswer: editModelAnswer.trim(),
           rubric: editRubric,
-          timeStandardMinutes: editTimeMinutes,
-          timeBreakdownDesc: `${editTimeMinutes}분 (수정판)`,
+          timeStandardMinutes: normalizedTimeMinutes,
+          timeBreakdownDesc: `${normalizedTimeMinutes}분 (수정판)`,
         },
         editReasonText.trim()
       );
 
-      if (!res.success) {
-        setEditValidationError(res.error || '수정 저장에 실패했습니다.');
-        return;
-      }
-
-      if (res.persisted === false) {
+      if (res.partialFailure) {
+        setEditPartialFailure(true);
         setEditValidationError(
-          res.error || '브라우저 저장 공간 부족(QuotaExceededError)으로 로컬 영속화에 실패했습니다. (메모리에 임시 보관 중이므로 입력을 유지한 채 다시 시도해 주세요.)'
+          res.error ||
+            '로컬 저장 중 일부 영역만 영속화되었습니다(부분 완료). 입력 내용을 유지한 채 [저장 재시도]를 눌러 영속 저장을 완료해 주세요.'
         );
         return;
       }
 
+      if (!res.success || res.persisted === false) {
+        setEditPartialFailure(false);
+        setEditValidationError(
+          res.error ||
+            '브라우저 저장 공간 부족(QuotaExceededError) 또는 쓰기 오류로 로컬 영속 저장에 실패했습니다. 편집 입력과 마지막 정상 원본은 유지되므로 다시 시도해 주세요.'
+        );
+        return;
+      }
+
+      setEditPartialFailure(false);
       setIsEditing(false);
       setEditValidationError(null);
     }
@@ -906,7 +942,21 @@ export function ProblemQualityReviewTab({
                   {!isEditing ? (
                     <button
                       type="button"
-                      onClick={() => setIsEditing(true)}
+                      onClick={() => {
+                        setEditTitle(activeProblem.title);
+                        setEditPrompt(activeProblem.promptText);
+                        setEditFormula(activeProblem.mathFormula || '');
+                        setEditCodeSnippet(activeProblem.codeSnippet || '');
+                        setEditAppliedConditionNote(activeProblem.appliedConditionNote || '');
+                        setEditHints([...activeProblem.hints]);
+                        setEditModelAnswer(activeProblem.modelAnswer || '');
+                        setEditRubric([...activeProblem.rubric]);
+                        setEditTimeMinutes(activeProblem.timeStandardMinutes || 20);
+                        setEditReasonText('');
+                        setEditValidationError(null);
+                        setEditPartialFailure(false);
+                        setIsEditing(true);
+                      }}
                       className="px-3 py-1 bg-white hover:bg-[#faf8f4] text-[#191817] border border-[#ded6c8] font-bold rounded-xs transition-colors flex items-center gap-1"
                     >
                       <Edit3 className="w-3.5 h-3.5" />
@@ -915,7 +965,11 @@ export function ProblemQualityReviewTab({
                   ) : (
                     <button
                       type="button"
-                      onClick={() => setIsEditing(false)}
+                      onClick={() => {
+                        setEditValidationError(null);
+                        setEditPartialFailure(false);
+                        setIsEditing(false);
+                      }}
                       className="px-3 py-1 bg-white hover:bg-[#faf8f4] text-[#57544e] border border-[#ded6c8] rounded-xs transition-colors"
                     >
                       수정 취소
@@ -1291,6 +1345,17 @@ export function ProblemQualityReviewTab({
                       </pre>
                     )}
 
+                    {activeProblem.appliedConditionNote && (
+                      <div className="p-3 bg-amber-50/70 border border-amber-200 rounded-xs space-y-1">
+                        <span className="font-academic-mono font-bold text-[11px] text-amber-900">
+                          적용 조건 및 변형 기준 (APPLIED CONDITION):
+                        </span>
+                        <p className="text-[11.5px] text-amber-950 whitespace-pre-wrap leading-relaxed">
+                          <AcademicMathView inline content={activeProblem.appliedConditionNote} />
+                        </p>
+                      </div>
+                    )}
+
                     {/* Hints */}
                     {activeProblem.hints && activeProblem.hints.length > 0 && (
                       <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1.5">
@@ -1407,6 +1472,49 @@ export function ProblemQualityReviewTab({
                         onChange={(e) => setEditFormula(e.target.value)}
                         placeholder="예: E[Y|X] = \int y f(y|x) dy"
                         className="w-full p-2 border border-[#ded6c8] rounded-xs bg-white text-xs font-mono"
+                      />
+                    </div>
+
+                    {/* Edit Code Snippet & Standard Time */}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div className="sm:col-span-2">
+                        <label className="block text-[11px] font-academic-mono text-[#57544e] mb-1">
+                          코드 스니펫 (선택사항):
+                        </label>
+                        <textarea
+                          value={editCodeSnippet}
+                          onChange={(e) => setEditCodeSnippet(e.target.value)}
+                          rows={3}
+                          placeholder="문제에 포함될 코드 블록 또는 의사코드"
+                          className="w-full p-2 border border-[#ded6c8] rounded-xs bg-white text-xs font-mono leading-relaxed"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-academic-mono text-[#57544e] mb-1">
+                          표준 제한시간 (분):
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={240}
+                          value={editTimeMinutes}
+                          onChange={(e) => setEditTimeMinutes(Math.max(1, Number(e.target.value) || 20))}
+                          className="w-full p-2 border border-[#ded6c8] rounded-xs bg-white text-xs font-academic-mono font-bold"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Edit Applied Condition Note */}
+                    <div>
+                      <label className="block text-[11px] font-academic-mono text-[#57544e] mb-1">
+                        적용 조건 및 변형 기준 (선택사항):
+                      </label>
+                      <input
+                        type="text"
+                        value={editAppliedConditionNote}
+                        onChange={(e) => setEditAppliedConditionNote(e.target.value)}
+                        placeholder="예: 정의역 x > 0 및 독립 항등 분포(i.i.d.) 가정 적용"
+                        className="w-full p-2 border border-[#ded6c8] rounded-xs bg-white text-xs"
                       />
                     </div>
 
@@ -1541,11 +1649,36 @@ export function ProblemQualityReviewTab({
                       </div>
                     </div>
 
-                    {/* Validation Error Banner */}
+                    {/* Validation / Persistence Error Banner */}
                     {editValidationError && (
-                      <div className="p-3 bg-red-50 border border-red-300 rounded-xs text-xs text-red-900 flex items-center gap-2">
-                        <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
-                        <span>{editValidationError}</span>
+                      <div
+                        className={`p-3 rounded-xs text-xs flex items-start justify-between gap-3 ${
+                          editPartialFailure
+                            ? 'bg-amber-50 border border-amber-300 text-amber-950'
+                            : 'bg-red-50 border border-red-300 text-red-900'
+                        }`}
+                      >
+                        <div className="flex items-start gap-2">
+                          <AlertTriangle
+                            className={`w-4 h-4 shrink-0 mt-0.5 ${
+                              editPartialFailure ? 'text-amber-600' : 'text-red-600'
+                            }`}
+                          />
+                          <div className="space-y-0.5">
+                            <strong className="block font-academic-mono text-[11px]">
+                              {editPartialFailure ? '로컬 저장 부분 완료 (재시도 필요)' : '로컬 저장 안내'}
+                            </strong>
+                            <span>{editValidationError}</span>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleSaveRevisedVersion}
+                          className="px-2.5 py-1 bg-[#191817] hover:bg-[#33302b] text-white font-academic-mono font-bold rounded-2xs text-[11px] shrink-0 flex items-center gap-1"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>저장 재시도</span>
+                        </button>
                       </div>
                     )}
 
@@ -1553,7 +1686,11 @@ export function ProblemQualityReviewTab({
                     <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#ded6c8]">
                       <button
                         type="button"
-                        onClick={() => setIsEditing(false)}
+                        onClick={() => {
+                          setEditValidationError(null);
+                          setEditPartialFailure(false);
+                          setIsEditing(false);
+                        }}
                         className="px-4 py-2 border border-[#ded6c8] text-[#57544e] rounded-xs hover:bg-[#faf8f4]"
                       >
                         취소
@@ -1564,7 +1701,11 @@ export function ProblemQualityReviewTab({
                         className="px-5 py-2 bg-[#c52828] hover:bg-[#a82020] text-white font-bold rounded-xs shadow-xs flex items-center gap-1.5"
                       >
                         <Save className="w-3.5 h-3.5" />
-                        <span>새 버전(v{(activeProblem.version || 1) + 1})으로 저장 및 수정 완료</span>
+                        <span>
+                          {editPartialFailure || editValidationError
+                            ? '영속 저장 재시도'
+                            : `새 버전(v${(activeProblem.version || 1) + 1})으로 저장 및 수정 완료`}
+                        </span>
                       </button>
                     </div>
                   </div>

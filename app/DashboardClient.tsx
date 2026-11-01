@@ -598,7 +598,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           serverKnownIds,
           unsavedRevisions,
           (rev) => {
-            saveUnsavedProblemRevision(rev);
+            saveUnsavedProblemRevision(rev, {
+              onlyIfRevisionId: rev.revisionId,
+              onlyIfGeneration: rev.generation,
+            });
           }
         );
         const mergedConceptDrafts = mergeDrafts(library.data.conceptDrafts, originals.data.conceptDrafts, migratedIds);
@@ -615,20 +618,26 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
         // Check for synced revisions to clean up and background auto-retry pending revisions
         let conflictCount = 0;
+        let clearFailedCount = 0;
         for (const [pId, rev] of Object.entries(unsavedRevisions)) {
           if (rev.syncStatus === 'synced') {
-            clearUnsavedProblemRevision(pId, { revisionId: rev.revisionId, generation: rev.generation });
+            const cleared = clearUnsavedProblemRevision(pId, { revisionId: rev.revisionId, generation: rev.generation });
+            if (!cleared && getUnsavedProblemRevision(pId)?.revisionId === rev.revisionId) {
+              clearFailedCount++;
+            }
           } else if (rev.syncStatus === 'conflict') {
             conflictCount++;
-          } else if (rev.syncStatus === 'pending') {
+          } else if (rev.syncStatus === 'pending' || rev.syncStatus === 'failed' || rev.syncStatus === 'syncing') {
             const sProblem = library.data.problems.find((p) => p.id === pId);
-            if (sProblem && (sProblem.version ?? 1) === rev.baseVersion) {
-              void pushProblemToServerRef.current(pId, { revise: true, expectedVersion: rev.baseVersion, silent: true });
+            if (sProblem && (sProblem.version ?? 1) <= rev.baseVersion) {
+              void pushProblemToServerRef.current(pId, { revise: true, expectedVersion: sProblem.version ?? 1, silent: true });
             }
           }
         }
         if (conflictCount > 0) {
           showToast(`서버 버전과 충돌한 문제 수정본 ${conflictCount}건이 안전하게 보존되었습니다.`);
+        } else if (clearFailedCount > 0) {
+          showToast(`동기화 완료된 수정본 임시 기록 ${clearFailedCount}건의 로컬 정리에 실패했습니다.`);
         }
 
         // Load server learning history (attempts / review events / plans / mock exams).
@@ -2834,11 +2843,34 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     opts: { revise?: boolean; expectedVersion?: number; silent?: boolean } = {}
   ): Promise<void> => {
     const pinnedScopeId = getStorageScopeId();
-    const problem = loadStoredProblems().find((p) => p.id === problemId);
-    if (!problem) return;
+    const baseProblem =
+      loadStoredProblems().find((p) => p.id === problemId) ??
+      allProblems.find((p) => p.id === problemId);
+    if (!baseProblem) return;
     const unsaved = getUnsavedProblemRevision(problemId);
     const targetRevisionId = unsaved?.revisionId;
     const targetGeneration = unsaved?.generation;
+    const problem: Problem =
+      unsaved && unsaved.syncStatus !== 'conflict'
+        ? {
+            ...baseProblem,
+            title: unsaved.title,
+            promptText: unsaved.promptText,
+            type: unsaved.type ?? baseProblem.type,
+            conceptIds: unsaved.conceptIds ?? baseProblem.conceptIds,
+            mathFormula: unsaved.mathFormula,
+            codeSnippet: unsaved.codeSnippet,
+            hints: unsaved.hints,
+            modelAnswer: unsaved.modelAnswer,
+            rubric: unsaved.rubric,
+            timeStandardMinutes: unsaved.timeStandardMinutes ?? baseProblem.timeStandardMinutes,
+            appliedConditionNote:
+              unsaved.appliedConditionNote !== undefined
+                ? unsaved.appliedConditionNote
+                : baseProblem.appliedConditionNote,
+            version: unsaved.revisionVersion,
+          }
+        : baseProblem;
     const snapshotProblem = { ...problem };
 
     try {
@@ -2846,7 +2878,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       if (unsaved && unsaved.syncStatus !== 'conflict') {
         saveUnsavedProblemRevision(
           { ...unsaved, syncStatus: 'syncing' },
-          { onlyIfRevisionId: targetRevisionId }
+          { onlyIfRevisionId: targetRevisionId, onlyIfGeneration: targetGeneration }
         );
       }
       const targetExpectedVersion = unsaved?.baseVersion ?? opts.expectedVersion ?? Math.max(1, (problem.version ?? 1) - 1);
@@ -2868,6 +2900,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
       if (opts.revise) {
         if (result.ok) {
+          const confirmedVersion = result.data?.version ?? (targetExpectedVersion + 1);
           const currentUnsaved = getUnsavedProblemRevision(problemId);
           if (
             currentUnsaved &&
@@ -2877,34 +2910,78 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           ) {
             // Consecutive edit occurred while this save was in flight!
             // Server just confirmed the previous revision. Advance baseVersion of the newer edit to server confirmed version.
-            const confirmedVersion = result.data?.version ?? (targetExpectedVersion + 1);
-            saveUnsavedProblemRevision({
-              ...currentUnsaved,
-              baseVersion: confirmedVersion,
-              baseSnapshot: {
-                version: confirmedVersion,
-                title: snapshotProblem.title,
-                promptText: snapshotProblem.promptText,
-                mathFormula: snapshotProblem.mathFormula,
-                codeSnippet: snapshotProblem.codeSnippet,
-                timeStandardMinutes: snapshotProblem.timeStandardMinutes,
-                appliedConditionNote: snapshotProblem.appliedConditionNote,
-                hints: [...(snapshotProblem.hints || [])],
-                modelAnswer: snapshotProblem.modelAnswer,
-                rubric: [...(snapshotProblem.rubric || [])],
-                editedAt: new Date().toISOString(),
-                editReason: unsaved?.editReason ?? '서버 동기화 완료 버전',
+            const confirmedSnapshot = {
+              version: confirmedVersion,
+              title: snapshotProblem.title,
+              promptText: snapshotProblem.promptText,
+              type: snapshotProblem.type,
+              conceptIds: [...(snapshotProblem.conceptIds || [])],
+              mathFormula: snapshotProblem.mathFormula,
+              codeSnippet: snapshotProblem.codeSnippet,
+              timeStandardMinutes: snapshotProblem.timeStandardMinutes,
+              appliedConditionNote: snapshotProblem.appliedConditionNote,
+              hints: [...(snapshotProblem.hints || [])],
+              modelAnswer: snapshotProblem.modelAnswer,
+              rubric: [...(snapshotProblem.rubric || [])],
+              editedAt: new Date().toISOString(),
+              editReason: unsaved?.editReason ?? '서버 동기화 완료 버전',
+            };
+            const nextRevVer = Math.max(currentUnsaved.revisionVersion, confirmedVersion + 1);
+            saveUnsavedProblemRevision(
+              {
+                ...currentUnsaved,
+                baseVersion: confirmedVersion,
+                revisionVersion: nextRevVer,
+                baseSnapshot: confirmedSnapshot,
               },
+              { onlyIfRevisionId: currentUnsaved.revisionId, onlyIfGeneration: currentUnsaved.generation }
+            );
+            const currentStored = loadStoredProblems();
+            const reconciledWithInFlight = currentStored.map((p) => {
+              if (p.id !== problemId) return p;
+              const existingHist = p.versionHistory || [];
+              const hasConfirmedSnap = existingHist.some((s) => s.version === confirmedVersion);
+              return {
+                ...p,
+                version: nextRevVer,
+                versionHistory: hasConfirmedSnap ? existingHist : [confirmedSnapshot, ...existingHist],
+              };
             });
+            saveStoredProblems(reconciledWithInFlight);
+            setAllProblems(reconciledWithInFlight);
             if (!opts.silent) {
               showToast('이전 수정본이 서버에 저장되었으며, 최신 로컬 편집 내용이 보존되었습니다.');
             }
           } else {
-            clearUnsavedProblemRevision(problemId, {
+            // Reconcile local storage and UI state with server-confirmed version
+            const currentStored = loadStoredProblems();
+            const reconciledProblems = currentStored.map((p) =>
+              p.id === problemId
+                ? {
+                    ...p,
+                    ...result.data,
+                    version: confirmedVersion,
+                    reports: p.reports ?? result.data.reports ?? [],
+                    versionHistory: p.versionHistory ?? result.data.versionHistory ?? [],
+                    reviewNotes: p.reviewNotes ?? result.data.reviewNotes,
+                  }
+                : p
+            );
+            saveStoredProblems(reconciledProblems);
+            setAllProblems(reconciledProblems);
+
+            const hadTargetUnsaved = Boolean(
+              currentUnsaved && (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId)
+            );
+            const cleared = clearUnsavedProblemRevision(problemId, {
               revisionId: targetRevisionId,
               generation: targetGeneration,
             });
-            if (!opts.silent) {
+            if (hadTargetUnsaved && !cleared && getUnsavedProblemRevision(problemId) !== null) {
+              if (!opts.silent) {
+                showToast('서버에는 저장되었으나 로컬 수정본 임시 기록 정리에 실패했습니다.');
+              }
+            } else if (!opts.silent) {
               showToast('문제 수정본이 서버에 안전하게 저장되었습니다.');
             }
           }
@@ -2916,9 +2993,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             if (
               latestServer.ok &&
               latestServer.data &&
-              latestServer.data.version === problem.version &&
+              (latestServer.data.version ?? 1) >= targetExpectedVersion &&
               isRevisionMatchingProblem(problem, latestServer.data)
             ) {
+              const serverVer = latestServer.data.version ?? 1;
               const currentUnsaved = getUnsavedProblemRevision(problemId);
               if (
                 currentUnsaved &&
@@ -2926,26 +3004,47 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 currentUnsaved.revisionId !== targetRevisionId &&
                 (currentUnsaved.generation ?? 0) > (targetGeneration ?? 0)
               ) {
-                const serverVer = latestServer.data.version ?? 1;
-                saveUnsavedProblemRevision({
-                  ...currentUnsaved,
-                  baseVersion: serverVer,
-                  baseSnapshot: {
-                    version: serverVer,
-                    title: snapshotProblem.title,
-                    promptText: snapshotProblem.promptText,
-                    mathFormula: snapshotProblem.mathFormula,
-                    codeSnippet: snapshotProblem.codeSnippet,
-                    timeStandardMinutes: snapshotProblem.timeStandardMinutes,
-                    appliedConditionNote: snapshotProblem.appliedConditionNote,
-                    hints: [...(snapshotProblem.hints || [])],
-                    modelAnswer: snapshotProblem.modelAnswer,
-                    rubric: [...(snapshotProblem.rubric || [])],
-                    editedAt: new Date().toISOString(),
-                    editReason: unsaved?.editReason ?? '서버 동기화 완료 버전',
+                const confirmedSnapshot = {
+                  version: serverVer,
+                  title: snapshotProblem.title,
+                  promptText: snapshotProblem.promptText,
+                  type: snapshotProblem.type,
+                  conceptIds: [...(snapshotProblem.conceptIds || [])],
+                  mathFormula: snapshotProblem.mathFormula,
+                  codeSnippet: snapshotProblem.codeSnippet,
+                  timeStandardMinutes: snapshotProblem.timeStandardMinutes,
+                  appliedConditionNote: snapshotProblem.appliedConditionNote,
+                  hints: [...(snapshotProblem.hints || [])],
+                  modelAnswer: snapshotProblem.modelAnswer,
+                  rubric: [...(snapshotProblem.rubric || [])],
+                  editedAt: new Date().toISOString(),
+                  editReason: unsaved?.editReason ?? '서버 동기화 완료 버전',
+                };
+                saveUnsavedProblemRevision(
+                  {
+                    ...currentUnsaved,
+                    baseVersion: serverVer,
+                    revisionVersion: Math.max(currentUnsaved.revisionVersion, serverVer + 1),
+                    baseSnapshot: confirmedSnapshot,
                   },
-                });
+                  { onlyIfRevisionId: currentUnsaved.revisionId, onlyIfGeneration: currentUnsaved.generation }
+                );
               } else {
+                const currentStored = loadStoredProblems();
+                const reconciledProblems = currentStored.map((p) =>
+                  p.id === problemId
+                    ? {
+                        ...p,
+                        ...latestServer.data!,
+                        version: serverVer,
+                        reports: p.reports ?? latestServer.data!.reports ?? [],
+                        versionHistory: p.versionHistory ?? latestServer.data!.versionHistory ?? [],
+                        reviewNotes: p.reviewNotes ?? latestServer.data!.reviewNotes,
+                      }
+                    : p
+                );
+                saveStoredProblems(reconciledProblems);
+                setAllProblems(reconciledProblems);
                 clearUnsavedProblemRevision(problemId, {
                   revisionId: targetRevisionId,
                   generation: targetGeneration,
@@ -2964,7 +3063,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                   syncStatus: 'conflict',
                   syncError: `서버 버전 충돌: ${result.error}`,
                 },
-                { onlyIfRevisionId: targetRevisionId }
+                { onlyIfRevisionId: targetRevisionId, onlyIfGeneration: targetGeneration }
               );
               showToast('서버 버전 충돌: 미저장 수정본이 충돌 복구 대상으로 보존되었습니다.');
             }
@@ -2982,7 +3081,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 syncStatus: 'failed',
                 syncError: result.error,
               },
-              { onlyIfRevisionId: targetRevisionId }
+              { onlyIfRevisionId: targetRevisionId, onlyIfGeneration: targetGeneration }
             );
           }
           if (!opts.silent) {
@@ -3006,7 +3105,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             syncStatus: 'failed',
             syncError: e instanceof Error ? e.message : '알 수 없는 오류',
           },
-          { onlyIfRevisionId: targetRevisionId }
+          { onlyIfRevisionId: targetRevisionId, onlyIfGeneration: targetGeneration }
         );
       }
       if (!opts.silent) {
@@ -3157,15 +3256,18 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     const unsavedBefore = getUnsavedProblemRevision(problemId);
     const beforeVersion = unsavedBefore ? unsavedBefore.baseVersion : (allProblems.find((p) => p.id === problemId)?.version ?? 1);
     const res = editAndReviseProblem(problemId, updates, editReason);
-    if (res.success) {
+    if (res.success && res.persisted) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
       void pushProblemToServer(problemId, { revise: true, expectedVersion: beforeVersion });
-      if (res.persisted === false) {
-        showToast(res.error || '로컬 영속 저장에 실패했습니다. (메모리 임시 보관) 서버 저장을 시도합니다.');
-      } else {
-        showToast('문제가 수정되어 로컬에 기록되었습니다. 서버 저장을 시도합니다.');
+      showToast('문제가 수정되어 로컬에 기록되었습니다. 서버 저장을 시도합니다.');
+    } else if (res.partialFailure) {
+      const reloadedProblems = loadStoredProblems();
+      setAllProblems(reloadedProblems);
+      if (res.revisionPersisted) {
+        void pushProblemToServer(problemId, { revise: true, expectedVersion: beforeVersion });
       }
+      showToast(res.error || '로컬 저장이 부분 완료되었습니다. 편집기에서 다시 저장을 시도해 주세요.');
     } else {
       showToast(`문제 수정 실패: ${res.error}`);
     }
