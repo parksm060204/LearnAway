@@ -22164,6 +22164,372 @@ exports.requireApiUser = async () => {
     }
   });
 
+  await checkAsync('Bug 1 (Conflict Re-merge): Repeated merges, serialization, and reloads preserve genuine conflict without auto-rebase', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_bug1_conflict_test' });
+    try {
+      const problemId = 'prob-bug1-conflict-test';
+      const baseProblem = {
+        id: problemId,
+        subjectId: 'sub-1',
+        title: 'Original Title v1',
+        promptText: 'Original Prompt v1',
+        type: 'essay',
+        conceptIds: ['c1'],
+        hints: ['Hint 1'],
+        modelAnswer: 'Original Model Answer v1',
+        rubric: [{ id: 'r1', criteria: 'c1', points: 5, description: 'd1' }],
+        timeStandardMinutes: 10,
+        appliedConditionNote: '조건: x > 0',
+        version: 1,
+        serverConfirmedVersion: 1,
+      };
+
+      // User edited locally against v1:
+      const localRevision = {
+        problemId,
+        revisionId: 'rev-conflict-1',
+        generation: 1,
+        baseVersion: 1,
+        revisionVersion: 2,
+        title: 'User Edited Title v2',
+        promptText: 'User Edited Prompt v2',
+        type: 'essay',
+        conceptIds: ['c1'],
+        hints: ['Hint 1'],
+        modelAnswer: 'User Edited Model Answer v2',
+        rubric: [{ id: 'r1', criteria: 'c1', points: 5, description: 'd1' }],
+        timeStandardMinutes: 10,
+        appliedConditionNote: '조건: x > 0',
+        editReason: '사용자 로컬 수정',
+        revisedAt: new Date().toISOString(),
+        syncStatus: 'pending',
+        baseSnapshot: {
+          version: 1,
+          title: 'Original Title v1',
+          promptText: 'Original Prompt v1',
+          type: 'essay',
+          conceptIds: ['c1'],
+          hints: ['Hint 1'],
+          modelAnswer: 'Original Model Answer v1',
+          rubric: [{ id: 'r1', criteria: 'c1', points: 5, description: 'd1' }],
+          timeStandardMinutes: 10,
+          appliedConditionNote: '조건: x > 0',
+          editedAt: new Date().toISOString(),
+          editReason: '초기 버전',
+        },
+      };
+
+      // Meanwhile, another device updated server problem to v2 with DIFFERENT content:
+      const serverProblemV2 = {
+        ...baseProblem,
+        version: 2,
+        title: 'Server Conflict Title v2 (From Other Device)',
+        promptText: 'Server Conflict Prompt v2 (From Other Device)',
+        appliedConditionNote: '조건: x > 0',
+      };
+
+      const unsavedMap = { [problemId]: { ...localRevision } };
+      let revisionChangeCalled = 0;
+      let lastChangedRev = null;
+
+      // 1. First merge: remote advanced past baseVersion and content differs.
+      // Must set syncStatus: 'conflict'!
+      const merged1 = cloudMerge.mergeProblems(
+        [serverProblemV2],
+        [baseProblem],
+        { [problemId]: [] },
+        new Set(),
+        new Set(),
+        unsavedMap,
+        (rev) => {
+          revisionChangeCalled++;
+          lastChangedRev = rev;
+        }
+      );
+
+      assert.equal(unsavedMap[problemId].syncStatus, 'conflict', 'First merge flags genuine conflict');
+      assert.equal(merged1[0].serverConfirmedVersion, 2, 'Problem records serverConfirmedVersion 2');
+      assert.equal(merged1[0].title, serverProblemV2.title, 'Server content authoritative for display');
+      assert.ok(revisionChangeCalled > 0, 'onRevisionChange invoked on conflict');
+      assert.ok(lastChangedRev, 'lastChangedRev recorded');
+
+      // 2. Second merge: using output of merge 1 (which has serverConfirmedVersion = 2) as candidate.
+      // Previously, serverConfirmedVersion === serverVersion falsely triggered isVerifiableLegacyBaseOnRemote
+      // and reverted syncStatus back to pending/baseVersion=2!
+      const merged2 = cloudMerge.mergeProblems(
+        [serverProblemV2],
+        merged1,
+        { [problemId]: [] },
+        new Set(),
+        new Set(),
+        unsavedMap,
+        (rev) => {
+          lastChangedRev = rev;
+        }
+      );
+
+      assert.equal(unsavedMap[problemId].syncStatus, 'conflict', 'Second merge strictly preserves conflict');
+      assert.equal(unsavedMap[problemId].baseVersion, 1, 'Base version is NOT falsely advanced to 2');
+
+      // 3. Serialization and reload (simulating localStorage / page refresh)
+      const serialized = JSON.stringify(unsavedMap);
+      const reloadedMap = JSON.parse(serialized);
+      assert.equal(reloadedMap[problemId].syncStatus, 'conflict', 'Serialized status is conflict');
+
+      const merged3 = cloudMerge.mergeProblems(
+        [serverProblemV2],
+        merged2,
+        { [problemId]: [] },
+        new Set(),
+        new Set(),
+        reloadedMap,
+        (rev) => {
+          lastChangedRev = rev;
+        }
+      );
+      assert.equal(reloadedMap[problemId].syncStatus, 'conflict', 'Reloaded merge strictly preserves conflict');
+      assert.ok(merged3[0], 'merged3 problem returned');
+
+      // 4. Verify background auto-retry never picks up conflict revisions
+      let autoPushTriggered = false;
+      for (const rev of Object.values(reloadedMap)) {
+        if (rev.syncStatus === 'conflict') {
+          // conflict counted, never auto-retried
+        } else if (rev.syncStatus === 'pending' || rev.syncStatus === 'failed' || rev.syncStatus === 'syncing') {
+          autoPushTriggered = true;
+        }
+      }
+      assert.equal(autoPushTriggered, false, 'No background auto-push for conflict revisions');
+
+      // 5. Verifiable legacy base rebase: if baseSnapshot ACTUALLY matches serverProblem, it rebases
+      const legacyVerifiableRevision = {
+        ...localRevision,
+        revisionId: 'rev-legacy-verifiable',
+        baseVersion: 1, // ambiguous/stale baseVersion
+        syncStatus: 'pending',
+        baseSnapshot: {
+          version: 2,
+          title: serverProblemV2.title,
+          promptText: serverProblemV2.promptText,
+          type: serverProblemV2.type,
+          conceptIds: serverProblemV2.conceptIds,
+          hints: serverProblemV2.hints,
+          modelAnswer: serverProblemV2.modelAnswer,
+          rubric: serverProblemV2.rubric,
+          timeStandardMinutes: serverProblemV2.timeStandardMinutes,
+          appliedConditionNote: serverProblemV2.appliedConditionNote,
+          editedAt: new Date().toISOString(),
+          editReason: '실제 서버 기준 스냅샷',
+        },
+      };
+      const verifiableMap = { [problemId]: legacyVerifiableRevision };
+      const mergedVerifiable = cloudMerge.mergeProblems(
+        [serverProblemV2],
+        merged2,
+        { [problemId]: [] },
+        new Set(),
+        new Set(),
+        verifiableMap
+      );
+      assert.equal(verifiableMap[problemId].syncStatus, 'pending', 'Verifiable base cleanly rebases to pending');
+      assert.equal(verifiableMap[problemId].baseVersion, 2, 'Verifiable base advances to server version 2');
+      assert.ok(mergedVerifiable[0], 'mergedVerifiable problem returned');
+
+      // 6. Response loss / identical content recovery: if server has user revised content, conflict transitions to synced
+      const serverProblemWithUserContent = {
+        ...serverProblemV2,
+        version: 3,
+        title: localRevision.title,
+        promptText: localRevision.promptText,
+        modelAnswer: localRevision.modelAnswer,
+      };
+      const conflictMapForRecovery = { [problemId]: { ...unsavedMap[problemId] } };
+      cloudMerge.mergeProblems(
+        [serverProblemWithUserContent],
+        merged2,
+        { [problemId]: [] },
+        new Set(),
+        new Set(),
+        conflictMapForRecovery
+      );
+      assert.equal(conflictMapForRecovery[problemId].syncStatus, 'synced', 'Identical server content resolves conflict safely');
+    } finally {
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+  });
+
+  await checkAsync('Bug 2 (Stale Persisted Revision vs Newer Memory Revision): In-flight edit A confirmed or failed while newer edit B is in memory preserves B', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_bug2_stale_vs_mem_test' });
+    try {
+      const problemId = 'prob-bug2-stale-vs-mem';
+      const initialProblem = {
+        id: problemId,
+        subjectId: 'sub-1',
+        title: 'Original Title v1',
+        promptText: 'Original Prompt v1',
+        type: 'essay',
+        conceptIds: ['c1'],
+        hints: ['Hint 1'],
+        modelAnswer: 'Original Model Answer v1',
+        rubric: [{ id: 'r1', criteria: 'c1', points: 5, description: 'd1' }],
+        timeStandardMinutes: 10,
+        version: 1,
+        serverConfirmedVersion: 1,
+      };
+      storage.saveStoredProblems([initialProblem]);
+
+      // 1. Edit A: user edits problem. Both problem body and unsaved revision persist successfully.
+      const editA = storage.editAndReviseProblem(
+        problemId,
+        { promptText: 'Edit A Prompt (In Flight)' },
+        'Edit A reason'
+      );
+      assert.equal(editA.success, true);
+      assert.equal(editA.persisted, true);
+      const revA = storage.getUnsavedProblemRevision(problemId);
+      assert.ok(revA);
+      assert.equal(revA.generation, 1);
+      const targetRevIdA = revA.revisionId;
+
+      // 2. Server request for Edit A starts in flight.
+      // While in flight, user makes Edit B!
+      // Mock localStorage so that writing to UNSAVED_PROBLEM_REVISIONS throws QuotaExceededError,
+      // but writing to PROBLEMS succeeds!
+      const revisionsKey = 'redcall_user_user_bug2_stale_vs_mem_test__unsaved_problem_revisions_v1';
+      const realSetItem = global.localStorage.setItem.bind(global.localStorage);
+
+      let quotaTriggered = false;
+      global.localStorage.setItem = function (k, v) {
+        if (k === revisionsKey) {
+          quotaTriggered = true;
+          const err = new Error('Quota exceeded on revisions');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+        return realSetItem(k, v);
+      };
+
+      let editB;
+      try {
+        editB = storage.editAndReviseProblem(
+          problemId,
+          { promptText: 'Edit B Prompt (Latest User Input)' },
+          'Edit B reason'
+        );
+      } finally {
+        global.localStorage.setItem = realSetItem;
+      }
+
+      assert.equal(quotaTriggered, true, 'QuotaExceededError was triggered for Edit B revision');
+      assert.equal(editB.status, 'partial_problem_only', 'Edit B problem body persisted, revision was memory-only');
+      assert.equal(editB.problemPersisted, true);
+      assert.equal(editB.revisionPersisted, false);
+
+      // Verify current state before server response:
+      // - Persisted revision is still Edit A!
+      const persistedUnsaved = storage.getUnsavedProblemRevision(problemId);
+      assert.equal(persistedUnsaved?.revisionId, targetRevIdA, 'Persisted revision is stale Edit A');
+      assert.equal(persistedUnsaved?.generation, 1);
+      // - Memory revision is Edit B!
+      const memoryUnsaved = storage.getInMemoryProblemRevision(problemId);
+      assert.ok(memoryUnsaved);
+      assert.equal(memoryUnsaved?.promptText, 'Edit B Prompt (Latest User Input)');
+      assert.equal(memoryUnsaved?.generation, 2);
+
+      // - Common resolution picks Edit B!
+      const resolved = storage.resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved);
+      assert.equal(resolved.latest?.revisionId, memoryUnsaved.revisionId, 'resolveLatestProblemRevision chooses newer Edit B');
+      assert.equal(resolved.persistedStale, true, 'Persisted Edit A is flagged as stale');
+      assert.equal(storage.getEffectiveUnsavedProblemRevision(problemId)?.revisionId, memoryUnsaved.revisionId);
+
+      // 3. Server confirms Edit A (serverProblem version 2)
+      const serverProblemA = {
+        ...initialProblem,
+        version: 2,
+        promptText: 'Edit A Prompt (In Flight)',
+      };
+      const syncOutcome = storage.confirmProblemRevisionSynced(
+        problemId,
+        serverProblemA,
+        {
+          revisionId: targetRevIdA,
+          generation: 1,
+          snapshotProblem: editA.updatedProblem,
+          editReason: 'Edit A reason',
+        }
+      );
+
+      assert.equal(syncOutcome.advancedInFlightRevision, true, 'Advances in-flight revision Edit B');
+      // Verify Edit B's baseVersion is advanced to 2, revisionVersion is 3:
+      const updatedMemRev = storage.getInMemoryProblemRevision(problemId);
+      assert.ok(updatedMemRev);
+      assert.equal(updatedMemRev?.baseVersion, 2, 'Edit B baseVersion advanced to confirmed version 2');
+      assert.equal(updatedMemRev?.revisionVersion, 3, 'Edit B revisionVersion is 3');
+      assert.equal(updatedMemRev?.promptText, 'Edit B Prompt (Latest User Input)', 'Edit B content maintained');
+
+      // Verify problem body was NOT reverted to Edit A:
+      const storedProblemAfterA = storage.loadStoredProblems().find((p) => p.id === problemId);
+      assert.equal(storedProblemAfterA?.promptText, 'Edit B Prompt (Latest User Input)', 'Problem body preserves Edit B, not overwritten by A');
+      assert.equal(storedProblemAfterA?.version, 3);
+      assert.equal(storedProblemAfterA?.serverConfirmedVersion, 2);
+
+      // Verify Edit A is removed from persistent storage (not lingering):
+      assert.equal(storage.getUnsavedProblemRevision(problemId)?.revisionId !== targetRevIdA, true, 'Stale Edit A cleared from localStorage');
+
+      // 4. Test failure scenario: if an older request fails, it must NOT mutate or overwrite Edit B in memory
+      const fakeOlderTargetId = 'rev-stale-old-xyz';
+      const effBefore = storage.getEffectiveUnsavedProblemRevision(problemId);
+      assert.equal(effBefore?.generation, 2);
+
+      // Attempting to clear in-memory revision with older/wrong target ID fails safely
+      const clearedWrong = storage.clearInMemoryProblemRevision(problemId, { revisionId: fakeOlderTargetId, generation: 1 });
+      assert.equal(clearedWrong, false, 'Refuses to clear in-memory revision with mismatched revisionId');
+      assert.equal(storage.getInMemoryProblemRevision(problemId)?.promptText, 'Edit B Prompt (Latest User Input)');
+
+      // Attempting to set an older generation revision in memory is rejected
+      const staleOldRev = {
+        ...updatedMemRev,
+        revisionId: fakeOlderTargetId,
+        generation: 1,
+        promptText: 'Stale Old Text',
+      };
+      const setStale = storage.setInMemoryProblemRevision(staleOldRev);
+      assert.equal(setStale, false, 'Refuses to overwrite newer in-memory revision with older generation');
+      assert.equal(storage.getInMemoryProblemRevision(problemId)?.promptText, 'Edit B Prompt (Latest User Input)');
+
+      // 5. Storage restored: now save Edit B cleanly
+      const saveBResult = storage.saveUnsavedProblemRevision(storage.getInMemoryProblemRevision(problemId));
+      assert.equal(saveBResult, true, 'Edit B saves cleanly to persistent storage after quota is available');
+      assert.equal(storage.getUnsavedProblemRevision(problemId)?.promptText, 'Edit B Prompt (Latest User Input)');
+
+      // 6. Server confirms Edit B at v3
+      const serverProblemB = {
+        ...storedProblemAfterA,
+        version: 3,
+        promptText: 'Edit B Prompt (Latest User Input)',
+      };
+      const syncOutcomeB = storage.confirmProblemRevisionSynced(
+        problemId,
+        serverProblemB,
+        {
+          revisionId: updatedMemRev.revisionId,
+          generation: 2,
+          snapshotProblem: storedProblemAfterA,
+          editReason: 'Edit B reason',
+        }
+      );
+      assert.equal(syncOutcomeB.advancedInFlightRevision, false, 'Edit B completes normally');
+      assert.equal(syncOutcomeB.localPersisted, true);
+      assert.equal(storage.getUnsavedProblemRevision(problemId), null, 'Revisions cleared after full sync');
+      assert.equal(storage.getInMemoryProblemRevision(problemId), null, 'In-memory revision cleared after full sync');
+      const finalStored = storage.loadStoredProblems().find((p) => p.id === problemId);
+      assert.equal(finalStored.version, 3);
+      assert.equal(finalStored.promptText, 'Edit B Prompt (Latest User Input)');
+    } finally {
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+  });
+
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
   else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
   AI_CONFIG.apiKey = savedApiKeyPlan03;

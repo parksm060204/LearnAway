@@ -69,12 +69,14 @@ import {
   buildProblemFromDraft,
   AttemptSaveStatus,
   resetToInitialDemoData,
-  loadUnsavedProblemRevisions,
+  loadAllEffectiveUnsavedProblemRevisions,
+  resolveLatestProblemRevision,
   getUnsavedProblemRevision,
   saveUnsavedProblemRevision,
   clearUnsavedProblemRevision,
   getInMemoryProblemRevision,
   setInMemoryProblemRevision,
+  clearInMemoryProblemRevision,
   getInMemoryProblem,
   confirmProblemRevisionSynced,
   loadConceptScheduleAdjustments,
@@ -584,7 +586,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         const candidateProblems = [...liveProblems, ...originals.data.problems];
         const liveConcepts = loadStoredConcepts();
         const candidateConcepts = [...liveConcepts, ...originals.data.concepts];
-        const unsavedRevisions = loadUnsavedProblemRevisions();
+        const unsavedRevisions = loadAllEffectiveUnsavedProblemRevisions();
         const scheduleAdjustments = loadConceptScheduleAdjustments();
 
         const mergedConcepts = mergeConcepts(
@@ -602,6 +604,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           serverKnownIds,
           unsavedRevisions,
           (rev) => {
+            setInMemoryProblemRevision(rev);
             saveUnsavedProblemRevision(rev, {
               onlyIfRevisionId: rev.revisionId,
               onlyIfGeneration: rev.generation,
@@ -626,6 +629,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         for (const [pId, rev] of Object.entries(unsavedRevisions)) {
           if (rev.syncStatus === 'synced') {
             const cleared = clearUnsavedProblemRevision(pId, { revisionId: rev.revisionId, generation: rev.generation });
+            clearInMemoryProblemRevision(pId, { revisionId: rev.revisionId, generation: rev.generation });
             if (!cleared && getUnsavedProblemRevision(pId)?.revisionId === rev.revisionId) {
               clearFailedCount++;
             }
@@ -2848,14 +2852,17 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     opts: { revise?: boolean; expectedVersion?: number; silent?: boolean; localPersisted?: boolean } = {}
   ): Promise<void> => {
     const pinnedScopeId = getStorageScopeId();
+    const memoryProb = getInMemoryProblem(problemId);
+    const storedProb = loadStoredProblems().find((p) => p.id === problemId);
+    const allProb = allProblems.find((p) => p.id === problemId);
     const baseProblem =
-      loadStoredProblems().find((p) => p.id === problemId) ??
-      getInMemoryProblem(problemId) ??
-      allProblems.find((p) => p.id === problemId);
+      memoryProb && (!storedProb || (memoryProb.version ?? 0) >= (storedProb.version ?? 0))
+        ? memoryProb
+        : (storedProb ?? allProb);
     if (!baseProblem) return;
     const persistedUnsaved = getUnsavedProblemRevision(problemId);
     const memoryUnsaved = getInMemoryProblemRevision(problemId);
-    const unsaved = persistedUnsaved ?? memoryUnsaved;
+    const { latest: unsaved } = resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved);
     const targetRevisionId = unsaved?.revisionId;
     const targetGeneration = unsaved?.generation;
     const problem: Problem =
@@ -3001,8 +3008,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               }
             }
 
-            const currentUnsaved = getUnsavedProblemRevision(problemId) ?? getInMemoryProblemRevision(problemId);
-            if (currentUnsaved && (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId)) {
+            const currentUnsaved = resolveLatestProblemRevision(
+              getUnsavedProblemRevision(problemId),
+              getInMemoryProblemRevision(problemId)
+            ).latest;
+            const isCurrentTarget = Boolean(
+              currentUnsaved &&
+              (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId) &&
+              (targetGeneration === undefined || (currentUnsaved.generation ?? 0) <= targetGeneration)
+            );
+            if (currentUnsaved && isCurrentTarget) {
               const conflictRev = {
                 ...currentUnsaved,
                 syncStatus: 'conflict' as const,
@@ -3017,12 +3032,17 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             }
             return;
           }
-          const currentUnsaved = getUnsavedProblemRevision(problemId) ?? getInMemoryProblemRevision(problemId);
-          if (
+          const currentUnsaved = resolveLatestProblemRevision(
+            getUnsavedProblemRevision(problemId),
+            getInMemoryProblemRevision(problemId)
+          ).latest;
+          const isCurrentTarget = Boolean(
             currentUnsaved &&
             currentUnsaved.syncStatus !== 'conflict' &&
-            (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId)
-          ) {
+            (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId) &&
+            (targetGeneration === undefined || (currentUnsaved.generation ?? 0) <= targetGeneration)
+          );
+          if (currentUnsaved && isCurrentTarget) {
             const failedRev = {
               ...currentUnsaved,
               syncStatus: 'failed' as const,
@@ -3047,12 +3067,17 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       }
     } catch (e) {
       if (getStorageScopeId() !== pinnedScopeId) return;
-      const currentUnsaved = getUnsavedProblemRevision(problemId) ?? getInMemoryProblemRevision(problemId);
-      if (
+      const currentUnsaved = resolveLatestProblemRevision(
+        getUnsavedProblemRevision(problemId),
+        getInMemoryProblemRevision(problemId)
+      ).latest;
+      const isCurrentTarget = Boolean(
         currentUnsaved &&
         currentUnsaved.syncStatus !== 'conflict' &&
-        (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId)
-      ) {
+        (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId) &&
+        (targetGeneration === undefined || (currentUnsaved.generation ?? 0) <= targetGeneration)
+      );
+      if (currentUnsaved && isCurrentTarget) {
         const failedRev = {
           ...currentUnsaved,
           syncStatus: 'failed' as const,
@@ -3214,7 +3239,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     updates: Partial<Problem>,
     editReason: string
   ) => {
-    const unsavedBefore = getUnsavedProblemRevision(problemId) ?? getInMemoryProblemRevision(problemId);
+    const unsavedBefore = resolveLatestProblemRevision(
+      getUnsavedProblemRevision(problemId),
+      getInMemoryProblemRevision(problemId)
+    ).latest;
     const fallbackBeforeVersion = unsavedBefore ? unsavedBefore.baseVersion : (allProblems.find((p) => p.id === problemId)?.version ?? 1);
     const res = editAndReviseProblem(problemId, updates, editReason);
     const beforeVersion = res.memoryRevision?.baseVersion ?? fallbackBeforeVersion;

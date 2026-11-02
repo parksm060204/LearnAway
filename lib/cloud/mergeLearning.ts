@@ -374,6 +374,11 @@ export function mergeProblems(
         }
         contentToApply = remote;
         effectiveVersion = serverVersion;
+      } else if (unsaved.syncStatus === 'conflict') {
+        // An existing conflict MUST remain conflict across repeated merges/reloads/fetches!
+        // Never auto-rebase or convert to pending unless server has identical content (checked above).
+        contentToApply = remote;
+        effectiveVersion = serverVersion;
       } else if (serverVersion <= unsaved.baseVersion) {
         // Revision branched from this or older server version, and remote hasn't advanced past base: apply revised content!
         const condCheck = hasVerifiableConditionNote(unsaved, referenceSnapshots);
@@ -401,15 +406,13 @@ export function mergeProblems(
       } else {
         // serverVersion > unsaved.baseVersion and content differs:
         // Check if this is a legacy ambiguous baseVersion where the user actually edited on top of `remote`
-        // (e.g. baseSnapshot matches `remote`, or local problem already confirmed `serverVersion`).
+        // (ONLY verifiable if unsaved.baseSnapshot explicitly matches `remote`!).
+        // serverConfirmedVersion or remote history presence ALONE does NOT prove legacy base!
         const condCheck = hasVerifiableConditionNote(unsaved, referenceSnapshots);
         const isVerifiableLegacyBaseOnRemote = Boolean(
           condCheck.verifiable &&
-          ((unsaved.baseSnapshot && isRevisionMatchingProblem(unsaved.baseSnapshot, remote, referenceSnapshots)) ||
-            mine?.serverConfirmedVersion === serverVersion ||
-            mine?.versionHistory?.some(
-              (s) => s.version === serverVersion && isRevisionMatchingProblem(s, remote, referenceSnapshots)
-            ))
+          unsaved.baseSnapshot &&
+          isRevisionMatchingProblem(unsaved.baseSnapshot, remote, referenceSnapshots)
         );
 
         if (isVerifiableLegacyBaseOnRemote) {
@@ -435,7 +438,7 @@ export function mergeProblems(
             baseVersion: serverVersion,
             revisionVersion: rebasedRevVer,
             baseSnapshot: rebasedSnapshot,
-            syncStatus: unsaved.syncStatus === 'conflict' ? 'pending' : unsaved.syncStatus,
+            syncStatus: 'pending',
             syncError: undefined,
           };
           unsavedRevisions[remote.id] = repairedRev;

@@ -1145,8 +1145,8 @@ export function approveConceptDraft(draftId: string): {
     targetDraft.sourceEvidence.type === 'page'
       ? `제${targetDraft.sourceEvidence.pageNumber || 1}페이지`
       : targetDraft.sourceEvidence.timestamp
-      ? `전사본 ${targetDraft.sourceEvidence.timestamp}`
-      : `전사본 발화 #${targetDraft.sourceEvidence.blockIndex || 1}`;
+        ? `전사본 ${targetDraft.sourceEvidence.timestamp}`
+        : `전사본 발화 #${targetDraft.sourceEvidence.blockIndex || 1}`;
 
   if (existingIndex >= 0) {
     newConcept = {
@@ -1224,8 +1224,8 @@ export function batchApproveConceptDrafts(draftIds: string[]): {
       draft.sourceEvidence.type === 'page'
         ? `제${draft.sourceEvidence.pageNumber || 1}페이지`
         : draft.sourceEvidence.timestamp
-        ? `전사본 ${draft.sourceEvidence.timestamp}`
-        : `전사본 발화 #${draft.sourceEvidence.blockIndex || 1}`;
+          ? `전사본 ${draft.sourceEvidence.timestamp}`
+          : `전사본 발화 #${draft.sourceEvidence.blockIndex || 1}`;
 
     if (existingIndex >= 0) {
       concepts[existingIndex] = {
@@ -1403,6 +1403,12 @@ function getScopedInMemoryProblemMap(): Record<string, Problem> {
 
 export function setInMemoryProblem(problem: Problem): void {
   const map = getScopedInMemoryProblemMap();
+  const existing = map[problem.id];
+  if (existing && typeof existing.version === 'number' && typeof problem.version === 'number') {
+    if (problem.version < existing.version) {
+      return;
+    }
+  }
   map[problem.id] = { ...problem };
 }
 
@@ -1411,8 +1417,13 @@ export function getInMemoryProblem(problemId: string): Problem | null {
   return map[problemId] ? { ...map[problemId] } : null;
 }
 
-export function clearInMemoryProblem(problemId: string): void {
+export function clearInMemoryProblem(problemId: string, expected?: { version?: number }): void {
   const map = getScopedInMemoryProblemMap();
+  const existing = map[problemId];
+  if (!existing) return;
+  if (expected?.version !== undefined && typeof existing.version === 'number' && existing.version > expected.version) {
+    return;
+  }
   delete map[problemId];
 }
 
@@ -2062,7 +2073,10 @@ export function editAndReviseProblem(
   const persistedTarget = problems.find((p) => p.id === problemId);
   const lastKnownTarget = getLastKnownProblem(problemId);
   const memoryTarget = getInMemoryProblem(problemId);
-  const target = persistedTarget ?? lastKnownTarget ?? memoryTarget;
+  const target =
+    memoryTarget && (!persistedTarget || (memoryTarget.version ?? 0) > (persistedTarget.version ?? 0))
+      ? memoryTarget
+      : (persistedTarget ?? lastKnownTarget ?? memoryTarget);
   if (!target) {
     return {
       success: false,
@@ -2124,7 +2138,7 @@ export function editAndReviseProblem(
 
   const persistedUnsaved = getUnsavedProblemRevision(problemId);
   const memoryUnsaved = getInMemoryProblemRevision(problemId);
-  const existingUnsaved = persistedUnsaved ?? memoryUnsaved;
+  const existingUnsaved = resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved).latest;
   const isUnsyncedEdit = Boolean(
     existingUnsaved &&
     (existingUnsaved.syncStatus === 'pending' || existingUnsaved.syncStatus === 'failed' || existingUnsaved.syncStatus === 'syncing')
@@ -2384,14 +2398,14 @@ export function reapproveProblem(
   // content does not immediately re-flag the problem as outdated.
   const refreshedSourceMaterials = currentMaterials
     ? target.sourceMaterials?.map((ref) => {
-        const material = currentMaterials.find((m) => m.id === ref.materialId);
-        if (!material) return ref;
-        return {
-          ...ref,
-          title: material.title,
-          markdownHash: computeMarkdownHash(material.parsedMarkdown || ''),
-        };
-      })
+      const material = currentMaterials.find((m) => m.id === ref.materialId);
+      if (!material) return ref;
+      return {
+        ...ref,
+        title: material.title,
+        markdownHash: computeMarkdownHash(material.parsedMarkdown || ''),
+      };
+    })
     : target.sourceMaterials;
 
   // Re-verify actual quote against current material text
@@ -2607,13 +2621,13 @@ export function markStudyPlanItemCompleted(
   const updated = items.map((i) =>
     i.id === itemId
       ? {
-          ...i,
-          status: 'completed' as const,
-          completedAt: now,
-          completedAttemptId: linkage.attemptId || i.completedAttemptId,
-          completedEventId: linkage.eventId || i.completedEventId,
-          completedMockSessionId: linkage.mockSessionId || i.completedMockSessionId,
-        }
+        ...i,
+        status: 'completed' as const,
+        completedAt: now,
+        completedAttemptId: linkage.attemptId || i.completedAttemptId,
+        completedEventId: linkage.eventId || i.completedEventId,
+        completedMockSessionId: linkage.mockSessionId || i.completedMockSessionId,
+      }
       : i
   );
   saveStoredStudyPlanItems(updated);
@@ -2625,10 +2639,10 @@ export function postponeStudyPlanItem(itemId: string, nextDate: string): StudyPl
   const updated = items.map((i) =>
     i.id === itemId
       ? {
-          ...i,
-          status: 'postponed' as const,
-          assignedDate: nextDate,
-        }
+        ...i,
+        status: 'postponed' as const,
+        assignedDate: nextDate,
+      }
       : i
   );
   saveStoredStudyPlanItems(updated);
@@ -2640,9 +2654,9 @@ export function skipStudyPlanItem(itemId: string): StudyPlanItem[] {
   const updated = items.map((i) =>
     i.id === itemId
       ? {
-          ...i,
-          status: 'skipped' as const,
-        }
+        ...i,
+        status: 'skipped' as const,
+      }
       : i
   );
   saveStoredStudyPlanItems(updated);
@@ -2659,12 +2673,12 @@ export interface PlanLinkageResult {
   persisted: boolean;
   /** 연결을 건너뛴 사유 (없으면 undefined) */
   skippedReason?:
-    | 'PLAN_ITEM_NOT_FOUND'
-    | 'PLAN_ITEM_MISMATCH'
-    | 'PLAN_ITEM_SKIPPED'
-    | 'PLAN_ITEM_COMPLETED_BY_OTHER'
-    | 'NO_MATCHING_ITEM'
-    | 'CORE_RECORD_NOT_PERSISTED';
+  | 'PLAN_ITEM_NOT_FOUND'
+  | 'PLAN_ITEM_MISMATCH'
+  | 'PLAN_ITEM_SKIPPED'
+  | 'PLAN_ITEM_COMPLETED_BY_OTHER'
+  | 'NO_MATCHING_ITEM'
+  | 'CORE_RECORD_NOT_PERSISTED';
   /** 완료 충돌 시 기존 완료 기록의 Attempt ID */
   conflictWithAttemptId?: string;
 }
@@ -2908,11 +2922,11 @@ export function recordAttemptAndUpdateConcept(
     const updatedPlanItems = currentPlanItems.map((i) =>
       i.id === targetId
         ? {
-            ...i,
-            status: 'completed' as const,
-            completedAt: effectiveAttempt.at,
-            completedAttemptId: effectiveAttempt.id,
-          }
+          ...i,
+          status: 'completed' as const,
+          completedAt: effectiveAttempt.at,
+          completedAttemptId: effectiveAttempt.id,
+        }
         : i
     );
     saveStoredStudyPlanItems(updatedPlanItems);
@@ -3249,9 +3263,38 @@ function getScopedInMemoryRevisionMap(): Record<string, UnsavedProblemRevision> 
   return inMemoryRevisionFallback[key];
 }
 
-export function setInMemoryProblemRevision(revision: UnsavedProblemRevision): void {
+export function setInMemoryProblemRevision(
+  revision: UnsavedProblemRevision,
+  options?: { onlyIfRevisionId?: string; onlyIfGeneration?: number }
+): boolean {
   const map = getScopedInMemoryRevisionMap();
+  const existing = map[revision.problemId];
+  if (existing) {
+    if (options?.onlyIfRevisionId && existing.revisionId !== options.onlyIfRevisionId) {
+      return false;
+    }
+    if (options?.onlyIfGeneration !== undefined && existing.generation !== options.onlyIfGeneration) {
+      return false;
+    }
+    if (
+      revision.generation !== undefined &&
+      existing.generation !== undefined &&
+      revision.generation < existing.generation
+    ) {
+      return false;
+    }
+    if (
+      revision.revisionId &&
+      existing.revisionId &&
+      revision.revisionId !== existing.revisionId &&
+      (existing.generation ?? 0) >= (revision.generation ?? 0) &&
+      new Date(existing.revisedAt).getTime() > new Date(revision.revisedAt).getTime()
+    ) {
+      return false;
+    }
+  }
   map[revision.problemId] = revision;
+  return true;
 }
 
 export function getInMemoryProblemRevision(problemId: string): UnsavedProblemRevision | null {
@@ -3259,9 +3302,95 @@ export function getInMemoryProblemRevision(problemId: string): UnsavedProblemRev
   return map[problemId] || null;
 }
 
-export function clearInMemoryProblemRevision(problemId: string): void {
+export function clearInMemoryProblemRevision(
+  problemId: string,
+  expected?: { revisionId?: string; generation?: number }
+): boolean {
   const map = getScopedInMemoryRevisionMap();
+  const existing = map[problemId];
+  if (!existing) return false;
+  if (expected) {
+    if (expected.revisionId && existing.revisionId && existing.revisionId !== expected.revisionId) {
+      return false;
+    }
+    if (expected.generation !== undefined && existing.generation !== undefined && existing.generation > expected.generation) {
+      return false;
+    }
+  }
   delete map[problemId];
+  return true;
+}
+
+/**
+ * Reconciles persisted and in-memory problem revision records using strict precedence:
+ * generation > revisedAt timestamp.
+ * Returns the latest revision, its source, and whether the persisted record is stale.
+ */
+export function resolveLatestProblemRevision(
+  persisted: UnsavedProblemRevision | null | undefined,
+  memory: UnsavedProblemRevision | null | undefined
+): {
+  latest: UnsavedProblemRevision | null;
+  source: 'persisted' | 'memory' | 'none';
+  persistedStale: boolean;
+} {
+  if (!persisted && !memory) {
+    return { latest: null, source: 'none', persistedStale: false };
+  }
+  if (!persisted) {
+    return { latest: memory!, source: 'memory', persistedStale: false };
+  }
+  if (!memory) {
+    return { latest: persisted, source: 'persisted', persistedStale: false };
+  }
+
+  const pGen = persisted.generation ?? 0;
+  const mGen = memory.generation ?? 0;
+
+  if (persisted.revisionId && memory.revisionId && persisted.revisionId === memory.revisionId) {
+    if (mGen > pGen) {
+      return { latest: memory, source: 'memory', persistedStale: true };
+    }
+    if (pGen > mGen) {
+      return { latest: persisted, source: 'persisted', persistedStale: false };
+    }
+    // Same revision ID and generation: memory holds active in-flight syncStatus (e.g. 'syncing')
+    return { latest: memory, source: 'memory', persistedStale: false };
+  }
+
+  if (mGen > pGen) {
+    return { latest: memory, source: 'memory', persistedStale: true };
+  }
+  if (pGen > mGen) {
+    return { latest: persisted, source: 'persisted', persistedStale: false };
+  }
+
+  const pTime = new Date(persisted.revisedAt).getTime();
+  const mTime = new Date(memory.revisedAt).getTime();
+  if (mTime > pTime) {
+    return { latest: memory, source: 'memory', persistedStale: true };
+  }
+  return { latest: persisted, source: 'persisted', persistedStale: false };
+}
+
+export function getEffectiveUnsavedProblemRevision(problemId: string): UnsavedProblemRevision | null {
+  const persisted = getUnsavedProblemRevision(problemId);
+  const memory = getInMemoryProblemRevision(problemId);
+  return resolveLatestProblemRevision(persisted, memory).latest;
+}
+
+export function loadAllEffectiveUnsavedProblemRevisions(): Record<string, UnsavedProblemRevision> {
+  const persisted = loadUnsavedProblemRevisions();
+  const memoryMap = getScopedInMemoryRevisionMap();
+  const result: Record<string, UnsavedProblemRevision> = {};
+  const allIds = new Set([...Object.keys(persisted), ...Object.keys(memoryMap)]);
+  for (const id of allIds) {
+    const resolved = resolveLatestProblemRevision(persisted[id], memoryMap[id]).latest;
+    if (resolved) {
+      result[id] = resolved;
+    }
+  }
+  return result;
 }
 
 function revisionRecordMatches(a: UnsavedProblemRevision, b: UnsavedProblemRevision): boolean {
@@ -3275,7 +3404,7 @@ function revisionRecordMatches(a: UnsavedProblemRevision, b: UnsavedProblemRevis
     a.title === b.title &&
     a.promptText === b.promptText &&
     a.modelAnswer === b.modelAnswer &&
-    (a.appliedConditionNote ?? '') === (b.appliedConditionNote ?? '') &&
+    (a.appliedConditionNote ?? '') === (a.appliedConditionNote ?? '') &&
     (a.mathFormula ?? '') === (b.mathFormula ?? '') &&
     (a.codeSnippet ?? '') === (b.codeSnippet ?? '') &&
     (a.timeStandardMinutes ?? 0) === (b.timeStandardMinutes ?? 0)
@@ -3355,7 +3484,7 @@ export function clearUnsavedProblemRevision(
   if (getUnsavedProblemRevision(problemId) !== null) {
     return false;
   }
-  clearInMemoryProblemRevision(problemId);
+  clearInMemoryProblemRevision(problemId, expected);
   return true;
 }
 
@@ -3392,17 +3521,18 @@ export function confirmProblemRevisionSynced(
   const confirmedVersion = serverProblem.version;
   const persistedUnsaved = getUnsavedProblemRevision(problemId);
   const memoryUnsaved = getInMemoryProblemRevision(problemId);
-  const currentUnsaved = persistedUnsaved ?? memoryUnsaved;
+  const { latest: currentUnsaved } = resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved);
   const targetRevisionId = expected?.revisionId;
   const targetGeneration = expected?.generation;
 
   // Check if a newer consecutive edit occurred while this server request was in flight
-  if (
+  const isNewerConsecutiveEdit = Boolean(
     currentUnsaved &&
-    targetRevisionId &&
-    currentUnsaved.revisionId !== targetRevisionId &&
-    (currentUnsaved.generation ?? 0) > (targetGeneration ?? 0)
-  ) {
+    ((targetRevisionId && currentUnsaved.revisionId !== targetRevisionId) ||
+      (targetGeneration !== undefined && (currentUnsaved.generation ?? 0) > targetGeneration))
+  );
+
+  if (isNewerConsecutiveEdit && currentUnsaved) {
     const baseSource = expected?.snapshotProblem ?? (serverProblem as Problem);
     const confirmedSnapshot: ProblemVersionSnapshot = {
       version: confirmedVersion,
@@ -3428,6 +3558,15 @@ export function confirmProblemRevisionSynced(
       baseSnapshot: confirmedSnapshot,
     };
     setInMemoryProblemRevision(updatedInFlightRev);
+
+    // If persistent storage still has the older target revision (A), clear it first!
+    if (persistedUnsaved && (!targetRevisionId || persistedUnsaved.revisionId === targetRevisionId)) {
+      clearUnsavedProblemRevision(problemId, {
+        revisionId: targetRevisionId,
+        generation: targetGeneration,
+      });
+    }
+
     const revSaved = saveUnsavedProblemRevision(updatedInFlightRev, {
       onlyIfRevisionId: currentUnsaved.revisionId,
       onlyIfGeneration: currentUnsaved.generation,
@@ -3436,12 +3575,16 @@ export function confirmProblemRevisionSynced(
     const currentStored = loadStoredProblems();
     const baseList =
       currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
+    const memoryProb = getInMemoryProblem(problemId);
+
     const reconciledWithInFlight = baseList.map((p) => {
       if (p.id !== problemId) return p;
-      const existingHist = p.versionHistory || [];
+      const effectiveProblem =
+        memoryProb && (memoryProb.version ?? 0) >= (p.version ?? 0) ? memoryProb : p;
+      const existingHist = effectiveProblem.versionHistory || p.versionHistory || [];
       const hasConfirmedSnap = existingHist.some((s) => s.version === confirmedVersion);
       return {
-        ...p,
+        ...effectiveProblem,
         version: nextRevVer,
         serverConfirmedVersion: confirmedVersion,
         localUnrecordedBaseVersion: undefined,
@@ -3449,6 +3592,10 @@ export function confirmProblemRevisionSynced(
       };
     });
     const probSaved = saveStoredProblems(reconciledWithInFlight);
+    const reconciledProb = reconciledWithInFlight.find((p) => p.id === problemId);
+    if (reconciledProb) {
+      setInMemoryProblem(reconciledProb);
+    }
     const localPersisted = revSaved && probSaved;
     return {
       reconciled: true,
@@ -3469,20 +3616,20 @@ export function confirmProblemRevisionSynced(
   const reconciledProblems = baseList.map((p) =>
     p.id === problemId
       ? {
-          ...p,
-          ...serverProblem,
-          version: confirmedVersion,
-          serverConfirmedVersion: confirmedVersion,
-          localUnrecordedBaseVersion: undefined,
-          reports: p.reports ?? serverProblem.reports ?? [],
-          versionHistory: p.versionHistory ?? serverProblem.versionHistory ?? [],
-          reviewNotes: p.reviewNotes ?? serverProblem.reviewNotes,
-        }
+        ...p,
+        ...serverProblem,
+        version: confirmedVersion,
+        serverConfirmedVersion: confirmedVersion,
+        localUnrecordedBaseVersion: undefined,
+        reports: p.reports ?? serverProblem.reports ?? [],
+        versionHistory: p.versionHistory ?? serverProblem.versionHistory ?? [],
+        reviewNotes: p.reviewNotes ?? serverProblem.reviewNotes,
+      }
       : p
   );
   const probSaved = saveStoredProblems(reconciledProblems);
   if (probSaved) {
-    clearInMemoryProblem(problemId);
+    clearInMemoryProblem(problemId, { version: confirmedVersion });
   } else {
     const memProb = reconciledProblems.find((p) => p.id === problemId);
     if (memProb) setInMemoryProblem(memProb);
@@ -3491,9 +3638,6 @@ export function confirmProblemRevisionSynced(
   const hadTargetPersistedUnsaved = Boolean(
     persistedUnsaved && (!targetRevisionId || persistedUnsaved.revisionId === targetRevisionId)
   );
-  const hadTargetMemoryUnsaved = Boolean(
-    memoryUnsaved && (!targetRevisionId || memoryUnsaved.revisionId === targetRevisionId)
-  );
 
   let cleared = true;
   if (hadTargetPersistedUnsaved) {
@@ -3501,9 +3645,11 @@ export function confirmProblemRevisionSynced(
       revisionId: targetRevisionId,
       generation: targetGeneration,
     });
-  } else if (hadTargetMemoryUnsaved) {
-    clearInMemoryProblemRevision(problemId);
   }
+  clearInMemoryProblemRevision(problemId, {
+    revisionId: targetRevisionId,
+    generation: targetGeneration,
+  });
 
   const localPersisted = probSaved && (!hadTargetPersistedUnsaved || cleared);
   return {
@@ -3525,9 +3671,9 @@ export interface LocalProblemVersionInconsistency {
   rowVersion: number;
   snapshotVersion?: number;
   issueType:
-    | 'CURRENT_SNAPSHOT_CONTENT_MISMATCH'
-    | 'DUPLICATE_HISTORY_VERSION'
-    | 'HISTORY_VERSION_GTE_CURRENT';
+  | 'CURRENT_SNAPSHOT_CONTENT_MISMATCH'
+  | 'DUPLICATE_HISTORY_VERSION'
+  | 'HISTORY_VERSION_GTE_CURRENT';
   details: string;
 }
 
