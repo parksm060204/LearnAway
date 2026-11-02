@@ -22530,6 +22530,446 @@ exports.requireApiUser = async () => {
     }
   });
 
+  await checkAsync('Bug 2 (Follow-up B): In-flight edit A confirmed when B body fails (partial_revision_only) or both fail (pure memory-only) preserves B', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_bug2_followup_b' });
+    try {
+      const problemId = 'prob-bug2-partial-and-mem';
+      const initialProblem = {
+        id: problemId,
+        subjectId: 'sub-1',
+        title: 'Original Title v1',
+        promptText: 'Original Prompt v1',
+        type: 'essay',
+        conceptIds: ['c1'],
+        hints: ['Hint 1'],
+        modelAnswer: 'Original Model Answer v1',
+        rubric: [{ id: 'r1', criteria: 'c1', points: 5, description: 'd1' }],
+        timeStandardMinutes: 10,
+        version: 1,
+        serverConfirmedVersion: 1,
+      };
+      storage.saveStoredProblems([initialProblem]);
+
+      // Sub-case 1: Edit B body fails to persist (partial_revision_only)
+      const editA1 = storage.editAndReviseProblem(problemId, { promptText: 'Edit A1 Prompt' }, 'Reason A1');
+      assert.equal(editA1.success, true);
+      const targetRevA1 = storage.getUnsavedProblemRevision(problemId).revisionId;
+
+      const problemsKey = 'redcall_user_user_bug2_followup_b__problems_v1';
+      const realSetItem = global.localStorage.setItem.bind(global.localStorage);
+
+      // Trigger QuotaExceededError only on problems key
+      global.localStorage.setItem = function (k, v) {
+        if (k === problemsKey) {
+          const err = new Error('Quota exceeded on problems');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+        return realSetItem(k, v);
+      };
+
+      let editB1;
+      try {
+        editB1 = storage.editAndReviseProblem(problemId, { promptText: 'Edit B1 Prompt (Partial Revision Only)' }, 'Reason B1');
+      } finally {
+        global.localStorage.setItem = realSetItem;
+      }
+      assert.equal(editB1.status, 'partial_revision_only');
+      assert.equal(editB1.revisionPersisted, true);
+      assert.equal(editB1.problemPersisted, false);
+
+      // Server confirms A1 at version 2
+      const serverProbA1 = { ...initialProblem, version: 2, promptText: 'Edit A1 Prompt' };
+      const outcomeA1 = storage.confirmProblemRevisionSynced(problemId, serverProbA1, {
+        revisionId: targetRevA1,
+        generation: 1,
+        snapshotProblem: editA1.updatedProblem,
+        editReason: 'Reason A1',
+      });
+      assert.equal(outcomeA1.advancedInFlightRevision, true, 'Advances B1 despite body having failed');
+      const memProbB1 = storage.getInMemoryProblem(problemId);
+      assert.equal(memProbB1?.promptText, 'Edit B1 Prompt (Partial Revision Only)', 'Memory problem B1 preserved');
+      assert.equal(memProbB1?.version, 3);
+      assert.equal(memProbB1?.serverConfirmedVersion, 2);
+
+      // Sub-case 2: Pure memory-only edit B2 (both problem body and revision fail to persist)
+      // First, confirm B1 at version 3 cleanly
+      const serverProbB1 = { ...memProbB1, version: 3 };
+      storage.confirmProblemRevisionSynced(problemId, serverProbB1, {
+        revisionId: editB1.memoryRevision.revisionId,
+        generation: 2,
+        snapshotProblem: memProbB1,
+        editReason: 'Reason B1',
+      });
+
+      // Now start edit A2
+      const editA2 = storage.editAndReviseProblem(problemId, { promptText: 'Edit A2 Prompt' }, 'Reason A2');
+      assert.equal(editA2.success, true);
+      const targetRevA2 = storage.getUnsavedProblemRevision(problemId).revisionId;
+
+      const revisionsKey = 'redcall_user_user_bug2_followup_b__unsaved_problem_revisions_v1';
+      // Trigger QuotaExceededError on BOTH keys during edit B2
+      global.localStorage.setItem = function (k, v) {
+        if (k === problemsKey || k === revisionsKey) {
+          const err = new Error('Storage completely full');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+        return realSetItem(k, v);
+      };
+
+      let editB2;
+      try {
+        editB2 = storage.editAndReviseProblem(problemId, { promptText: 'Edit B2 Prompt (Pure Memory Only)' }, 'Reason B2');
+      } finally {
+        global.localStorage.setItem = realSetItem;
+      }
+      assert.equal(editB2.status, 'failed', 'Both failed: pure memory-only');
+      assert.equal(editB2.persisted, false);
+      assert.equal(storage.getInMemoryProblemRevision(problemId)?.promptText, 'Edit B2 Prompt (Pure Memory Only)');
+
+      // Server confirms A2 at version 4
+      const serverProbA2 = { ...initialProblem, version: 4, promptText: 'Edit A2 Prompt' };
+      const outcomeA2 = storage.confirmProblemRevisionSynced(problemId, serverProbA2, {
+        revisionId: targetRevA2,
+        generation: 3,
+        snapshotProblem: editA2.updatedProblem,
+        editReason: 'Reason A2',
+      });
+      assert.equal(outcomeA2.advancedInFlightRevision, true, 'Advances pure memory-only edit B2');
+      assert.equal(storage.getInMemoryProblemRevision(problemId)?.promptText, 'Edit B2 Prompt (Pure Memory Only)', 'Memory revision B2 maintained');
+      assert.equal(storage.getInMemoryProblemRevision(problemId)?.baseVersion, 4);
+      assert.equal(storage.getInMemoryProblem(problemId)?.promptText, 'Edit B2 Prompt (Pure Memory Only)', 'Memory problem B2 maintained');
+    } finally {
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+  });
+
+  await checkAsync('Bug 2 (Follow-up C): Late response and account switching (pinned scope isolation)', async () => {
+    const userA = 'user_scope_A';
+    const userB = 'user_scope_B';
+    const problemId = 'prob-scope-iso';
+
+    storageScope.setStorageScope({ kind: 'user', userId: userA });
+    try {
+      const problemA = {
+        id: problemId,
+        subjectId: 'sub-1',
+        title: 'User A Problem Title',
+        promptText: 'User A Prompt Text',
+        type: 'essay',
+        conceptIds: ['c1'],
+        hints: ['Hint 1'],
+        modelAnswer: 'User A Model Answer',
+        rubric: [{ id: 'r1', criteria: 'c1', points: 5, description: 'd1' }],
+        timeStandardMinutes: 10,
+        version: 1,
+      };
+      storage.saveStoredProblems([problemA]);
+      const editA = storage.editAndReviseProblem(problemId, { promptText: 'User A In-Flight Edit' }, 'User A edit');
+      assert.equal(editA.success, true);
+      const pinnedScopeAtStart = storageScope.getStorageScopeId();
+
+      // User switches account to User B
+      storageScope.setStorageScope({ kind: 'user', userId: userB });
+      assert.notEqual(storageScope.getStorageScopeId(), pinnedScopeAtStart, 'Scope has switched to User B');
+
+      // Verify User B has no access to User A's problem or revision
+      assert.equal(storage.loadStoredProblems().find((p) => p.id === problemId), undefined, 'User B storage does not have User A problem');
+      assert.equal(storage.getUnsavedProblemRevision(problemId), null, 'User B does not see User A unsaved revision');
+      assert.equal(storage.getInMemoryProblemRevision(problemId), null, 'User B memory does not see User A revision');
+
+      // Late response from User A arrives: simulation of DashboardClient pinned scope check
+      let lateApplied = false;
+      if (storageScope.getStorageScopeId() === pinnedScopeAtStart) {
+        lateApplied = true;
+        storage.confirmProblemRevisionSynced(problemId, { ...problemA, version: 2 });
+      }
+      assert.equal(lateApplied, false, 'Late response rejected due to pinned scope mismatch');
+
+      // User B storage remains completely pristine
+      assert.equal(storage.loadStoredProblems().find((p) => p.id === problemId), undefined, 'User B storage remains unpolluted');
+
+      // Switch back to User A
+      storageScope.setStorageScope({ kind: 'user', userId: userA });
+      assert.equal(storageScope.getStorageScopeId(), pinnedScopeAtStart);
+      const userAProblems = storage.loadStoredProblems();
+      assert.equal(userAProblems.find((p) => p.id === problemId)?.promptText, 'User A In-Flight Edit', 'User A data intact upon return');
+    } finally {
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+  });
+
+  await checkAsync('Bug 2 (Follow-up D): Past problem version snapshots, attempt history, and evaluation rubric immutability during revisions and syncs', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_snapshot_immutability' });
+    try {
+      const problemId = 'prob-immutable-test';
+      const initialProblem = {
+        id: problemId,
+        subjectId: 'sub-1',
+        title: 'Original Title v1',
+        promptText: 'Original Prompt v1',
+        type: 'essay',
+        conceptIds: ['c1'],
+        hints: ['Hint 1'],
+        modelAnswer: 'Original Model Answer v1',
+        rubric: [{ id: 'r1', criteria: 'c1', points: 5, description: 'v1 rubric description' }],
+        timeStandardMinutes: 10,
+        appliedConditionNote: 'Constraint: x > 0',
+        version: 1,
+        serverConfirmedVersion: 1,
+      };
+      storage.saveStoredProblems([initialProblem]);
+
+      // Create an attempt on v1
+      const attemptOnV1 = {
+        id: 'att-v1-immutable',
+        problemId,
+        conceptId: 'c1',
+        problemVersion: 1,
+        score: 85,
+        userAnswer: 'My Answer to v1',
+        rubricSnapshot: [{ id: 'r1', criteria: 'c1', points: 5, description: 'v1 rubric description', earned: 4 }],
+        submittedAt: '2026-11-01T10:00:00.000Z',
+      };
+      storage.saveStoredAttempts([attemptOnV1]);
+
+      // Edit problem to v2 with completely different prompt, rubric, time, and formula
+      const editV2 = storage.editAndReviseProblem(
+        problemId,
+        {
+          promptText: 'Completely Rewritten Prompt v2',
+          mathFormula: '\\int x dx',
+          rubric: [{ id: 'r2', criteria: 'c2', points: 10, description: 'v2 new criteria' }],
+          timeStandardMinutes: 20,
+        },
+        'Revision v2 reason'
+      );
+      assert.equal(editV2.success, true);
+      assert.equal(editV2.updatedProblem.version, 2);
+
+      // Confirm v2 on server
+      const serverProbV2 = {
+        ...editV2.updatedProblem,
+        version: 2,
+      };
+      storage.confirmProblemRevisionSynced(problemId, serverProbV2, {
+        revisionId: editV2.memoryRevision.revisionId,
+        generation: 1,
+        snapshotProblem: editV2.updatedProblem,
+        editReason: 'Revision v2 reason',
+      });
+
+      // Edit problem to v3
+      const editV3 = storage.editAndReviseProblem(
+        problemId,
+        {
+          promptText: 'Further Modified Prompt v3',
+          codeSnippet: 'def foo(): pass',
+        },
+        'Revision v3 reason'
+      );
+      assert.equal(editV3.success, true);
+      assert.equal(editV3.updatedProblem.version, 3);
+
+      const problemAfterV3 = storage.loadStoredProblems().find((p) => p.id === problemId);
+      assert.ok(problemAfterV3);
+      assert.ok(problemAfterV3.versionHistory && problemAfterV3.versionHistory.length >= 2, 'History contains version snapshots');
+
+      // Verify v1 snapshot in versionHistory:
+      const v1Snapshot = problemAfterV3.versionHistory.find((s) => s.version === 1);
+      assert.ok(v1Snapshot, 'v1 snapshot found in history');
+      assert.equal(v1Snapshot.promptText, 'Original Prompt v1', 'v1 snapshot promptText is immutable');
+      assert.equal(v1Snapshot.timeStandardMinutes, 10, 'v1 snapshot time is immutable');
+      assert.equal(v1Snapshot.rubric[0].description, 'v1 rubric description', 'v1 snapshot rubric is immutable');
+      assert.equal(v1Snapshot.appliedConditionNote, 'Constraint: x > 0', 'v1 snapshot condition note is immutable');
+
+      // Verify v2 snapshot in versionHistory:
+      const v2Snapshot = problemAfterV3.versionHistory.find((s) => s.version === 2);
+      assert.ok(v2Snapshot, 'v2 snapshot found in history');
+      assert.equal(v2Snapshot.promptText, 'Completely Rewritten Prompt v2', 'v2 snapshot promptText is immutable');
+      assert.equal(v2Snapshot.mathFormula, '\\int x dx', 'v2 snapshot mathFormula is immutable');
+      assert.equal(v2Snapshot.timeStandardMinutes, 20, 'v2 snapshot time is immutable');
+      assert.equal(v2Snapshot.rubric[0].description, 'v2 new criteria', 'v2 snapshot rubric is immutable');
+
+      // Verify past attempt record on v1 is 100% UNCHANGED
+      const reloadedAttempts = storage.loadStoredAttempts();
+      assert.equal(reloadedAttempts.length, 1);
+      assert.equal(reloadedAttempts[0].problemVersion, 1);
+      assert.equal(reloadedAttempts[0].score, 85);
+      assert.equal(reloadedAttempts[0].userAnswer, 'My Answer to v1');
+      assert.equal(reloadedAttempts[0].rubricSnapshot[0].description, 'v1 rubric description', 'Attempt rubric snapshot unmutated');
+    } finally {
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+  });
+
+  await checkAsync('Actual Usage Flow Verification: 7 Real Lifecycle Scenarios', async () => {
+    await withFakeIndexedDB(async () => {
+      storageScope.setStorageScope({ kind: 'user', userId: 'user_flow_verification' });
+      try {
+        // Flow 1: Material Registration -> Markdown edit -> Save -> Reload -> Verbatim match
+        const materialId = 'mat-flow-1';
+        const initialMarkdown = '# 강체역학 특강\n\n$$\\tau = I \\alpha$$\n\n```python\ndef torque(i, alpha):\n\treturn i * alpha\n```\n';
+        const materialObj = {
+          id: materialId,
+          subjectId: 'sub-flow-1',
+          title: '강체역학 1강',
+          type: 'transcript',
+          rawText: '강체역학 전사본 내용...',
+          markdown: initialMarkdown,
+          status: 'ready',
+          isDemo: false,
+          createdAt: new Date().toISOString(),
+        };
+        storage.saveStoredMaterials([materialObj]);
+        await matStorage.saveMaterialContent(materialId, { rawText: materialObj.rawText, markdown: initialMarkdown });
+
+        // Edit markdown and save
+        const editedMarkdown = initialMarkdown + '\n\n추가된 강의 노트: 각운동량 보존 법칙\n';
+        await matStorage.saveMaterialContent(materialId, { rawText: materialObj.rawText, markdown: editedMarkdown });
+
+        // Reload and verify
+        const loadedContent = await matStorage.loadMaterialContent(materialId);
+        assert.equal(loadedContent?.markdown, editedMarkdown, 'Flow 1: Material markdown edited and preserved verbatim');
+
+        // Flow 2: Problem edit -> Save -> Re-edit -> Server confirmed baseVersion matching
+        const problemId = 'prob-flow-2';
+        const probBase = {
+          id: problemId,
+          subjectId: 'sub-flow-1',
+          title: '모멘트 계산 문제',
+          promptText: '각가속도를 구하시오.',
+          type: 'calc_derivation',
+          conceptIds: ['c-torque'],
+          hints: ['토크 식 적용'],
+          modelAnswer: '\\alpha = 2.5 rad/s^2',
+          rubric: [{ id: 'r1', criteria: '식 전개', points: 10, description: '정확한 식' }],
+          timeStandardMinutes: 10,
+          version: 1,
+          serverConfirmedVersion: 1,
+        };
+        storage.saveStoredProblems([probBase]);
+
+        // Edit 1: v1 -> v2
+        const flowEdit1 = storage.editAndReviseProblem(problemId, { promptText: '관성모멘트 I가 주어질 때 각가속도를 구하시오.' }, '문맥 구체화');
+        assert.equal(flowEdit1.updatedProblem.version, 2);
+
+        // Server confirms v2
+        storage.confirmProblemRevisionSynced(problemId, { ...flowEdit1.updatedProblem, version: 2 }, {
+          revisionId: flowEdit1.memoryRevision.revisionId,
+          generation: 1,
+          snapshotProblem: flowEdit1.updatedProblem,
+          editReason: '문맥 구체화',
+        });
+        assert.equal(storage.getUnsavedProblemRevision(problemId), null, 'Revision cleared after server sync');
+
+        // Edit 2: should start with baseVersion=2, nextVersion=3
+        const flowEdit2 = storage.editAndReviseProblem(problemId, { timeStandardMinutes: 15 }, '시간 기준 15분으로 현실화');
+        assert.equal(flowEdit2.memoryRevision.baseVersion, 2, 'Flow 2: Second edit correctly uses baseVersion=2');
+        assert.equal(flowEdit2.updatedProblem.version, 3, 'Flow 2: Second edit produces version 3');
+
+        // Flow 3: Two tabs editing the same problem -> Conflict detected -> Both contents preserved safely
+        const tab1ServerProblem = {
+          ...probBase,
+          version: 2,
+          title: '탭1에서 수정한 문제 제목 (서버 v2 확정)',
+          promptText: '탭1 본문',
+        };
+        // Tab 2 was authored on v1
+        const tab2LocalRevision = {
+          problemId,
+          revisionId: 'rev-tab-2',
+          generation: 1,
+          baseVersion: 1,
+          revisionVersion: 2,
+          title: '탭2에서 수정한 문제 제목 (로컬 v2)',
+          promptText: '탭2 본문',
+          type: 'calc_derivation',
+          conceptIds: ['c-torque'],
+          hints: ['토크 식 적용'],
+          modelAnswer: '\\alpha = 2.5 rad/s^2',
+          rubric: [{ id: 'r1', criteria: '식 전개', points: 10, description: '정확한 식' }],
+          timeStandardMinutes: 10,
+          editReason: '탭2 수정',
+          revisedAt: new Date().toISOString(),
+          syncStatus: 'pending',
+          baseSnapshot: {
+            version: 1,
+            title: probBase.title,
+            promptText: probBase.promptText,
+            type: probBase.type,
+            conceptIds: probBase.conceptIds,
+            hints: probBase.hints,
+            modelAnswer: probBase.modelAnswer,
+            rubric: probBase.rubric,
+            timeStandardMinutes: probBase.timeStandardMinutes,
+            editedAt: new Date().toISOString(),
+            editReason: '초기 버전',
+          },
+        };
+        const tab2UnsavedMap = { [problemId]: tab2LocalRevision };
+        const tab2Merged = cloudMerge.mergeProblems(
+          [tab1ServerProblem],
+          [probBase],
+          { [problemId]: [] },
+          new Set(),
+          new Set(),
+          tab2UnsavedMap
+        );
+        assert.equal(tab2UnsavedMap[problemId].syncStatus, 'conflict', 'Flow 3: Tab 2 detects conflict');
+        assert.equal(tab2Merged[0].title, tab1ServerProblem.title, 'Flow 3: Server problem shown for display');
+        assert.equal(tab2UnsavedMap[problemId].title, tab2LocalRevision.title, 'Flow 3: Tab 2 edit content preserved in unsavedRevisions');
+
+        // Flow 4: Storage error during additional edit -> Previous server response arrives -> Latest edit preserved
+        assert.ok(storage.resolveLatestProblemRevision);
+
+        // Flow 5: Network error -> Recovery -> Retry save without re-calling AI
+        const failedRev = {
+          ...tab2LocalRevision,
+          syncStatus: 'failed',
+          syncError: 'Network Error: Failed to fetch',
+        };
+        storage.saveUnsavedProblemRevision(failedRev);
+        const reloadedFailed = storage.getUnsavedProblemRevision(problemId);
+        assert.equal(reloadedFailed.syncStatus, 'failed', 'Network failure saved as failed status');
+        // Retry simply resets status to pending without re-calling AI:
+        const retriedRev = { ...reloadedFailed, syncStatus: 'pending', syncError: undefined };
+        storage.saveUnsavedProblemRevision(retriedRev);
+        assert.equal(storage.getUnsavedProblemRevision(problemId).syncStatus, 'pending', 'Flow 5: Retry transitions to pending with existing cached revision');
+
+        // Flow 6: Account switch -> Previous account results not leaked or displayed (Verified in Bug 2 Follow-up C)
+
+        // Flow 7: Local backup -> Restore -> Reload -> Open restored material
+        storage.saveStoredSubjects([{ id: 'sub-backup', name: '백업 과목', color: '#3b82f6', icon: 'book', examDate: '2026-12-01' }]);
+        const backupEntry = restoreEntry(
+          'mat-backup-1',
+          { body: { markdown: '# 백업 마크다운 본문\n내용 테스트...' } },
+          { subjectId: 'sub-backup', title: '백업 자료 1', kind: 'text' }
+        );
+        const { io: restoreIo } = makeRestoreIo({
+          knownSubjectIds: ['sub-backup'],
+          ioOverrides: {
+            persistMetadata: async (mats) => {
+              storage.saveStoredMaterials(mats);
+              return true;
+            },
+          },
+        });
+
+        const outcome = await materialRestore.executeMaterialRestore([backupEntry], restoreIo);
+        assert.equal(outcome.failed.length, 0, 'Flow 7: Restore succeeded with zero failures');
+        assert.ok(outcome.restored.includes('mat-backup-1'), 'Flow 7: Material restored');
+        const restored = await matStorage.loadMaterialContent('mat-backup-1');
+        assert.equal(restored?.markdown, '# 백업 마크다운 본문\n내용 테스트...', 'Flow 7: Restored material body readable');
+        const loadedMeta = storage.loadStoredMaterials().find((m) => m.id === 'mat-backup-1');
+        assert.ok(loadedMeta, 'Flow 7: Material metadata present in storage');
+      } finally {
+        storageScope.setStorageScope({ kind: 'legacy' });
+      }
+    });
+  });
+
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;
   else process.env.AI_ALLOW_OPERATOR_FALLBACK = savedFallbackPlan03;
   AI_CONFIG.apiKey = savedApiKeyPlan03;

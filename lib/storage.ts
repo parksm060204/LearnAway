@@ -3577,20 +3577,32 @@ export function confirmProblemRevisionSynced(
       currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
     const memoryProb = getInMemoryProblem(problemId);
 
-    const reconciledWithInFlight = baseList.map((p) => {
-      if (p.id !== problemId) return p;
-      const effectiveProblem =
-        memoryProb && (memoryProb.version ?? 0) >= (p.version ?? 0) ? memoryProb : p;
-      const existingHist = effectiveProblem.versionHistory || p.versionHistory || [];
-      const hasConfirmedSnap = existingHist.some((s) => s.version === confirmedVersion);
-      return {
-        ...effectiveProblem,
-        version: nextRevVer,
-        serverConfirmedVersion: confirmedVersion,
-        localUnrecordedBaseVersion: undefined,
-        versionHistory: hasConfirmedSnap ? existingHist : [confirmedSnapshot, ...existingHist],
-      };
-    });
+    const hasInBaseList = baseList.some((p) => p.id === problemId);
+    const reconciledWithInFlight = hasInBaseList
+      ? baseList.map((p) => {
+          if (p.id !== problemId) return p;
+          const effectiveProblem =
+            memoryProb && (memoryProb.version ?? 0) >= (p.version ?? 0) ? memoryProb : p;
+          const existingHist = effectiveProblem.versionHistory || p.versionHistory || [];
+          const hasConfirmedSnap = existingHist.some((s) => s.version === confirmedVersion);
+          return {
+            ...effectiveProblem,
+            version: nextRevVer,
+            serverConfirmedVersion: confirmedVersion,
+            localUnrecordedBaseVersion: undefined,
+            versionHistory: hasConfirmedSnap ? existingHist : [confirmedSnapshot, ...existingHist],
+          };
+        })
+      : [
+          ...baseList,
+          {
+            ...(memoryProb ?? (serverProblem as Problem)),
+            version: nextRevVer,
+            serverConfirmedVersion: confirmedVersion,
+            localUnrecordedBaseVersion: undefined,
+            versionHistory: [confirmedSnapshot],
+          },
+        ];
     const probSaved = saveStoredProblems(reconciledWithInFlight);
     const reconciledProb = reconciledWithInFlight.find((p) => p.id === problemId);
     if (reconciledProb) {
@@ -3613,20 +3625,34 @@ export function confirmProblemRevisionSynced(
   const currentStored = loadStoredProblems();
   const baseList =
     currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
-  const reconciledProblems = baseList.map((p) =>
-    p.id === problemId
-      ? {
-        ...p,
-        ...serverProblem,
-        version: confirmedVersion,
-        serverConfirmedVersion: confirmedVersion,
-        localUnrecordedBaseVersion: undefined,
-        reports: p.reports ?? serverProblem.reports ?? [],
-        versionHistory: p.versionHistory ?? serverProblem.versionHistory ?? [],
-        reviewNotes: p.reviewNotes ?? serverProblem.reviewNotes,
-      }
-      : p
-  );
+  const hasInBaseList = baseList.some((p) => p.id === problemId);
+  const reconciledProblems = hasInBaseList
+    ? baseList.map((p) =>
+        p.id === problemId
+          ? {
+              ...p,
+              ...serverProblem,
+              version: confirmedVersion,
+              serverConfirmedVersion: confirmedVersion,
+              localUnrecordedBaseVersion: undefined,
+              reports: p.reports ?? serverProblem.reports ?? [],
+              versionHistory: p.versionHistory ?? serverProblem.versionHistory ?? [],
+              reviewNotes: p.reviewNotes ?? serverProblem.reviewNotes,
+            }
+          : p
+      )
+    : [
+        ...baseList,
+        {
+          ...(serverProblem as Problem),
+          version: confirmedVersion,
+          serverConfirmedVersion: confirmedVersion,
+          localUnrecordedBaseVersion: undefined,
+          reports: serverProblem.reports ?? [],
+          versionHistory: serverProblem.versionHistory ?? [],
+          reviewNotes: serverProblem.reviewNotes,
+        },
+      ];
   const probSaved = saveStoredProblems(reconciledProblems);
   if (probSaved) {
     clearInMemoryProblem(problemId, { version: confirmedVersion });
