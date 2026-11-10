@@ -15,6 +15,8 @@ const compile = spawnSync(
   [
     path.join(root, 'node_modules/typescript/bin/tsc'),
     'lib/types.ts',
+    'lib/dateUtils.ts',
+    'lib/problemComparison.ts',
     'lib/storage.ts',
     'lib/storageScope.ts',
     'lib/cloud/types.ts',
@@ -459,8 +461,66 @@ async function run() {
         ],
       };
 
-      const fallbackMockSupabase = {
-        rpc: async () => ({ data: null, error: { message: 'Could not find the function public.update_problem_quality' } }),
+      // Test adapter implementing `update_problem_quality` RPC (production code must never fall back to direct table `.update()`):
+      const rpcMockSupabase = {
+        rpc: async (fnName, args) => {
+          if (fnName !== 'update_problem_quality') {
+            return { data: null, error: { code: '42883', message: `Could not find the function public.${fnName}` } };
+          }
+          const { p_problem_id: id, p_patch: patch } = args;
+          if (id !== serverState.row.id) {
+            return { data: null, error: { message: 'PROBLEM_NOT_FOUND' } };
+          }
+          if (typeof patch.expectedVersion === 'number' && serverState.row.version !== patch.expectedVersion) {
+            return { data: null, error: { message: 'VERSION_CONFLICT' } };
+          }
+          if (typeof patch.expectedUpdatedAt === 'string' && serverState.row.updated_at !== patch.expectedUpdatedAt) {
+            return { data: null, error: { message: 'VERSION_CONFLICT' } };
+          }
+          const currentPayload = { ...serverState.row.payload };
+          const existingReports = Array.isArray(currentPayload.reports) ? currentPayload.reports : [];
+          if (patch.dismissReport && !existingReports.some((r) => r.id === patch.dismissReport.reportId)) {
+            return { data: null, error: { message: 'REPORT_NOT_FOUND' } };
+          }
+          const mergedReports = learningRepo.mergeProblemReportsAtomically(existingReports, patch);
+          const hasOpenReports = mergedReports.some((r) => r.status === 'open' || r.status === 'under_review');
+          let nextStatus = serverState.row.quality_status ?? 'normal';
+          if (patch.addReport) {
+            nextStatus = serverState.row.quality_status === 'under_review' ? 'under_review' : 'reported';
+          } else if (patch.dismissReport) {
+            nextStatus = hasOpenReports
+              ? serverState.row.quality_status === 'under_review'
+                ? 'under_review'
+                : 'reported'
+              : serverState.row.version > 1
+                ? 'reapproved'
+                : 'normal';
+          } else if (typeof patch.qualityStatus === 'string' && patch.qualityStatus) {
+            nextStatus = patch.qualityStatus;
+          }
+          const nextOutdated =
+            typeof patch.isOutdated === 'boolean' ? patch.isOutdated : serverState.row.is_outdated;
+          const nextNeedsReview =
+            typeof patch.needsSourceReview === 'boolean'
+              ? patch.needsSourceReview
+              : serverState.row.needs_source_review;
+          const safePayload = {
+            ...currentPayload,
+            version: serverState.row.version,
+            qualityStatus: nextStatus,
+            isOutdated: nextOutdated,
+            needsSourceReview: nextNeedsReview,
+            reports: mergedReports,
+          };
+          serverState.row = {
+            ...serverState.row,
+            quality_status: nextStatus,
+            is_outdated: nextOutdated,
+            needs_source_review: nextNeedsReview,
+            payload: safePayload,
+          };
+          return { data: { ...serverState.row, payload: { ...serverState.row.payload } }, error: null };
+        },
         from: (table) => {
           if (table === 'problems') {
             return {
@@ -470,30 +530,9 @@ async function run() {
                 }),
                 in: async () => ({ data: [{ ...serverState.row, payload: { ...serverState.row.payload } }], error: null }),
               }),
-              update: (upd) => ({
-                eq: () => {
-                  const applyUpdate = async () => {
-                    serverState.row = {
-                      ...serverState.row,
-                      ...upd,
-                      payload: { ...upd.payload },
-                    };
-                    return { data: { ...serverState.row }, error: null };
-                  };
-                  return {
-                    eq: () => ({
-                      select: () => ({
-                        single: applyUpdate,
-                        maybeSingle: applyUpdate,
-                      }),
-                    }),
-                    select: () => ({
-                      single: applyUpdate,
-                      maybeSingle: applyUpdate,
-                    }),
-                  };
-                },
-              }),
+              update: () => {
+                throw new Error('updateProblemQuality must NOT fall back to direct problems.update()');
+              },
               upsert: async () => {
                 throw new Error('upsertProblems must not overwrite existing problem rows');
               },
@@ -504,7 +543,7 @@ async function run() {
       };
 
       // Tab A calls updateProblemQuality with stale v1 payload + new report:
-      const qualResA = await learningRepo.updateProblemQuality(fallbackMockSupabase, 'prob-c1', {
+      const qualResA = await learningRepo.updateProblemQuality(rpcMockSupabase, 'prob-c1', {
         qualityStatus: 'reported',
         addReport: staleV1Problem.reports[0],
         payload: staleV1Problem,
@@ -518,7 +557,7 @@ async function run() {
       assert.equal(qualResA.data.reports[0].id, 'rep-tab-a');
 
       // Retry of Tab A's report must be idempotent (no duplicate report):
-      const qualResARetry = await learningRepo.updateProblemQuality(fallbackMockSupabase, 'prob-c1', {
+      const qualResARetry = await learningRepo.updateProblemQuality(rpcMockSupabase, 'prob-c1', {
         qualityStatus: 'reported',
         addReport: staleV1Problem.reports[0],
       });
@@ -534,7 +573,7 @@ async function run() {
         createdAt: '2026-11-02T11:01:00.000Z',
         status: 'open',
       };
-      const qualResB = await learningRepo.updateProblemQuality(fallbackMockSupabase, 'prob-c1', {
+      const qualResB = await learningRepo.updateProblemQuality(rpcMockSupabase, 'prob-c1', {
         qualityStatus: 'reported',
         addReport: reportTabB,
       });
@@ -542,15 +581,44 @@ async function run() {
       assert.equal(qualResB.data.reports.length, 2, 'Both Tab A and Tab B reports preserved');
 
       // Precondition mismatch on expectedVersion must fail with version_conflict:
-      const qualConflict = await learningRepo.updateProblemQuality(fallbackMockSupabase, 'prob-c1', {
+      const qualConflict = await learningRepo.updateProblemQuality(rpcMockSupabase, 'prob-c1', {
         qualityStatus: 'suspended',
         expectedVersion: 1,
       });
       assert.equal(qualConflict.ok, false, 'Mismatched expectedVersion rejected');
       assert.ok(qualConflict.error.includes('version_conflict'), 'Error code indicates version_conflict');
 
+      // Missing RPC in production must fail safely with not_configured and NEVER call direct .from('problems').update():
+      let directUpdateCalled = false;
+      const missingRpcSupabase = {
+        rpc: async () => ({
+          data: null,
+          error: { code: '42883', message: 'Could not find the function public.update_problem_quality' },
+        }),
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => {
+                directUpdateCalled = true;
+                return { data: serverState.row, error: null };
+              },
+            }),
+          }),
+          update: () => {
+            directUpdateCalled = true;
+            throw new Error('Direct update fallback must not be called when RPC is missing');
+          },
+        }),
+      };
+      const missingRpcRes = await learningRepo.updateProblemQuality(missingRpcSupabase, 'prob-c1', {
+        qualityStatus: 'suspended',
+      });
+      assert.equal(missingRpcRes.ok, false, 'Missing update_problem_quality RPC fails safely');
+      assert.ok(missingRpcRes.error.startsWith('not_configured:'), 'Missing RPC returns not_configured error code');
+      assert.equal(directUpdateCalled, false, 'Direct problems table fallback is never executed');
+
       // upsertProblems must skip existing problem IDs so full-payload upserts cannot overwrite server v2 with stale v1:
-      const upsertRes = await learningRepo.upsertProblems(fallbackMockSupabase, [staleV1Problem]);
+      const upsertRes = await learningRepo.upsertProblems(rpcMockSupabase, [staleV1Problem]);
       assert.equal(upsertRes.ok, true, 'upsertProblems skips existing problems without overwriting');
       assert.equal(serverState.row.payload.promptText, 'Prompt v2 LATEST', 'Server v2 body untouched by upsertProblems');
 
@@ -633,38 +701,19 @@ async function run() {
       const raceMockSupabase = {
         rpc: async (fnName) => {
           if (fnName === 'revise_problem_with_snapshot') {
-            return { data: null, error: { message: 'Could not find the function public.revise_problem_with_snapshot' } };
-          }
-          if (fnName === 'revise_problem') {
-            return { data: 2, error: null };
+            return {
+              data: {
+                confirmedVersion: 2,
+                confirmedSnapshot: snapshotV2,
+                problemRow: serverRowV3,
+              },
+              error: null,
+            };
           }
           throw new Error(`Unexpected RPC ${fnName}`);
         },
-        from: (table) => {
-          if (table === 'problems') {
-            return {
-              select: () => ({
-                eq: () => ({
-                  maybeSingle: async () => ({ data: serverRowV3, error: null }),
-                }),
-              }),
-            };
-          }
-          if (table === 'problem_versions') {
-            return {
-              select: () => ({
-                eq: () => ({
-                  eq: (_col, ver) => ({
-                    maybeSingle: async () => ({
-                      data: ver === 2 ? { snapshot: snapshotV2 } : null,
-                      error: null,
-                    }),
-                  }),
-                }),
-              }),
-            };
-          }
-          throw new Error(`Unexpected table ${table}`);
+        from: () => {
+          throw new Error('Atomic revise_problem_with_snapshot must not issue redundant follow-up queries when snapshot and problemRow are returned');
         },
       };
 
@@ -704,9 +753,9 @@ async function run() {
       const readFailMockSupabase = {
         rpc: async (fnName) => {
           if (fnName === 'revise_problem_with_snapshot') {
-            return { data: null, error: { message: 'Could not find the function public.revise_problem_with_snapshot' } };
+            return { data: { confirmedVersion: 2 }, error: null };
           }
-          return { data: 2, error: null };
+          throw new Error(`Unexpected RPC ${fnName}`);
         },
         from: () => ({
           select: () => ({
@@ -923,6 +972,544 @@ async function run() {
       checklistSrc.includes('SERVICE_POLICY_METADATA'),
       'Publication checklist must document SERVICE_POLICY_METADATA fields'
     );
+  });
+
+  await checkAsync('Items 1, 2, 3 & 4: Rubric JSONB key-order independence, unified problem comparison, atomic revise_problem_with_snapshot, and post-save verification separation', async () => {
+    const problemComp = load(path.join(output, 'lib/problemComparison.js'));
+
+    // 1. Explicit array ordering policy
+    assert.deepEqual(
+      problemComp.PROBLEM_ARRAY_ORDER_POLICY,
+      {
+        rubric: 'ordered',
+        hints: 'ordered',
+        conceptIds: 'unordered',
+      },
+      'Array ordering policy must explicitly specify rubric/hints as ordered and conceptIds as unordered'
+    );
+
+    const baseProblem = {
+      id: 'prob-rubric-key-order-1',
+      subjectId: 'sub-math-1',
+      type: 'proof_counterexample',
+      conceptIds: ['concept-a', 'concept-b'],
+      title: '코시-슈바르츠 부등식 증명',
+      promptText: '내적공간에서 코시-슈바르츠 부등식을 증명하시오.',
+      appliedConditionNote: '실수 내적공간 가정',
+      mathFormula: '|<u, v>| <= ||u|| ||v||',
+      codeSnippet: '    def check_equality(u, v):\n        return True',
+      modelAnswer: '임의의 실수 t에 대해 ||u - tv||^2 >= 0 성질을 이용한다.',
+      hints: ['||u - tv||^2 전개', '판별식 D <= 0 적용'],
+      rubric: [
+        {
+          id: 'r1',
+          label: '내적의 양의 정부호성 설정',
+          maxScore: 40,
+          weight: 0.4,
+          description: '||u - tv||^2 >= 0 식을 정확히 세움',
+        },
+        {
+          id: 'r2',
+          label: '판별식 전개 및 결론 도출',
+          maxScore: 60,
+          weight: 0.6,
+          description: 't에 대한 이차부등식의 판별식 D <= 0으로부터 결론 도출',
+        },
+      ],
+      timeStandardMinutes: 20,
+      designIntent: '내적공간의 공리와 이차형식 판별식 연결 확인',
+      version: 2,
+    };
+
+    // Simulate PostgreSQL JSONB key reordering (sorted by key length then ASCII order):
+    // In Postgres JSONB, keys of r1/r2 come back as: id (2), label (5), weight (6), maxScore (8), description (11)
+    const jsonbReorderedRubric = [
+      {
+        id: 'r1',
+        label: '내적의 양의 정부호성 설정',
+        weight: 0.4,
+        maxScore: 40,
+        description: '||u - tv||^2 >= 0 식을 정확히 세움',
+      },
+      {
+        id: 'r2',
+        label: '판별식 전개 및 결론 도출',
+        weight: 0.6,
+        maxScore: 60,
+        description: 't에 대한 이차부등식의 판별식 D <= 0으로부터 결론 도출',
+      },
+    ];
+    // Note that raw JSON.stringify differs because of key order:
+    assert.notEqual(
+      JSON.stringify(baseProblem.rubric),
+      JSON.stringify(jsonbReorderedRubric),
+      'Precondition: raw JSON.stringify differs when JSONB reorders object keys'
+    );
+
+    const jsonbSnapshot = {
+      version: 2,
+      title: baseProblem.title,
+      promptText: baseProblem.promptText,
+      type: baseProblem.type,
+      conceptIds: ['concept-b', 'concept-a'], // unordered set
+      appliedConditionNote: baseProblem.appliedConditionNote,
+      mathFormula: baseProblem.mathFormula,
+      codeSnippet: baseProblem.codeSnippet,
+      timeStandardMinutes: baseProblem.timeStandardMinutes,
+      hints: [...baseProblem.hints],
+      modelAnswer: baseProblem.modelAnswer,
+      rubric: jsonbReorderedRubric,
+      editedAt: '2026-11-10T06:00:00.000Z',
+    };
+
+    // Key order difference alone MUST match across all comparison functions!
+    assert.equal(problemComp.rubricsEqual(baseProblem.rubric, jsonbReorderedRubric), true);
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, jsonbSnapshot),
+      true,
+      'snapshotEvaluationMatchesProblem must ignore JSONB key order and conceptIds order'
+    );
+    assert.equal(
+      problemComp.getProblemEvaluationSignature(baseProblem),
+      problemComp.getProblemEvaluationSignature({ ...baseProblem, rubric: jsonbReorderedRubric, conceptIds: ['concept-b', 'concept-a'] }),
+      'getProblemEvaluationSignature must be invariant to rubric key order and conceptIds order'
+    );
+    assert.equal(
+      problemComp.isRevisionMatchingProblem({ ...baseProblem, rubric: jsonbReorderedRubric }, baseProblem),
+      true,
+      'isRevisionMatchingProblem must match when rubric key order differs'
+    );
+
+    // Meaningful changes in rubric description, maxScore, weight, label, or array order MUST be detected:
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, {
+        ...jsonbSnapshot,
+        rubric: [
+          { ...jsonbReorderedRubric[0], description: '변경된 채점 기준 설명' },
+          jsonbReorderedRubric[1],
+        ],
+      }),
+      false,
+      'Detects rubric description change'
+    );
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, {
+        ...jsonbSnapshot,
+        rubric: [
+          { ...jsonbReorderedRubric[0], maxScore: 50 },
+          { ...jsonbReorderedRubric[1], maxScore: 50 },
+        ],
+      }),
+      false,
+      'Detects rubric maxScore change'
+    );
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, {
+        ...jsonbSnapshot,
+        rubric: [
+          { ...jsonbReorderedRubric[0], weight: 0.5 },
+          { ...jsonbReorderedRubric[1], weight: 0.5 },
+        ],
+      }),
+      false,
+      'Detects rubric weight change'
+    );
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, {
+        ...jsonbSnapshot,
+        rubric: [jsonbReorderedRubric[1], jsonbReorderedRubric[0]],
+      }),
+      false,
+      'Detects rubric array order change'
+    );
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, {
+        ...jsonbSnapshot,
+        hints: [baseProblem.hints[1], baseProblem.hints[0]],
+      }),
+      false,
+      'Detects hints array order change'
+    );
+
+    // Code indentation changes (including leading spaces on line 1) MUST be detected:
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, {
+        ...jsonbSnapshot,
+        codeSnippet: '  def check_equality(u, v):\n        return True', // 2 leading spaces on line 1 instead of 4
+      }),
+      false,
+      'Detects leading indentation change on line 1 of codeSnippet'
+    );
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, {
+        ...jsonbSnapshot,
+        codeSnippet: '    def check_equality(u, v):\n    return True', // 4 spaces on line 2 instead of 8
+      }),
+      false,
+      'Detects internal indentation change on line 2 of codeSnippet'
+    );
+
+    // Incomplete snapshots must NEVER be treated as matching:
+    assert.equal(problemComp.isCompleteProblemSnapshot({}), false);
+    assert.equal(problemComp.isCompleteProblemSnapshot({ version: 2 }), false);
+    assert.equal(
+      problemComp.isCompleteProblemSnapshot({
+        title: baseProblem.title,
+        promptText: baseProblem.promptText,
+        modelAnswer: baseProblem.modelAnswer,
+        // missing rubric array
+      }),
+      false
+    );
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, {}),
+      false,
+      'Empty snapshot {} must NOT match'
+    );
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, { version: 2 }),
+      false,
+      'Incomplete snapshot { version: 2 } must NOT match'
+    );
+
+    // Atomic revise_problem_with_snapshot return path:
+    // 1) Succeeds with JSONB-reordered rubric and issues ZERO follow-up table queries when atomic payload is complete
+    let followUpTableQueried = false;
+    const atomicSuccessSupabase = {
+      rpc: async (fnName, args) => {
+        assert.equal(fnName, 'revise_problem_with_snapshot');
+        assert.equal(args.p_problem_id, baseProblem.id);
+        assert.equal(args.p_expected_version, 1);
+        return {
+          data: {
+            confirmedVersion: 2,
+            confirmedSnapshot: jsonbSnapshot,
+            problemRow: {
+              id: baseProblem.id,
+              user_id: 'user-atomic-1',
+              subject_id: baseProblem.subjectId,
+              type: baseProblem.type,
+              title: baseProblem.title,
+              quality_status: 'review_after_edit',
+              is_outdated: false,
+              needs_source_review: false,
+              version: 2,
+              payload: {
+                ...baseProblem,
+                rubric: jsonbReorderedRubric,
+                version: 2,
+              },
+              created_at: '2026-11-10T05:00:00.000Z',
+              updated_at: '2026-11-10T06:00:00.000Z',
+            },
+          },
+          error: null,
+        };
+      },
+      from: () => {
+        followUpTableQueried = true;
+        throw new Error('Should not query tables when revise_problem_with_snapshot returns atomic snapshot and row');
+      },
+    };
+    const atomicRes = await learningRepo.reviseProblem(atomicSuccessSupabase, baseProblem.id, 1, baseProblem);
+    assert.equal(atomicRes.ok, true);
+    assert.equal(atomicRes.savedToServer, true);
+    assert.equal(atomicRes.confirmedVersion, 2);
+    assert.equal(atomicRes.verificationStatus, 'verified_current');
+    assert.equal(followUpTableQueried, false, 'Zero redundant follow-up queries on atomic return');
+
+    // 2) When RPC succeeds (savedToServer: true) but snapshot is incomplete or mismatched,
+    //    report savedToServer: true and verificationStatus: 'verification_failed' (NOT savedToServer: false / VERSION_CONFLICT!)
+    const incompleteSnapSupabase = {
+      rpc: async () => ({
+        data: {
+          confirmedVersion: 2,
+          confirmedSnapshot: { version: 2 }, // incomplete snapshot
+          problemRow: {
+            id: baseProblem.id,
+            user_id: 'user-atomic-1',
+            subject_id: baseProblem.subjectId,
+            type: baseProblem.type,
+            title: baseProblem.title,
+            quality_status: 'review_after_edit',
+            is_outdated: false,
+            needs_source_review: false,
+            version: 2,
+            payload: { ...baseProblem, version: 2 },
+            created_at: '2026-11-10T05:00:00.000Z',
+            updated_at: '2026-11-10T06:00:00.000Z',
+          },
+        },
+        error: null,
+      }),
+    };
+    const incompleteSnapRes = await learningRepo.reviseProblem(incompleteSnapSupabase, baseProblem.id, 1, baseProblem);
+    assert.equal(incompleteSnapRes.ok, true, 'RPC succeeded so ok is true');
+    assert.equal(incompleteSnapRes.savedToServer, true, 'savedToServer is true even when snapshot verification fails');
+    assert.equal(incompleteSnapRes.confirmedVersion, 2);
+    assert.equal(incompleteSnapRes.verificationStatus, 'verification_failed');
+    assert.ok(incompleteSnapRes.verificationError, 'Provides verificationError reason');
+    assert.equal(incompleteSnapRes.data.title, baseProblem.title, 'Does not clobber local title with incomplete snapshot');
+
+    // 3) Invalid RPC return value (missing/zero confirmedVersion) must NEVER guess expectedVersion + 1:
+    const badReturnSupabase = {
+      rpc: async () => ({ data: {}, error: null }),
+    };
+    const badReturnRes = await learningRepo.reviseProblem(badReturnSupabase, baseProblem.id, 1, baseProblem);
+    assert.equal(badReturnRes.ok, false, 'Invalid RPC return value must fail');
+    assert.equal(badReturnRes.savedToServer, false);
+    assert.ok(badReturnRes.error.startsWith('invalid_rpc_response:'), 'Marks invalid_rpc_response instead of guessing expectedVersion + 1');
+
+    // 4) Unapplied RPC or permission error must be classified as not_configured / forbidden:
+    const unappliedRpcSupabase = {
+      rpc: async () => ({
+        data: null,
+        error: { code: '42883', message: 'Could not find the function public.revise_problem_with_snapshot' },
+      }),
+    };
+    const unappliedRes = await learningRepo.reviseProblem(unappliedRpcSupabase, baseProblem.id, 1, baseProblem);
+    assert.equal(unappliedRes.ok, false);
+    assert.equal(unappliedRes.savedToServer, false);
+    assert.ok(unappliedRes.error.startsWith('not_configured:'));
+
+    const forbiddenRpcSupabase = {
+      rpc: async () => ({
+        data: null,
+        error: { code: '42501', message: 'permission denied for function revise_problem_with_snapshot' },
+      }),
+    };
+    const forbiddenRes = await learningRepo.reviseProblem(forbiddenRpcSupabase, baseProblem.id, 1, baseProblem);
+    assert.equal(forbiddenRes.ok, false);
+    assert.equal(forbiddenRes.savedToServer, false);
+    assert.ok(forbiddenRes.error.startsWith('forbidden:'));
+
+    // 5) Real PGlite RPC save -> problem_versions snapshot query -> learningRepo.reviseProblem judgment
+    const savedWindow = global.window;
+    delete global.window;
+    let pg;
+    try {
+      const { PGlite } = await import('@electric-sql/pglite');
+      pg = new PGlite();
+      await pg.waitReady;
+    } finally {
+      global.window = savedWindow;
+    }
+    await pg.exec(`
+      do $$
+      begin
+        if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon; end if;
+        if not exists (select 1 from pg_roles where rolname = 'authenticated') then create role authenticated; end if;
+        if not exists (select 1 from pg_roles where rolname = 'service_role') then create role service_role; end if;
+      end $$;
+      create schema if not exists auth;
+      create schema if not exists storage;
+      create table if not exists auth.users (
+        id uuid primary key default gen_random_uuid(),
+        email text,
+        raw_user_meta_data jsonb default '{}'::jsonb,
+        created_at timestamptz default now()
+      );
+      create or replace function auth.uid() returns uuid language sql stable as $$
+        select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid;
+      $$;
+      create or replace function auth.role() returns text language sql stable as $$
+        select coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), 'anon');
+      $$;
+      create table if not exists storage.buckets (id text primary key, name text not null, public boolean default false, created_at timestamptz default now());
+      create or replace function storage.foldername(name text) returns text[] language sql immutable as $$ select string_to_array(name, '/'); $$;
+      create or replace function storage.filename(name text) returns text language sql immutable as $$ select (string_to_array(name, '/'))[array_length(string_to_array(name, '/'), 1)]; $$;
+      create or replace function storage.extension(name text) returns text language sql immutable as $$ select split_part(name, '.', 2); $$;
+      create table if not exists storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text references storage.buckets(id), name text not null, owner uuid, created_at timestamptz default now(), updated_at timestamptz default now());
+      grant usage on schema public, auth to anon, authenticated, service_role;
+      grant execute on all functions in schema auth to anon, authenticated, service_role;
+    `);
+    const migDir = path.join(root, 'supabase/migrations');
+    const migFiles = fs.readdirSync(migDir).filter((f) => f.endsWith('.sql')).sort();
+    for (const mf of migFiles) {
+      const sql = fs
+        .readFileSync(path.join(migDir, mf), 'utf8')
+        .replace(/create extension if not exists ["']pgcrypto["'];?/gi, '-- pgcrypto');
+      await pg.exec(sql);
+    }
+    const pgUserId = '99999999-9999-9999-9999-999999999999';
+    await pg.query(
+      `insert into auth.users (id, email, raw_user_meta_data) values ($1, 'pg@example.com', '{"auth_type":"email"}'::jsonb);`,
+      [pgUserId]
+    );
+    await pg.exec(`
+      select set_config('request.jwt.claim.sub', '${pgUserId}', false);
+      select set_config('request.jwt.claim.role', 'authenticated', false);
+    `);
+    await pg.query(
+      `insert into public.subjects (id, user_id, name, code, timezone) values ($1, $2, '해석학', '2026-MATH-99', 'Asia/Seoul');`,
+      [baseProblem.subjectId, pgUserId]
+    );
+    for (const cid of baseProblem.conceptIds) {
+      await pg.query(
+        `insert into public.concepts (id, user_id, subject_id, title) values ($1, $2, $3, $4);`,
+        [cid, pgUserId, baseProblem.subjectId, cid]
+      );
+    }
+    const v1Problem = { ...baseProblem, version: 1, title: '초기 제목 v1' };
+    await pg.query(
+      `insert into public.problems (id, user_id, subject_id, type, title, quality_status, version, payload)
+       values ($1, $2, $3, $4, $5, 'normal', 1, $6::jsonb);`,
+      [baseProblem.id, pgUserId, baseProblem.subjectId, baseProblem.type, v1Problem.title, JSON.stringify(v1Problem)]
+    );
+
+    // Supabase adapter backed by live PGlite instance
+    const pgliteSupabase = {
+      rpc: async (fnName, args) => {
+        if (fnName === 'revise_problem_with_snapshot') {
+          const r = await pg.query(
+            `select public.revise_problem_with_snapshot($1, $2, $3::jsonb) as res;`,
+            [args.p_problem_id, args.p_expected_version, JSON.stringify(args.p_problem)]
+          );
+          return { data: r.rows[0].res, error: null };
+        }
+        throw new Error(`Unexpected RPC ${fnName}`);
+      },
+      from: (table) => {
+        if (table === 'problem_versions') {
+          return {
+            select: () => ({
+              eq: (_col1, pid) => ({
+                eq: (_col2, ver) => ({
+                  maybeSingle: async () => {
+                    const r = await pg.query(
+                      `select * from public.problem_versions where problem_id = $1 and version = $2 limit 1;`,
+                      [pid, ver]
+                    );
+                    return { data: r.rows[0] ?? null, error: null };
+                  },
+                }),
+              }),
+            }),
+          };
+        }
+        if (table === 'problems') {
+          return {
+            select: () => ({
+              eq: (_col, pid) => ({
+                maybeSingle: async () => {
+                  const r = await pg.query(`select * from public.problems where id = $1 limit 1;`, [pid]);
+                  return { data: r.rows[0] ?? null, error: null };
+                },
+              }),
+            }),
+          };
+        }
+        throw new Error(`Unexpected table ${table}`);
+      },
+    };
+
+    const pgReviseRes = await learningRepo.reviseProblem(pgliteSupabase, baseProblem.id, 1, baseProblem);
+    assert.equal(pgReviseRes.ok, true, 'Real PGlite reviseProblem succeeds without false VERSION_CONFLICT');
+    assert.equal(pgReviseRes.savedToServer, true);
+    assert.equal(pgReviseRes.confirmedVersion, 2);
+    assert.equal(pgReviseRes.verificationStatus, 'verified_current');
+
+    // Also query snapshot via getProblemVersionSnapshot and verify snapshotEvaluationMatchesProblem
+    const pgSnapRes = await learningRepo.getProblemVersionSnapshot(pgliteSupabase, baseProblem.id, 2);
+    assert.equal(pgSnapRes.ok, true);
+    assert.ok(pgSnapRes.data);
+    assert.notEqual(
+      JSON.stringify(baseProblem.rubric),
+      JSON.stringify(pgSnapRes.data.rubric),
+      'PostgreSQL JSONB reordered rubric keys in problem_versions'
+    );
+    assert.equal(
+      problemComp.snapshotEvaluationMatchesProblem(baseProblem, pgSnapRes.data),
+      true,
+      'snapshotEvaluationMatchesProblem matches real PGlite JSONB snapshot'
+    );
+    await pg.close();
+  });
+
+  await checkAsync('Item 5: Exam schedule date and time are extracted and round-tripped consistently in Asia/Seoul across timezones', async () => {
+    const dateUtils = load(path.join(output, 'lib/dateUtils.js'));
+
+    // Verify ExamScheduleModal.tsx no longer uses browser-local toTimeString()
+    const examModalSrc = fs.readFileSync(path.join(root, 'components/ExamScheduleModal.tsx'), 'utf8');
+    assert.ok(!examModalSrc.includes('toTimeString('), 'ExamScheduleModal.tsx must not use browser-local toTimeString()');
+    assert.ok(examModalSrc.includes('extractSeoulExamSchedule'), 'ExamScheduleModal.tsx must use extractSeoulExamSchedule');
+    assert.ok(examModalSrc.includes('buildSeoulIsoTimestamp'), 'ExamScheduleModal.tsx must use buildSeoulIsoTimestamp');
+
+    // Test cases in Asia/Seoul (+09:00) and their UTC equivalents (as returned by Supabase timestamptz)
+    const testCases = [
+      {
+        label: 'Seoul 10:00 standard exam',
+        seoulIso: '2026-10-20T10:00:00+09:00',
+        utcIso: '2026-10-20T01:00:00.000Z',
+        expectedDate: '2026-10-20',
+        expectedTime: '10:00',
+      },
+      {
+        label: 'Seoul 00:00 midnight boundary (previous day 15:00 in UTC / 08:00 in LA)',
+        seoulIso: '2026-10-20T00:00:00+09:00',
+        utcIso: '2026-10-19T15:00:00.000Z',
+        expectedDate: '2026-10-20',
+        expectedTime: '00:00',
+      },
+      {
+        label: 'Seoul 12:00 noon boundary',
+        seoulIso: '2026-10-20T12:00:00+09:00',
+        utcIso: '2026-10-20T03:00:00.000Z',
+        expectedDate: '2026-10-20',
+        expectedTime: '12:00',
+      },
+      {
+        label: 'Seoul 23:55 end-of-day boundary',
+        seoulIso: '2026-10-20T23:55:00+09:00',
+        utcIso: '2026-10-20T14:55:00.000Z',
+        expectedDate: '2026-10-20',
+        expectedTime: '23:55',
+      },
+    ];
+
+    // Empty / unset date handling
+    assert.equal(dateUtils.toSeoulDateString(''), '');
+    assert.equal(dateUtils.toSeoulTimeString(''), '');
+    assert.equal(dateUtils.buildSeoulIsoTimestamp(''), '');
+    assert.deepEqual(dateUtils.extractSeoulExamSchedule(undefined, undefined), {
+      dateStr: '',
+      startTime: '10:00',
+      endTime: '12:00',
+    });
+
+    // Spawn child node processes with TZ=Asia/Seoul, TZ=UTC, and TZ=America/Los_Angeles
+    // to verify 100% identical extraction and round-trip regardless of runtime local timezone!
+    const timezones = ['Asia/Seoul', 'UTC', 'America/Los_Angeles'];
+    const dateUtilsPath = path.join(output, 'lib/dateUtils.js');
+
+    for (const tz of timezones) {
+      const childScript = `
+        const assert = require('node:assert/strict');
+        const dateUtils = require(${JSON.stringify(dateUtilsPath)});
+        const cases = ${JSON.stringify(testCases)};
+        for (const c of cases) {
+          for (const inputIso of [c.seoulIso, c.utcIso]) {
+            const extracted = dateUtils.extractSeoulExamSchedule(inputIso, '12:00');
+            assert.equal(extracted.dateStr, c.expectedDate, \`[\${process.env.TZ}] \${c.label} dateStr mismatch for \${inputIso}\`);
+            assert.equal(extracted.startTime, c.expectedTime, \`[\${process.env.TZ}] \${c.label} startTime mismatch for \${inputIso}\`);
+            const rebuiltIso = dateUtils.buildSeoulIsoTimestamp(extracted.dateStr, extracted.startTime);
+            assert.equal(rebuiltIso, c.seoulIso, \`[\${process.env.TZ}] \${c.label} rebuiltIso mismatch\`);
+            assert.equal(
+              new Date(rebuiltIso).getTime(),
+              new Date(inputIso).getTime(),
+              \`[\${process.env.TZ}] \${c.label} epoch timestamp must be preserved identically on open+save\`
+            );
+          }
+        }
+      `;
+      const tzRun = spawnSync(process.execPath, ['-e', childScript], {
+        env: { ...process.env, TZ: tz },
+        encoding: 'utf8',
+      });
+      if (tzRun.status !== 0) {
+        throw new Error(`Timezone check failed for TZ=${tz}: ${tzRun.stdout}\n${tzRun.stderr}`);
+      }
+    }
   });
 
   console.log(`${passed} concurrency regression checks passed`);

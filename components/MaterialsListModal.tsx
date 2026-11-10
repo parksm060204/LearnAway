@@ -130,7 +130,7 @@ export function MaterialsListModal({
                 {activeSubject?.name || ''} 학습 자료 보관함
               </h2>
               <div className="text-[10px] text-[#ded6c8] font-academic-mono">
-                {activeSubject?.code || ''} • 총 {subjectMaterials.length}건 등록 (사용자 {userCount}건 / 데모 {demoCount}건)
+                총 {subjectMaterials.length}건 등록 (사용자 {userCount}건 / 데모 {demoCount}건)
               </div>
             </div>
           </div>

@@ -1056,7 +1056,7 @@ export function DataManagementSection({
                   >
                     {subjects.map((s) => (
                       <option key={s.id} value={s.id}>
-                        {s.name} ({s.code})
+                        {s.name}
                       </option>
                     ))}
                   </select>

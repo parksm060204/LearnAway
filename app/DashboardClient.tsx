@@ -2921,7 +2921,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         if (getStorageScopeId() !== pinnedScopeId) return;
 
         if (result.ok) {
-          const confirmedVersion = result.confirmedVersion ?? result.data?.version ?? (targetExpectedVersion + 1);
+          const confirmedVersion = result.confirmedVersion;
           const syncOutcome = confirmProblemRevisionSynced(
             problemId,
             { ...result.data, version: confirmedVersion },
@@ -3103,7 +3103,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 );
                 if (getStorageScopeId() !== pinnedScopeId) return;
                 if (retryResult.ok) {
-                  const confirmedVer = retryResult.confirmedVersion ?? retryResult.data?.version ?? (serverVer + 1);
+                  const confirmedVer = retryResult.confirmedVersion;
                   const syncOutcome = confirmProblemRevisionSynced(
                     problemId,
                     { ...retryResult.data, version: confirmedVer },
@@ -3128,7 +3128,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                   }
                   setAllProblems(syncOutcome.updatedProblems);
                   if (!opts.silent) {
-                    showToast(syncOutcome.message);
+                    if (retryResult.verificationStatus === 'verification_failed') {
+                      showToast(
+                        `서버에는 수정본(v${confirmedVer})이 저장되었으나 저장 직후 재조회 검증에 실패했습니다. 새로고침 시 최신 서버 상태가 반영됩니다.`
+                      );
+                    } else {
+                      showToast(syncOutcome.message);
+                    }
                   }
                   return;
                 }
@@ -3182,10 +3188,15 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             });
           }
           if (!opts.silent) {
+            const isConfigOrAuthErr = /^(not_configured|invalid_rpc_response|forbidden):/i.test(
+              result.error
+            );
             showToast(
               opts.localPersisted === false
                 ? `로컬 영속 저장과 서버 동기화가 모두 실패했습니다 (${result.error}). 편집기 입력과 메모리 수정본은 유지되었으니 다시 시도해 주세요.`
-                : `서버 동기화 실패: ${result.error}`
+                : isConfigOrAuthErr
+                  ? `서버 설정·권한 확인 실패 (${result.error}): 미저장 수정본은 보존되었으며 DB 마이그레이션(0039) 및 RPC 권한 확인 후 다시 시도해 주세요.`
+                  : `서버 동기화 실패: ${result.error}`
             );
           }
         }
@@ -3209,7 +3220,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             }
           }
         } else if (!opts.silent) {
-          showToast(`서버 동기화 실패: ${result.error}`);
+          const isConfigOrAuthErr = /^(not_configured|invalid_rpc_response|forbidden):/i.test(
+            result.error
+          );
+          showToast(
+            isConfigOrAuthErr
+              ? `서버 설정·권한 확인 실패 (${result.error}): 로컬 입력은 유지되었으며 DB 마이그레이션(0039) 및 RPC 권한 확인 후 다시 시도해 주세요.`
+              : `서버 동기화 실패: ${result.error}`
+          );
         }
       }
     } catch (e) {

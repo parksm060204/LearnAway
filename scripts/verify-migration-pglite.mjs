@@ -1876,6 +1876,67 @@ async function testUpgradePath() {
   }
   console.log('✓ Both orderings (revise -> quality and quality -> revise) preserve latest body AND all reports');
 
+  // Real JSONB round-trip + repository judgment (revise_problem_with_snapshot -> problem_versions -> snapshotEvaluationMatchesProblem):
+  // PostgreSQL JSONB reorders object keys by length then ASCII order (id, label, weight, maxScore, description).
+  // Verify that a rubric with description/weight/maxScore and indented codeSnippet round-trips through PGlite JSONB
+  // without false VERSION_CONFLICT.
+  const v4ProblemInput = {
+    id: mig39ProbId,
+    subjectId: subjectIdS,
+    type: 'essay_descriptive',
+    title: 'Mig39 v4 JSONB Rubric Round-Trip',
+    promptText: 'Prove convergence and write helper code',
+    codeSnippet: '    def step_one(x):\n        return x + 1',
+    modelAnswer: 'By monotone convergence theorem',
+    rubric: [
+      {
+        id: 'r1',
+        label: '단조증가 확인',
+        maxScore: 40,
+        weight: 0.4,
+        description: '수열이 단조증가함을 귀납법으로 보임',
+      },
+      {
+        id: 'r2',
+        label: '위로 유계 증명',
+        maxScore: 60,
+        weight: 0.6,
+        description: '상계를 제시하고 극한의 존재성을 결론지음',
+      },
+    ],
+    hints: ['단조수렴정리 떠올리기'],
+    conceptIds: [conceptIdS],
+    timeStandardMinutes: 25,
+    appliedConditionNote: '실수 수열 조건',
+    version: 4,
+    qualityStatus: 'review_after_edit',
+    editReason: 'Add full rubric with description and weight',
+    reports: [tabAReport1],
+  };
+
+  const revV4Res = (await db.query(`
+    select public.revise_problem_with_snapshot($1, 3, $2::jsonb) as res;
+  `, [mig39ProbId, JSON.stringify(v4ProblemInput)])).rows[0].res;
+
+  const snapRowV4 = (await db.query(`
+    select snapshot from public.problem_versions where problem_id = $1 and version = 4;
+  `, [mig39ProbId])).rows[0];
+
+  if (!snapRowV4 || !snapRowV4.snapshot || snapRowV4.snapshot.rubric[0].description !== '수열이 단조증가함을 귀납법으로 보임') {
+    throw new Error(`Expected v4 snapshot in problem_versions with rubric description, got: ${JSON.stringify(snapRowV4)}`);
+  }
+  // Confirm that PostgreSQL JSONB actually reordered keys compared to JS input order (id, label, maxScore, weight, description):
+  if (JSON.stringify(v4ProblemInput.rubric) === JSON.stringify(snapRowV4.snapshot.rubric)) {
+    throw new Error('Expected PostgreSQL JSONB to reorder rubric object keys relative to JS declaration order');
+  }
+  if (
+    revV4Res.confirmedVersion !== 4 ||
+    revV4Res.confirmedSnapshot.codeSnippet !== '    def step_one(x):\n        return x + 1'
+  ) {
+    throw new Error(`Expected v4 atomic snapshot to preserve leading code indentation, got: ${JSON.stringify(revV4Res)}`);
+  }
+  console.log('✓ PGlite JSONB round-trip of rubric (with description/weight/maxScore) and indented codeSnippet verified');
+
   // Precondition check: expectedVersion mismatch raises VERSION_CONFLICT
   let expectedVerConflict = false;
   try {

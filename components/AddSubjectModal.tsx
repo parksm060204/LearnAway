@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react';
 import { Subject } from '../lib/types';
-import { calculateDDay } from '../lib/dateUtils';
+import { buildSeoulIsoTimestamp, calculateDDay } from '../lib/dateUtils';
 import { X, Plus, Check } from 'lucide-react';
 import { TimeDialPicker } from './TimeDialPicker';
 
@@ -37,7 +37,7 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
   if (!isOpen) return null;
 
   // Real-time D-day calculation for preview
-  const previewIso = examDate ? `${examDate}T${startTime}:00+09:00` : undefined;
+  const previewIso = examDate ? buildSeoulIsoTimestamp(examDate, startTime || '10:00') || undefined : undefined;
   const ddayResult = calculateDDay(previewIso);
 
   const handleSubmit = (e: React.FormEvent) => {

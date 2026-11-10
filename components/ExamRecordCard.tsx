@@ -48,9 +48,6 @@ export function ExamRecordCard({
             <h1 className="text-base sm:text-lg font-bold text-[#191817] font-academic-serif tracking-tight">
               {subject.name}
             </h1>
-            <span className="text-[11px] font-academic-mono bg-[#f4f1ea] border border-[#ded6c8] text-[#57544e] px-2 py-0.5 rounded-xs">
-              코드 {subject.code}
-            </span>
             {subject.isDemo && (
               <span className="text-[10px] font-academic-mono bg-[#fef3c7] border border-[#fde68a] text-[#92400e] px-1.5 py-0.5 rounded-xs font-semibold">
                 데모 데이터

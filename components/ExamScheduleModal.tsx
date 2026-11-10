@@ -2,7 +2,11 @@
 
 import React, { useState } from 'react';
 import { Subject } from '../lib/types';
-import { toSeoulDateString, calculateDDay } from '../lib/dateUtils';
+import {
+  buildSeoulIsoTimestamp,
+  calculateDDay,
+  extractSeoulExamSchedule,
+} from '../lib/dateUtils';
 import { X, Calendar, Check } from 'lucide-react';
 import { TimeDialPicker } from './TimeDialPicker';
 
@@ -19,19 +23,28 @@ export function ExamScheduleModal({
   subject,
   onUpdateSubject,
 }: ExamScheduleModalProps) {
-  // Extract initial date and time
-  const currentSeoulDate = subject?.examAt ? toSeoulDateString(subject.examAt) : '';
-  const initialTime = subject?.examAt ? new Date(subject.examAt).toTimeString().slice(0, 5) : '10:00';
+  // Extract initial date and time explicitly in Asia/Seoul timezone
+  const initialSchedule = extractSeoulExamSchedule(subject?.examAt, subject?.examEndTime);
+  const syncKey = `${isOpen}:${subject?.id ?? ''}:${subject?.examAt ?? ''}:${subject?.examEndTime ?? ''}:${subject?.location ?? ''}`;
 
-  const [dateStr, setDateStr] = useState(currentSeoulDate);
-  const [startTime, setStartTime] = useState(initialTime);
-  const [endTime, setEndTime] = useState(subject?.examEndTime || '12:00');
+  const [prevSyncKey, setPrevSyncKey] = useState(syncKey);
+  const [dateStr, setDateStr] = useState(initialSchedule.dateStr);
+  const [startTime, setStartTime] = useState(initialSchedule.startTime);
+  const [endTime, setEndTime] = useState(initialSchedule.endTime);
   const [location, setLocation] = useState(subject?.location || '');
+
+  if (prevSyncKey !== syncKey) {
+    setPrevSyncKey(syncKey);
+    setDateStr(initialSchedule.dateStr);
+    setStartTime(initialSchedule.startTime);
+    setEndTime(initialSchedule.endTime);
+    setLocation(subject?.location || '');
+  }
 
   if (!isOpen || !subject) return null;
 
-  // Real-time preview calculation
-  const previewIso = dateStr ? `${dateStr}T${startTime || '10:00'}:00+09:00` : undefined;
+  // Real-time preview calculation in Asia/Seoul
+  const previewIso = dateStr ? buildSeoulIsoTimestamp(dateStr, startTime || '10:00') || undefined : undefined;
   const previewDDay = calculateDDay(previewIso);
 
   const handleSave = (e: React.FormEvent) => {

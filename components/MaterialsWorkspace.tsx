@@ -169,9 +169,6 @@ export function MaterialsWorkspace({
               <h2 className="text-base sm:text-lg font-bold font-academic-serif text-[#191817]">
                 {activeSubject.name} 학습 자료 관리
               </h2>
-              <span className="text-xs font-academic-mono px-2 py-0.5 bg-[#faf8f4] border border-[#ded6c8] text-[#57544e] rounded-xs font-medium">
-                {activeSubject.code}
-              </span>
             </div>
             <p className="text-xs text-[#827d73] font-academic-mono">
               총 {subjectMaterials.length}건 등록됨 (사용자 자료 {userCount}건 · 데모 자료 {demoCount}건)

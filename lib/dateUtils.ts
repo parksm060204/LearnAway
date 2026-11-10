@@ -15,10 +15,11 @@ export function getCurrentDate(): Date {
 /**
  * Converts a date or ISO string to Asia/Seoul calendar date string YYYY-MM-DD
  */
-export function toSeoulDateString(dateInput: string | Date): string {
+export function toSeoulDateString(dateInput?: string | Date | null): string {
+  if (!dateInput) return '';
   const date = typeof dateInput === 'string' ? new Date(dateInput) : dateInput;
   if (isNaN(date.getTime())) return '';
-  
+
   const formatter = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Seoul',
     year: 'numeric',
@@ -26,6 +27,63 @@ export function toSeoulDateString(dateInput: string | Date): string {
     day: '2-digit',
   });
   return formatter.format(date); // returns YYYY-MM-DD
+}
+
+/**
+ * Extracts 24-hour time string ('HH:mm', '00:00' ~ '23:59') explicitly in Asia/Seoul timezone.
+ * Never depends on the browser or host machine local timezone.
+ */
+export function toSeoulTimeString(dateInput?: string | Date | null): string {
+  if (!dateInput) return '';
+  const date = typeof dateInput === 'string' ? new Date(dateInput) : dateInput;
+  if (isNaN(date.getTime())) return '';
+
+  const formatter = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Seoul',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  });
+  const parts = formatter.formatToParts(date);
+  const rawHour = parts.find((p) => p.type === 'hour')?.value ?? '00';
+  const rawMinute = parts.find((p) => p.type === 'minute')?.value ?? '00';
+  const normalizedHour = rawHour === '24' ? '00' : rawHour.padStart(2, '0');
+  const normalizedMinute = rawMinute.padStart(2, '0');
+  return `${normalizedHour}:${normalizedMinute}`;
+}
+
+/**
+ * Builds an explicit Asia/Seoul ISO timestamp (`YYYY-MM-DDTHH:mm:00+09:00`) from
+ * a Seoul calendar date string (`YYYY-MM-DD`) and 24-hour time string (`HH:mm`).
+ */
+export function buildSeoulIsoTimestamp(dateStr?: string | null, timeStr: string = '10:00'): string {
+  const cleanDate = (dateStr ?? '').trim();
+  if (!cleanDate) return '';
+
+  const rawTime = (timeStr ?? '').trim();
+  const [rawH = '10', rawM = '00'] = (rawTime.includes(':') ? rawTime : '10:00').split(':');
+  let hNum = parseInt(rawH, 10);
+  if (hNum === 24) hNum = 0;
+  if (isNaN(hNum) || hNum < 0 || hNum > 23) hNum = 10;
+  let mNum = parseInt(rawM, 10);
+  if (isNaN(mNum) || mNum < 0 || mNum > 59) mNum = 0;
+
+  const hh = String(hNum).padStart(2, '0');
+  const mm = String(mNum).padStart(2, '0');
+  return `${cleanDate}T${hh}:${mm}:00+09:00`;
+}
+
+/**
+ * Extracts initial date and time fields for the exam schedule editor in Asia/Seoul timezone.
+ */
+export function extractSeoulExamSchedule(
+  examAt?: string | null,
+  examEndTime?: string | null
+): { dateStr: string; startTime: string; endTime: string } {
+  const dateStr = examAt ? toSeoulDateString(examAt) : '';
+  const startTime = (examAt ? toSeoulTimeString(examAt) : '') || '10:00';
+  const endTime = examEndTime || '12:00';
+  return { dateStr, startTime, endTime };
 }
 
 /**
@@ -65,26 +123,12 @@ export function formatSeoulDate(
   dateInput: string | Date,
   options?: { includeYear?: boolean; includeDayName?: boolean }
 ): string {
-  const date = typeof dateInput === 'string' ? new Date(dateInput) : dateInput;
-  if (isNaN(date.getTime())) return '';
+  const seoulDateStr = toSeoulDateString(dateInput);
+  if (!seoulDateStr) return '';
 
   const koreanDayNames = ['일', '월', '화', '수', '목', '금', '토'];
-
-  const formatter = new Intl.DateTimeFormat('ko-KR', {
-    timeZone: 'Asia/Seoul',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
-
-  const parts = formatter.formatToParts(date);
-  const getPart = (type: string) => parts.find((p) => p.type === type)?.value || '';
-
-  const year = getPart('year');
-  const month = getPart('month');
-  const day = getPart('day');
-
-  const seoulDayIndex = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Seoul' })).getDay();
+  const [year, month, day] = seoulDateStr.split('-');
+  const seoulDayIndex = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day))).getUTCDay();
   const dayName = koreanDayNames[seoulDayIndex];
 
   let result = options?.includeYear ? `${year}.${month}.${day}` : `${month}.${day}`;
@@ -109,35 +153,16 @@ export function addDaysToDate(baseDateInput: string | Date, daysToAdd: number): 
  */
 export function formatExamDate(isoString: string, endTime?: string): string {
   if (!isoString) return '시험일 미설정';
-  const date = new Date(isoString);
-  if (isNaN(date.getTime())) return '시험일 미설정';
+  const seoulDateStr = toSeoulDateString(isoString);
+  const seoulTimeStr = toSeoulTimeString(isoString);
+  if (!seoulDateStr || !seoulTimeStr) return '시험일 미설정';
 
   const koreanDayNames = ['일', '월', '화', '수', '목', '금', '토'];
-
-  const formatter = new Intl.DateTimeFormat('ko-KR', {
-    timeZone: 'Asia/Seoul',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  });
-
-  const parts = formatter.formatToParts(date);
-  const getPart = (type: string) => parts.find((p) => p.type === type)?.value || '';
-
-  const year = getPart('year');
-  const month = getPart('month');
-  const day = getPart('day');
-  const hour = getPart('hour');
-  const minute = getPart('minute');
-
-  // get day of week in Seoul
-  const seoulDayIndex = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Seoul' })).getDay();
+  const [year, month, day] = seoulDateStr.split('-');
+  const seoulDayIndex = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day))).getUTCDay();
   const dayName = koreanDayNames[seoulDayIndex];
 
-  let res = `${year}.${month}.${day} (${dayName}) ${hour}:${minute}`;
+  let res = `${year}.${month}.${day} (${dayName}) ${seoulTimeStr}`;
   if (endTime) {
     res += ` - ${endTime}`;
   }

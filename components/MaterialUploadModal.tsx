@@ -675,7 +675,7 @@ export function MaterialUploadModal({
             >
               {subjects.map((sub) => (
                 <option key={sub.id} value={sub.id}>
-                  {sub.name} ({sub.code})
+                  {sub.name}
                 </option>
               ))}
             </select>

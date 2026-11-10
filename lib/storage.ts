@@ -20,8 +20,6 @@ import {
   PersonalizationCorrectionState,
   DEFAULT_PERSONALIZATION_SETTINGS,
   AttemptSaveStatus,
-  ProblemType,
-  RubricCriterion,
   toAcademicDifficultyLevel,
   SourceVerificationStatus,
   UnsavedProblemRevision,
@@ -51,7 +49,13 @@ import {
   unmarkMaterialBodyPersistedInScope,
 } from './materialStorage';
 import { materialContentHash } from './cloud/hash';
-import { isRevisionMatchingProblem } from './cloud/mergeLearning';
+import {
+  getProblemEvaluationSignature,
+  problemContentMatches,
+  isRevisionMatchingProblem,
+} from './problemComparison';
+
+export { getProblemEvaluationSignature, problemContentMatches } from './problemComparison';
 import {
   getStorageScopeId,
   scopedStorageKey,
@@ -1525,66 +1529,6 @@ export function deleteProblemDraft(draftId: string): ProblemDraft[] {
  * that every approval route preserves the SAME fields, including transfer linkage
  * (isTransfer / sourceProblemId / logicSessionId / structured condition change).
  */
-/**
- * Canonical evaluation-affecting content representation shared between
- * version bump detection in `buildProblemFromDraft` and persistence verification in `problemContentMatches`.
- * Covers:
- * - 문제 유형 (type)
- * - 개념 범위 (conceptIds)
- * - 제목 (title)
- * - 지문 (promptText)
- * - 적용 조건 (appliedConditionNote)
- * - 수식 (mathFormula)
- * - 코드 (codeSnippet)
- * - 모범답안 (modelAnswer)
- * - 힌트 (hints)
- * - 루브릭 (rubric)
- * - 기준 시간 (timeStandardMinutes)
- * - 출제 의도 (designIntent)
- */
-export function getProblemEvaluationSignature(p: {
-  type: ProblemType;
-  conceptIds: string[];
-  title: string;
-  promptText: string;
-  appliedConditionNote?: string;
-  mathFormula?: string;
-  codeSnippet?: string;
-  modelAnswer: string;
-  hints: string[];
-  rubric: RubricCriterion[];
-  timeStandardMinutes: number;
-  designIntent?: string;
-}): string {
-  const sortedConcepts = [...(p.conceptIds || [])].sort();
-  const normalizedRubric = (p.rubric || []).map((r) => ({
-    id: r.id,
-    label: r.label,
-    maxScore: r.maxScore,
-    weight: r.weight,
-    description: r.description,
-  }));
-  return JSON.stringify([
-    p.type,
-    sortedConcepts,
-    p.title,
-    p.promptText,
-    p.appliedConditionNote || '',
-    p.mathFormula || '',
-    p.codeSnippet || '',
-    p.modelAnswer,
-    p.hints || [],
-    normalizedRubric,
-    p.timeStandardMinutes,
-    p.designIntent || '',
-  ]);
-}
-
-/**
- * Single conversion path from an approved draft to a stored Problem. Guarantees
- * that every approval route preserves the SAME fields, including transfer linkage
- * (isTransfer / sourceProblemId / logicSessionId / structured condition change).
- */
 export function buildProblemFromDraft(
   draft: ProblemDraft,
   existing: Problem | undefined,
@@ -1697,45 +1641,6 @@ export function buildProblemFromDraft(
     reports: [],
     versionHistory: [],
   };
-}
-
-/**
- * Compares the evaluation-affecting content, transfer linkage, version and metadata
- * of two problems so that a failed save of a CHANGED re-approval is never mistaken
- * for success just because an older problem with the same id/draftId is still stored.
- */
-export function problemContentMatches(a: Problem, b: Problem): boolean {
-  if (a.version !== b.version) return false;
-  if (getProblemEvaluationSignature(a) !== getProblemEvaluationSignature(b)) {
-    return false;
-  }
-  // Transition / transfer connection info verification
-  const isTransferA = Boolean(a.isTransfer);
-  const isTransferB = Boolean(b.isTransfer);
-  if (isTransferA !== isTransferB) return false;
-  if (isTransferA) {
-    if (
-      (a.sourceProblemId || '') !== (b.sourceProblemId || '') ||
-      (a.logicSessionId || '') !== (b.logicSessionId || '') ||
-      (a.transferChanges || '') !== (b.transferChanges || '') ||
-      (a.understandingFocus || '') !== (b.understandingFocus || '') ||
-      (a.transferKind || '') !== (b.transferKind || '') ||
-      (a.originalCondition || '') !== (b.originalCondition || '') ||
-      (a.newCondition || '') !== (b.newCondition || '')
-    ) {
-      return false;
-    }
-  }
-  // Required metadata verification
-  if (
-    a.subjectId !== b.subjectId ||
-    (a.difficulty || '') !== (b.difficulty || '') ||
-    (a.sourceRefs || '') !== (b.sourceRefs || '') ||
-    (a.draftId || '') !== (b.draftId || '')
-  ) {
-    return false;
-  }
-  return true;
 }
 
 export type ApprovalStatus = 'complete' | 'failed' | 'partial_draft_failed';
