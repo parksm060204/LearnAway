@@ -23,6 +23,7 @@ const compile = spawnSync(
     'lib/cloud/learningMappers.ts',
     'lib/cloud/learningRepository.ts',
     'lib/cloud/mergeLearning.ts',
+    'lib/serviceGuideContent.ts',
     '--jsx',
     'react-jsx',
     '--rootDir',
@@ -814,6 +815,114 @@ async function run() {
     } finally {
       storageScope.setStorageScope({ kind: 'legacy' });
     }
+  });
+
+  await checkAsync('service guide modal content, policy draft metadata, and accessibility integration', async () => {
+    const serviceGuide = load(path.join(output, 'lib/serviceGuideContent.js'));
+
+    // 1. Verify section IDs and order
+    assert.deepEqual(
+      serviceGuide.SERVICE_GUIDE_SECTION_ORDER,
+      ['overview', 'terms', 'privacy', 'ai', 'storage'],
+      'Section order must match overview, terms, privacy, ai, storage'
+    );
+    assert.equal(serviceGuide.isServiceGuideSection('overview'), true);
+    assert.equal(serviceGuide.isServiceGuideSection('terms'), true);
+    assert.equal(serviceGuide.isServiceGuideSection('privacy'), true);
+    assert.equal(serviceGuide.isServiceGuideSection('ai'), true);
+    assert.equal(serviceGuide.isServiceGuideSection('storage'), true);
+    assert.equal(serviceGuide.isServiceGuideSection('unknown'), false);
+
+    // 2. Verify unconfirmed policy metadata is strictly draft/null without fake placeholders
+    const meta = serviceGuide.SERVICE_POLICY_METADATA;
+    assert.equal(meta.status, 'draft');
+    assert.equal(meta.statusBadgeLabel, '안내 초안 · 운영 정보 확인 중');
+    assert.equal(meta.operatorName, null);
+    assert.equal(meta.contactEmail, null);
+    assert.equal(meta.privacyRightsContact, null);
+    assert.equal(meta.effectiveDate, null);
+    assert.equal(meta.documentVersion, null);
+    assert.equal(meta.hostingProviderAndRegion, null);
+    assert.equal(meta.retentionScheduleConfirmed, false);
+
+    // 3. Verify document titles and summaries
+    const docs = serviceGuide.SERVICE_GUIDE_DOCUMENTS;
+    assert.equal(docs.overview.title, '서비스 소개');
+    assert.equal(
+      docs.overview.summary,
+      '강의 자료를 이해하고, 시험 수준의 문제를 풀며, 복습을 이어가는 학습 도구입니다.'
+    );
+    assert.equal(docs.terms.title, '이용약관');
+    assert.equal(docs.terms.isDraftPolicy, true);
+    assert.equal(docs.privacy.title, '개인정보 처리 안내');
+    assert.equal(docs.privacy.isDraftPolicy, true);
+    assert.equal(docs.ai.title, 'AI 이용 안내');
+    assert.equal(docs.ai.isDraftPolicy, true);
+    assert.equal(docs.storage.title, '저장 및 백업');
+    assert.equal(docs.storage.isDraftPolicy, true);
+
+    // 4. Verify required core sentences and absence of placeholder tokens like [운영자명]
+    const serializedDocs = JSON.stringify(docs);
+    assert.ok(
+      serializedDocs.includes(
+        '자료를 이 기기에 보관하는 설정과 AI 분석을 위한 전송은 별개입니다. 로컬 보관 자료라도 AI 기능을 실행하면 필요한 내용이 외부 처리 경로로 전송될 수 있습니다.'
+      ),
+      'AI guide must contain exact local-storage vs AI-transmission notice'
+    );
+    assert.ok(
+      !serializedDocs.includes('[운영자명]'),
+      'Policy documents must not expose unreplaced placeholder tokens like [운영자명]'
+    );
+    assert.ok(
+      docs.overview.blocks[1].orderedItems.length === 7,
+      'Overview must describe the 7-step learning workflow'
+    );
+    assert.ok(
+      serviceGuide.VERIFIED_EXTERNAL_PROCESSING_ENTRIES.length >= 6,
+      'Privacy guide must list the verified external processing paths'
+    );
+
+    // 5. Verify ServiceGuideModal and GatewayPage integration & accessibility guards
+    const modalSrc = fs.readFileSync(path.join(root, 'components/ServiceGuideModal.tsx'), 'utf8');
+    const gatewaySrc = fs.readFileSync(path.join(root, 'components/GatewayPage.tsx'), 'utf8');
+    const checklistSrc = fs.readFileSync(
+      path.join(root, 'docs/service-policy-publication-checklist.md'),
+      'utf8'
+    );
+
+    assert.ok(modalSrc.includes('role="dialog"'), 'Modal must declare role="dialog"');
+    assert.ok(modalSrc.includes('aria-modal="true"'), 'Modal must declare aria-modal="true"');
+    assert.ok(modalSrc.includes("event.key === 'Escape'"), 'Modal must close on Escape');
+    assert.ok(modalSrc.includes("event.key === 'Tab'"), 'Modal must trap Tab focus');
+    assert.ok(
+      modalSrc.includes('bodyScrollRef.current.scrollTop = 0'),
+      'Modal must reset body scroll position on section switch'
+    );
+    assert.ok(
+      !modalSrc.includes('동의하고 시작'),
+      'Modal close button must not be labeled 동의하고 시작'
+    );
+    assert.ok(
+      !modalSrc.includes('fetch('),
+      'ServiceGuideModal must not trigger network, AI, or deletion calls while reading'
+    );
+
+    assert.ok(
+      gatewaySrc.includes("openServiceGuide('overview')"),
+      'Header 서비스 안내 button must open overview section'
+    );
+    assert.ok(
+      gatewaySrc.includes("openServiceGuide('terms')"),
+      '이용약관 quick link must open terms section'
+    );
+    assert.ok(
+      gatewaySrc.includes("openServiceGuide('privacy')"),
+      '개인정보 처리 안내 quick link must open privacy section'
+    );
+    assert.ok(
+      checklistSrc.includes('SERVICE_POLICY_METADATA'),
+      'Publication checklist must document SERVICE_POLICY_METADATA fields'
+    );
   });
 
   console.log(`${passed} concurrency regression checks passed`);

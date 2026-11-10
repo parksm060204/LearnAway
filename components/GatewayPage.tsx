@@ -1,36 +1,28 @@
 'use client';
 
 import { useState } from 'react';
-import { Loader2, Sparkles, PenTool, CalendarCheck, UserCheck } from 'lucide-react';
+import { Loader2, UserCheck } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
 import { AppReadySignal } from './AppReadySignal';
+import { ServiceGuideModal } from './ServiceGuideModal';
+import type { ServiceGuideSection } from '@/lib/serviceGuideContent';
 
 interface GatewayPageProps {
   nextPath: string;
   initialError: string | null;
 }
 
-const FEATURES = [
-  {
-    icon: Sparkles,
-    title: '자료 기반 문제',
-    description: '수학·코딩 개념을 엮은 서술형·증명형 문제',
-  },
-  {
-    icon: PenTool,
-    title: '답안 논리 보완',
-    description: '풀이의 근거와 오류를 확인하고 답안 개선',
-  },
-  {
-    icon: CalendarCheck,
-    title: '복습과 재도전',
-    description: '시험 일정과 학습 기록을 활용한 복습 안내',
-  },
-] as const;
-
 export function GatewayPage({ nextPath, initialError }: GatewayPageProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(initialError);
+
+  const [guideOpen, setGuideOpen] = useState(false);
+  const [guideSection, setGuideSection] = useState<ServiceGuideSection>('overview');
+
+  const openServiceGuide = (section: ServiceGuideSection) => {
+    setGuideSection(section);
+    setGuideOpen(true);
+  };
 
   const [showEmailLogin, setShowEmailLogin] = useState(false);
   const [email, setEmail] = useState('');
@@ -161,350 +153,372 @@ export function GatewayPage({ nextPath, initialError }: GatewayPageProps) {
     <div className="min-h-screen bg-[#faf8f4] text-[#191817] flex flex-col">
       <AppReadySignal />
 
-      {/* Header */}
-      <header className="w-full border-b border-[#e2ded6] bg-[#fcfbfa]">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="w-3 h-3 bg-[#c52828] inline-block" aria-hidden="true" />
-            <span className="font-extrabold tracking-wider text-base font-academic-mono">
-              Learn my way
-            </span>
-          </div>
-          <a
-            href="#features"
-            className="text-xs font-semibold text-[#57544e] hover:text-[#c52828] rounded-xs px-2 py-1 transition-colors"
-          >
-            서비스 안내
-          </a>
-        </div>
-      </header>
-
-      <main className="flex-1">
-        {/* Hero */}
-        <section className="max-w-3xl mx-auto px-4 sm:px-6 pt-16 sm:pt-24 pb-12 text-center">
-          <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold leading-snug tracking-tight text-balance">
-            강의 자료를, 시험에서 풀 수 있는 실력으로.
-          </h1>
-          <p className="mt-5 mx-auto max-w-xl text-sm sm:text-base text-[#57544e] leading-relaxed">
-            PDF와 강의 전사본을 바탕으로 대학 시험 수준의 문제를 풀고, 답안의 논리를 보완하며
-            복습을 이어가세요.
-          </p>
-
-          {errorMessage && (
-            <div
-              role="alert"
-              className="mt-6 mx-auto max-w-md text-[11px] text-[#8a1f1f] bg-[#fef2f2] border border-[#f3c6c6] rounded-xs p-3 leading-relaxed text-left"
-            >
-              {errorMessage}
-              <button
-                type="button"
-                onClick={handleGoogleLogin}
-                className="mt-2 block underline text-[#c52828]"
-              >
-                다시 시도
-              </button>
+      <div
+        data-gateway-background="true"
+        aria-hidden={guideOpen ? 'true' : undefined}
+        className="min-h-screen flex flex-col"
+      >
+        {/* Header */}
+        <header className="w-full border-b border-[#e2ded6] bg-[#fcfbfa]">
+          <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="w-3 h-3 bg-[#c52828] inline-block" aria-hidden="true" />
+              <span className="font-extrabold tracking-wider text-base font-academic-mono">
+                Learn my way
+              </span>
             </div>
-          )}
-
-          <div className="mt-8 flex flex-col items-center gap-3">
             <button
               type="button"
-              onClick={handleGoogleLogin}
-              disabled={isSubmitting}
-              aria-busy={isSubmitting}
-              className="inline-flex items-center justify-center gap-3 rounded-xs border border-[#c8c2b5] bg-white px-6 py-3.5 text-sm font-semibold text-[#191817] hover:bg-[#faf8f4] transition-colors disabled:opacity-60 disabled:cursor-not-allowed shadow-sm"
+              id="btn-open-service-guide"
+              onClick={() => openServiceGuide('overview')}
+              aria-haspopup="dialog"
+              aria-expanded={guideOpen}
+              className="text-xs font-semibold text-[#57544e] hover:text-[#c52828] rounded-xs px-2.5 py-1.5 transition-colors"
             >
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin motion-reduce:animate-none text-[#827d73]" aria-hidden="true" />
-                  로그인 처리 중...
-                </>
-              ) : (
-                <>
-                  <GoogleMark />
-                  Google로 시작하기
-                </>
-              )}
+              서비스 안내
             </button>
+          </div>
+        </header>
 
-            {/* Username Auth (간편 회원가입 / 아이디 로그인) */}
-            {!showUsernameAuth ? (
-              <button
-                type="button"
-                id="btn-username-auth-toggle"
-                onClick={() => {
-                  setShowUsernameAuth(true);
-                  setUsernameError(null);
-                }}
-                className="inline-flex items-center justify-center gap-2 rounded-xs border border-[#c8c2b5] bg-white px-5 py-2.5 text-xs font-semibold text-[#57544e] hover:text-[#191817] hover:bg-[#faf8f4] transition-colors shadow-2xs w-full max-w-xs"
+        <main className="flex-1">
+          {/* Hero */}
+          <section className="max-w-3xl mx-auto px-4 sm:px-6 pt-16 sm:pt-24 pb-12 text-center">
+            <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold leading-snug tracking-tight text-balance">
+              강의 자료를, 시험에서 풀 수 있는 실력으로.
+            </h1>
+            <p className="mt-5 mx-auto max-w-xl text-sm sm:text-base text-[#57544e] leading-relaxed">
+              PDF와 강의 전사본을 바탕으로 대학 시험 수준의 문제를 풀고, 답안의 논리를 보완하며
+              복습을 이어가세요.
+            </p>
+
+            {errorMessage && (
+              <div
+                role="alert"
+                className="mt-6 mx-auto max-w-md text-[11px] text-[#8a1f1f] bg-[#fef2f2] border border-[#f3c6c6] rounded-xs p-3 leading-relaxed text-left"
               >
-                <UserCheck className="w-4 h-4 text-[#827d73]" />
-                간편 회원가입 / 아이디 로그인
-              </button>
-            ) : (
-              <div className="w-full max-w-xs p-3.5 bg-white border border-[#c8c2b5] rounded-xs shadow-2xs text-left space-y-3">
-                <div className="flex items-center justify-between border-b border-[#e2ded6] pb-2">
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      id="tab-username-login"
-                      onClick={() => {
-                        setUsernameTab('login');
-                        setUsernameError(null);
-                      }}
-                      className={`text-xs font-semibold pb-0.5 border-b-2 transition-colors ${
-                        usernameTab === 'login'
-                          ? 'border-[#191817] text-[#191817]'
-                          : 'border-transparent text-[#827d73] hover:text-[#191817]'
-                      }`}
-                    >
-                      아이디 로그인
-                    </button>
-                    <button
-                      type="button"
-                      id="tab-username-register"
-                      onClick={() => {
-                        setUsernameTab('register');
-                        setUsernameError(null);
-                      }}
-                      className={`text-xs font-semibold pb-0.5 border-b-2 transition-colors ${
-                        usernameTab === 'register'
-                          ? 'border-[#191817] text-[#191817]'
-                          : 'border-transparent text-[#827d73] hover:text-[#191817]'
-                      }`}
-                    >
-                      간편 회원가입
-                    </button>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowUsernameAuth(false);
-                      setUsernameError(null);
-                    }}
-                    className="text-[11px] text-[#827d73] hover:text-[#191817] underline"
-                  >
-                    닫기
-                  </button>
-                </div>
-
-                <form onSubmit={handleUsernameAuth} className="space-y-2.5">
-                  <div>
-                    <label
-                      htmlFor="username-input"
-                      className="block text-[11px] font-semibold text-[#57544e] mb-1"
-                    >
-                      아이디
-                    </label>
-                    <input
-                      type="text"
-                      id="username-input"
-                      value={username}
-                      onChange={(e) => {
-                        setUsername(e.target.value);
-                        if (usernameError) setUsernameError(null);
-                      }}
-                      placeholder="3~30자 영문, 숫자, _, -"
-                      className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
-                      autoFocus
-                    />
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="username-password-input"
-                      className="block text-[11px] font-semibold text-[#57544e] mb-1"
-                    >
-                      비밀번호
-                    </label>
-                    <input
-                      type="password"
-                      id="username-password-input"
-                      value={usernamePassword}
-                      onChange={(e) => {
-                        setUsernamePassword(e.target.value);
-                        if (usernameError) setUsernameError(null);
-                      }}
-                      placeholder="6자 이상 입력"
-                      className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
-                    />
-                  </div>
-
-                  {usernameTab === 'register' && (
-                    <div>
-                      <label
-                        htmlFor="username-password-confirm-input"
-                        className="block text-[11px] font-semibold text-[#57544e] mb-1"
-                      >
-                        비밀번호 확인
-                      </label>
-                      <input
-                        type="password"
-                        id="username-password-confirm-input"
-                        value={usernamePasswordConfirm}
-                        onChange={(e) => {
-                          setUsernamePasswordConfirm(e.target.value);
-                          if (usernameError) setUsernameError(null);
-                        }}
-                        placeholder="비밀번호 다시 입력"
-                        className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
-                      />
-                    </div>
-                  )}
-
-                  {usernameError && (
-                    <p className="text-[11px] text-[#c52828] leading-tight">{usernameError}</p>
-                  )}
-
-                  {usernameTab === 'register' && (
-                    <div className="p-2 bg-[#f4f2ee] rounded-xs text-[10.5px] text-[#78716c] leading-relaxed">
-                      ⚠️ 이메일 없는 간편 계정은 비밀번호 분실 시 재설정이나 복구가 지원되지 않습니다. 비밀번호를 반드시 기억해 주세요.
-                    </div>
-                  )}
-
-                  <button
-                    type="submit"
-                    id="btn-username-submit"
-                    disabled={isUsernameSubmitting}
-                    className="w-full py-2 bg-[#191817] text-white text-xs font-semibold rounded-xs hover:bg-[#333] transition-colors disabled:opacity-60 flex items-center justify-center gap-1.5"
-                  >
-                    {isUsernameSubmitting ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : usernameTab === 'register' ? (
-                      '간편 가입 완료'
-                    ) : (
-                      '아이디로 로그인'
-                    )}
-                  </button>
-                </form>
+                {errorMessage}
+                <button
+                  type="button"
+                  onClick={handleGoogleLogin}
+                  className="mt-2 block underline text-[#c52828]"
+                >
+                  다시 시도
+                </button>
               </div>
             )}
 
-            <p className="text-xs text-[#827d73]">
-              로그인 후 과목을 만들고 학습 자료를 등록하세요.
-            </p>
+            <div className="mt-8 mx-auto w-full max-w-xs flex flex-col items-stretch gap-2.5">
+              <button
+                type="button"
+                onClick={handleGoogleLogin}
+                disabled={isSubmitting}
+                aria-busy={isSubmitting}
+                className="w-full inline-flex items-center justify-center gap-2.5 rounded-xs border border-[#c8c2b5] bg-white px-5 py-3 text-sm font-semibold text-[#191817] hover:bg-[#faf8f4] hover:border-[#827d73] transition-colors disabled:opacity-60 disabled:cursor-not-allowed shadow-2xs"
+              >
+                {isSubmitting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin motion-reduce:animate-none text-[#827d73]" aria-hidden="true" />
+                    로그인 처리 중...
+                  </>
+                ) : (
+                  <>
+                    <GoogleMark />
+                    Google로 시작하기
+                  </>
+                )}
+              </button>
 
-            {process.env.NODE_ENV !== 'production' && (
-              <div className="w-full max-w-sm mt-1 pt-3 border-t border-[#e2ded6]/60">
+              {/* Username Auth (간편 회원가입 / 아이디 로그인) */}
+              {!showUsernameAuth ? (
                 <button
                   type="button"
-                  id="toggle-email-login"
-                  onClick={() => setShowEmailLogin(!showEmailLogin)}
-                  className="text-xs text-[#57544e] hover:text-[#191817] underline transition-colors"
+                  id="btn-username-auth-toggle"
+                  onClick={() => {
+                    setShowUsernameAuth(true);
+                    setUsernameError(null);
+                  }}
+                  className="w-full inline-flex items-center justify-center gap-2.5 rounded-xs border border-[#c8c2b5] bg-white px-5 py-3 text-sm font-semibold text-[#191817] hover:bg-[#faf8f4] hover:border-[#827d73] transition-colors shadow-2xs"
                 >
-                  {showEmailLogin ? '테스트 로그인 접기' : '개발용 이메일 로그인'}
+                  <UserCheck className="w-4 h-4 text-[#57544e]" aria-hidden="true" />
+                  간편 회원가입 / 아이디 로그인
                 </button>
+              ) : (
+                <div className="w-full p-4 bg-white border border-[#c8c2b5] rounded-xs shadow-2xs text-left space-y-3">
+                  <div className="flex items-center justify-between border-b border-[#e2ded6] pb-2">
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        id="tab-username-login"
+                        onClick={() => {
+                          setUsernameTab('login');
+                          setUsernameError(null);
+                        }}
+                        className={`text-xs font-semibold pb-0.5 border-b-2 transition-colors ${
+                          usernameTab === 'login'
+                            ? 'border-[#191817] text-[#191817]'
+                            : 'border-transparent text-[#827d73] hover:text-[#191817]'
+                        }`}
+                      >
+                        아이디 로그인
+                      </button>
+                      <button
+                        type="button"
+                        id="tab-username-register"
+                        onClick={() => {
+                          setUsernameTab('register');
+                          setUsernameError(null);
+                        }}
+                        className={`text-xs font-semibold pb-0.5 border-b-2 transition-colors ${
+                          usernameTab === 'register'
+                            ? 'border-[#191817] text-[#191817]'
+                            : 'border-transparent text-[#827d73] hover:text-[#191817]'
+                        }`}
+                      >
+                        간편 회원가입
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowUsernameAuth(false);
+                        setUsernameError(null);
+                      }}
+                      className="text-[11px] text-[#827d73] hover:text-[#191817] underline"
+                    >
+                      닫기
+                    </button>
+                  </div>
 
-                {showEmailLogin && (
-                  <form
-                    onSubmit={handleEmailLogin}
-                    className="mt-3 p-4 bg-white border border-[#c8c2b5] rounded-xs text-left space-y-3"
-                  >
+                  <form onSubmit={handleUsernameAuth} className="space-y-2.5">
                     <div>
                       <label
-                        htmlFor="email-input"
+                        htmlFor="username-input"
                         className="block text-[11px] font-semibold text-[#57544e] mb-1"
                       >
-                        이메일
+                        아이디
                       </label>
                       <input
-                        id="email-input"
-                        type="email"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        placeholder="user@example.com"
-                        className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] focus:outline-hidden focus:border-[#c52828]"
-                        required
+                        type="text"
+                        id="username-input"
+                        value={username}
+                        onChange={(e) => {
+                          setUsername(e.target.value);
+                          if (usernameError) setUsernameError(null);
+                        }}
+                        placeholder="3~30자 영문, 숫자, _, -"
+                        className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
+                        autoFocus
                       />
                     </div>
+
                     <div>
                       <label
-                        htmlFor="password-input"
+                        htmlFor="username-password-input"
                         className="block text-[11px] font-semibold text-[#57544e] mb-1"
                       >
                         비밀번호
                       </label>
                       <input
-                        id="password-input"
                         type="password"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        placeholder="••••••••"
-                        className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] focus:outline-hidden focus:border-[#c52828]"
-                        required
+                        id="username-password-input"
+                        value={usernamePassword}
+                        onChange={(e) => {
+                          setUsernamePassword(e.target.value);
+                          if (usernameError) setUsernameError(null);
+                        }}
+                        placeholder="6자 이상 입력"
+                        className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
                       />
                     </div>
-                    <div className="flex gap-2 pt-1">
-                      <button
-                        type="submit"
-                        id="email-login-submit"
-                        disabled={isEmailSubmitting}
-                        className="flex-1 rounded-xs bg-[#191817] text-white px-3 py-2 text-xs font-semibold hover:bg-[#333] transition-colors disabled:opacity-50"
-                      >
-                        {isEmailSubmitting ? '로그인 중...' : '로그인'}
-                      </button>
-                    </div>
-                    <div className="pt-2 border-t border-[#e2ded6] flex flex-wrap gap-1.5 text-[10px]">
-                      <span className="text-[#827d73] self-center">이메일 채우기:</span>
-                      <button
-                        type="button"
-                        id="quick-fill-test1"
-                        onClick={() => {
-                          setEmail('learnaway-test-user-01@example.com');
-                        }}
-                        className="px-2 py-0.5 border border-[#c8c2b5] bg-[#faf8f4] text-[#57544e] rounded-xs hover:border-[#191817]"
-                      >
-                        테스트 계정 1
-                      </button>
-                      <button
-                        type="button"
-                        id="quick-fill-test2"
-                        onClick={() => {
-                          setEmail('learnaway-test-user-02@example.com');
-                        }}
-                        className="px-2 py-0.5 border border-[#c8c2b5] bg-[#faf8f4] text-[#57544e] rounded-xs hover:border-[#191817]"
-                      >
-                        테스트 계정 2
-                      </button>
-                    </div>
+
+                    {usernameTab === 'register' && (
+                      <div>
+                        <label
+                          htmlFor="username-password-confirm-input"
+                          className="block text-[11px] font-semibold text-[#57544e] mb-1"
+                        >
+                          비밀번호 확인
+                        </label>
+                        <input
+                          type="password"
+                          id="username-password-confirm-input"
+                          value={usernamePasswordConfirm}
+                          onChange={(e) => {
+                            setUsernamePasswordConfirm(e.target.value);
+                            if (usernameError) setUsernameError(null);
+                          }}
+                          placeholder="비밀번호 다시 입력"
+                          className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] placeholder:text-[#a8a29e] focus:outline-hidden focus:border-[#191817]"
+                        />
+                      </div>
+                    )}
+
+                    {usernameError && (
+                      <p className="text-[11px] text-[#c52828] leading-tight">{usernameError}</p>
+                    )}
+
+                    {usernameTab === 'register' && (
+                      <div className="p-2 bg-[#f4f2ee] rounded-xs text-[10.5px] text-[#78716c] leading-relaxed">
+                        ⚠️ 이메일 없는 간편 계정은 비밀번호 분실 시 재설정이나 복구가 지원되지 않습니다. 비밀번호를 반드시 기억해 주세요.
+                      </div>
+                    )}
+
+                    <button
+                      type="submit"
+                      id="btn-username-submit"
+                      disabled={isUsernameSubmitting}
+                      className="w-full py-2.5 bg-[#191817] text-white text-xs font-semibold rounded-xs hover:bg-[#333] transition-colors disabled:opacity-60 flex items-center justify-center gap-1.5"
+                    >
+                      {isUsernameSubmitting ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : usernameTab === 'register' ? (
+                        '간편 가입 완료'
+                      ) : (
+                        '아이디로 로그인'
+                      )}
+                    </button>
                   </form>
-                )}
-              </div>
-            )}
-          </div>
-        </section>
+                </div>
+              )}
 
-        {/* Features */}
-        <section id="features" className="border-t border-[#e2ded6] bg-[#fcfbfa] scroll-mt-16">
-          <div className="max-w-6xl mx-auto px-4 sm:px-6 py-14">
-            <h2 className="text-lg font-bold text-center">핵심 기능</h2>
-            <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {FEATURES.map(({ icon: Icon, title, description }) => (
-                <article
-                  key={title}
-                  className="rounded-xs border border-[#e2ded6] bg-white p-5 text-left"
+              <p className="mt-1 text-xs text-[#827d73]">
+                로그인 후 과목을 만들고 학습 자료를 등록하세요.
+              </p>
+
+              {/* Policy & Guide quick links below login area */}
+              <div className="flex items-center justify-center gap-3 pt-0.5 text-[11px] text-[#57544e]">
+                <button
+                  type="button"
+                  id="btn-open-guide-terms"
+                  onClick={() => openServiceGuide('terms')}
+                  aria-haspopup="dialog"
+                  className="underline underline-offset-2 hover:text-[#c52828] transition-colors"
                 >
-                  <Icon className="w-5 h-5 text-[#c52828]" aria-hidden="true" />
-                  <h3 className="mt-3 text-sm font-bold">{title}</h3>
-                  <p className="mt-1.5 text-xs text-[#57544e] leading-relaxed">{description}</p>
-                </article>
-              ))}
-            </div>
-          </div>
-        </section>
-      </main>
+                  이용약관
+                </button>
+                <span className="text-[#c8c2b5]" aria-hidden="true">
+                  ·
+                </span>
+                <button
+                  type="button"
+                  id="btn-open-guide-privacy"
+                  onClick={() => openServiceGuide('privacy')}
+                  aria-haspopup="dialog"
+                  className="underline underline-offset-2 hover:text-[#c52828] transition-colors"
+                >
+                  개인정보 처리 안내
+                </button>
+              </div>
 
-      {/* Footer */}
-      <footer className="border-t border-[#e2ded6] bg-[#faf8f4]">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 text-center">
-          <p className="text-xs text-[#57544e] leading-relaxed">
-            Learn my way는 강의 자료를 대학 시험 수준의 문제와 복습으로 연결하는 학습 도구입니다.
-          </p>
-          <p className="mt-2 text-[10px] font-academic-mono text-[#827d73]">
-            © {new Date().getFullYear()} Learn my way
-          </p>
-        </div>
-      </footer>
+              {process.env.NODE_ENV !== 'production' && (
+                <div className="w-full mt-1 pt-3 border-t border-[#e2ded6]/60">
+                  <button
+                    type="button"
+                    id="toggle-email-login"
+                    onClick={() => setShowEmailLogin(!showEmailLogin)}
+                    className="text-xs text-[#57544e] hover:text-[#191817] underline transition-colors"
+                  >
+                    {showEmailLogin ? '테스트 로그인 접기' : '개발용 이메일 로그인'}
+                  </button>
+
+                  {showEmailLogin && (
+                    <form
+                      onSubmit={handleEmailLogin}
+                      className="mt-3 p-4 bg-white border border-[#c8c2b5] rounded-xs text-left space-y-3"
+                    >
+                      <div>
+                        <label
+                          htmlFor="email-input"
+                          className="block text-[11px] font-semibold text-[#57544e] mb-1"
+                        >
+                          이메일
+                        </label>
+                        <input
+                          id="email-input"
+                          type="email"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          placeholder="user@example.com"
+                          className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] focus:outline-hidden focus:border-[#c52828]"
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor="password-input"
+                          className="block text-[11px] font-semibold text-[#57544e] mb-1"
+                        >
+                          비밀번호
+                        </label>
+                        <input
+                          id="password-input"
+                          type="password"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          placeholder="••••••••"
+                          className="w-full px-3 py-1.5 text-xs border border-[#c8c2b5] rounded-xs bg-[#faf8f4] text-[#191817] focus:outline-hidden focus:border-[#c52828]"
+                          required
+                        />
+                      </div>
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          type="submit"
+                          id="email-login-submit"
+                          disabled={isEmailSubmitting}
+                          className="flex-1 rounded-xs bg-[#191817] text-white px-3 py-2 text-xs font-semibold hover:bg-[#333] transition-colors disabled:opacity-50"
+                        >
+                          {isEmailSubmitting ? '로그인 중...' : '로그인'}
+                        </button>
+                      </div>
+                      <div className="pt-2 border-t border-[#e2ded6] flex flex-wrap gap-1.5 text-[10px]">
+                        <span className="text-[#827d73] self-center">이메일 채우기:</span>
+                        <button
+                          type="button"
+                          id="quick-fill-test1"
+                          onClick={() => {
+                            setEmail('learnaway-test-user-01@example.com');
+                          }}
+                          className="px-2 py-0.5 border border-[#c8c2b5] bg-[#faf8f4] text-[#57544e] rounded-xs hover:border-[#191817]"
+                        >
+                          테스트 계정 1
+                        </button>
+                        <button
+                          type="button"
+                          id="quick-fill-test2"
+                          onClick={() => {
+                            setEmail('learnaway-test-user-02@example.com');
+                          }}
+                          className="px-2 py-0.5 border border-[#c8c2b5] bg-[#faf8f4] text-[#57544e] rounded-xs hover:border-[#191817]"
+                        >
+                          테스트 계정 2
+                        </button>
+                      </div>
+                    </form>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+        </main>
+
+        {/* Footer */}
+        <footer className="border-t border-[#e2ded6] bg-[#faf8f4]">
+          <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 text-center">
+            <p className="text-xs text-[#57544e] leading-relaxed">
+              Learn my way는 강의 자료를 대학 시험 수준의 문제와 복습으로 연결하는 학습 도구입니다.
+            </p>
+            <p className="mt-2 text-[10px] font-academic-mono text-[#827d73]">
+              © {new Date().getFullYear()} Learn my way
+            </p>
+          </div>
+        </footer>
+      </div>
+
+      <ServiceGuideModal
+        open={guideOpen}
+        initialSection={guideSection}
+        onClose={() => setGuideOpen(false)}
+      />
     </div>
   );
 }
