@@ -831,6 +831,8 @@ export interface Problem {
   // Stage 6 fields:
   version?: number;                      // 문제 버전 (기본 1)
   serverConfirmedVersion?: number;       // 서버 동기화로 확정된 문제 버전
+  serverConfirmedRevisionId?: string;    // 서버 동기화로 확정된 최신 수정본 ID
+  serverConfirmedGeneration?: number;    // 서버 동기화로 확정된 최신 세대(generation) 번호
   localUnrecordedBaseVersion?: number;   // 로컬 본문만 저장되고 보호 수정본이 누락된 경우(partial_problem_only)의 기준 버전
   qualityStatus?: ProblemQualityStatus;  // 품질 검토 상태 (정상, 신고 접수, 검토 중, 수정 후 재검토, 재승인, 사용 중지)
   reports?: ProblemReport[];             // 누적 신고 기록

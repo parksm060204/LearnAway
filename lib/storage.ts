@@ -51,6 +51,7 @@ import {
   unmarkMaterialBodyPersistedInScope,
 } from './materialStorage';
 import { materialContentHash } from './cloud/hash';
+import { isRevisionMatchingProblem } from './cloud/mergeLearning';
 import {
   getStorageScopeId,
   scopedStorageKey,
@@ -1404,8 +1405,18 @@ function getScopedInMemoryProblemMap(): Record<string, Problem> {
 export function setInMemoryProblem(problem: Problem): void {
   const map = getScopedInMemoryProblemMap();
   const existing = map[problem.id];
-  if (existing && typeof existing.version === 'number' && typeof problem.version === 'number') {
-    if (problem.version < existing.version) {
+  if (existing) {
+    const existingConfirmed = existing.serverConfirmedVersion ?? 0;
+    const incomingConfirmed = problem.serverConfirmedVersion ?? 0;
+    if (incomingConfirmed < existingConfirmed) {
+      return;
+    }
+    if (
+      incomingConfirmed === existingConfirmed &&
+      typeof existing.version === 'number' &&
+      typeof problem.version === 'number' &&
+      problem.version < existing.version
+    ) {
       return;
     }
   }
@@ -1417,11 +1428,23 @@ export function getInMemoryProblem(problemId: string): Problem | null {
   return map[problemId] ? { ...map[problemId] } : null;
 }
 
-export function clearInMemoryProblem(problemId: string, expected?: { version?: number }): void {
+export function clearInMemoryProblem(
+  problemId: string,
+  expected?: { version?: number; serverConfirmedVersion?: number }
+): void {
   const map = getScopedInMemoryProblemMap();
   const existing = map[problemId];
   if (!existing) return;
-  if (expected?.version !== undefined && typeof existing.version === 'number' && existing.version > expected.version) {
+  if (expected?.serverConfirmedVersion !== undefined) {
+    const existingConfirmed = existing.serverConfirmedVersion ?? 0;
+    if (existingConfirmed > expected.serverConfirmedVersion) {
+      return;
+    }
+  } else if (
+    expected?.version !== undefined &&
+    typeof existing.version === 'number' &&
+    existing.version > expected.version
+  ) {
     return;
   }
   delete map[problemId];
@@ -3506,18 +3529,99 @@ export function clearAllUnsavedProblemRevisions(): boolean {
  *   advancing their `baseVersion` to `confirmedVersion` instead of overwriting or deleting them.
  * - Clears `localUnrecordedBaseVersion` and records `serverConfirmedVersion`.
  */
-export function confirmProblemRevisionSynced(
-  problemId: string,
-  serverProblem: Partial<Problem> & { version: number },
-  expected?: { revisionId?: string; generation?: number; snapshotProblem?: Problem; editReason?: string }
-): {
+export type ConfirmProblemRevisionSyncStatus =
+  | 'applied'
+  | 'in_flight_advanced'
+  | 'duplicate'
+  | 'stale_ignored'
+  | 'conflict';
+
+export interface ConfirmProblemRevisionSyncOutcome {
+  status: ConfirmProblemRevisionSyncStatus;
   reconciled: boolean;
   advancedInFlightRevision: boolean;
   localPersisted: boolean;
   revisionCleared: boolean;
   updatedProblems: Problem[];
   message: string;
-} {
+}
+
+/**
+ * Resolves the authoritative server-confirmed version of a problem,
+ * strictly distinguishing it from temporary local optimistic versions
+ * and unconfirmed in-progress revisions.
+ */
+export function getAuthoritativeServerConfirmedVersion(
+  problem?: Problem | null,
+  unsaved?: UnsavedProblemRevision | null
+): number | undefined {
+  if (!problem) return undefined;
+  if (typeof problem.serverConfirmedVersion === 'number') {
+    return problem.serverConfirmedVersion;
+  }
+  const hasActiveUnsaved = Boolean(unsaved && unsaved.syncStatus !== 'synced');
+  if (hasActiveUnsaved && typeof unsaved?.baseVersion === 'number') {
+    return unsaved.baseVersion;
+  }
+  if (typeof problem.localUnrecordedBaseVersion === 'number') {
+    return problem.localUnrecordedBaseVersion;
+  }
+  return problem.version ?? 1;
+}
+
+/**
+ * Reconciles local problem state and unsaved revision records after the server
+ * confirms a problem revision at `confirmedVersion`.
+ * - Explicitly separates server save success from local persistent storage (`localPersisted`).
+ * - Protects newer in-flight consecutive edits (`generation` / `revisionId` guard) by
+ *   advancing their `baseVersion` to `confirmedVersion` instead of overwriting or deleting them.
+ * - Guards against stale responses: ignores older responses (`confirmedVersion < existingConfirmedVersion`,
+ *   stale generation, or mismatched scope/problem identity) to guarantee local body and confirmed version
+ *   are never rolled back even after the active unsaved revision has been cleared.
+ * - Idempotently handles duplicates (same version and content) and rejects mismatches as conflict.
+ * - Clears `localUnrecordedBaseVersion` and records `serverConfirmedVersion`, `serverConfirmedRevisionId`,
+ *   and `serverConfirmedGeneration`.
+ */
+export function confirmProblemRevisionSynced(
+  problemId: string,
+  serverProblem: Partial<Problem> & { version: number },
+  expected?: {
+    revisionId?: string;
+    generation?: number;
+    snapshotProblem?: Problem;
+    editReason?: string;
+    scopeId?: string;
+  }
+): ConfirmProblemRevisionSyncOutcome {
+  // 0. SCOPE & PROBLEM IDENTITY CHECK:
+  if (expected?.scopeId && expected.scopeId !== getStorageScopeId()) {
+    const currentStored = loadStoredProblems();
+    return {
+      status: 'stale_ignored',
+      reconciled: false,
+      advancedInFlightRevision: false,
+      localPersisted: true,
+      revisionCleared: false,
+      updatedProblems: currentStored,
+      message: '계정 범위가 변경되어 이전 계정의 서버 저장 응답을 무시했습니다.',
+    };
+  }
+  if (
+    (serverProblem.id && serverProblem.id !== problemId) ||
+    (expected?.snapshotProblem?.id && expected.snapshotProblem.id !== problemId)
+  ) {
+    const currentStored = loadStoredProblems();
+    return {
+      status: 'stale_ignored',
+      reconciled: false,
+      advancedInFlightRevision: false,
+      localPersisted: true,
+      revisionCleared: false,
+      updatedProblems: currentStored,
+      message: '문제 식별정보가 일치하지 않는 응답을 무시했습니다.',
+    };
+  }
+
   const confirmedVersion = serverProblem.version;
   const persistedUnsaved = getUnsavedProblemRevision(problemId);
   const memoryUnsaved = getInMemoryProblemRevision(problemId);
@@ -3525,15 +3629,163 @@ export function confirmProblemRevisionSynced(
   const targetRevisionId = expected?.revisionId;
   const targetGeneration = expected?.generation;
 
+  const currentStored = loadStoredProblems();
+  const baseList =
+    currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
+  const storedProb = baseList.find((p) => p.id === problemId);
+  const memoryProb = getInMemoryProblem(problemId);
+  const existingProblem = (() => {
+    if (!memoryProb) return storedProb;
+    if (!storedProb) return memoryProb;
+    const memConfirmed = memoryProb.serverConfirmedVersion ?? 0;
+    const storedConfirmed = storedProb.serverConfirmedVersion ?? 0;
+    if (memConfirmed !== storedConfirmed) {
+      return memConfirmed > storedConfirmed ? memoryProb : storedProb;
+    }
+    return (memoryProb.version ?? 0) >= (storedProb.version ?? 0) ? memoryProb : storedProb;
+  })();
+
+  const existingConfirmedVersion = getAuthoritativeServerConfirmedVersion(existingProblem, currentUnsaved);
+  const effectiveCurrentProblems = (() => {
+    if (!existingProblem) return currentStored;
+    if (currentStored.length === 0) return [existingProblem];
+    return currentStored.some((p) => p.id === problemId)
+      ? currentStored.map((p) => (p.id === problemId ? existingProblem : p))
+      : [...currentStored, existingProblem];
+  })();
+
+  // 1. STALE RESPONSE CHECK:
+  // If the server response confirmed a version lower than our already-confirmed version,
+  // or lower than our active pending revision's baseVersion,
+  // ignore it completely so late responses cannot revert newer versions, bodies, or baseVersions.
+  const isStaleByConfirmedVersion = Boolean(
+    existingProblem && existingConfirmedVersion !== undefined && confirmedVersion < existingConfirmedVersion
+  );
+  const isStaleByPendingBaseVersion = Boolean(
+    currentUnsaved && confirmedVersion < currentUnsaved.baseVersion
+  );
+
+  if (isStaleByConfirmedVersion || isStaleByPendingBaseVersion) {
+    const authoritativeVer = Math.max(
+      existingConfirmedVersion ?? 0,
+      currentUnsaved?.baseVersion ?? 0
+    );
+    return {
+      status: 'stale_ignored',
+      reconciled: false,
+      advancedInFlightRevision: false,
+      localPersisted: true,
+      revisionCleared: false,
+      updatedProblems: effectiveCurrentProblems,
+      message: `이미 최신 서버 확정 버전(v${authoritativeVer})이 존재하여 이전 응답(v${confirmedVersion})을 무시했습니다.`,
+    };
+  }
+
+  // 2. SAME-VERSION CHECK (Duplicate vs Conflict):
+  // If the response matches our existing confirmed version:
+  if (existingProblem && existingConfirmedVersion !== undefined && confirmedVersion === existingConfirmedVersion) {
+    const snapshotAtConfirmedVersion =
+      existingProblem.version === confirmedVersion
+        ? undefined
+        : (Array.isArray(existingProblem.versionHistory)
+          ? existingProblem.versionHistory.find((s) => s.version === confirmedVersion)
+          : undefined) ??
+        (currentUnsaved?.baseSnapshot?.version === confirmedVersion
+          ? currentUnsaved.baseSnapshot
+          : undefined);
+
+    const referenceProblemForComparison: Problem = snapshotAtConfirmedVersion
+      ? {
+        ...existingProblem,
+        ...snapshotAtConfirmedVersion,
+        version: confirmedVersion,
+      }
+      : existingProblem;
+
+    const isIdentical = isRevisionMatchingProblem(referenceProblemForComparison, serverProblem as Problem);
+    if (isIdentical) {
+      // Idempotent duplicate: identical content confirmed at the same version.
+      // Clean up target revision ONLY if it corresponds to this confirmed revision
+      // (never delete a newer pending revision whose baseVersion >= confirmedVersion).
+      const isPersistedMatchingConfirmed = Boolean(
+        persistedUnsaved &&
+        (targetRevisionId
+          ? persistedUnsaved.revisionId === targetRevisionId
+          : persistedUnsaved.revisionVersion <= confirmedVersion &&
+          persistedUnsaved.baseVersion < confirmedVersion)
+      );
+      let cleared = true;
+      if (isPersistedMatchingConfirmed) {
+        cleared = clearUnsavedProblemRevision(problemId, {
+          revisionId: targetRevisionId ?? persistedUnsaved?.revisionId,
+          generation: targetGeneration ?? persistedUnsaved?.generation,
+        });
+      }
+      const isMemoryMatchingConfirmed = Boolean(
+        memoryUnsaved &&
+        (targetRevisionId
+          ? memoryUnsaved.revisionId === targetRevisionId
+          : memoryUnsaved.revisionVersion <= confirmedVersion &&
+          memoryUnsaved.baseVersion < confirmedVersion)
+      );
+      if (isMemoryMatchingConfirmed) {
+        clearInMemoryProblemRevision(problemId, {
+          revisionId: targetRevisionId ?? memoryUnsaved?.revisionId,
+          generation: targetGeneration ?? memoryUnsaved?.generation,
+        });
+      }
+      return {
+        status: 'duplicate',
+        reconciled: true,
+        advancedInFlightRevision: false,
+        localPersisted: true,
+        revisionCleared: cleared,
+        updatedProblems: effectiveCurrentProblems,
+        message: `문제 수정본(v${confirmedVersion})이 이미 동일한 내용으로 동기화되어 있습니다.`,
+      };
+    } else {
+      // Content mismatch on the same version: DO NOT OVERWRITE! Mark conflict or preserve.
+      if (currentUnsaved && (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId)) {
+        const conflictRev: UnsavedProblemRevision = {
+          ...currentUnsaved,
+          syncStatus: 'conflict',
+          syncError: `동일 버전(v${confirmedVersion}) 내용 불일치: 서버에 다른 내용이 이미 저장되어 있습니다.`,
+        };
+        setInMemoryProblemRevision(conflictRev);
+        saveUnsavedProblemRevision(conflictRev, {
+          onlyIfRevisionId: targetRevisionId,
+          onlyIfGeneration: targetGeneration,
+        });
+      }
+      return {
+        status: 'conflict',
+        reconciled: false,
+        advancedInFlightRevision: false,
+        localPersisted: true,
+        revisionCleared: false,
+        updatedProblems: effectiveCurrentProblems,
+        message: `동일한 서버 버전(v${confirmedVersion})에 다른 내용이 이미 존재하여 충돌로 보존되었습니다.`,
+      };
+    }
+  }
+
+  // 3. FRESH CONFIRMATION (confirmedVersion > existingConfirmedVersion or new problem)
   // Check if a newer consecutive edit occurred while this server request was in flight
   const isNewerConsecutiveEdit = Boolean(
     currentUnsaved &&
     ((targetRevisionId && currentUnsaved.revisionId !== targetRevisionId) ||
-      (targetGeneration !== undefined && (currentUnsaved.generation ?? 0) > targetGeneration))
+      (targetGeneration !== undefined && (currentUnsaved.generation ?? 0) > targetGeneration) ||
+      (!targetRevisionId &&
+        targetGeneration === undefined &&
+        (currentUnsaved.baseVersion >= confirmedVersion ||
+          currentUnsaved.revisionVersion > confirmedVersion)))
   );
 
   if (isNewerConsecutiveEdit && currentUnsaved) {
-    const baseSource = expected?.snapshotProblem ?? (serverProblem as Problem);
+    const baseSource =
+      serverProblem.promptText !== undefined
+        ? (serverProblem as Problem)
+        : (expected?.snapshotProblem ?? (serverProblem as Problem));
     const confirmedSnapshot: ProblemVersionSnapshot = {
       version: confirmedVersion,
       title: baseSource.title ?? currentUnsaved.title,
@@ -3550,10 +3802,11 @@ export function confirmProblemRevisionSynced(
       editedAt: new Date().toISOString(),
       editReason: expected?.editReason ?? '서버 동기화 완료 버전',
     };
-    const nextRevVer = Math.max(currentUnsaved.revisionVersion, confirmedVersion + 1);
+    const nextBaseVersion = Math.max(currentUnsaved.baseVersion, confirmedVersion);
+    const nextRevVer = Math.max(currentUnsaved.revisionVersion, nextBaseVersion + 1);
     const updatedInFlightRev: UnsavedProblemRevision = {
       ...currentUnsaved,
-      baseVersion: confirmedVersion,
+      baseVersion: nextBaseVersion,
       revisionVersion: nextRevVer,
       baseSnapshot: confirmedSnapshot,
     };
@@ -3572,37 +3825,42 @@ export function confirmProblemRevisionSynced(
       onlyIfGeneration: currentUnsaved.generation,
     });
 
-    const currentStored = loadStoredProblems();
-    const baseList =
-      currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
-    const memoryProb = getInMemoryProblem(problemId);
-
     const hasInBaseList = baseList.some((p) => p.id === problemId);
     const reconciledWithInFlight = hasInBaseList
       ? baseList.map((p) => {
-          if (p.id !== problemId) return p;
-          const effectiveProblem =
-            memoryProb && (memoryProb.version ?? 0) >= (p.version ?? 0) ? memoryProb : p;
-          const existingHist = effectiveProblem.versionHistory || p.versionHistory || [];
-          const hasConfirmedSnap = existingHist.some((s) => s.version === confirmedVersion);
-          return {
-            ...effectiveProblem,
-            version: nextRevVer,
-            serverConfirmedVersion: confirmedVersion,
-            localUnrecordedBaseVersion: undefined,
-            versionHistory: hasConfirmedSnap ? existingHist : [confirmedSnapshot, ...existingHist],
-          };
-        })
+        if (p.id !== problemId) return p;
+        const effectiveProblem =
+          memoryProb && (memoryProb.version ?? 0) >= (p.version ?? 0) ? memoryProb : p;
+        const existingHist = effectiveProblem.versionHistory || p.versionHistory || [];
+        const hasConfirmedSnap = existingHist.some((s) => s.version === confirmedVersion);
+        const nextConfirmedGen = Math.max(
+          targetGeneration ?? 0,
+          effectiveProblem.serverConfirmedGeneration ?? 0
+        );
+        return {
+          ...effectiveProblem,
+          version: nextRevVer,
+          serverConfirmedVersion: confirmedVersion,
+          serverConfirmedRevisionId: targetRevisionId ?? effectiveProblem.serverConfirmedRevisionId,
+          serverConfirmedGeneration: nextConfirmedGen > 0 ? nextConfirmedGen : undefined,
+          localUnrecordedBaseVersion: undefined,
+          reports: mergeProblemReportLists(effectiveProblem.reports, serverProblem.reports),
+          versionHistory: hasConfirmedSnap ? existingHist : [confirmedSnapshot, ...existingHist],
+        };
+      })
       : [
-          ...baseList,
-          {
-            ...(memoryProb ?? (serverProblem as Problem)),
-            version: nextRevVer,
-            serverConfirmedVersion: confirmedVersion,
-            localUnrecordedBaseVersion: undefined,
-            versionHistory: [confirmedSnapshot],
-          },
-        ];
+        ...baseList,
+        {
+          ...(memoryProb ?? (serverProblem as Problem)),
+          version: nextRevVer,
+          serverConfirmedVersion: confirmedVersion,
+          serverConfirmedRevisionId: targetRevisionId,
+          serverConfirmedGeneration: targetGeneration,
+          localUnrecordedBaseVersion: undefined,
+          reports: mergeProblemReportLists(memoryProb?.reports, serverProblem.reports),
+          versionHistory: [confirmedSnapshot],
+        },
+      ];
     const probSaved = saveStoredProblems(reconciledWithInFlight);
     const reconciledProb = reconciledWithInFlight.find((p) => p.id === problemId);
     if (reconciledProb) {
@@ -3610,6 +3868,7 @@ export function confirmProblemRevisionSynced(
     }
     const localPersisted = revSaved && probSaved;
     return {
+      status: 'in_flight_advanced',
       reconciled: true,
       advancedInFlightRevision: true,
       localPersisted,
@@ -3622,40 +3881,68 @@ export function confirmProblemRevisionSynced(
   }
 
   // Normal completion of the active revision
-  const currentStored = loadStoredProblems();
-  const baseList =
-    currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
   const hasInBaseList = baseList.some((p) => p.id === problemId);
   const reconciledProblems = hasInBaseList
-    ? baseList.map((p) =>
-        p.id === problemId
-          ? {
-              ...p,
-              ...serverProblem,
-              version: confirmedVersion,
-              serverConfirmedVersion: confirmedVersion,
-              localUnrecordedBaseVersion: undefined,
-              reports: p.reports ?? serverProblem.reports ?? [],
-              versionHistory: p.versionHistory ?? serverProblem.versionHistory ?? [],
-              reviewNotes: p.reviewNotes ?? serverProblem.reviewNotes,
-            }
-          : p
-      )
-    : [
-        ...baseList,
-        {
-          ...(serverProblem as Problem),
-          version: confirmedVersion,
-          serverConfirmedVersion: confirmedVersion,
-          localUnrecordedBaseVersion: undefined,
-          reports: serverProblem.reports ?? [],
-          versionHistory: serverProblem.versionHistory ?? [],
-          reviewNotes: serverProblem.reviewNotes,
-        },
+    ? baseList.map((p) => {
+      if (p.id !== problemId) return p;
+      const combinedHistory = [
+        ...(serverProblem.versionHistory ?? []),
+        ...(p.versionHistory ?? []),
       ];
+      const seenVersions = new Set<number>();
+      const dedupedHistory: ProblemVersionSnapshot[] = [];
+      for (const snap of combinedHistory) {
+        if (
+          snap &&
+          typeof snap.version === 'number' &&
+          snap.version < confirmedVersion &&
+          !seenVersions.has(snap.version)
+        ) {
+          seenVersions.add(snap.version);
+          dedupedHistory.push(snap);
+        }
+      }
+      dedupedHistory.sort((a, b) => (b.version ?? 0) - (a.version ?? 0));
+      const nextConfirmedGen = Math.max(
+        targetGeneration ?? 0,
+        p.serverConfirmedGeneration ?? 0
+      );
+
+      return {
+        ...p,
+        ...serverProblem,
+        version: confirmedVersion,
+        serverConfirmedVersion: confirmedVersion,
+        serverConfirmedRevisionId: targetRevisionId ?? p.serverConfirmedRevisionId,
+        serverConfirmedGeneration: nextConfirmedGen > 0 ? nextConfirmedGen : undefined,
+        localUnrecordedBaseVersion: undefined,
+        reports: mergeProblemReportLists(p.reports, serverProblem.reports),
+        versionHistory: dedupedHistory,
+        reviewNotes: serverProblem.reviewNotes ?? p.reviewNotes,
+      };
+    })
+    : [
+      ...baseList,
+      {
+        ...(serverProblem as Problem),
+        version: confirmedVersion,
+        serverConfirmedVersion: confirmedVersion,
+        serverConfirmedRevisionId: targetRevisionId,
+        serverConfirmedGeneration: targetGeneration,
+        localUnrecordedBaseVersion: undefined,
+        reports: serverProblem.reports ?? [],
+        versionHistory: (serverProblem.versionHistory ?? []).filter(
+          (s) => s && typeof s.version === 'number' && s.version < confirmedVersion
+        ),
+        reviewNotes: serverProblem.reviewNotes,
+      },
+    ];
   const probSaved = saveStoredProblems(reconciledProblems);
   if (probSaved) {
-    clearInMemoryProblem(problemId, { version: confirmedVersion });
+    clearInMemoryProblem(problemId, {
+      version: confirmedVersion,
+      serverConfirmedVersion: confirmedVersion,
+    });
   } else {
     const memProb = reconciledProblems.find((p) => p.id === problemId);
     if (memProb) setInMemoryProblem(memProb);
@@ -3679,6 +3966,7 @@ export function confirmProblemRevisionSynced(
 
   const localPersisted = probSaved && (!hadTargetPersistedUnsaved || cleared);
   return {
+    status: 'applied',
     reconciled: true,
     advancedInFlightRevision: false,
     localPersisted,
@@ -3689,6 +3977,135 @@ export function confirmProblemRevisionSynced(
       : hadTargetPersistedUnsaved && !cleared
         ? '서버에는 저장되었으나 로컬 수정본 임시 기록 정리에 실패했습니다.'
         : '문제 수정본이 서버에 안전하게 저장되었습니다.',
+  };
+}
+
+function mergeProblemReportLists(
+  localReports: ProblemReport[] | undefined,
+  serverReports: ProblemReport[] | undefined
+): ProblemReport[] {
+  const localArr = Array.isArray(localReports) ? localReports : [];
+  const serverArr = Array.isArray(serverReports) ? serverReports : [];
+  if (localArr.length === 0) return serverArr;
+  if (serverArr.length === 0) return localArr;
+
+  const statusRank = (s: ProblemReport['status'] | undefined): number => {
+    if (s === 'resolved' || s === 'dismissed') return 3;
+    if (s === 'under_review') return 2;
+    return 1;
+  };
+
+  const mergedById = new Map<string, ProblemReport>();
+  for (const rep of [...serverArr, ...localArr]) {
+    if (!rep || !rep.id) continue;
+    const prev = mergedById.get(rep.id);
+    if (!prev) {
+      mergedById.set(rep.id, rep);
+    } else if (statusRank(rep.status) > statusRank(prev.status)) {
+      mergedById.set(rep.id, rep);
+    }
+  }
+  return Array.from(mergedById.values());
+}
+
+/**
+ * Reconciles a server quality-update response into local problem storage without
+ * ever reverting a newer local body/version or clobbering an active unsaved revision.
+ */
+export function reconcileProblemQualitySynced(
+  problemId: string,
+  serverProblem: Problem,
+  options?: { scopeId?: string }
+): { reconciled: boolean; localPersisted: boolean; updatedProblems: Problem[] } {
+  if (options?.scopeId && options.scopeId !== getStorageScopeId()) {
+    return {
+      reconciled: false,
+      localPersisted: true,
+      updatedProblems: loadStoredProblems(),
+    };
+  }
+  if (!serverProblem || (serverProblem.id && serverProblem.id !== problemId)) {
+    return {
+      reconciled: false,
+      localPersisted: true,
+      updatedProblems: loadStoredProblems(),
+    };
+  }
+
+  const currentStored = loadStoredProblems();
+  const baseList =
+    currentStored.length > 0 ? currentStored : Object.values(getScopedLastKnownProblemsMap());
+  const persistedUnsaved = getUnsavedProblemRevision(problemId);
+  const memoryUnsaved = getInMemoryProblemRevision(problemId);
+  const { latest: currentUnsaved } = resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved);
+  const memoryProb = getInMemoryProblem(problemId);
+
+  const hasInBaseList = baseList.some((p) => p.id === problemId);
+  if (!hasInBaseList && !memoryProb) {
+    return {
+      reconciled: false,
+      localPersisted: true,
+      updatedProblems: currentStored,
+    };
+  }
+
+  const reconciledProblems = (hasInBaseList ? baseList : [memoryProb!]).map((p) => {
+    if (p.id !== problemId) return p;
+    const effectiveLocal =
+      memoryProb && (memoryProb.version ?? 0) >= (p.version ?? 0) ? memoryProb : p;
+    const localConfirmedVer =
+      getAuthoritativeServerConfirmedVersion(effectiveLocal, currentUnsaved) ??
+      (effectiveLocal.version ?? 1);
+    const serverVer = serverProblem.version ?? 1;
+    const mergedReports = mergeProblemReportLists(effectiveLocal.reports, serverProblem.reports);
+
+    // Only adopt the server's body/version if there is NO active local unsaved revision
+    // AND the server row has a strictly newer version than our local confirmed version.
+    const canAdoptNewerServerBody = !currentUnsaved && serverVer > localConfirmedVer;
+
+    if (canAdoptNewerServerBody) {
+      return {
+        ...effectiveLocal,
+        ...serverProblem,
+        version: serverVer,
+        serverConfirmedVersion: serverVer,
+        reports: mergedReports,
+      };
+    }
+
+    // Otherwise, preserve local body, version, and unsaved state; merge quality fields only.
+    return {
+      ...effectiveLocal,
+      qualityStatus: serverProblem.qualityStatus ?? effectiveLocal.qualityStatus,
+      isOutdated:
+        typeof serverProblem.isOutdated === 'boolean'
+          ? serverProblem.isOutdated
+          : effectiveLocal.isOutdated,
+      needsSourceReview:
+        typeof serverProblem.needsSourceReview === 'boolean'
+          ? serverProblem.needsSourceReview
+          : effectiveLocal.needsSourceReview,
+      lastReviewedAt: serverProblem.lastReviewedAt ?? effectiveLocal.lastReviewedAt,
+      reviewNotes: serverProblem.reviewNotes ?? effectiveLocal.reviewNotes,
+      sourceMaterials: serverProblem.sourceMaterials ?? effectiveLocal.sourceMaterials,
+      sourceContentVersion: serverProblem.sourceContentVersion ?? effectiveLocal.sourceContentVersion,
+      sourceVerificationStatus:
+        serverProblem.sourceVerificationStatus ?? effectiveLocal.sourceVerificationStatus,
+      sourcePage: serverProblem.sourcePage ?? effectiveLocal.sourcePage,
+      difficultyLevel: serverProblem.difficultyLevel ?? effectiveLocal.difficultyLevel,
+      reports: mergedReports,
+    };
+  });
+
+  const probSaved = saveStoredProblems(reconciledProblems);
+  if (!probSaved) {
+    const memProb = reconciledProblems.find((p) => p.id === problemId);
+    if (memProb) setInMemoryProblem(memProb);
+  }
+  return {
+    reconciled: true,
+    localPersisted: probSaved,
+    updatedProblems: probSaved ? loadStoredProblems() : reconciledProblems,
   };
 }
 

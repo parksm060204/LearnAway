@@ -79,6 +79,7 @@ import {
   clearInMemoryProblemRevision,
   getInMemoryProblem,
   confirmProblemRevisionSynced,
+  reconcileProblemQualitySynced,
   loadConceptScheduleAdjustments,
 } from '../lib/storage';
 import { AdminAiMetricsModal } from '../components/AdminAiMetricsModal';
@@ -90,6 +91,7 @@ import {
   getConceptById,
   getConceptDraftById,
   getProblemById,
+  getProblemVersionSnapshot,
   getProblemDraftById,
   deleteProblemDraft as deleteProblemDraftCloud,
   updateProblemDraft as updateProblemDraftCloud,
@@ -97,6 +99,7 @@ import {
   updateConceptDraft as updateConceptDraftCloud,
   updateProblemQuality,
   reviseProblem,
+  type ProblemQualityPatch,
 } from '../lib/cloud/learningRepository';
 import { buildConceptFromDraft } from '../lib/learningApproval';
 import {
@@ -1578,7 +1581,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           const r = await updateProblemQuality(supabase, prob.id, {
             isOutdated: prob.isOutdated,
             needsSourceReview: prob.needsSourceReview,
-            payload: prob as unknown as Record<string, unknown>,
+            sourceVerificationStatus: prob.sourceVerificationStatus,
+            sourceContentVersion: prob.sourceContentVersion,
+            sourcePage: prob.sourcePage,
           });
           return r.ok;
         }),
@@ -2849,7 +2854,13 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   // explicitly separates server persistence from local persistent storage.
   const pushProblemToServer = async (
     problemId: string,
-    opts: { revise?: boolean; expectedVersion?: number; silent?: boolean; localPersisted?: boolean } = {}
+    opts: {
+      revise?: boolean;
+      expectedVersion?: number;
+      silent?: boolean;
+      localPersisted?: boolean;
+      qualityPatch?: ProblemQualityPatch;
+    } = {}
   ): Promise<void> => {
     const pinnedScopeId = getStorageScopeId();
     const memoryProb = getInMemoryProblem(problemId);
@@ -2890,7 +2901,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
     try {
       const supabase = createBrowserSupabaseClient();
-      if (unsaved && unsaved.syncStatus !== 'conflict') {
+      if (opts.revise && unsaved && unsaved.syncStatus !== 'conflict') {
         const syncingRev = { ...unsaved, syncStatus: 'syncing' as const };
         setInMemoryProblemRevision(syncingRev);
         saveUnsavedProblemRevision(syncingRev, {
@@ -2899,25 +2910,18 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         });
       }
       const targetExpectedVersion = unsaved?.baseVersion ?? opts.expectedVersion ?? Math.max(1, (problem.version ?? 1) - 1);
-      const result = opts.revise
-        ? await reviseProblem(
-            supabase,
-            problemId,
-            targetExpectedVersion,
-            problem
-          )
-        : await updateProblemQuality(supabase, problemId, {
-            qualityStatus: problem.qualityStatus,
-            isOutdated: problem.isOutdated,
-            needsSourceReview: problem.needsSourceReview,
-            payload: problem as unknown as Record<string, unknown>,
-          });
-
-      if (getStorageScopeId() !== pinnedScopeId) return;
 
       if (opts.revise) {
+        const result = await reviseProblem(
+          supabase,
+          problemId,
+          targetExpectedVersion,
+          problem
+        );
+        if (getStorageScopeId() !== pinnedScopeId) return;
+
         if (result.ok) {
-          const confirmedVersion = result.data?.version ?? (targetExpectedVersion + 1);
+          const confirmedVersion = result.confirmedVersion ?? result.data?.version ?? (targetExpectedVersion + 1);
           const syncOutcome = confirmProblemRevisionSynced(
             problemId,
             { ...result.data, version: confirmedVersion },
@@ -2926,11 +2930,47 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
               generation: targetGeneration,
               snapshotProblem,
               editReason: unsaved?.editReason,
+              scopeId: pinnedScopeId,
             }
           );
-          setAllProblems(syncOutcome.updatedProblems);
+          if (syncOutcome.status === 'stale_ignored') {
+            return;
+          }
+          if (syncOutcome.status === 'duplicate') {
+            if (!opts.silent) {
+              showToast(syncOutcome.message);
+            }
+            return;
+          }
+          if (syncOutcome.status === 'conflict') {
+            showToast(syncOutcome.message || '서버 버전 충돌이 감지되었습니다.');
+            return;
+          }
+          let nextProblems = syncOutcome.updatedProblems;
+          if (
+            result.serverAdvancedBeyondConfirmed &&
+            result.latestServerProblem &&
+            !syncOutcome.advancedInFlightRevision
+          ) {
+            const latestVer = result.latestServerProblem.version ?? confirmedVersion;
+            if (latestVer > confirmedVersion) {
+              const advanceOutcome = confirmProblemRevisionSynced(
+                problemId,
+                { ...result.latestServerProblem, version: latestVer },
+                { scopeId: pinnedScopeId }
+              );
+              if (advanceOutcome.reconciled) {
+                nextProblems = advanceOutcome.updatedProblems;
+              }
+            }
+          }
+          setAllProblems(nextProblems);
           if (!opts.silent) {
-            if (opts.localPersisted === false && !syncOutcome.localPersisted) {
+            if (result.verificationStatus === 'verification_failed') {
+              showToast(
+                `서버에는 수정본(v${confirmedVersion})이 저장되었으나 저장 직후 재조회 검증에 실패했습니다. 새로고침 시 최신 서버 상태가 반영됩니다.`
+              );
+            } else if (opts.localPersisted === false && !syncOutcome.localPersisted) {
               showToast('서버에는 수정본이 저장되었으나 브라우저 로컬 영속 저장소 기록에는 실패했습니다. (메모리 상태만 유지됨)');
             } else {
               showToast(syncOutcome.message);
@@ -2944,6 +2984,63 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             if (getStorageScopeId() !== pinnedScopeId) return;
             if (latestServer.ok && latestServer.data) {
               const serverVer = latestServer.data.version ?? 1;
+              const expectedConfirmedVer = targetExpectedVersion + 1;
+
+              // Check 1: If server advanced beyond targetExpectedVersion + 1, inspect the immutable snapshot
+              // for targetExpectedVersion + 1 in problem_versions so an earlier request A recovering after B wrote v3
+              // confirms A/v2 (its own snapshot) rather than mistaking B/v3 or failing to recover.
+              if (serverVer > expectedConfirmedVer) {
+                const snapRes = await getProblemVersionSnapshot(supabase, problemId, expectedConfirmedVer);
+                if (getStorageScopeId() !== pinnedScopeId) return;
+                if (snapRes.ok && snapRes.data) {
+                  const candidateAtExpected: Problem & { version: number } = {
+                    ...latestServer.data,
+                    ...snapRes.data,
+                    id: problemId,
+                    version: expectedConfirmedVer,
+                  };
+                  if (isRevisionMatchingProblem(problem, candidateAtExpected)) {
+                    const syncOutcome = confirmProblemRevisionSynced(
+                      problemId,
+                      candidateAtExpected,
+                      {
+                        revisionId: targetRevisionId,
+                        generation: targetGeneration,
+                        snapshotProblem,
+                        editReason: unsaved?.editReason,
+                        scopeId: pinnedScopeId,
+                      }
+                    );
+                    if (syncOutcome.status === 'stale_ignored') return;
+                    if (syncOutcome.status === 'conflict') {
+                      showToast(syncOutcome.message || '서버 버전 충돌: 내용 불일치가 감지되었습니다.');
+                      return;
+                    }
+                    let nextProblems = syncOutcome.updatedProblems;
+                    if (!syncOutcome.advancedInFlightRevision) {
+                      const advanceOutcome = confirmProblemRevisionSynced(
+                        problemId,
+                        { ...latestServer.data, version: serverVer },
+                        { scopeId: pinnedScopeId }
+                      );
+                      if (advanceOutcome.reconciled) {
+                        nextProblems = advanceOutcome.updatedProblems;
+                      }
+                    }
+                    setAllProblems(nextProblems);
+                    if (!opts.silent) {
+                      showToast(
+                        syncOutcome.localPersisted
+                          ? '문제 수정본이 이미 서버에 동기화되어 있습니다.'
+                          : '문제 수정본이 서버에 동기화되어 있으나 브라우저 로컬 영속 저장소 갱신에는 실패했습니다.'
+                      );
+                    }
+                    return;
+                  }
+                }
+              }
+
+              // Check 2: Current server version matches this revision (response loss recovery when no newer edit intervened)
               if (
                 serverVer >= targetExpectedVersion &&
                 isRevisionMatchingProblem(problem, latestServer.data)
@@ -2956,8 +3053,26 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                     generation: targetGeneration,
                     snapshotProblem,
                     editReason: unsaved?.editReason,
+                    scopeId: pinnedScopeId,
                   }
                 );
+                if (syncOutcome.status === 'stale_ignored') {
+                  return;
+                }
+                if (syncOutcome.status === 'conflict') {
+                  showToast(syncOutcome.message || '서버 버전 충돌: 내용 불일치가 감지되었습니다.');
+                  return;
+                }
+                if (syncOutcome.status === 'duplicate') {
+                  if (!opts.silent) {
+                    showToast(
+                      syncOutcome.localPersisted
+                        ? '문제 수정본이 이미 서버에 동기화되어 있습니다.'
+                        : '문제 수정본이 서버에 동기화되어 있으나 브라우저 로컬 영속 저장소 갱신에는 실패했습니다.'
+                    );
+                  }
+                  return;
+                }
                 setAllProblems(syncOutcome.updatedProblems);
                 if (!opts.silent) {
                   showToast(
@@ -2988,7 +3103,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                 );
                 if (getStorageScopeId() !== pinnedScopeId) return;
                 if (retryResult.ok) {
-                  const confirmedVer = retryResult.data?.version ?? (serverVer + 1);
+                  const confirmedVer = retryResult.confirmedVersion ?? retryResult.data?.version ?? (serverVer + 1);
                   const syncOutcome = confirmProblemRevisionSynced(
                     problemId,
                     { ...retryResult.data, version: confirmedVer },
@@ -2997,8 +3112,20 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
                       generation: targetGeneration,
                       snapshotProblem: rebasedProblem,
                       editReason: unsaved?.editReason,
+                      scopeId: pinnedScopeId,
                     }
                   );
+                  if (syncOutcome.status === 'stale_ignored') {
+                    return;
+                  }
+                  if (syncOutcome.status === 'conflict') {
+                    showToast(syncOutcome.message || '서버 버전 충돌이 감지되었습니다.');
+                    return;
+                  }
+                  if (syncOutcome.status === 'duplicate') {
+                    if (!opts.silent) showToast(syncOutcome.message);
+                    return;
+                  }
                   setAllProblems(syncOutcome.updatedProblems);
                   if (!opts.silent) {
                     showToast(syncOutcome.message);
@@ -3063,7 +3190,27 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           }
         }
       } else {
-        if (!result.ok && !opts.silent) showToast(`서버 동기화 실패: ${result.error}`);
+        const patchToApply: ProblemQualityPatch = opts.qualityPatch ?? {
+          qualityStatus: baseProblem.qualityStatus,
+          isOutdated: baseProblem.isOutdated,
+          needsSourceReview: baseProblem.needsSourceReview,
+          lastReviewedAt: baseProblem.lastReviewedAt,
+          reviewNotes: baseProblem.reviewNotes,
+        };
+        const result = await updateProblemQuality(supabase, problemId, patchToApply);
+        if (getStorageScopeId() !== pinnedScopeId) return;
+        if (result.ok) {
+          if (result.data) {
+            const reconciled = reconcileProblemQualitySynced(problemId, result.data, {
+              scopeId: pinnedScopeId,
+            });
+            if (reconciled.reconciled) {
+              setAllProblems(reconciled.updatedProblems);
+            }
+          }
+        } else if (!opts.silent) {
+          showToast(`서버 동기화 실패: ${result.error}`);
+        }
       }
     } catch (e) {
       if (getStorageScopeId() !== pinnedScopeId) return;
@@ -3195,7 +3342,14 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
-      void pushProblemToServer(problemId);
+      const updatedProb = res.updatedProblems.find((p) => p.id === problemId);
+      void pushProblemToServer(problemId, {
+        qualityPatch: {
+          addReport: res.newReport ?? undefined,
+          qualityStatus: updatedProb?.qualityStatus ?? 'reported',
+          lastReviewedAt: res.newReport?.createdAt ?? updatedProb?.lastReviewedAt,
+        },
+      });
       showToast('문제 오류가 신고되었습니다. 품질 검토 및 수정 완료 시까지 출제에서 제외됩니다.');
     } else {
       showToast(`신고 접수 실패: ${res.error}`);
@@ -3209,10 +3363,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     note?: string
   ) => {
     const updated = updateProblemQualityStatus(problemId, newStatus, note);
-    if (updated) {
+    if (updated.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
-      void pushProblemToServer(problemId);
+      void pushProblemToServer(problemId, {
+        qualityPatch: {
+          qualityStatus: newStatus,
+          lastReviewedAt: updated.updatedProblem?.lastReviewedAt,
+          reviewNotes: note !== undefined ? note : updated.updatedProblem?.reviewNotes,
+        },
+      });
       showToast(`문제 상태가 [${newStatus}]으로 변경되었습니다.`);
     }
   };
@@ -3226,7 +3386,18 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
-      void pushProblemToServer(problemId);
+      void pushProblemToServer(problemId, {
+        qualityPatch: {
+          dismissReport: {
+            reportId,
+            resolutionNote: dismissReason.trim(),
+            resolvedAt: res.updatedProblem?.lastReviewedAt,
+          },
+          qualityStatus: res.updatedProblem?.qualityStatus,
+          lastReviewedAt: res.updatedProblem?.lastReviewedAt,
+          reviewNotes: res.updatedProblem?.reviewNotes,
+        },
+      });
       showToast('신고가 기각 사유와 함께 종결 처리되었습니다.');
     } else {
       showToast(`신고 기각 실패: ${res.error}`);
@@ -3270,12 +3441,34 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   };
 
   const handleReapproveProblem = (problemId: string, reapprovalNote?: string) => {
-    const beforeVersion = allProblems.find((p) => p.id === problemId)?.version ?? 1;
+    const unsavedBefore = resolveLatestProblemRevision(
+      getUnsavedProblemRevision(problemId),
+      getInMemoryProblemRevision(problemId)
+    ).latest;
+    const hasPendingRevision = Boolean(unsavedBefore && unsavedBefore.syncStatus !== 'conflict');
+    const beforeVersion = unsavedBefore ? unsavedBefore.baseVersion : (allProblems.find((p) => p.id === problemId)?.version ?? 1);
     const res = reapproveProblem(problemId, reapprovalNote, materials);
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
-      void pushProblemToServer(problemId, { revise: true, expectedVersion: beforeVersion });
+      const updatedProb = res.updatedProblem;
+      void pushProblemToServer(problemId, {
+        revise: hasPendingRevision,
+        expectedVersion: hasPendingRevision ? beforeVersion : undefined,
+        qualityPatch: {
+          qualityStatus: 'reapproved',
+          isOutdated: false,
+          needsSourceReview: updatedProb?.needsSourceReview,
+          lastReviewedAt: updatedProb?.lastReviewedAt,
+          reviewNotes: updatedProb?.reviewNotes,
+          resolveOpenReports: true,
+          resolutionNote: reapprovalNote || '문제 검토 및 수정/보완 완료 후 사용자 재승인',
+          sourceMaterials: updatedProb?.sourceMaterials,
+          sourceContentVersion: updatedProb?.sourceContentVersion,
+          sourceVerificationStatus: updatedProb?.sourceVerificationStatus,
+          sourcePage: updatedProb?.sourcePage,
+        },
+      });
       showToast('문제 품질 검토 및 재승인이 완료되어 다시 출제에 포함됩니다.');
     } else {
       showToast(`재승인 실패: ${res.error}`);
@@ -3285,10 +3478,16 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
 
   const handleSuspendProblem = (problemId: string, suspensionReason?: string) => {
     const suspended = suspendProblem(problemId, suspensionReason);
-    if (suspended) {
+    if (suspended.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
-      void pushProblemToServer(problemId);
+      void pushProblemToServer(problemId, {
+        qualityPatch: {
+          qualityStatus: 'suspended',
+          lastReviewedAt: suspended.updatedProblem?.lastReviewedAt,
+          reviewNotes: suspended.updatedProblem?.reviewNotes,
+        },
+      });
       showToast('문제가 사용 중지 처리되었습니다.');
     }
   };

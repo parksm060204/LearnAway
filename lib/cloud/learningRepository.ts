@@ -1,5 +1,15 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Concept, ConceptDraft, Problem, ProblemDraft, ProblemVersionSnapshot } from '../types';
+import type {
+  Concept,
+  ConceptDraft,
+  Problem,
+  ProblemDraft,
+  ProblemQualityStatus,
+  ProblemReport,
+  ProblemSourceRef,
+  ProblemVersionSnapshot,
+  SourceVerificationStatus,
+} from '../types';
 import {
   conceptDraftContentUpsert,
   conceptDraftToUpsert,
@@ -532,14 +542,15 @@ export interface ApprovalResult {
 function approvalErrorCode(error: { message?: string; code?: string } | null): string {
   const raw = `${error?.message ?? ''} ${error?.code ?? ''}`;
   if (raw.includes('DRAFT_STALE')) return 'stale';
-  if (raw.includes('DRAFT_NOT_FOUND')) return 'missing';
+  if (raw.includes('DRAFT_NOT_FOUND') || raw.includes('PROBLEM_NOT_FOUND') || raw.includes('REPORT_NOT_FOUND')) return 'missing';
   if (raw.includes('DRAFT_NOT_PENDING')) return 'not_pending';
   if (raw.includes('RUBRIC_NOT_100')) return 'rubric';
-  if (raw.includes('DRAFT_INCOMPLETE')) return 'incomplete';
+  if (raw.includes('DRAFT_INCOMPLETE') || raw.includes('PROBLEM_INCOMPLETE') || raw.includes('REPORT_INVALID') || raw.includes('DISMISS_REASON_REQUIRED')) return 'incomplete';
   if (raw.includes('NO_CONCEPT_LINK')) return 'no_concept';
   if (raw.includes('ENTITY_ID_CONFLICT')) return 'id_conflict';
   if (raw.includes('DRAFT_SCOPE_MISMATCH')) return 'scope';
   if (raw.includes('VERSION_CONFLICT')) return 'version_conflict';
+  if (raw.includes('UNAUTHENTICATED') || raw.includes('FORBIDDEN') || raw.includes('42501')) return 'forbidden';
   return 'error';
 }
 
@@ -582,26 +593,378 @@ export async function approveProblemDraft(
 }
 
 export interface ProblemQualityPatch {
-  qualityStatus?: string;
+  qualityStatus?: ProblemQualityStatus | string;
   isOutdated?: boolean;
   needsSourceReview?: boolean;
-  /** Full updated Problem document (carries reports / review notes). */
+  expectedVersion?: number;
+  expectedUpdatedAt?: string;
+  addReport?: ProblemReport;
+  dismissReport?: {
+    reportId: string;
+    resolutionNote: string;
+    resolvedAt?: string;
+  };
+  resolveOpenReports?: boolean;
+  resolutionNote?: string;
+  reviewNotes?: string;
+  lastReviewedAt?: string;
+  sourceMaterials?: ProblemSourceRef[];
+  sourceContentVersion?: string;
+  sourceVerificationStatus?: SourceVerificationStatus;
+  sourcePage?: string;
+  reports?: ProblemReport[];
+  /**
+   * @deprecated Full payload writes are forbidden for quality updates.
+   * If passed by legacy callers, only allowed quality/review fields are extracted;
+   * problem body, answer, rubric, and version are strictly ignored.
+   */
   payload?: Record<string, unknown>;
 }
 
-/** Persists a quality/review status change (report, dismiss, suspend, ...). */
+/**
+ * Extracts only allowed quality/review/source-verification fields from a patch,
+ * ensuring problem body, model answer, rubric, hints, conceptIds, and version
+ * are never sent or overwritten during quality updates.
+ */
+export function sanitizeProblemQualityPatch(patch: ProblemQualityPatch): Record<string, unknown> {
+  const legacyPayload =
+    patch.payload && typeof patch.payload === 'object'
+      ? (patch.payload as Record<string, unknown>)
+      : undefined;
+
+  const clean: Record<string, unknown> = {};
+
+  const qualityStatus =
+    patch.qualityStatus ?? (typeof legacyPayload?.qualityStatus === 'string' ? legacyPayload.qualityStatus : undefined);
+  if (qualityStatus !== undefined) clean.qualityStatus = qualityStatus;
+
+  const isOutdated =
+    patch.isOutdated ?? (typeof legacyPayload?.isOutdated === 'boolean' ? legacyPayload.isOutdated : undefined);
+  if (isOutdated !== undefined) clean.isOutdated = isOutdated;
+
+  const needsSourceReview =
+    patch.needsSourceReview ??
+    (typeof legacyPayload?.needsSourceReview === 'boolean' ? legacyPayload.needsSourceReview : undefined);
+  if (needsSourceReview !== undefined) clean.needsSourceReview = needsSourceReview;
+
+  if (typeof patch.expectedVersion === 'number' && Number.isFinite(patch.expectedVersion)) {
+    clean.expectedVersion = patch.expectedVersion;
+  }
+  if (typeof patch.expectedUpdatedAt === 'string' && patch.expectedUpdatedAt.trim()) {
+    clean.expectedUpdatedAt = patch.expectedUpdatedAt.trim();
+  }
+  if (patch.addReport && typeof patch.addReport === 'object') {
+    clean.addReport = patch.addReport;
+  }
+  if (patch.dismissReport && typeof patch.dismissReport === 'object') {
+    clean.dismissReport = patch.dismissReport;
+  }
+  if (typeof patch.resolveOpenReports === 'boolean') {
+    clean.resolveOpenReports = patch.resolveOpenReports;
+  }
+  if (typeof patch.resolutionNote === 'string') {
+    clean.resolutionNote = patch.resolutionNote;
+  }
+
+  const reviewNotes =
+    patch.reviewNotes ?? (typeof legacyPayload?.reviewNotes === 'string' ? legacyPayload.reviewNotes : undefined);
+  if (reviewNotes !== undefined) clean.reviewNotes = reviewNotes;
+
+  const lastReviewedAt =
+    patch.lastReviewedAt ??
+    (typeof legacyPayload?.lastReviewedAt === 'string' ? legacyPayload.lastReviewedAt : undefined);
+  if (lastReviewedAt !== undefined) clean.lastReviewedAt = lastReviewedAt;
+
+  const sourceMaterials =
+    patch.sourceMaterials ?? (Array.isArray(legacyPayload?.sourceMaterials) ? legacyPayload.sourceMaterials : undefined);
+  if (sourceMaterials !== undefined) clean.sourceMaterials = sourceMaterials;
+
+  const sourceContentVersion =
+    patch.sourceContentVersion ??
+    (typeof legacyPayload?.sourceContentVersion === 'string' ? legacyPayload.sourceContentVersion : undefined);
+  if (sourceContentVersion !== undefined) clean.sourceContentVersion = sourceContentVersion;
+
+  const sourceVerificationStatus =
+    patch.sourceVerificationStatus ??
+    (typeof legacyPayload?.sourceVerificationStatus === 'string'
+      ? legacyPayload.sourceVerificationStatus
+      : undefined);
+  if (sourceVerificationStatus !== undefined) clean.sourceVerificationStatus = sourceVerificationStatus;
+
+  const sourcePage =
+    patch.sourcePage ?? (typeof legacyPayload?.sourcePage === 'string' ? legacyPayload.sourcePage : undefined);
+  if (sourcePage !== undefined) clean.sourcePage = sourcePage;
+
+  const reports =
+    patch.reports ?? (Array.isArray(legacyPayload?.reports) ? (legacyPayload.reports as ProblemReport[]) : undefined);
+  if (reports !== undefined) clean.reports = reports;
+
+  return clean;
+}
+
+/**
+ * Atomically merges report lists in memory (mirroring `public.merge_problem_reports` in SQL)
+ * for fallback or client-side verification.
+ */
+export function mergeProblemReportsAtomically(
+  existingReports: ProblemReport[] | undefined,
+  patch: ProblemQualityPatch
+): ProblemReport[] {
+  const legacyPayload =
+    patch.payload && typeof patch.payload === 'object'
+      ? (patch.payload as Record<string, unknown>)
+      : undefined;
+  const incomingReports =
+    patch.reports ??
+    (Array.isArray(legacyPayload?.reports) ? (legacyPayload.reports as ProblemReport[]) : undefined);
+
+  let reports: ProblemReport[] = Array.isArray(existingReports)
+    ? existingReports.map((r) => ({ ...r }))
+    : [];
+  const nowIso = patch.lastReviewedAt || new Date().toISOString();
+
+  const isRecentDuplicate = (list: ProblemReport[], candidate: ProblemReport): boolean => {
+    const candDetails = (candidate.details ?? '').trim();
+    if (!candDetails) return false;
+    return list.some((r) => {
+      if (r.id && candidate.id && r.id === candidate.id) return true;
+      if (r.status === 'dismissed' || r.status === 'resolved') return false;
+      if (r.type !== candidate.type) return false;
+      if ((r.details ?? '').trim() !== candDetails) return false;
+      const tA = new Date(candidate.createdAt || nowIso).getTime();
+      const tB = new Date(r.createdAt || nowIso).getTime();
+      if (Number.isFinite(tA) && Number.isFinite(tB) && Math.abs(tA - tB) < 15000) {
+        return true;
+      }
+      return false;
+    });
+  };
+
+  if (Array.isArray(incomingReports)) {
+    for (const item of incomingReports) {
+      if (!item || typeof item !== 'object' || !item.id) continue;
+      const existingIdx = reports.findIndex((r) => r.id === item.id);
+      if (existingIdx >= 0) {
+        const cur = reports[existingIdx];
+        if (
+          (cur.status === 'open' || cur.status === 'under_review') &&
+          (item.status === 'under_review' || item.status === 'resolved' || item.status === 'dismissed')
+        ) {
+          reports[existingIdx] = { ...cur, ...item };
+        }
+      } else if (!isRecentDuplicate(reports, item)) {
+        reports = [{ ...item }, ...reports];
+      }
+    }
+  }
+
+  if (patch.addReport) {
+    const rep = patch.addReport;
+    if (!isRecentDuplicate(reports, rep)) {
+      reports = [
+        {
+          id: rep.id,
+          problemId: rep.problemId,
+          ...(rep.attemptId ? { attemptId: rep.attemptId } : {}),
+          type: rep.type,
+          details: rep.details.trim(),
+          createdAt: rep.createdAt || nowIso,
+          status: rep.status || 'open',
+        },
+        ...reports,
+      ];
+    }
+  }
+
+  if (patch.dismissReport) {
+    const { reportId, resolutionNote, resolvedAt } = patch.dismissReport;
+    reports = reports.map((r) =>
+      r.id === reportId
+        ? {
+            ...r,
+            status: 'dismissed',
+            resolutionNote: resolutionNote.trim(),
+            resolvedAt: r.resolvedAt || resolvedAt || nowIso,
+          }
+        : r
+    );
+  }
+
+  const nextStatus =
+    patch.qualityStatus ?? (typeof legacyPayload?.qualityStatus === 'string' ? legacyPayload.qualityStatus : undefined);
+
+  if (nextStatus === 'under_review') {
+    reports = reports.map((r) => (r.status === 'open' ? { ...r, status: 'under_review' } : r));
+  }
+
+  if (patch.resolveOpenReports || nextStatus === 'reapproved') {
+    const resolveNote =
+      (patch.resolutionNote ?? patch.reviewNotes ?? '').trim() ||
+      '문제 검토 및 수정/보완 완료 후 사용자 재승인';
+    reports = reports.map((r) =>
+      r.status === 'open' || r.status === 'under_review'
+        ? {
+            ...r,
+            status: 'resolved',
+            resolutionNote: resolveNote,
+            resolvedAt: nowIso,
+          }
+        : r
+    );
+  }
+
+  return reports;
+}
+
+/**
+ * Persists a quality/review status change (report, dismiss, suspend, reapprove, outdated flag)
+ * without EVER overwriting the server's problem body, model answer, rubric, or version.
+ */
 export async function updateProblemQuality(
   supabase: SupabaseClient,
   id: string,
   patch: ProblemQualityPatch
 ): Promise<RepoResult<Problem>> {
   try {
-    const row: Record<string, unknown> = {};
-    if (patch.qualityStatus !== undefined) row.quality_status = patch.qualityStatus;
-    if (patch.isOutdated !== undefined) row.is_outdated = patch.isOutdated;
-    if (patch.needsSourceReview !== undefined) row.needs_source_review = patch.needsSourceReview;
-    if (patch.payload !== undefined) row.payload = patch.payload;
-    const { data, error } = await supabase.from('problems').update(row).eq('id', id).select('*').maybeSingle();
+    if (patch.addReport) {
+      if (!patch.addReport.id?.trim() || !patch.addReport.type?.trim() || !patch.addReport.details?.trim()) {
+        return repoError('incomplete:REPORT_INVALID: 신고 ID, 유형, 상세 사유가 필요합니다.');
+      }
+    }
+    if (patch.dismissReport) {
+      if (!patch.dismissReport.reportId?.trim() || !patch.dismissReport.resolutionNote?.trim()) {
+        return repoError('incomplete:DISMISS_REASON_REQUIRED: 신고 ID와 기각 사유가 필요합니다.');
+      }
+    }
+
+    const sanitizedPatch = sanitizeProblemQualityPatch(patch);
+
+    if (typeof supabase.rpc === 'function') {
+      const { data: rpcData, error: rpcErr } = await supabase.rpc('update_problem_quality', {
+        p_problem_id: id,
+        p_patch: sanitizedPatch,
+      });
+
+      if (!rpcErr && rpcData && typeof rpcData === 'object') {
+        return repoOk(rowToProblem(rpcData as ProblemRow));
+      }
+
+      if (rpcErr) {
+        const errMsg = rpcErr.message ?? '';
+        const isUnimplementedMockRpc =
+          /does not exist|not found in schema cache|could not find the function|mock_rpc_not_implemented|unknown rpc/i.test(errMsg) &&
+          !/PROBLEM_NOT_FOUND|REPORT_NOT_FOUND/i.test(errMsg);
+        if (!isUnimplementedMockRpc) {
+          return repoError(`${approvalErrorCode(rpcErr)}:${errMsg}`);
+        }
+      }
+    }
+
+    // Safe fallback for unit-test mocks that only stub `.from('problems')`:
+    // Read current authoritative server row first and merge ONLY allowed quality fields.
+    const { data: currentRowData, error: readErr } = await supabase
+      .from('problems')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+    if (readErr) return repoError(readErr.message);
+    if (!currentRowData) return repoError('missing:PROBLEM_NOT_FOUND: 문제를 찾을 수 없습니다.');
+
+    const currentRow = currentRowData as ProblemRow;
+    if (
+      typeof sanitizedPatch.expectedVersion === 'number' &&
+      currentRow.version !== sanitizedPatch.expectedVersion
+    ) {
+      return repoError('version_conflict:VERSION_CONFLICT');
+    }
+    if (
+      typeof sanitizedPatch.expectedUpdatedAt === 'string' &&
+      currentRow.updated_at !== sanitizedPatch.expectedUpdatedAt
+    ) {
+      return repoError('version_conflict:VERSION_CONFLICT');
+    }
+
+    const currentPayload = (currentRow.payload ?? {}) as Record<string, unknown>;
+    const existingReports = Array.isArray(currentPayload.reports)
+      ? (currentPayload.reports as ProblemReport[])
+      : [];
+
+    if (patch.dismissReport) {
+      const exists = existingReports.some((r) => r.id === patch.dismissReport!.reportId);
+      if (!exists) {
+        return repoError('missing:REPORT_NOT_FOUND: 해당 신고 내역을 찾을 수 없습니다.');
+      }
+    }
+
+    const mergedReports = mergeProblemReportsAtomically(existingReports, patch);
+    const hasOpenReports = mergedReports.some(
+      (r) => r.status === 'open' || r.status === 'under_review'
+    );
+
+    let nextStatus = currentRow.quality_status ?? 'normal';
+    if (patch.addReport) {
+      nextStatus = currentRow.quality_status === 'under_review' ? 'under_review' : 'reported';
+    } else if (patch.dismissReport) {
+      nextStatus = hasOpenReports
+        ? currentRow.quality_status === 'under_review'
+          ? 'under_review'
+          : 'reported'
+        : currentRow.version > 1
+          ? 'reapproved'
+          : 'normal';
+    } else if (typeof sanitizedPatch.qualityStatus === 'string' && sanitizedPatch.qualityStatus) {
+      nextStatus = sanitizedPatch.qualityStatus;
+    }
+
+    const nextOutdated =
+      typeof sanitizedPatch.isOutdated === 'boolean'
+        ? sanitizedPatch.isOutdated
+        : currentRow.is_outdated;
+    const nextNeedsReview =
+      typeof sanitizedPatch.needsSourceReview === 'boolean'
+        ? sanitizedPatch.needsSourceReview
+        : currentRow.needs_source_review;
+
+    const safePayload: Record<string, unknown> = {
+      ...currentPayload,
+      version: currentRow.version,
+      qualityStatus: nextStatus,
+      isOutdated: nextOutdated,
+      needsSourceReview: nextNeedsReview,
+      reports: mergedReports,
+      ...(sanitizedPatch.lastReviewedAt !== undefined
+        ? { lastReviewedAt: sanitizedPatch.lastReviewedAt }
+        : {}),
+      ...(sanitizedPatch.reviewNotes !== undefined
+        ? { reviewNotes: sanitizedPatch.reviewNotes }
+        : {}),
+      ...(sanitizedPatch.sourceMaterials !== undefined
+        ? { sourceMaterials: sanitizedPatch.sourceMaterials }
+        : {}),
+      ...(sanitizedPatch.sourceContentVersion !== undefined
+        ? { sourceContentVersion: sanitizedPatch.sourceContentVersion }
+        : {}),
+      ...(sanitizedPatch.sourceVerificationStatus !== undefined
+        ? { sourceVerificationStatus: sanitizedPatch.sourceVerificationStatus }
+        : {}),
+      ...(sanitizedPatch.sourcePage !== undefined
+        ? { sourcePage: sanitizedPatch.sourcePage }
+        : {}),
+    };
+
+    const updateRow: Record<string, unknown> = {
+      quality_status: nextStatus,
+      is_outdated: nextOutdated,
+      needs_source_review: nextNeedsReview,
+      payload: safePayload,
+    };
+
+    const { data, error } = await supabase
+      .from('problems')
+      .update(updateRow)
+      .eq('id', id)
+      .select('*')
+      .maybeSingle();
     if (error) return repoError(error.message);
     if (!data) return repoError('missing: 문제를 찾을 수 없습니다.');
     return repoOk(rowToProblem(data as ProblemRow));
@@ -610,26 +973,285 @@ export async function updateProblemQuality(
   }
 }
 
-/** Revises a problem: writes a new immutable version in one transaction. */
+export async function getProblemVersionSnapshot(
+  supabase: SupabaseClient,
+  problemId: string,
+  version: number
+): Promise<RepoResult<ProblemVersionSnapshot | null>> {
+  try {
+    const { data, error } = await supabase
+      .from('problem_versions')
+      .select('*')
+      .eq('problem_id', problemId)
+      .eq('version', version)
+      .maybeSingle();
+    if (error) return repoError(error.message);
+    if (!data) return repoOk(null);
+    const row = data as ProblemVersionRow;
+    const snap = (row.snapshot ?? {}) as unknown as ProblemVersionSnapshot;
+    return repoOk({ ...snap, version: row.version ?? version });
+  } catch (error) {
+    return repoError(message(error, '문제 버전 스냅샷을 불러오지 못했습니다.'));
+  }
+}
+
+function buildSnapshotFromProblem(problem: Problem, version: number): ProblemVersionSnapshot {
+  return {
+    version,
+    title: problem.title,
+    promptText: problem.promptText,
+    type: problem.type,
+    conceptIds: Array.isArray(problem.conceptIds) ? [...problem.conceptIds] : [],
+    appliedConditionNote: problem.appliedConditionNote,
+    mathFormula: problem.mathFormula,
+    codeSnippet: problem.codeSnippet,
+    timeStandardMinutes: problem.timeStandardMinutes,
+    hints: Array.isArray(problem.hints) ? [...problem.hints] : [],
+    modelAnswer: problem.modelAnswer,
+    rubric: Array.isArray(problem.rubric) ? [...problem.rubric] : [],
+    editedAt: problem.lastReviewedAt || new Date().toISOString(),
+    editReason: problem.reviewNotes,
+    difficultyLevel: problem.difficultyLevel,
+    sourceMaterialId: problem.sourceMaterialId,
+    sourceConceptIds: problem.sourceConceptIds ? [...problem.sourceConceptIds] : undefined,
+    sourceExcerpt: problem.sourceExcerpt,
+    sourcePage: problem.sourcePage,
+    sourceContentVersion: problem.sourceContentVersion,
+    sourceVerificationStatus: problem.sourceVerificationStatus,
+  };
+}
+
+function snapshotEvaluationMatchesProblem(
+  submitted: Problem,
+  candidate: Partial<ProblemVersionSnapshot> & Partial<Problem>
+): boolean {
+  // Only compare when candidate actually populates the core evaluation fields
+  if (
+    candidate.title === undefined &&
+    candidate.promptText === undefined &&
+    candidate.modelAnswer === undefined
+  ) {
+    return true;
+  }
+  const norm = (s: unknown) => (typeof s === 'string' ? s.trim() : '');
+  if (candidate.title !== undefined && norm(submitted.title) !== norm(candidate.title)) return false;
+  if (candidate.promptText !== undefined && norm(submitted.promptText) !== norm(candidate.promptText)) return false;
+  if (candidate.modelAnswer !== undefined && norm(submitted.modelAnswer) !== norm(candidate.modelAnswer)) return false;
+  if (candidate.mathFormula !== undefined && norm(submitted.mathFormula) !== norm(candidate.mathFormula)) return false;
+  if (candidate.codeSnippet !== undefined && norm(submitted.codeSnippet) !== norm(candidate.codeSnippet)) return false;
+  if (
+    candidate.appliedConditionNote !== undefined &&
+    norm(submitted.appliedConditionNote) !== norm(candidate.appliedConditionNote)
+  ) {
+    return false;
+  }
+  if (
+    candidate.timeStandardMinutes !== undefined &&
+    Number(submitted.timeStandardMinutes ?? 0) !== Number(candidate.timeStandardMinutes ?? 0)
+  ) {
+    return false;
+  }
+  if (candidate.type !== undefined && norm(submitted.type) !== norm(candidate.type)) {
+    return false;
+  }
+  if (Array.isArray(candidate.conceptIds) && Array.isArray(submitted.conceptIds)) {
+    if (JSON.stringify(submitted.conceptIds) !== JSON.stringify(candidate.conceptIds)) return false;
+  }
+  if (Array.isArray(candidate.hints) && Array.isArray(submitted.hints)) {
+    if (JSON.stringify(submitted.hints) !== JSON.stringify(candidate.hints)) return false;
+  }
+  if (Array.isArray(candidate.rubric) && Array.isArray(submitted.rubric)) {
+    if (JSON.stringify(submitted.rubric) !== JSON.stringify(candidate.rubric)) return false;
+  }
+  return true;
+}
+
+export type ReviseProblemVerificationStatus =
+  | 'verified_current'
+  | 'verified_snapshot_only'
+  | 'verification_failed';
+
+export type ReviseProblemRepoResult =
+  | {
+      ok: true;
+      /** Authoritative problem state at the exact version confirmed by THIS request (`confirmedVersion`). */
+      data: Problem;
+      confirmedVersion: number;
+      confirmedSnapshot: ProblemVersionSnapshot;
+      /** Latest server problem row if available (may have a higher version if another request succeeded afterwards). */
+      latestServerProblem: Problem | null;
+      serverAdvancedBeyondConfirmed: boolean;
+      savedToServer: true;
+      verificationStatus: ReviseProblemVerificationStatus;
+      verificationError?: string;
+    }
+  | {
+      ok: false;
+      error: string;
+      savedToServer: false;
+    };
+
+/**
+ * Revises a problem: writes a new immutable version in one transaction and binds
+ * the returned `data` strictly to the `confirmedVersion` returned by the RPC and
+ * its immutable snapshot in `problem_versions` (never confusing a subsequent
+ * request's newer version for this request's result).
+ */
 export async function reviseProblem(
   supabase: SupabaseClient,
   problemId: string,
   expectedVersion: number,
   problem: Problem
-): Promise<RepoResult<Problem>> {
+): Promise<ReviseProblemRepoResult> {
   try {
-    const { error } = await supabase.rpc('revise_problem', {
+    const { data: rpcData, error } = await supabase.rpc('revise_problem', {
       p_problem_id: problemId,
       p_expected_version: expectedVersion,
       p_problem: problem as unknown as Record<string, unknown>,
     });
-    if (error) return repoError(`${approvalErrorCode(error)}:${error.message}`);
-    const refetched = await getProblemById(supabase, problemId);
-    if (!refetched.ok) return refetched;
-    if (!refetched.data) return repoError('missing: 수정된 문제를 찾을 수 없습니다.');
-    return repoOk(refetched.data);
+    if (error) {
+      return {
+        ok: false,
+        error: `${approvalErrorCode(error)}:${error.message}`,
+        savedToServer: false,
+      };
+    }
+
+    let confirmedVersion: number;
+    if (typeof rpcData === 'number' && Number.isFinite(rpcData) && rpcData > 0) {
+      confirmedVersion = rpcData;
+    } else if (typeof rpcData === 'string' && /^\d+$/.test(rpcData.trim())) {
+      confirmedVersion = Number(rpcData.trim());
+    } else if (
+      rpcData &&
+      typeof rpcData === 'object' &&
+      typeof (rpcData as { confirmedVersion?: unknown }).confirmedVersion === 'number'
+    ) {
+      confirmedVersion = (rpcData as { confirmedVersion: number }).confirmedVersion;
+    } else if (
+      rpcData &&
+      typeof rpcData === 'object' &&
+      typeof (rpcData as { version?: unknown }).version === 'number'
+    ) {
+      confirmedVersion = (rpcData as { version: number }).version;
+    } else {
+      confirmedVersion = expectedVersion + 1;
+    }
+
+    const fallbackSnapshot = buildSnapshotFromProblem(
+      { ...problem, version: confirmedVersion },
+      confirmedVersion
+    );
+
+    const [snapRes, latestRes] = await Promise.all([
+      getProblemVersionSnapshot(supabase, problemId, confirmedVersion),
+      getProblemById(supabase, problemId),
+    ]);
+
+    const immutableSnap = snapRes.ok && snapRes.data ? snapRes.data : null;
+    if (immutableSnap && !snapshotEvaluationMatchesProblem(problem, immutableSnap)) {
+      return {
+        ok: false,
+        error: 'version_conflict:VERSION_CONFLICT: 확정 버전 스냅샷 내용이 요청한 수정본과 일치하지 않습니다.',
+        savedToServer: false,
+      };
+    }
+
+    // If post-save reads failed (or row is missing), distinguish post-save verification failure from save failure!
+    if (!latestRes.ok || !latestRes.data) {
+      const confirmedSnapshot = immutableSnap
+        ? { ...fallbackSnapshot, ...immutableSnap, version: confirmedVersion }
+        : fallbackSnapshot;
+      const confirmedProblem: Problem = {
+        ...problem,
+        ...(immutableSnap ?? {}),
+        id: problemId,
+        version: confirmedVersion,
+        serverConfirmedVersion: confirmedVersion,
+      };
+      return {
+        ok: true,
+        data: confirmedProblem,
+        confirmedVersion,
+        confirmedSnapshot,
+        latestServerProblem: null,
+        serverAdvancedBeyondConfirmed: false,
+        savedToServer: true,
+        verificationStatus: 'verification_failed',
+        verificationError: !latestRes.ok
+          ? latestRes.error
+          : '수정된 문제를 다시 조회하지 못했습니다.',
+      };
+    }
+
+    const latestServerProblem = latestRes.data;
+    const latestServerVer = latestServerProblem.version ?? confirmedVersion;
+    const serverAdvancedBeyondConfirmed = latestServerVer > confirmedVersion;
+
+    if (!serverAdvancedBeyondConfirmed) {
+      // Current server row is at `confirmedVersion`
+      if (!immutableSnap && !snapshotEvaluationMatchesProblem(problem, latestServerProblem)) {
+        return {
+          ok: false,
+          error: 'version_conflict:VERSION_CONFLICT: 서버의 현재 버전 내용이 요청한 수정본과 일치하지 않습니다.',
+          savedToServer: false,
+        };
+      }
+      const confirmedSnapshot: ProblemVersionSnapshot = immutableSnap
+        ? { ...buildSnapshotFromProblem(latestServerProblem, confirmedVersion), ...immutableSnap, version: confirmedVersion }
+        : buildSnapshotFromProblem(latestServerProblem, confirmedVersion);
+      const confirmedProblem: Problem = {
+        ...latestServerProblem,
+        ...(immutableSnap ?? {}),
+        id: problemId,
+        version: confirmedVersion,
+        serverConfirmedVersion: confirmedVersion,
+        reports: latestServerProblem.reports ?? problem.reports ?? [],
+      };
+      return {
+        ok: true,
+        data: confirmedProblem,
+        confirmedVersion,
+        confirmedSnapshot,
+        latestServerProblem,
+        serverAdvancedBeyondConfirmed: false,
+        savedToServer: true,
+        verificationStatus: 'verified_current',
+      };
+    }
+
+    // Server already advanced beyond `confirmedVersion` (e.g. Request B wrote v3 after Request A wrote v2).
+    // Strictly return Request A's confirmed version & immutable snapshot (`A/v2`) as `data`,
+    // while exposing `latestServerProblem` (`B/v3`) separately!
+    const confirmedSnapshot: ProblemVersionSnapshot = immutableSnap
+      ? { ...fallbackSnapshot, ...immutableSnap, version: confirmedVersion }
+      : fallbackSnapshot;
+    const confirmedProblem: Problem = {
+      ...problem,
+      ...(immutableSnap ?? {}),
+      id: problemId,
+      subjectId: problem.subjectId || latestServerProblem.subjectId,
+      version: confirmedVersion,
+      serverConfirmedVersion: confirmedVersion,
+      reports: latestServerProblem.reports ?? problem.reports ?? [],
+    };
+
+    return {
+      ok: true,
+      data: confirmedProblem,
+      confirmedVersion,
+      confirmedSnapshot,
+      latestServerProblem,
+      serverAdvancedBeyondConfirmed: true,
+      savedToServer: true,
+      verificationStatus: 'verified_snapshot_only',
+    };
   } catch (error) {
-    return repoError(message(error, '문제 수정에 실패했습니다.'));
+    return {
+      ok: false,
+      error: message(error, '문제 수정에 실패했습니다.'),
+      savedToServer: false,
+    };
   }
 }
 
@@ -654,12 +1276,45 @@ export async function upsertConcepts(supabase: SupabaseClient, concepts: Concept
 export async function upsertProblems(supabase: SupabaseClient, problems: Problem[]): Promise<RepoResult<Problem[]>> {
   try {
     if (problems.length === 0) return repoOk([]);
-    const { data, error } = await supabase
+    const ids = problems.map((p) => p.id);
+    const { data: existingRows, error: fetchErr } = await supabase
       .from('problems')
-      .upsert(problems.map(problemToUpsert), { onConflict: 'id,user_id' })
-      .select('*');
-    if (error) return repoError(error.message);
-    return repoOk(((data as ProblemRow[]) ?? []).map(rowToProblem));
+      .select('*')
+      .in('id', ids);
+    if (fetchErr) return repoError(fetchErr.message);
+
+    const existingMap = new Map<string, ProblemRow>(
+      ((existingRows as ProblemRow[]) ?? []).map((r) => [r.id, r])
+    );
+
+    const rowsToInsert = problems
+      .filter((p) => !existingMap.has(p.id))
+      .map(problemToUpsert);
+
+    if (rowsToInsert.length > 0) {
+      const { error } = await supabase
+        .from('problems')
+        .upsert(rowsToInsert, { onConflict: 'id,user_id', ignoreDuplicates: true });
+      if (error) return repoError(error.message);
+    }
+
+    const { data: finalRows, error: finalErr } = await supabase
+      .from('problems')
+      .select('*')
+      .in('id', ids);
+    if (finalErr) return repoError(finalErr.message);
+
+    const finalMap = new Map<string, ProblemRow>(
+      ((finalRows as ProblemRow[]) ?? []).map((r) => [r.id, r])
+    );
+    const ordered = problems
+      .map((p) => {
+        const row = finalMap.get(p.id);
+        return row ? rowToProblem(row) : undefined;
+      })
+      .filter((p): p is Problem => Boolean(p));
+
+    return repoOk(ordered);
   } catch (error) {
     return repoError(message(error, '문제를 저장하지 못했습니다.'));
   }

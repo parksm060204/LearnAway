@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:regressions": "node scripts/test-regressions.mjs",
+    "test:regressions": "node scripts/test-regressions.mjs && node scripts/test-regressions-concurrency.mjs",
     "test:suite": "node scripts/test-suite.mjs"
   },
   "dependencies": {
@@ -16,7 +16,7 @@
     "@types/katex": "^0.16.8",
     "katex": "^0.18.9",
     "lucide-react": "^1.48.0",
-    "next": "16.3.6",
+    "next": "16.4.3",
     "pdfjs-dist": "^4.10.38",
     "react": "19.2.8",
     "react-dom": "19.2.8"
@@ -28,7 +28,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.3.6",
+    "eslint-config-next": "16.4.3",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

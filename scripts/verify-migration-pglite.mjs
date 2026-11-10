@@ -1562,11 +1562,361 @@ async function testUpgradePath() {
   await db.exec(`reset role;`);
   console.log('✓ SET ROLE service_role succeeds on detect_problem_version_inconsistencies() and remains read-only');
 
-  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33, 34, 35, 36, 37 & 38) Passed Successfully! ===\n');
+  // ---------------------------------------------------------------------------
+  // SCENARIO U: Migration 39 (20260101000039_problem_quality_and_revision_concurrency.sql)
+  // 1. Pre-39 reproduction: confirm direct UPDATE of payload from a stale v1 tab
+  //    overwrites v2 body before Migration 39 is applied.
+  // 2. Apply Migration 39.
+  // 3. Verify public.update_problem_quality and enforce_problems_update_integrity
+  //    protect problem body, rubric, modelAnswer, and version against stale quality updates.
+  // 4. Verify concurrent report additions from two tabs preserve both reports atomically.
+  // 5. Verify report retry idempotency (no duplicate reports).
+  // 6. Verify both orderings: (quality -> revise) and (revise -> quality) preserve both body & reports.
+  // 7. Verify expectedVersion precondition check (VERSION_CONFLICT), cross-user rejection, and anon role rejection.
+  // 8. Verify public.revise_problem_with_snapshot returns confirmedVersion and confirmedSnapshot atomically.
+  // ---------------------------------------------------------------------------
+  console.log('\n--- Scenario U: Migration 39 Problem Quality & Revision Concurrency ---');
+
+  await setAuthContext(db, { uid: userIdA, role: 'authenticated' });
+  const mig39PreReproId = 'prob-mig39-pre-repro';
+  await db.query(`
+    insert into public.problems (id, user_id, subject_id, type, title, quality_status, is_outdated, needs_source_review, version, payload)
+    values ($1, $2, $3, 'essay_descriptive', 'Pre39 v1', 'normal', false, false, 1, $4::jsonb);
+  `, [
+    mig39PreReproId,
+    userIdA,
+    subjectIdS,
+    JSON.stringify({
+      id: mig39PreReproId,
+      subjectId: subjectIdS,
+      type: 'essay_descriptive',
+      title: 'Pre39 v1',
+      promptText: 'Prompt v1',
+      modelAnswer: 'Answer v1',
+      rubric: [{ id: 'r1', description: 'R1', maxScore: 100 }],
+      conceptIds: [conceptIdS],
+      version: 1,
+      qualityStatus: 'normal',
+      reports: [],
+    }),
+  ]);
+  await db.query(`select public.revise_problem($1, 1, $2::jsonb);`, [
+    mig39PreReproId,
+    JSON.stringify({
+      id: mig39PreReproId,
+      subjectId: subjectIdS,
+      type: 'essay_descriptive',
+      title: 'Pre39 v2',
+      promptText: 'Prompt v2',
+      modelAnswer: 'Answer v2',
+      rubric: [{ id: 'r1', description: 'R2', maxScore: 100 }],
+      conceptIds: [conceptIdS],
+      version: 2,
+      qualityStatus: 'review_after_edit',
+      reports: [],
+    }),
+  ]);
+  // Before Migration 39, a stale v1 full-payload UPDATE overwrites payload to v1 while row version stays 2:
+  await db.query(`
+    update public.problems
+    set quality_status = 'reported',
+        payload = $1::jsonb
+    where id = $2;
+  `, [
+    JSON.stringify({
+      id: mig39PreReproId,
+      subjectId: subjectIdS,
+      type: 'essay_descriptive',
+      title: 'Pre39 v1',
+      promptText: 'Prompt v1',
+      modelAnswer: 'Answer v1',
+      rubric: [{ id: 'r1', description: 'R1', maxScore: 100 }],
+      conceptIds: [conceptIdS],
+      version: 1,
+      qualityStatus: 'reported',
+      reports: [{ id: 'rep-pre', type: 'typo_or_expression', details: 'typo', status: 'open', createdAt: '2026-11-02T10:00:00Z' }],
+    }),
+    mig39PreReproId,
+  ]);
+  const pre39Check = (await db.query(`select version, payload->>'version' as pver, payload->>'promptText' as prompt from public.problems where id = $1`, [mig39PreReproId])).rows[0];
+  if (pre39Check.version !== 2 || pre39Check.pver !== '1' || pre39Check.prompt !== 'Prompt v1') {
+    throw new Error(`Expected pre-39 bug reproduction, got: ${JSON.stringify(pre39Check)}`);
+  }
+  await db.query(`delete from public.problems where id = $1;`, [mig39PreReproId]);
+  console.log('✓ Pre-39 bug reproduced: direct full-payload quality update reverted payload to v1 while row version stayed 2');
+
+  // Apply Migration 39
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, '20260101000039_problem_quality_and_revision_concurrency.sql'));
+  console.log('✓ Applied 20260101000039_problem_quality_and_revision_concurrency.sql');
+
+  // Verify function privileges for update_problem_quality and revise_problem_with_snapshot
+  const mig39Privs = (await db.query(`
+    select
+      has_function_privilege('anon', 'public.update_problem_quality(text, jsonb)', 'EXECUTE') as anon_qual,
+      has_function_privilege('authenticated', 'public.update_problem_quality(text, jsonb)', 'EXECUTE') as auth_qual,
+      has_function_privilege('anon', 'public.revise_problem_with_snapshot(text, integer, jsonb)', 'EXECUTE') as anon_rev_snap,
+      has_function_privilege('authenticated', 'public.revise_problem_with_snapshot(text, integer, jsonb)', 'EXECUTE') as auth_rev_snap
+  `)).rows[0];
+  if (
+    mig39Privs.anon_qual !== false ||
+    mig39Privs.auth_qual !== true ||
+    mig39Privs.anon_rev_snap !== false ||
+    mig39Privs.auth_rev_snap !== true
+  ) {
+    throw new Error(`Migration 39 RPC privileges mismatch: ${JSON.stringify(mig39Privs)}`);
+  }
+
+  // Verify SET ROLE anon is blocked on update_problem_quality and revise_problem_with_snapshot
+  await setAuthContext(db, { uid: null, role: 'anon' });
+  await db.exec(`set role anon;`);
+  let anonQualBlocked = false;
+  try {
+    await db.query(`select public.update_problem_quality('any', '{}'::jsonb);`);
+  } catch (err) {
+    anonQualBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  let anonRevSnapBlocked = false;
+  try {
+    await db.query(`select public.revise_problem_with_snapshot('any', 1, '{}'::jsonb);`);
+  } catch (err) {
+    anonRevSnapBlocked = err.code === '42501' || /permission denied/i.test(err.message);
+  }
+  await db.exec(`reset role;`);
+  if (!anonQualBlocked || !anonRevSnapBlocked) {
+    throw new Error('SET ROLE anon must be denied on update_problem_quality and revise_problem_with_snapshot');
+  }
+  console.log('✓ SET ROLE anon is denied on update_problem_quality and revise_problem_with_snapshot (42501)');
+
+  // Test post-39 quality update & trigger protection as authenticated userIdA
+  await setAuthContext(db, { uid: userIdA, role: 'authenticated' });
+  await db.exec(`set role authenticated;`);
+  const mig39ProbId = 'prob-mig39-concurrency';
+  await db.query(`
+    insert into public.problems (id, user_id, subject_id, type, title, quality_status, is_outdated, needs_source_review, version, payload)
+    values ($1, $2, $3, 'essay_descriptive', 'Mig39 v1', 'normal', false, false, 1, $4::jsonb);
+  `, [
+    mig39ProbId,
+    userIdA,
+    subjectIdS,
+    JSON.stringify({
+      id: mig39ProbId,
+      subjectId: subjectIdS,
+      type: 'essay_descriptive',
+      title: 'Mig39 v1',
+      promptText: 'Prompt v1',
+      modelAnswer: 'Answer v1',
+      rubric: [{ id: 'r1', description: 'R1', maxScore: 100 }],
+      hints: ['Hint v1'],
+      conceptIds: [conceptIdS],
+      version: 1,
+      qualityStatus: 'normal',
+      reports: [],
+    }),
+  ]);
+
+  // Tab B revises problem to v2 via revise_problem_with_snapshot
+  const revV2Row = (await db.query(`
+    select public.revise_problem_with_snapshot($1, 1, $2::jsonb) as res;
+  `, [
+    mig39ProbId,
+    JSON.stringify({
+      id: mig39ProbId,
+      subjectId: subjectIdS,
+      type: 'essay_descriptive',
+      title: 'Mig39 v2',
+      promptText: 'Prompt v2 updated by Tab B',
+      modelAnswer: 'Answer v2 updated by Tab B',
+      rubric: [{ id: 'r1', description: 'Rubric v2', maxScore: 100 }],
+      hints: ['Hint v2'],
+      conceptIds: [conceptIdS],
+      version: 2,
+      qualityStatus: 'review_after_edit',
+      editReason: 'Tab B edit to v2',
+      reports: [],
+    }),
+  ])).rows[0].res;
+  if (
+    revV2Row.confirmedVersion !== 2 ||
+    revV2Row.confirmedSnapshot.version !== 2 ||
+    revV2Row.confirmedSnapshot.promptText !== 'Prompt v2 updated by Tab B'
+  ) {
+    throw new Error(`revise_problem_with_snapshot unexpected result: ${JSON.stringify(revV2Row)}`);
+  }
+
+  // Tab A (still holding stale v1 state) reports an error via update_problem_quality,
+  // even including malicious/stale body fields in the patch JSON:
+  const tabAReport1 = {
+    id: 'rep-tab-a-1',
+    problemId: mig39ProbId,
+    type: 'typo_or_expression',
+    details: 'Tab A found typo',
+    createdAt: '2026-11-02T10:01:00.000Z',
+    status: 'open',
+  };
+  await db.query(`
+    select public.update_problem_quality($1, $2::jsonb);
+  `, [
+    mig39ProbId,
+    JSON.stringify({
+      qualityStatus: 'reported',
+      addReport: tabAReport1,
+      // Attempt to sneak in stale v1 body fields:
+      version: 1,
+      title: 'Mig39 v1',
+      promptText: 'Prompt v1',
+      modelAnswer: 'Answer v1',
+      rubric: [{ id: 'r1', description: 'R1', maxScore: 100 }],
+    }),
+  ]);
+
+  // Also test direct UPDATE on public.problems with stale v1 payload (trigger protection):
+  await db.query(`
+    update public.problems
+    set quality_status = 'reported',
+        payload = $1::jsonb
+    where id = $2;
+  `, [
+    JSON.stringify({
+      id: mig39ProbId,
+      subjectId: subjectIdS,
+      type: 'essay_descriptive',
+      title: 'Mig39 v1 STALE DIRECT',
+      promptText: 'Prompt v1 STALE DIRECT',
+      modelAnswer: 'Answer v1 STALE DIRECT',
+      rubric: [{ id: 'r1', description: 'R1', maxScore: 100 }],
+      hints: ['Hint v1'],
+      conceptIds: [conceptIdS],
+      version: 1,
+      qualityStatus: 'reported',
+      reports: [tabAReport1],
+    }),
+    mig39ProbId,
+  ]);
+
+  // Verify v2 body, modelAnswer, rubric, version are 100% intact and zero inconsistencies exist!
+  const afterStaleQuality = (await db.query(`
+    select version, title, quality_status, payload from public.problems where id = $1;
+  `, [mig39ProbId])).rows[0];
+  if (
+    afterStaleQuality.version !== 2 ||
+    afterStaleQuality.title !== 'Mig39 v2' ||
+    afterStaleQuality.payload.version !== 2 ||
+    afterStaleQuality.payload.promptText !== 'Prompt v2 updated by Tab B' ||
+    afterStaleQuality.payload.modelAnswer !== 'Answer v2 updated by Tab B' ||
+    afterStaleQuality.payload.rubric[0].description !== 'Rubric v2'
+  ) {
+    throw new Error(`Migration 39 failed to protect v2 body from stale quality update: ${JSON.stringify(afterStaleQuality)}`);
+  }
+  const mig39Inconsistencies = (await db.query(`
+    select * from public.detect_my_problem_version_inconsistencies() where problem_id = $1;
+  `, [mig39ProbId])).rows;
+  if (mig39Inconsistencies.length !== 0) {
+    throw new Error(`Expected 0 version inconsistencies on ${mig39ProbId}, got: ${JSON.stringify(mig39Inconsistencies)}`);
+  }
+  console.log('✓ Stale v1 quality update (via RPC and direct UPDATE) preserved v2 body, rubric, answer, and version with 0 inconsistencies');
+
+  // Retry of the exact same report from Tab A must NOT duplicate the report:
+  await db.query(`
+    select public.update_problem_quality($1, $2::jsonb);
+  `, [
+    mig39ProbId,
+    JSON.stringify({
+      qualityStatus: 'reported',
+      addReport: tabAReport1,
+    }),
+  ]);
+  // Tab B concurrently adds a second report:
+  const tabBReport2 = {
+    id: 'rep-tab-b-2',
+    problemId: mig39ProbId,
+    type: 'grading_rubric_error',
+    details: 'Tab B rubric note',
+    createdAt: '2026-11-02T10:02:00.000Z',
+    status: 'open',
+  };
+  await db.query(`
+    select public.update_problem_quality($1, $2::jsonb);
+  `, [
+    mig39ProbId,
+    JSON.stringify({
+      qualityStatus: 'reported',
+      addReport: tabBReport2,
+    }),
+  ]);
+  const reportsAfterBoth = (await db.query(`select payload->'reports' as reports from public.problems where id = $1`, [mig39ProbId])).rows[0].reports;
+  if (!Array.isArray(reportsAfterBoth) || reportsAfterBoth.length !== 2) {
+    throw new Error(`Expected exactly 2 merged reports (no retry duplicate, both tabs preserved), got: ${JSON.stringify(reportsAfterBoth)}`);
+  }
+  console.log('✓ Two-tab concurrent reports preserved both reports and idempotently ignored retry duplicate');
+
+  // Ordering test: Quality reports added -> now Tab A revises body to v3 WITHOUT knowing about Tab B's report in its local payload:
+  await db.query(`
+    select public.revise_problem_with_snapshot($1, 2, $2::jsonb);
+  `, [
+    mig39ProbId,
+    JSON.stringify({
+      id: mig39ProbId,
+      subjectId: subjectIdS,
+      type: 'essay_descriptive',
+      title: 'Mig39 v3',
+      promptText: 'Prompt v3 after reports',
+      modelAnswer: 'Answer v3',
+      rubric: [{ id: 'r1', description: 'Rubric v3', maxScore: 100 }],
+      hints: ['Hint v3'],
+      conceptIds: [conceptIdS],
+      version: 3,
+      qualityStatus: 'review_after_edit',
+      editReason: 'Revise to v3',
+      reports: [tabAReport1], // Tab A payload only had tabAReport1!
+    }),
+  ]);
+  const afterV3 = (await db.query(`select version, payload from public.problems where id = $1`, [mig39ProbId])).rows[0];
+  if (afterV3.version !== 3 || afterV3.payload.promptText !== 'Prompt v3 after reports' || afterV3.payload.reports.length !== 2) {
+    throw new Error(`Expected v3 revision to preserve both server reports, got: ${JSON.stringify(afterV3)}`);
+  }
+  console.log('✓ Both orderings (revise -> quality and quality -> revise) preserve latest body AND all reports');
+
+  // Precondition check: expectedVersion mismatch raises VERSION_CONFLICT
+  let expectedVerConflict = false;
+  try {
+    await db.query(`
+      select public.update_problem_quality($1, $2::jsonb);
+    `, [mig39ProbId, JSON.stringify({ qualityStatus: 'suspended', expectedVersion: 1 })]);
+  } catch (err) {
+    expectedVerConflict = /VERSION_CONFLICT/i.test(err.message);
+  }
+  if (!expectedVerConflict) {
+    throw new Error('update_problem_quality with mismatched expectedVersion must raise VERSION_CONFLICT');
+  }
+  console.log('✓ update_problem_quality enforces optional expectedVersion precondition');
+
+  // Cross-user isolation: userIdB cannot call update_problem_quality or revise_problem_with_snapshot on userIdA's problem
+  await db.exec(`reset role;`);
+  await setAuthContext(db, { uid: userIdB, role: 'authenticated' });
+  await db.exec(`set role authenticated;`);
+  let crossUserQualBlocked = false;
+  try {
+    await db.query(`select public.update_problem_quality($1, '{"qualityStatus":"suspended"}'::jsonb);`, [mig39ProbId]);
+  } catch (err) {
+    crossUserQualBlocked = /PROBLEM_NOT_FOUND/i.test(err.message);
+  }
+  let crossUserRevBlocked = false;
+  try {
+    await db.query(`select public.revise_problem_with_snapshot($1, 3, '{}'::jsonb);`, [mig39ProbId]);
+  } catch (err) {
+    crossUserRevBlocked = /PROBLEM_NOT_FOUND/i.test(err.message);
+  }
+  await db.exec(`reset role;`);
+  if (!crossUserQualBlocked || !crossUserRevBlocked) {
+    throw new Error('Cross-user quality update and revision must be rejected with PROBLEM_NOT_FOUND');
+  }
+  console.log('✓ Cross-user quality update and revision rejected (PROBLEM_NOT_FOUND)');
+
+  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33~39) Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~38) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~39) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
@@ -1574,7 +1924,7 @@ async function testFreshInstallPath() {
   for (const f of files) {
     await runSqlFile(db, path.join(MIGRATIONS_DIR, f));
   }
-  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 38 on clean database`);
+  console.log(`✓ Successfully applied all ${files.length} migrations from 00 to 39 on clean database`);
 
   // Verify permissions on fresh install DB
   const freshPrivs = (await db.query(`
