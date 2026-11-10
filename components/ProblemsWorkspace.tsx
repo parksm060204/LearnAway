@@ -14,7 +14,10 @@ import {
 } from '../lib/types';
 import { AcademicMathView } from './AcademicMathView';
 import { ProblemQualityReviewTab } from './ProblemQualityReviewTab';
-import type { ResolveProblemRevisionConflictResult } from '../lib/problemRevisionSync';
+import type {
+  ProblemConflictResolutionAction,
+  ResolveProblemRevisionConflictResult,
+} from '../lib/problemRevisionSync';
 import {
   FileQuestion,
   Sparkles,
@@ -68,7 +71,7 @@ export interface ProblemsWorkspaceProps {
   onRetryVerifyProblemRevision?: (problemId: string) => Promise<void>;
   onResolveProblemRevisionConflict?: (
     problemId: string,
-    action: 'accept_server' | 'prepare_rebase_edit',
+    action: ProblemConflictResolutionAction,
     expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
   ) => ResolveProblemRevisionConflictResult;
   onRetrySaveProblemRevision?: (problemId: string, expectedVersion?: number) => Promise<void>;

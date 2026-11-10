@@ -46,9 +46,11 @@ import {
   type TaskRecoveryRecord,
 } from '../lib/taskRecoveryClient';
 import {
+  buildConflictResolutionRequest,
   isConflictResolutionComplete,
   isConflictResolutionPartial,
   canOpenEditorAfterRebasePrepare,
+  type ProblemConflictResolutionAction,
   type ResolveProblemRevisionConflictResult,
 } from '../lib/problemRevisionSync';
 
@@ -85,7 +87,7 @@ interface ProblemQualityReviewTabProps {
   onRetryVerifyProblemRevision?: (problemId: string) => Promise<void>;
   onResolveProblemRevisionConflict?: (
     problemId: string,
-    action: 'accept_server' | 'prepare_rebase_edit',
+    action: ProblemConflictResolutionAction,
     expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
   ) => ResolveProblemRevisionConflictResult;
   onRetrySaveProblemRevision?: (problemId: string, expectedVersion?: number) => Promise<void>;
@@ -1066,20 +1068,8 @@ export function ProblemQualityReviewTab({
 
                 const serverCompareTarget =
                   activeUnsavedRev.serverLatestSummary ??
-                  (activeUnsavedRev.serverSnapshotSummary
-                    ? { ...activeProblem, ...activeUnsavedRev.serverSnapshotSummary }
-                    : activeProblem);
-                const verifiedServerProblemForResolution: Problem | null =
-                  activeUnsavedRev.serverLatestSummary ??
-                  (activeUnsavedRev.serverSnapshotSummary
-                    ? ({
-                        ...activeProblem,
-                        ...activeUnsavedRev.serverSnapshotSummary,
-                        id: activeProblem.id,
-                        subjectId: activeProblem.subjectId,
-                        version: activeUnsavedRev.serverSnapshotSummary.version,
-                      } as Problem)
-                    : null);
+                  activeUnsavedRev.serverSnapshotSummary ??
+                  null;
                 const isConflict = activeUnsavedRev.syncStatus === 'conflict';
                 const isVerifPending = activeUnsavedRev.syncStatus === 'verification_pending';
                 const isFailed = activeUnsavedRev.syncStatus === 'failed';
@@ -1094,11 +1084,16 @@ export function ProblemQualityReviewTab({
 
                 const handleAcceptServerResolution = () => {
                   if (!onResolveProblemRevisionConflict) return;
-                  const res = onResolveProblemRevisionConflict(activeProblem.id, 'accept_server', {
-                    revisionId: activeUnsavedRev.revisionId,
-                    generation: activeUnsavedRev.generation,
-                    serverProblem: verifiedServerProblemForResolution,
-                  });
+                  const req = buildConflictResolutionRequest(
+                    activeUnsavedRev,
+                    'accept_server',
+                    conflictResolutionState
+                  );
+                  const res = onResolveProblemRevisionConflict(
+                    activeProblem.id,
+                    req.action,
+                    req.params
+                  );
                   if (isConflictResolutionComplete(res)) {
                     setConflictResolutionState(null);
                     setShowConflictDiff(false);
@@ -1109,14 +1104,15 @@ export function ProblemQualityReviewTab({
 
                 const handleRetryPersistRebasedRevision = () => {
                   if (!onResolveProblemRevisionConflict) return;
+                  const req = buildConflictResolutionRequest(
+                    activeUnsavedRev,
+                    'prepare_rebase_edit',
+                    conflictResolutionState
+                  );
                   const res = onResolveProblemRevisionConflict(
                     activeProblem.id,
-                    'prepare_rebase_edit',
-                    {
-                      revisionId: activeUnsavedRev.revisionId,
-                      generation: activeUnsavedRev.generation,
-                      serverProblem: verifiedServerProblemForResolution,
-                    }
+                    req.action,
+                    req.params
                   );
                   if (isConflictResolutionComplete(res)) {
                     setConflictResolutionState(null);
@@ -1128,14 +1124,15 @@ export function ProblemQualityReviewTab({
                 const loadProtectedIntoEditor = (rebased: boolean) => {
                   let sourceRev: UnsavedProblemRevision = activeUnsavedRev;
                   if (rebased && onResolveProblemRevisionConflict) {
+                    const req = buildConflictResolutionRequest(
+                      activeUnsavedRev,
+                      'prepare_rebase_edit',
+                      conflictResolutionState
+                    );
                     const res = onResolveProblemRevisionConflict(
                       activeProblem.id,
-                      'prepare_rebase_edit',
-                      {
-                        revisionId: activeUnsavedRev.revisionId,
-                        generation: activeUnsavedRev.generation,
-                        serverProblem: verifiedServerProblemForResolution,
-                      }
+                      req.action,
+                      req.params
                     );
                     if (!canOpenEditorAfterRebasePrepare(res)) {
                       setConflictResolutionState(res);
@@ -1359,22 +1356,22 @@ export function ProblemQualityReviewTab({
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-red-200">
                         <div className="p-3 bg-white border border-red-200 rounded-xs space-y-1.5">
                           <div className="font-academic-mono font-bold text-[11px] text-red-900">
-                            서버 확정 내용 (v{serverCompareTarget.version ?? activeUnsavedRev.confirmedVersion ?? '?'})
+                            서버 확정 내용 (v{serverCompareTarget?.version ?? activeUnsavedRev.confirmedVersion ?? '?'})
                           </div>
                           <div>
                             <span className="text-[10.5px] font-academic-mono text-[#827d73]">제목: </span>
-                            <span className="font-bold">{serverCompareTarget.title || '(비어 있음)'}</span>
+                            <span className="font-bold">{serverCompareTarget?.title || '(비어 있음)'}</span>
                           </div>
                           <div>
                             <span className="text-[10.5px] font-academic-mono text-[#827d73] block">지문:</span>
                             <p className="whitespace-pre-wrap text-[11px] bg-[#faf8f4] p-2 rounded-2xs border border-[#ded6c8]">
-                              {serverCompareTarget.promptText || '(비어 있음)'}
+                              {serverCompareTarget?.promptText || '(비어 있음)'}
                             </p>
                           </div>
                           <div>
                             <span className="text-[10.5px] font-academic-mono text-[#827d73] block">모범 답안:</span>
                             <p className="whitespace-pre-wrap text-[11px] bg-[#faf8f4] p-2 rounded-2xs border border-[#ded6c8]">
-                              {serverCompareTarget.modelAnswer || '(비어 있음)'}
+                              {serverCompareTarget?.modelAnswer || '(비어 있음)'}
                             </p>
                           </div>
                         </div>

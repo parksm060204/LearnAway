@@ -54,16 +54,30 @@ async function run() {
 
   const data = new Map();
   let blockedSubstrings = [];
+  const writeCounts = new Map();
   global.window = { localStorage: {} };
   global.localStorage = {
     setBlockedKeys: (keys) => {
       blockedSubstrings = Array.isArray(keys) ? keys : [];
+    },
+    resetWriteCounts: () => {
+      writeCounts.clear();
+    },
+    getWriteCount: (keySubstring) => {
+      let total = 0;
+      for (const [k, count] of writeCounts.entries()) {
+        if (k === keySubstring || k.endsWith(keySubstring)) {
+          total += count;
+        }
+      }
+      return total;
     },
     getItem: (key) => (data.has(key) ? data.get(key) : null),
     setItem: (key, value) => {
       if (blockedSubstrings.some((b) => key === b || key.endsWith(b))) {
         throw new Error(`QuotaExceededError: blocked write to ${key}`);
       }
+      writeCounts.set(key, (writeCounts.get(key) || 0) + 1);
       data.set(key, String(value));
     },
     removeItem: (key) => {
@@ -2390,6 +2404,463 @@ async function run() {
     assert.equal(crossScopeRes.status, 'scope_changed');
     assert.equal(storage.loadStoredProblems().length, 0, 'Other account problems untouched');
     assert.equal(storage.getUnsavedProblemRevision(probId), null);
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('Reproduction 1: accept_server / prepare_rebase_edit must never mix local fields into incomplete server snapshot or resurrect deleted optional fields', async () => {
+    const storage = load(path.join(output, 'lib/storage.js'));
+    const revSync = load(path.join(output, 'lib/problemRevisionSync.js'));
+    localStorage.clear();
+    storage.clearAllUnsavedProblemRevisions();
+
+    const probId = 'p_repro1_server_only';
+    const baseRubric = [
+      { id: 'r1', label: 'C1', maxScore: 60, weight: 0.6, description: 'Criterion 1' },
+      { id: 'r2', label: 'C2', maxScore: 40, weight: 0.4, description: 'Criterion 2' },
+    ];
+    const localProbV2 = {
+      id: probId,
+      subjectId: 'sub-cs-1',
+      type: 'essay_descriptive',
+      categoryLabel: 'Theory',
+      categoryNumber: 1,
+      conceptIds: ['c-1'],
+      sourceRefs: 'S1',
+      timeBreakdownDesc: '15m',
+      coreEvaluationHighlight: 'H1',
+      itemCountDesc: '1',
+      title: 'Local Title v2',
+      promptText: 'Local Prompt v2',
+      mathFormula: 'E = mc^2',
+      codeSnippet: 'const localCode = 42;',
+      appliedConditionNote: 'Local condition x > 0',
+      hints: ['Local Hint 1'],
+      modelAnswer: 'Local Model Answer v2',
+      rubric: baseRubric,
+      timeStandardMinutes: 15,
+      version: 2,
+      serverConfirmedVersion: 1,
+      versionHistory: [],
+    };
+    storage.saveStoredProblems([localProbV2]);
+
+    // Server snapshot has NO serverLatestSummary, and serverSnapshotSummary is missing required modelAnswer!
+    const incompleteServerSnapshot = {
+      version: 3,
+      title: 'Server Snapshot Title v3',
+      promptText: 'Server Snapshot Prompt v3',
+      type: 'essay_descriptive',
+      conceptIds: ['c-1'],
+      hints: ['Server Hint'],
+      rubric: baseRubric,
+      timeStandardMinutes: 20,
+      // modelAnswer is missing!
+    };
+    const conflictRev = {
+      problemId: probId,
+      revisionId: 'rev-repro1-1',
+      generation: 1,
+      baseVersion: 1,
+      revisionVersion: 2,
+      title: localProbV2.title,
+      promptText: localProbV2.promptText,
+      type: localProbV2.type,
+      conceptIds: localProbV2.conceptIds,
+      mathFormula: localProbV2.mathFormula,
+      codeSnippet: localProbV2.codeSnippet,
+      appliedConditionNote: localProbV2.appliedConditionNote,
+      hints: localProbV2.hints,
+      modelAnswer: localProbV2.modelAnswer,
+      rubric: localProbV2.rubric,
+      timeStandardMinutes: localProbV2.timeStandardMinutes,
+      editReason: 'Local edit v2',
+      revisedAt: new Date().toISOString(),
+      syncStatus: 'conflict',
+      confirmedVersion: 3,
+      saveConfirmedOnServer: true,
+      serverLatestSummary: undefined,
+      serverSnapshotSummary: incompleteServerSnapshot,
+    };
+    storage.saveUnsavedProblemRevision(conflictRev);
+
+    // Build the exact input that ProblemQualityReviewTab uses for the button click
+    const uiReq =
+      typeof revSync.buildConflictResolutionRequest === 'function'
+        ? revSync.buildConflictResolutionRequest(conflictRev, 'accept_server', null)
+        : {
+            action: 'accept_server',
+            params: {
+              revisionId: conflictRev.revisionId,
+              generation: conflictRev.generation,
+              serverProblem:
+                conflictRev.serverLatestSummary ??
+                (conflictRev.serverSnapshotSummary
+                  ? {
+                      ...localProbV2,
+                      ...conflictRev.serverSnapshotSummary,
+                      id: localProbV2.id,
+                      subjectId: localProbV2.subjectId,
+                      version: conflictRev.serverSnapshotSummary.version,
+                    }
+                  : null),
+            },
+          };
+    localStorage.resetWriteCounts();
+    const res = storage.resolveProblemRevisionConflict(probId, uiReq.action, uiReq.params);
+
+    assert.equal(res.ok, false, `Expected ok:false but got ok:${res.ok} status:${res.status}`);
+    assert.equal(res.status, 'invalid_server_base');
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0, 'Zero writes to problems_v1');
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 0, 'Zero deletes/writes to unsaved_problem_revisions_v1');
+    assert.ok(storage.getUnsavedProblemRevision(probId), 'Protected revision preserved');
+    assert.ok(res.message.includes('저장 결과 다시 확인'), 'Must guide user to 저장 결과 다시 확인');
+
+    // Same server-base validation for prepare_rebase_edit while keeping protected revision
+    const uiRebaseReq =
+      typeof revSync.buildConflictResolutionRequest === 'function'
+        ? revSync.buildConflictResolutionRequest(conflictRev, 'prepare_rebase_edit', null)
+        : {
+            action: 'prepare_rebase_edit',
+            params: uiReq.params,
+          };
+    localStorage.resetWriteCounts();
+    const resRebase = storage.resolveProblemRevisionConflict(probId, uiRebaseReq.action, uiRebaseReq.params);
+    assert.equal(resRebase.ok, false);
+    assert.equal(resRebase.status, 'invalid_server_base');
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0);
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 0);
+    assert.equal(storage.getUnsavedProblemRevision(probId)?.promptText, 'Local Prompt v2', 'User protected revision preserved');
+
+    // Complete server snapshot where optional fields (codeSnippet, mathFormula, appliedConditionNote) were deleted on server:
+    // must NOT resurrect local optional fields from localProbV2!
+    const completeServerSnapshotWithoutOptionals = {
+      version: 3,
+      title: 'Server Clean Title v3',
+      promptText: 'Server Clean Prompt v3',
+      type: 'essay_descriptive',
+      conceptIds: ['c-1'],
+      hints: ['Server Hint v3'],
+      modelAnswer: 'Server Complete Model Answer v3',
+      rubric: baseRubric,
+      timeStandardMinutes: 20,
+      // codeSnippet, mathFormula, appliedConditionNote omitted (deleted on server)
+    };
+    const conflictRevComplete = {
+      ...conflictRev,
+      serverSnapshotSummary: completeServerSnapshotWithoutOptionals,
+    };
+    storage.saveUnsavedProblemRevision(conflictRevComplete);
+    const uiCleanReq =
+      typeof revSync.buildConflictResolutionRequest === 'function'
+        ? revSync.buildConflictResolutionRequest(conflictRevComplete, 'accept_server', null)
+        : {
+            action: 'accept_server',
+            params: {
+              revisionId: conflictRevComplete.revisionId,
+              generation: conflictRevComplete.generation,
+            },
+          };
+    const resClean = storage.resolveProblemRevisionConflict(probId, uiCleanReq.action, uiCleanReq.params);
+    assert.equal(resClean.ok, true);
+    assert.equal(resClean.status, 'complete');
+    const savedProbAfterAccept = storage.loadStoredProblems().find((p) => p.id === probId);
+    assert.equal(savedProbAfterAccept?.modelAnswer, 'Server Complete Model Answer v3');
+    assert.equal(savedProbAfterAccept?.codeSnippet, undefined, 'Deleted codeSnippet must not resurrect from local problem');
+    assert.equal(savedProbAfterAccept?.mathFormula, undefined, 'Deleted mathFormula must not resurrect from local problem');
+    assert.equal(savedProbAfterAccept?.appliedConditionNote, undefined, 'Deleted appliedConditionNote must not resurrect from local problem');
+
+    const uiSrc = fs.readFileSync(path.join(root, 'components/ProblemQualityReviewTab.tsx'), 'utf8');
+    assert.ok(
+      uiSrc.includes('buildConflictResolutionRequest'),
+      'ProblemQualityReviewTab must use shared buildConflictResolutionRequest without spreading activeProblem into serverSnapshotSummary'
+    );
+  });
+
+  await checkAsync('Reproduction 2: Pre-write read failure or corrupted JSON in problems_v1 must never delete other problems (Problem B)', async () => {
+    const storage = load(path.join(output, 'lib/storage.js'));
+    localStorage.clear();
+    storage.clearAllUnsavedProblemRevisions();
+
+    const baseRubric = [
+      { id: 'r1', label: 'C1', maxScore: 100, weight: 1, description: 'Criterion 1' },
+    ];
+    const probA = {
+      id: 'prob_A',
+      subjectId: 'sub-1',
+      type: 'essay_descriptive',
+      categoryLabel: 'T',
+      categoryNumber: 1,
+      conceptIds: ['c-1'],
+      sourceRefs: 'S1',
+      timeBreakdownDesc: '15m',
+      coreEvaluationHighlight: 'H1',
+      itemCountDesc: '1',
+      title: 'Problem A v2',
+      promptText: 'Prompt A v2',
+      hints: ['H1'],
+      modelAnswer: 'Answer A v2',
+      rubric: baseRubric,
+      timeStandardMinutes: 15,
+      version: 2,
+      serverConfirmedVersion: 1,
+      versionHistory: [],
+    };
+    const probB = {
+      ...probA,
+      id: 'prob_B',
+      title: 'Problem B v1',
+      promptText: 'Prompt B v1',
+      modelAnswer: 'Answer B v1',
+      version: 1,
+    };
+    storage.saveStoredProblems([probA, probB]);
+    const rawBefore = localStorage.getItem('redcall_problems_v1');
+
+    // A also has an in-memory problem and a conflict revision
+    storage.editAndReviseProblem('prob_A', { promptText: 'Prompt A edit' }, 'Reason A');
+    const revA = storage.getEffectiveUnsavedProblemRevision('prob_A');
+    const serverProbAV3 = {
+      ...probA,
+      title: 'Server A v3',
+      promptText: 'Server Prompt A v3',
+      modelAnswer: 'Server Answer A v3',
+      version: 3,
+      serverConfirmedVersion: 3,
+    };
+    storage.recordProblemRevisionMismatchConflict('prob_A', {
+      targetRevisionId: revA.revisionId,
+      targetGeneration: revA.generation,
+      confirmedVersion: 3,
+      saveConfirmedOnServer: true,
+      errorMessage: 'Conflict A',
+      serverLatestProblem: serverProbAV3,
+    });
+    // Reset raw problems_v1 to [probA, probB] snapshot to verify exact string preservation
+    localStorage.setItem('redcall_problems_v1', rawBefore);
+
+    // Fail ONLY the first getItem on problems_v1, while setItem remains unblocked
+    const origGetItem = localStorage.getItem;
+    let failFirstProblemsGet = true;
+    localStorage.getItem = (key) => {
+      if (failFirstProblemsGet && key.endsWith('problems_v1')) {
+        failFirstProblemsGet = false;
+        throw new Error('Transient read error on problems_v1');
+      }
+      return origGetItem(key);
+    };
+    localStorage.resetWriteCounts();
+    let resReadFail;
+    try {
+      resReadFail = storage.resolveProblemRevisionConflict('prob_A', 'accept_server', {
+        revisionId: revA.revisionId,
+        generation: revA.generation,
+        serverProblem: serverProbAV3,
+      });
+    } finally {
+      localStorage.getItem = origGetItem;
+    }
+
+    assert.equal(resReadFail.ok, false);
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0, 'Must NOT write to problems_v1 when initial list read failed');
+    assert.equal(localStorage.getItem('redcall_problems_v1'), rawBefore, 'Persisted JSON string unchanged');
+    assert.equal(storage.loadStoredProblems().length, 2, 'Both Problem A and Problem B preserved');
+    assert.ok(storage.loadStoredProblems().some((p) => p.id === 'prob_B'), 'Problem B preserved');
+    assert.ok(storage.getUnsavedProblemRevision('prob_A'), 'Problem A protected revision preserved');
+
+    // Subcase 2b: Corrupted JSON string in problems_v1 must NOT be overwritten
+    localStorage.setItem('redcall_problems_v1', '{corrupted_json');
+    localStorage.resetWriteCounts();
+    const resCorrupt = storage.resolveProblemRevisionConflict('prob_A', 'accept_server', {
+      revisionId: revA.revisionId,
+      generation: revA.generation,
+      serverProblem: serverProbAV3,
+    });
+    assert.equal(resCorrupt.ok, false);
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0, 'Zero writes when problems_v1 has corrupted JSON');
+    assert.equal(localStorage.getItem('redcall_problems_v1'), '{corrupted_json', 'Corrupted raw value untouched');
+    assert.ok(storage.getUnsavedProblemRevision('prob_A'), 'Protected revision preserved on corrupted JSON');
+
+    // Subcase 2c: Non-array JSON in problems_v1 must NOT be overwritten
+    localStorage.setItem('redcall_problems_v1', '{"notAnArray":true}');
+    localStorage.resetWriteCounts();
+    const resNonArray = storage.resolveProblemRevisionConflict('prob_A', 'accept_server', {
+      revisionId: revA.revisionId,
+      generation: revA.generation,
+      serverProblem: serverProbAV3,
+    });
+    assert.equal(resNonArray.ok, false);
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0, 'Zero writes when problems_v1 is non-array JSON');
+    assert.equal(localStorage.getItem('redcall_problems_v1'), '{"notAnArray":true}');
+    assert.ok(storage.getUnsavedProblemRevision('prob_A'), 'Protected revision preserved on non-array JSON');
+
+    // Subcase 2d: When problems_v1 key genuinely does NOT exist (absent), recovering in-memory problem A works cleanly
+    localStorage.removeItem('redcall_problems_v1');
+    localStorage.resetWriteCounts();
+    const resAbsentRecover = storage.resolveProblemRevisionConflict('prob_A', 'accept_server', {
+      revisionId: revA.revisionId,
+      generation: revA.generation,
+      serverProblem: serverProbAV3,
+    });
+    assert.equal(resAbsentRecover.ok, true, 'Recovering in-memory problem when key is genuinely absent must succeed');
+    assert.equal(resAbsentRecover.status, 'complete');
+    assert.equal(localStorage.getWriteCount('problems_v1'), 1);
+    assert.equal(storage.loadStoredProblems().length, 1);
+    assert.equal(storage.loadStoredProblems()[0].id, 'prob_A');
+    assert.equal(storage.loadStoredProblems()[0].version, 3);
+  });
+
+  await checkAsync('Reproduction 3: Retry after partial_cleanup_failed must clean up target revision with 0 writes to problems_v1', async () => {
+    const storage = load(path.join(output, 'lib/storage.js'));
+    const revSync = load(path.join(output, 'lib/problemRevisionSync.js'));
+    const storageScope = load(path.join(output, 'lib/storageScope.js'));
+    localStorage.clear();
+    storage.clearAllUnsavedProblemRevisions();
+
+    const probId = 'p_repro3_cleanup_only';
+    const baseRubric = [
+      { id: 'r1', label: 'C1', maxScore: 100, weight: 1, description: 'Criterion 1' },
+    ];
+    const probV1 = {
+      id: probId,
+      subjectId: 'sub-1',
+      type: 'essay_descriptive',
+      categoryLabel: 'T',
+      categoryNumber: 1,
+      conceptIds: ['c-1'],
+      sourceRefs: 'S1',
+      timeBreakdownDesc: '15m',
+      coreEvaluationHighlight: 'H1',
+      itemCountDesc: '1',
+      title: 'Title v1',
+      promptText: 'Prompt v1',
+      hints: ['H1'],
+      modelAnswer: 'Answer v1',
+      rubric: baseRubric,
+      timeStandardMinutes: 15,
+      version: 1,
+      serverConfirmedVersion: 1,
+      versionHistory: [],
+    };
+    storage.saveStoredProblems([probV1]);
+    storage.editAndReviseProblem(probId, { promptText: 'Edit v2' }, 'Reason v2');
+    const rev = storage.getEffectiveUnsavedProblemRevision(probId);
+    const serverV3 = {
+      ...probV1,
+      title: 'Server Title v3',
+      promptText: 'Server Prompt v3',
+      modelAnswer: 'Server Answer v3',
+      version: 3,
+      serverConfirmedVersion: 3,
+    };
+    storage.recordProblemRevisionMismatchConflict(probId, {
+      targetRevisionId: rev.revisionId,
+      targetGeneration: rev.generation,
+      confirmedVersion: 3,
+      saveConfirmedOnServer: true,
+      errorMessage: 'Conflict v3',
+      serverLatestProblem: serverV3,
+    });
+
+    // Also put a protected revision on a sibling problem to verify only target problem's revision is removed
+    storage.saveUnsavedProblemRevision({
+      ...rev,
+      problemId: 'p_repro3_sibling',
+      revisionId: 'rev-sibling-keep',
+    });
+
+    // Step 1: accept_server succeeds on problems_v1 write & read-back, fails on unsaved_problem_revisions_v1 cleanup
+    localStorage.setBlockedKeys(['unsaved_problem_revisions_v1']);
+    localStorage.resetWriteCounts();
+    let firstRes;
+    try {
+      firstRes = storage.resolveProblemRevisionConflict(probId, 'accept_server', {
+        revisionId: rev.revisionId,
+        generation: rev.generation,
+        serverProblem: serverV3,
+      });
+    } finally {
+      localStorage.setBlockedKeys([]);
+    }
+    assert.equal(firstRes.status, 'partial_cleanup_failed');
+    assert.equal(localStorage.getWriteCount('problems_v1'), 1, 'First accept_server writes problems_v1 once');
+
+    // Step 2: Retry using the UI button request builder
+    const activeUnsavedNow = storage.getEffectiveUnsavedProblemRevision(probId);
+    const retryReq =
+      typeof revSync.buildConflictResolutionRequest === 'function'
+        ? revSync.buildConflictResolutionRequest(activeUnsavedNow, 'accept_server', firstRes)
+        : {
+            action: 'accept_server',
+            params: {
+              revisionId: activeUnsavedNow.revisionId,
+              generation: activeUnsavedNow.generation,
+              serverProblem: activeUnsavedNow.serverLatestSummary,
+            },
+          };
+    assert.equal(retryReq.action, 'retry_cleanup');
+    localStorage.resetWriteCounts();
+    const secondRes = storage.resolveProblemRevisionConflict(probId, retryReq.action, retryReq.params);
+
+    assert.equal(secondRes.ok, true);
+    assert.equal(secondRes.status, 'complete');
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0, 'Retry cleanup must write problems_v1 ZERO times');
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 1, 'Retry cleanup writes unsaved_problem_revisions_v1 once');
+    assert.equal(storage.getUnsavedProblemRevision(probId), null, 'Protected revision cleaned up');
+    assert.equal(storage.getInMemoryProblemRevision(probId), null, 'Memory revision cleaned up');
+    assert.ok(storage.getUnsavedProblemRevision('p_repro3_sibling'), 'Sibling problem protected revision untouched');
+
+    // Step 3: If another tab modified the persisted problem body in problems_v1 before retry_cleanup,
+    // must NOT overwrite problems_v1 or delete the revision, and must guide to 저장 결과 다시 확인
+    storage.saveUnsavedProblemRevision(activeUnsavedNow);
+    const crossTabModifiedBody = {
+      ...serverV3,
+      promptText: 'Cross-tab modified prompt in problems_v1',
+      version: 4,
+      serverConfirmedVersion: 4,
+    };
+    storage.saveStoredProblems([crossTabModifiedBody]);
+    localStorage.resetWriteCounts();
+    const resCrossTabBody = storage.resolveProblemRevisionConflict(probId, 'retry_cleanup', retryReq.params);
+    assert.equal(resCrossTabBody.ok, false);
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0, 'Zero writes to problems_v1 when cross-tab body changed');
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 0, 'Zero writes to unsaved_problem_revisions_v1 when cross-tab body changed');
+    assert.equal(storage.loadStoredProblems()[0].promptText, 'Cross-tab modified prompt in problems_v1', 'Cross-tab body preserved');
+    assert.ok(storage.getUnsavedProblemRevision(probId), 'Protected revision preserved when cross-tab body changed');
+    assert.ok(resCrossTabBody.message.includes('저장 결과 다시 확인'), 'Guides user to 저장 결과 다시 확인');
+
+    // Step 3b: If another tab modified the protected revision in unsaved_problem_revisions_v1 before retry_cleanup,
+    // must NOT delete the modified revision and must guide to 저장 결과 다시 확인
+    storage.saveStoredProblems([serverV3]);
+    const crossTabModifiedRev = {
+      ...activeUnsavedNow,
+      revisionId: 'rev-cross-tab-newer',
+      generation: (activeUnsavedNow.generation ?? 1) + 1,
+      promptText: 'Cross-tab newer revision prompt',
+    };
+    storage.saveUnsavedProblemRevision(crossTabModifiedRev);
+    localStorage.resetWriteCounts();
+    const resCrossTabRev = storage.resolveProblemRevisionConflict(probId, 'retry_cleanup', retryReq.params);
+    assert.equal(resCrossTabRev.ok, false);
+    assert.equal(resCrossTabRev.status, 'stale_revision_aborted');
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0);
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 0);
+    assert.equal(storage.getUnsavedProblemRevision(probId)?.promptText, 'Cross-tab newer revision prompt', 'Cross-tab newer revision preserved');
+    assert.ok(resCrossTabRev.message.includes('저장 결과 다시 확인'), 'Guides user to 저장 결과 다시 확인');
+
+    // Step 4: Account switch isolation during retry_cleanup
+    storage.saveStoredProblems([serverV3]);
+    const scopeBefore = storageScope.getStorageScopeId();
+    storageScope.setStorageScope({ kind: 'user', userId: 'other_user_retry_cleanup' });
+    localStorage.clear();
+    localStorage.resetWriteCounts();
+    const resScopeSwitch = storage.resolveProblemRevisionConflict(probId, 'retry_cleanup', {
+      ...retryReq.params,
+      scopeId: scopeBefore,
+    });
+    assert.equal(resScopeSwitch.ok, false);
+    assert.equal(resScopeSwitch.status, 'scope_changed');
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0);
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 0);
     storageScope.setStorageScope({ kind: 'legacy' });
   });
 

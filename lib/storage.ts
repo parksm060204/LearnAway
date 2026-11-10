@@ -1458,14 +1458,13 @@ export function clearInMemoryProblem(
   delete map[problemId];
 }
 
-export function loadStoredProblems(): Problem[] {
-  const raw = safeGetItem<Problem[]>(STORAGE_KEYS.PROBLEMS, []);
+function hydrateStoredProblemsList(raw: Problem[]): Problem[] {
   // Legacy migration: recover transfer linkage ONLY when the original draft can
   // still be resolved by draftId. Never infer a source/session.
   const drafts = loadStoredProblemDrafts();
   const draftById = new Map(drafts.map((d) => [d.id, d]));
 
-  const loaded = raw.map((p) => {
+  return raw.map((p) => {
     const base: Problem = {
       ...p,
       isDemo: p.isDemo ?? true,
@@ -1490,6 +1489,74 @@ export function loadStoredProblems(): Problem[] {
     }
     return base;
   });
+}
+
+type StoredProblemsReadForWriteResult =
+  | { status: 'ok'; problems: Problem[]; keyAbsent: false }
+  | { status: 'absent'; problems: []; keyAbsent: true }
+  | { status: 'read_error'; error: string };
+
+/**
+ * Strictly distinguishes `'ok'` (valid persisted array), `'absent'` (key genuinely
+ * does not exist in `localStorage`), and `'read_error'` (storage unavailable,
+ * `getItem` threw, corrupted JSON, or non-array/invalid shape) before any write
+ * that would replace `problems_v1`. Display-only `[]` fallbacks must never be used
+ * as the base for overwriting `problems_v1`.
+ */
+function readStoredProblemsForWrite(): StoredProblemsReadForWriteResult {
+  const storage = getLocalStorage();
+  if (!storage) {
+    return {
+      status: 'read_error',
+      error: '브라우저 영속 저장소(localStorage)에 접근할 수 없습니다.',
+    };
+  }
+  const problemsKey = scopedStorageKey(STORAGE_KEYS.PROBLEMS);
+  let raw: string | null;
+  try {
+    raw = storage.getItem(problemsKey);
+  } catch (e) {
+    console.error(`Failed to read localStorage key ${problemsKey}`, e);
+    return {
+      status: 'read_error',
+      error: '기존 문제 목록을 읽는 중 브라우저 저장소 읽기 오류가 발생했습니다.',
+    };
+  }
+  if (raw === null) {
+    return { status: 'absent', problems: [], keyAbsent: true };
+  }
+  if (raw.trim() === '') {
+    return {
+      status: 'read_error',
+      error: '저장된 문제 목록 JSON 데이터가 비어 있거나 손상되었습니다.',
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.error(`Failed to parse JSON for localStorage key ${problemsKey}`, e);
+    return {
+      status: 'read_error',
+      error: '저장된 문제 목록 JSON이 손상되어 파싱할 수 없습니다.',
+    };
+  }
+  if (!matchesStoredShape(STORAGE_KEYS.PROBLEMS, parsed)) {
+    return {
+      status: 'read_error',
+      error: '저장된 문제 목록 데이터가 유효한 문제 배열 형식이 아닙니다.',
+    };
+  }
+  const loaded = hydrateStoredProblemsList(parsed as Problem[]);
+  if (loaded.length > 0) {
+    recordLastKnownProblems(loaded);
+  }
+  return { status: 'ok', problems: loaded, keyAbsent: false };
+}
+
+export function loadStoredProblems(): Problem[] {
+  const raw = safeGetItem<Problem[]>(STORAGE_KEYS.PROBLEMS, []);
+  const loaded = hydrateStoredProblemsList(Array.isArray(raw) ? raw : []);
   if (getLocalStorage() !== null && loaded.length > 0) {
     recordLastKnownProblems(loaded);
   }
@@ -4140,6 +4207,11 @@ export type ResolveProblemRevisionConflictStatus =
   | 'stale_revision_aborted'
   | 'scope_changed';
 
+export type ProblemConflictResolutionAction =
+  | 'accept_server'
+  | 'prepare_rebase_edit'
+  | 'retry_cleanup';
+
 export interface ResolveProblemRevisionConflictResult {
   /**
    * True ONLY when `status === 'complete'`.
@@ -4149,7 +4221,7 @@ export interface ResolveProblemRevisionConflictResult {
    */
   ok: boolean;
   status: ResolveProblemRevisionConflictStatus;
-  action: 'accept_server' | 'prepare_rebase_edit';
+  action: ProblemConflictResolutionAction;
   bodyPersisted: boolean;
   bodyVerified: boolean;
   revisionPersisted: boolean;
@@ -4160,6 +4232,36 @@ export interface ResolveProblemRevisionConflictResult {
   updatedProblems: Problem[];
   revision: UnsavedProblemRevision | null;
   message: string;
+}
+
+/**
+ * Shared request builder for UI conflict resolution buttons.
+ * - Never mixes or spreads `activeProblem` (local problem) into `serverSnapshotSummary`
+ *   or `serverLatestSummary`.
+ * - Routes retries after `partial_cleanup_failed` to `'retry_cleanup'` so the already-verified
+ *   problem body in `problems_v1` is never rewritten.
+ */
+export function buildConflictResolutionRequest(
+  unsaved: UnsavedProblemRevision | null | undefined,
+  desiredAction: 'accept_server' | 'prepare_rebase_edit',
+  lastResolutionResult?: Pick<ResolveProblemRevisionConflictResult, 'status'> | null
+): {
+  action: ProblemConflictResolutionAction;
+  params: {
+    revisionId?: string;
+    generation?: number;
+  };
+} {
+  const isCleanupOnlyRetry =
+    desiredAction === 'accept_server' &&
+    lastResolutionResult?.status === 'partial_cleanup_failed';
+  return {
+    action: isCleanupOnlyRetry ? 'retry_cleanup' : desiredAction,
+    params: {
+      revisionId: unsaved?.revisionId,
+      generation: unsaved?.generation,
+    },
+  };
 }
 
 export function isConflictResolutionComplete(
@@ -4248,6 +4350,11 @@ function isTargetOrMemoryRebaseRetryRevision(
   return true;
 }
 
+function normalizeOptionalServerField(val: unknown): string | undefined {
+  if (typeof val !== 'string') return undefined;
+  return val.length > 0 ? val : undefined;
+}
+
 function extractValidatedServerBase(
   problemId: string,
   localCurrent: Problem | null | undefined,
@@ -4269,7 +4376,7 @@ function extractValidatedServerBase(
     return {
       ok: false,
       message:
-        '로컬 문제 원본을 찾을 수 없어 서버 기준의 문제·과목 소속을 검증할 수 없습니다.',
+        '로컬 문제 원본을 찾을 수 없어 서버 기준의 문제·과목 소속을 검증할 수 없습니다. [저장 결과 다시 확인]으로 서버 내용을 먼저 확인해 주세요.',
     };
   }
 
@@ -4298,20 +4405,41 @@ function extractValidatedServerBase(
     if (typeof ver !== 'number' || !Number.isInteger(ver) || ver < 1) {
       return {
         ok: false,
-        message: '서버 기준 문제의 확정 버전 정보가 유효하지 않습니다.',
+        message:
+          '서버 기준 문제의 확정 버전 정보가 유효하지 않습니다. [저장 결과 다시 확인]으로 서버 원본을 다시 조회해 주세요.',
       };
     }
     const snapCandidate = {
       ...candidate,
       version: ver,
     };
-    if (!isCompleteProblemSnapshot(snapCandidate)) {
+    const hasValidType =
+      typeof snapCandidate.type === 'string' &&
+      snapCandidate.type.trim().length > 0;
+    const hasValidConceptIds =
+      Array.isArray(snapCandidate.conceptIds) &&
+      snapCandidate.conceptIds.length > 0 &&
+      snapCandidate.conceptIds.every((c) => typeof c === 'string' && c.trim().length > 0);
+    const hasValidHints =
+      Array.isArray(snapCandidate.hints) &&
+      snapCandidate.hints.every((h) => typeof h === 'string');
+
+    if (
+      !isCompleteProblemSnapshot(snapCandidate) ||
+      !hasValidType ||
+      !hasValidConceptIds ||
+      !hasValidHints
+    ) {
       return {
         ok: false,
         message:
-          '서버 기준 문제·스냅샷의 필수 평가 필드(제목·지문·모범답안·루브릭 등)가 불완전하여 적용할 수 없습니다.',
+          '서버 기준 문제·스냅샷의 필수 평가 필드(제목·지문·모범답안·루브릭·유형·개념·힌트)가 불완전하여 적용할 수 없습니다. [저장 결과 다시 확인]으로 서버 원본을 다시 조회해 주세요.',
       };
     }
+
+    // Build mergedProblem using ONLY validated server evaluation fields so that
+    // optional evaluation fields deleted on the server (codeSnippet, mathFormula,
+    // appliedConditionNote, designIntent) never resurrect from localCurrent.
     const mergedProblem: Problem = {
       ...localCurrent,
       ...snapCandidate,
@@ -4319,9 +4447,22 @@ function extractValidatedServerBase(
       subjectId: localCurrent.subjectId,
       version: ver,
       serverConfirmedVersion: ver,
+      title: snapCandidate.title!,
+      promptText: snapCandidate.promptText!,
+      modelAnswer: snapCandidate.modelAnswer!,
+      type: snapCandidate.type as Problem['type'],
       rubric: (snapCandidate.rubric ?? []).map((r) => ({ ...r })),
       hints: [...(snapCandidate.hints ?? [])],
       conceptIds: [...(snapCandidate.conceptIds ?? [])],
+      timeStandardMinutes:
+        typeof snapCandidate.timeStandardMinutes === 'number' &&
+        Number.isFinite(snapCandidate.timeStandardMinutes)
+          ? snapCandidate.timeStandardMinutes
+          : localCurrent.timeStandardMinutes,
+      mathFormula: normalizeOptionalServerField(snapCandidate.mathFormula),
+      codeSnippet: normalizeOptionalServerField(snapCandidate.codeSnippet),
+      appliedConditionNote: normalizeOptionalServerField(snapCandidate.appliedConditionNote),
+      designIntent: normalizeOptionalServerField(snapCandidate.designIntent),
     };
     const snapshot: ProblemVersionSnapshot = {
       version: ver,
@@ -4377,6 +4518,9 @@ function extractValidatedServerBase(
 
   const latestSummary =
     currentUnsaved.serverLatestSummary ?? persistedUnsaved?.serverLatestSummary ?? null;
+  const snapshotSummary =
+    currentUnsaved.serverSnapshotSummary ?? persistedUnsaved?.serverSnapshotSummary ?? null;
+
   if (latestSummary) {
     if (latestSummary.id && latestSummary.id !== problemId) {
       return {
@@ -4403,10 +4547,11 @@ function extractValidatedServerBase(
         snapshot: validatedLatest.snapshot,
       };
     }
+    if (!snapshotSummary) {
+      return validatedLatest;
+    }
   }
 
-  const snapshotSummary =
-    currentUnsaved.serverSnapshotSummary ?? persistedUnsaved?.serverSnapshotSummary ?? null;
   if (snapshotSummary) {
     const snapWithMeta = snapshotSummary as ProblemVersionSnapshot & {
       id?: string;
@@ -4469,12 +4614,176 @@ function extractValidatedServerBase(
   };
 }
 
+function performConditionalRevisionCleanup(
+  problemId: string,
+  action: 'accept_server' | 'retry_cleanup',
+  paramsScopeId: string | undefined,
+  currentUnsaved: UnsavedProblemRevision,
+  persistedUnsaved: UnsavedProblemRevision | null,
+  memoryUnsaved: UnsavedProblemRevision | null,
+  authoritativeSource: Problem,
+  validatedBaseSnapshot: ProblemVersionSnapshot,
+  serverVer: number,
+  verifiedProblemsList: Problem[]
+): ResolveProblemRevisionConflictResult {
+  if (paramsScopeId && paramsScopeId !== getStorageScopeId()) {
+    return {
+      ok: false,
+      status: 'scope_changed',
+      action,
+      bodyPersisted: true,
+      bodyVerified: true,
+      revisionPersisted: Boolean(persistedUnsaved),
+      memorySaved: Boolean(memoryUnsaved),
+      memoryOnly: false,
+      revisionCleared: false,
+      needsRetry: false,
+      updatedProblems: verifiedProblemsList,
+      revision: null,
+      message: '계정 범위가 변경되어 보호 수정본 정리를 중단했습니다.',
+    };
+  }
+
+  const persistedBeforeClear = getUnsavedProblemRevision(problemId);
+  const memoryBeforeClear = getInMemoryProblemRevision(problemId);
+  const latestBeforeClear = resolveLatestProblemRevision(
+    persistedBeforeClear,
+    memoryBeforeClear
+  ).latest;
+
+  if (
+    latestBeforeClear &&
+    !isMatchingTargetRevision(
+      latestBeforeClear,
+      currentUnsaved.revisionId,
+      currentUnsaved.generation
+    )
+  ) {
+    return {
+      ok: false,
+      status: 'stale_revision_aborted',
+      action,
+      bodyPersisted: true,
+      bodyVerified: true,
+      revisionPersisted: Boolean(persistedBeforeClear),
+      memorySaved: Boolean(memoryBeforeClear),
+      memoryOnly: false,
+      revisionCleared: false,
+      needsRetry: false,
+      updatedProblems: verifiedProblemsList,
+      revision: latestBeforeClear,
+      message:
+        '중간에 생성된 더 최신 편집 내용을 보호하기 위해 수정본 삭제를 중단했습니다. [저장 결과 다시 확인]으로 최신 상태를 확인해 주세요.',
+    };
+  }
+
+  // Also detect if another tab modified the persisted revision's content in-place
+  if (
+    persistedBeforeClear &&
+    memoryBeforeClear &&
+    getProblemEvaluationSignature(persistedBeforeClear) !==
+      getProblemEvaluationSignature(memoryBeforeClear)
+  ) {
+    return {
+      ok: false,
+      status: 'stale_revision_aborted',
+      action,
+      bodyPersisted: true,
+      bodyVerified: true,
+      revisionPersisted: true,
+      memorySaved: true,
+      memoryOnly: false,
+      revisionCleared: false,
+      needsRetry: false,
+      updatedProblems: verifiedProblemsList,
+      revision: persistedBeforeClear,
+      message:
+        '다른 탭에서 보호 수정본 내용이 변경되어 삭제를 중단했습니다. 변경된 수정본을 보존했으니 [저장 결과 다시 확인]으로 확인해 주세요.',
+    };
+  }
+
+  clearInMemoryProblem(problemId, { version: serverVer, serverConfirmedVersion: serverVer });
+
+  const targetRevId = currentUnsaved.revisionId;
+  const targetGen = currentUnsaved.generation;
+  const hasTargetPersisted = Boolean(
+    persistedBeforeClear &&
+      (!targetRevId || persistedBeforeClear.revisionId === targetRevId) &&
+      (targetGen === undefined || (persistedBeforeClear.generation ?? 0) <= targetGen)
+  );
+
+  let clearOk = true;
+  if (hasTargetPersisted) {
+    clearOk = clearUnsavedProblemRevision(problemId, {
+      revisionId: targetRevId,
+      generation: targetGen,
+    });
+  }
+  const remainingPersisted = getUnsavedProblemRevision(problemId);
+  const stillHasTargetPersisted = Boolean(
+    remainingPersisted &&
+      (!targetRevId || remainingPersisted.revisionId === targetRevId) &&
+      (targetGen === undefined || (remainingPersisted.generation ?? 0) <= targetGen)
+  );
+
+  if (!clearOk || stillHasTargetPersisted) {
+    const partialRev: UnsavedProblemRevision = {
+      ...(remainingPersisted ?? currentUnsaved),
+      serverLatestSummary:
+        currentUnsaved.serverLatestSummary ?? authoritativeSource,
+      serverSnapshotSummary:
+        currentUnsaved.serverSnapshotSummary ?? validatedBaseSnapshot,
+      syncError: `서버 확정 본문(v${serverVer})은 로컬에 반영·검증되었으나, 보호 수정본 임시 기록 정리에 실패했습니다(부분 완료). [보호 기록 정리 재시도]를 눌러 완료해 주세요.`,
+    };
+    setInMemoryProblemRevision(partialRev);
+    return {
+      ok: false,
+      status: 'partial_cleanup_failed',
+      action,
+      bodyPersisted: true,
+      bodyVerified: true,
+      revisionPersisted: true,
+      memorySaved: true,
+      memoryOnly: false,
+      revisionCleared: false,
+      needsRetry: true,
+      updatedProblems: verifiedProblemsList,
+      revision: partialRev,
+      message: `서버 확정 본문(v${serverVer})은 로컬에 반영·검증되었으나 보호 수정본 기록 정리에 실패했습니다(부분 완료). 다시 시도하면 보호 기록만 안전하게 정리됩니다.`,
+    };
+  }
+
+  clearInMemoryProblemRevision(problemId, {
+    revisionId: targetRevId,
+    generation: targetGen,
+  });
+
+  return {
+    ok: true,
+    status: 'complete',
+    action,
+    bodyPersisted: true,
+    bodyVerified: true,
+    revisionPersisted: false,
+    memorySaved: false,
+    memoryOnly: false,
+    revisionCleared: true,
+    needsRetry: false,
+    updatedProblems: verifiedProblemsList,
+    revision: null,
+    message: `서버 확정 내용(v${serverVer})을 채택하여 동기화했습니다.`,
+  };
+}
+
 /**
  * Resolves a preserved conflict revision through explicit user choice:
  * - `'accept_server'`: Adopts actual server content into local problems (never modifying
  *   historical snapshots), verifies persistence via read-back (version, identity, evaluation fields),
  *   and only then clears the matching conflict revision. Distinguishes full completion, body save
  *   failure, read-back verification failure, and partial cleanup failure.
+ * - `'retry_cleanup'`: After `partial_cleanup_failed`, verifies that the persisted problem body in
+ *   `problems_v1` still matches the already-adopted server version & content without rewriting
+ *   `problems_v1` (`0` writes to `problems_v1`), then conditionally deletes only the target revision.
  * - `'prepare_rebase_edit'`: Validates the server base problem/snapshot completeness & ownership,
  *   reconciles `pendingPriorVerification`, and re-anchors the protected local revision onto the
  *   verified server version (`baseVersion = serverVersion`, `revisionVersion = serverVersion + 1`).
@@ -4482,7 +4791,7 @@ function extractValidatedServerBase(
  */
 export function resolveProblemRevisionConflict(
   problemId: string,
-  action: 'accept_server' | 'prepare_rebase_edit',
+  action: ProblemConflictResolutionAction,
   params: {
     scopeId?: string;
     revisionId?: string;
@@ -4502,7 +4811,7 @@ export function resolveProblemRevisionConflict(
       memoryOnly: false,
       revisionCleared: false,
       needsRetry: false,
-      updatedProblems: loadStoredProblems(),
+      updatedProblems: Object.values(getScopedLastKnownProblemsMap()),
       revision: null,
       message: '계정 범위가 변경되어 충돌 해결을 중단했습니다.',
     };
@@ -4532,15 +4841,41 @@ export function resolveProblemRevisionConflict(
       memoryOnly: !persistedUnsaved && Boolean(memoryUnsaved),
       revisionCleared: false,
       needsRetry: false,
-      updatedProblems: loadStoredProblems(),
+      updatedProblems: Object.values(getScopedLastKnownProblemsMap()),
       revision: currentUnsaved,
-      message: '더 최신 편집 내용이 존재하여 이전 충돌 해결 요청을 적용하지 않았습니다.',
+      message:
+        '더 최신 편집 내용이 존재하여 이전 충돌 해결 요청을 적용하지 않았습니다. [저장 결과 다시 확인]으로 최신 상태를 확인해 주세요.',
     };
   }
 
-  const currentList = loadStoredProblems();
+  const problemsRead = readStoredProblemsForWrite();
+  if (
+    problemsRead.status === 'read_error' &&
+    (action === 'accept_server' || action === 'retry_cleanup')
+  ) {
+    const fallbackKnown = Object.values(getScopedLastKnownProblemsMap());
+    return {
+      ok: false,
+      status: action === 'retry_cleanup' ? 'body_verify_failed' : 'body_save_failed',
+      action,
+      bodyPersisted: false,
+      bodyVerified: false,
+      revisionPersisted: Boolean(persistedUnsaved),
+      memorySaved: Boolean(memoryUnsaved),
+      memoryOnly: !persistedUnsaved && Boolean(memoryUnsaved),
+      revisionCleared: false,
+      needsRetry: true,
+      updatedProblems: fallbackKnown,
+      revision: currentUnsaved,
+      message: `${problemsRead.error} 다른 문제 손실을 방지하기 위해 목록 덮어쓰기와 보호 수정본 삭제를 모두 중단했습니다. 다시 시도해 주세요.`,
+    };
+  }
+
+  const currentList = problemsRead.status === 'ok' ? problemsRead.problems : [];
   const localCurrent =
-    currentList.find((p) => p.id === problemId) ?? getInMemoryProblem(problemId);
+    currentList.find((p) => p.id === problemId) ??
+    getInMemoryProblem(problemId) ??
+    getLastKnownProblem(problemId);
 
   const validatedBase = extractValidatedServerBase(
     problemId,
@@ -4573,6 +4908,54 @@ export function resolveProblemRevisionConflict(
     serverVersion: serverVer,
     snapshot: validatedBaseSnapshot,
   } = validatedBase;
+
+  if (action === 'retry_cleanup') {
+    const persistedTarget =
+      problemsRead.status === 'ok'
+        ? currentList.find((p) => p.id === problemId)
+        : undefined;
+    const isPersistedBodyStillMatchingServer = Boolean(
+      persistedTarget &&
+        persistedTarget.id === problemId &&
+        persistedTarget.subjectId === authoritativeSource.subjectId &&
+        persistedTarget.version === serverVer &&
+        persistedTarget.serverConfirmedVersion === serverVer &&
+        isCompleteProblemSnapshot(persistedTarget) &&
+        snapshotEvaluationMatchesProblem(authoritativeSource, persistedTarget)
+    );
+
+    if (!isPersistedBodyStillMatchingServer) {
+      return {
+        ok: false,
+        status: 'stale_revision_aborted',
+        action: 'retry_cleanup',
+        bodyPersisted: false,
+        bodyVerified: false,
+        revisionPersisted: Boolean(persistedUnsaved),
+        memorySaved: Boolean(memoryUnsaved),
+        memoryOnly: !persistedUnsaved && Boolean(memoryUnsaved),
+        revisionCleared: false,
+        needsRetry: false,
+        updatedProblems: currentList,
+        revision: currentUnsaved,
+        message:
+          '다른 탭이나 작업에서 영속 문제 본문이 변경되어 보호 기록 정리를 중단했습니다. 변경된 본문과 보호 수정본은 그대로 보존되었으니 [저장 결과 다시 확인]으로 최신 상태를 먼저 확인해 주세요.',
+      };
+    }
+
+    return performConditionalRevisionCleanup(
+      problemId,
+      'retry_cleanup',
+      params.scopeId,
+      currentUnsaved,
+      persistedUnsaved,
+      memoryUnsaved,
+      authoritativeSource,
+      validatedBaseSnapshot,
+      serverVer,
+      currentList
+    );
+  }
 
   if (action === 'accept_server') {
     const cleanedHistory = (localCurrent!.versionHistory || [])
@@ -4626,17 +5009,20 @@ export function resolveProblemRevisionConflict(
         memoryOnly: !persistedUnsaved && Boolean(memoryUnsaved),
         revisionCleared: false,
         needsRetry: true,
-        updatedProblems: loadStoredProblems(),
+        updatedProblems: currentList,
         revision: currentUnsaved,
         message: `서버 확정 내용(v${serverVer})을 브라우저 영속 저장소에 기록하지 못했습니다. 기존 문제 본문과 내 보호 수정본은 그대로 유지되었으니 저장 공간을 확인한 뒤 다시 시도해 주세요.`,
       };
     }
 
-    // Read-back verification of problem body, version, identity, and evaluation fields
-    const reloadedProblems = loadStoredProblems();
+    // Read-back verification of problem body, version, identity, list count, and evaluation fields
+    const reloadedRead = readStoredProblemsForWrite();
+    const reloadedProblems = reloadedRead.status === 'ok' ? reloadedRead.problems : [];
     const reloadedTarget = reloadedProblems.find((p) => p.id === problemId);
     const isReadBackVerified = Boolean(
-      reloadedTarget &&
+      reloadedRead.status === 'ok' &&
+        reloadedProblems.length === updatedList.length &&
+        reloadedTarget &&
         reloadedTarget.id === problemId &&
         reloadedTarget.subjectId === expectedServerProblem.subjectId &&
         reloadedTarget.version === serverVer &&
@@ -4668,126 +5054,18 @@ export function resolveProblemRevisionConflict(
 
     recordLastKnownProblems(reloadedProblems);
 
-    // Re-check scope and target revision right before deleting the protected revision
-    if (params.scopeId && params.scopeId !== getStorageScopeId()) {
-      return {
-        ok: false,
-        status: 'scope_changed',
-        action: 'accept_server',
-        bodyPersisted: true,
-        bodyVerified: true,
-        revisionPersisted: Boolean(persistedUnsaved),
-        memorySaved: Boolean(memoryUnsaved),
-        memoryOnly: false,
-        revisionCleared: false,
-        needsRetry: false,
-        updatedProblems: reloadedProblems,
-        revision: null,
-        message: '계정 범위가 변경되어 보호 수정본 정리를 중단했습니다.',
-      };
-    }
-
-    const latestBeforeClear = resolveLatestProblemRevision(
-      getUnsavedProblemRevision(problemId),
-      getInMemoryProblemRevision(problemId)
-    ).latest;
-    if (
-      latestBeforeClear &&
-      !isMatchingTargetRevision(
-        latestBeforeClear,
-        currentUnsaved.revisionId,
-        currentUnsaved.generation
-      )
-    ) {
-      return {
-        ok: false,
-        status: 'stale_revision_aborted',
-        action: 'accept_server',
-        bodyPersisted: true,
-        bodyVerified: true,
-        revisionPersisted: Boolean(getUnsavedProblemRevision(problemId)),
-        memorySaved: Boolean(getInMemoryProblemRevision(problemId)),
-        memoryOnly: false,
-        revisionCleared: false,
-        needsRetry: false,
-        updatedProblems: reloadedProblems,
-        revision: latestBeforeClear,
-        message: '중간에 생성된 더 최신 편집 내용을 보호하기 위해 수정본 삭제를 중단했습니다.',
-      };
-    }
-
-    clearInMemoryProblem(problemId, { version: serverVer, serverConfirmedVersion: serverVer });
-
-    const targetRevId = currentUnsaved.revisionId;
-    const targetGen = currentUnsaved.generation;
-    const persistedBeforeClear = getUnsavedProblemRevision(problemId);
-    const hasTargetPersisted = Boolean(
-      persistedBeforeClear &&
-        (!targetRevId || persistedBeforeClear.revisionId === targetRevId) &&
-        (targetGen === undefined || (persistedBeforeClear.generation ?? 0) <= targetGen)
+    return performConditionalRevisionCleanup(
+      problemId,
+      'accept_server',
+      params.scopeId,
+      currentUnsaved,
+      persistedUnsaved,
+      memoryUnsaved,
+      authoritativeSource,
+      validatedBaseSnapshot,
+      serverVer,
+      reloadedProblems
     );
-
-    let clearOk = true;
-    if (hasTargetPersisted) {
-      clearOk = clearUnsavedProblemRevision(problemId, {
-        revisionId: targetRevId,
-        generation: targetGen,
-      });
-    }
-    const remainingPersisted = getUnsavedProblemRevision(problemId);
-    const stillHasTargetPersisted = Boolean(
-      remainingPersisted &&
-        (!targetRevId || remainingPersisted.revisionId === targetRevId) &&
-        (targetGen === undefined || (remainingPersisted.generation ?? 0) <= targetGen)
-    );
-
-    if (!clearOk || stillHasTargetPersisted) {
-      const partialRev: UnsavedProblemRevision = {
-        ...(remainingPersisted ?? currentUnsaved),
-        serverLatestSummary:
-          currentUnsaved.serverLatestSummary ?? authoritativeSource,
-        serverSnapshotSummary:
-          currentUnsaved.serverSnapshotSummary ?? validatedBaseSnapshot,
-        syncError: `서버 확정 본문(v${serverVer})은 로컬에 반영·검증되었으나, 보호 수정본 임시 기록 정리에 실패했습니다(부분 완료). [보호 기록 정리 재시도]를 눌러 완료해 주세요.`,
-      };
-      setInMemoryProblemRevision(partialRev);
-      return {
-        ok: false,
-        status: 'partial_cleanup_failed',
-        action: 'accept_server',
-        bodyPersisted: true,
-        bodyVerified: true,
-        revisionPersisted: true,
-        memorySaved: true,
-        memoryOnly: false,
-        revisionCleared: false,
-        needsRetry: true,
-        updatedProblems: reloadedProblems,
-        revision: partialRev,
-        message: `서버 확정 본문(v${serverVer})은 로컬에 반영·검증되었으나 보호 수정본 기록 정리에 실패했습니다(부분 완료). 다시 시도하면 보호 기록만 안전하게 정리됩니다.`,
-      };
-    }
-
-    clearInMemoryProblemRevision(problemId, {
-      revisionId: targetRevId,
-      generation: targetGen,
-    });
-
-    return {
-      ok: true,
-      status: 'complete',
-      action: 'accept_server',
-      bodyPersisted: true,
-      bodyVerified: true,
-      revisionPersisted: false,
-      memorySaved: false,
-      memoryOnly: false,
-      revisionCleared: true,
-      needsRetry: false,
-      updatedProblems: reloadedProblems,
-      revision: null,
-      message: `서버 확정 내용(v${serverVer})을 채택하여 동기화했습니다.`,
-    };
   }
 
   // 'prepare_rebase_edit': re-anchor local edits onto the verified server version for explicit review/save.

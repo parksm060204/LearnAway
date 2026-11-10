@@ -283,6 +283,13 @@ export function isCompleteProblemSnapshot(
   if (!Array.isArray(candidate.rubric) || candidate.rubric.length === 0) {
     return false;
   }
+  for (const item of candidate.rubric) {
+    if (!item || typeof item !== 'object') return false;
+    const rec = item as unknown as Record<string, unknown>;
+    const rawScore = rec.maxScore !== undefined && rec.maxScore !== null ? rec.maxScore : rec.points;
+    const scoreNum = rawScore !== undefined && rawScore !== null ? Number(rawScore) : NaN;
+    if (!Number.isFinite(scoreNum)) return false;
+  }
   return true;
 }
 

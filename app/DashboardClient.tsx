@@ -3078,7 +3078,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   // Explicit resolution for Case C mismatches and version conflicts.
   const handleResolveProblemRevisionConflict = (
     problemId: string,
-    action: 'accept_server' | 'prepare_rebase_edit',
+    action: 'accept_server' | 'prepare_rebase_edit' | 'retry_cleanup',
     expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
   ): ResolveProblemRevisionConflictResult => {
     const pinnedScopeId = getStorageScopeId();

@@ -29,11 +29,13 @@ import {
   recordProblemRevisionVerificationPending,
   recordProblemRevisionMismatchConflict,
   resolveProblemRevisionConflict,
+  buildConflictResolutionRequest,
   isConflictResolutionComplete,
   isConflictResolutionPartial,
   canOpenEditorAfterRebasePrepare,
   getEffectiveUnsavedProblemRevision,
   type ConfirmProblemRevisionSyncStatus,
+  type ProblemConflictResolutionAction,
   type ResolveProblemRevisionConflictStatus,
   type ResolveProblemRevisionConflictResult,
 } from './storage';
@@ -1196,9 +1198,11 @@ function finalizeReadOnlyVerificationResult(params: {
 
 export {
   resolveProblemRevisionConflict,
+  buildConflictResolutionRequest,
   isConflictResolutionComplete,
   isConflictResolutionPartial,
   canOpenEditorAfterRebasePrepare,
+  type ProblemConflictResolutionAction,
   type ResolveProblemRevisionConflictStatus,
   type ResolveProblemRevisionConflictResult,
 };
