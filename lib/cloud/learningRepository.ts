@@ -946,37 +946,268 @@ function buildSnapshotFromProblem(problem: Problem, version: number): ProblemVer
   };
 }
 
+export type ReviseProblemFailureReason =
+  | 'read_error'
+  | 'snapshot_missing'
+  | 'snapshot_incomplete'
+  | 'content_mismatch';
+
 export type ReviseProblemVerificationStatus =
   | 'verified_current'
   | 'verified_snapshot_only'
   | 'verification_failed';
 
+export type ReviseProblemOutcome =
+  | 'verified_current'
+  | 'verified_snapshot_only'
+  | 'verification_failed'
+  | 'save_uncertain'
+  | 'save_failed';
+
+export type ReviseProblemVerifiedResult = {
+  outcome: 'verified_current' | 'verified_snapshot_only';
+  ok: true;
+  savedToServer: true;
+  contentVerified: true;
+  verificationStatus: 'verified_current' | 'verified_snapshot_only';
+  /** Authoritative problem state built from verified server data at `confirmedVersion`. */
+  data: Problem;
+  confirmedVersion: number;
+  confirmedSnapshot: ProblemVersionSnapshot;
+  /** Latest server problem row (may have a higher version if another request succeeded afterwards). */
+  latestServerProblem: Problem | null;
+  serverAdvancedBeyondConfirmed: boolean;
+};
+
+export type ReviseProblemVerificationFailedResult = {
+  outcome: 'verification_failed';
+  /** Verification failure never masquerades as full completion (`ok: true`) and never exposes request-derived `data`. */
+  ok: false;
+  savedToServer: true;
+  contentVerified: false;
+  verificationStatus: 'verification_failed';
+  verificationFailureReason: ReviseProblemFailureReason;
+  verificationError: string;
+  confirmedVersion: number;
+  serverSnapshot: ProblemVersionSnapshot | null;
+  latestServerProblem: Problem | null;
+  serverAdvancedBeyondConfirmed: boolean;
+  error: string;
+  data?: never;
+};
+
 export type ReviseProblemRepoResult =
+  | ReviseProblemVerifiedResult
+  | ReviseProblemVerificationFailedResult
   | {
-      ok: true;
-      /** Authoritative problem state at the exact version confirmed by THIS request (`confirmedVersion`). */
-      data: Problem;
-      confirmedVersion: number;
-      confirmedSnapshot: ProblemVersionSnapshot;
-      /** Latest server problem row if available (may have a higher version if another request succeeded afterwards). */
-      latestServerProblem: Problem | null;
-      serverAdvancedBeyondConfirmed: boolean;
-      savedToServer: true;
-      verificationStatus: ReviseProblemVerificationStatus;
-      verificationError?: string;
+      outcome: 'save_uncertain';
+      ok: false;
+      savedToServer: 'unknown';
+      contentVerified: false;
+      verificationStatus: 'save_uncertain';
+      error: string;
+      data?: never;
     }
   | {
+      outcome: 'save_failed';
       ok: false;
-      error: string;
       savedToServer: false;
+      contentVerified: false;
+      verificationStatus: 'save_failed';
+      error: string;
+      data?: never;
     };
+
+function isUncertainTransportError(error: unknown): boolean {
+  const code = approvalErrorCode(
+    error && typeof error === 'object' ? (error as { message?: string; code?: string }) : null
+  );
+  // Explicit business/auth/config rejections are known not to have committed.
+  if (
+    code === 'version_conflict' ||
+    code === 'missing' ||
+    code === 'forbidden' ||
+    code === 'not_configured' ||
+    code === 'incomplete' ||
+    code === 'no_concept' ||
+    code === 'id_conflict' ||
+    code === 'rubric' ||
+    code === 'scope'
+  ) {
+    return false;
+  }
+  const msg =
+    error instanceof Error
+      ? error.message
+      : error && typeof error === 'object' && 'message' in error
+        ? String((error as { message?: unknown }).message ?? '')
+        : String(error ?? '');
+  return /failed to fetch|fetch failed|network|timeout|timed out|econnreset|etimedout|enotfound|econnrefused|aborted|abort|bad gateway|service unavailable|gateway timeout|502|503|504|unexpected end of json/i.test(
+    msg
+  );
+}
+
+/**
+ * Shared read-only server verification helper used both right after `revise_problem_with_snapshot`
+ * and during user-triggered/background "저장 결과 다시 확인" recovery.
+ * NEVER fabricates missing snapshot fields from `submittedProblem` and NEVER mutates the database.
+ */
+export async function verifyProblemVersionSnapshotOnServer(
+  supabase: SupabaseClient,
+  problemId: string,
+  confirmedVersion: number,
+  submittedProblem: Problem,
+  options?: {
+    atomicSnapshot?: ProblemVersionSnapshot | null;
+    atomicProblem?: Problem | null;
+  }
+): Promise<ReviseProblemVerifiedResult | ReviseProblemVerificationFailedResult> {
+  const [snapRes, latestRes] = await Promise.all([
+    options?.atomicSnapshot
+      ? Promise.resolve(repoOk<ProblemVersionSnapshot | null>(options.atomicSnapshot))
+      : getProblemVersionSnapshot(supabase, problemId, confirmedVersion),
+    options?.atomicProblem
+      ? Promise.resolve(repoOk<Problem | null>(options.atomicProblem))
+      : getProblemById(supabase, problemId),
+  ]);
+
+  const immutableSnap = snapRes.ok && snapRes.data ? snapRes.data : null;
+  const latestServerProblem = latestRes.ok && latestRes.data ? latestRes.data : null;
+  const latestServerVer = latestServerProblem?.version ?? confirmedVersion;
+  const serverAdvancedBeyondConfirmed = Boolean(
+    latestServerProblem && latestServerVer > confirmedVersion
+  );
+
+  const fail = (
+    reason: ReviseProblemFailureReason,
+    errMsg: string
+  ): ReviseProblemVerificationFailedResult => ({
+    outcome: 'verification_failed',
+    ok: false,
+    savedToServer: true,
+    contentVerified: false,
+    verificationStatus: 'verification_failed',
+    verificationFailureReason: reason,
+    verificationError: errMsg,
+    confirmedVersion,
+    serverSnapshot: immutableSnap,
+    latestServerProblem,
+    serverAdvancedBeyondConfirmed,
+    error: errMsg,
+  });
+
+  if (!snapRes.ok) {
+    return fail('read_error', snapRes.error || '확정 버전 스냅샷 조회에 실패했습니다.');
+  }
+
+  if (immutableSnap !== null) {
+    if (!isCompleteProblemSnapshot(immutableSnap)) {
+      return fail(
+        'snapshot_incomplete',
+        '확정 버전 스냅샷의 필수 평가 필드가 누락되어 검증에 실패했습니다.'
+      );
+    }
+    if (!snapshotEvaluationMatchesProblem(submittedProblem, immutableSnap)) {
+      return fail(
+        'content_mismatch',
+        '서버 확정 버전 스냅샷 내용이 요청한 수정본과 일치하지 않습니다.'
+      );
+    }
+  }
+
+  if (!latestRes.ok) {
+    return fail('read_error', latestRes.error || '수정된 문제를 다시 조회하지 못했습니다.');
+  }
+  if (!latestServerProblem) {
+    return fail(
+      immutableSnap === null ? 'snapshot_missing' : 'read_error',
+      '서버에서 수정된 문제 행을 조회하지 못했습니다.'
+    );
+  }
+
+  if (immutableSnap === null) {
+    return fail(
+      'snapshot_missing',
+      serverAdvancedBeyondConfirmed
+        ? '서버가 후속 버전으로 진행되었으나 확정 버전 스냅샷이 누락되어 검증에 실패했습니다.'
+        : '확정 버전 스냅샷이 누락되어 저장 결과를 검증할 수 없습니다.'
+    );
+  }
+
+  if (!serverAdvancedBeyondConfirmed) {
+    if (!isCompleteProblemSnapshot(latestServerProblem)) {
+      return fail(
+        'snapshot_incomplete',
+        '서버 문제 본문의 필수 평가 필드가 누락되어 검증에 실패했습니다.'
+      );
+    }
+    if (!snapshotEvaluationMatchesProblem(submittedProblem, latestServerProblem)) {
+      return fail(
+        'content_mismatch',
+        '서버의 현재 버전 내용이 요청한 수정본과 일치하지 않습니다.'
+      );
+    }
+    const verifiedSnapshot: ProblemVersionSnapshot = {
+      ...buildSnapshotFromProblem(latestServerProblem, confirmedVersion),
+      ...immutableSnap,
+      version: confirmedVersion,
+    };
+    const verifiedProblem: Problem = {
+      ...latestServerProblem,
+      ...immutableSnap,
+      id: problemId,
+      version: confirmedVersion,
+      serverConfirmedVersion: confirmedVersion,
+      reports: latestServerProblem.reports ?? [],
+    };
+    return {
+      outcome: 'verified_current',
+      ok: true,
+      savedToServer: true,
+      contentVerified: true,
+      verificationStatus: 'verified_current',
+      data: verifiedProblem,
+      confirmedVersion,
+      confirmedSnapshot: verifiedSnapshot,
+      latestServerProblem,
+      serverAdvancedBeyondConfirmed: false,
+    };
+  }
+
+  // Server already advanced beyond `confirmedVersion`: build verifiedProblem strictly from
+  // verified `immutableSnap` + authoritative server metadata on `latestServerProblem` (never from request).
+  const verifiedSnapshot: ProblemVersionSnapshot = {
+    ...immutableSnap,
+    version: confirmedVersion,
+  };
+  const verifiedProblem: Problem = {
+    ...latestServerProblem,
+    ...immutableSnap,
+    id: problemId,
+    subjectId: latestServerProblem.subjectId,
+    version: confirmedVersion,
+    serverConfirmedVersion: confirmedVersion,
+    reports: latestServerProblem.reports ?? [],
+  };
+
+  return {
+    outcome: 'verified_snapshot_only',
+    ok: true,
+    savedToServer: true,
+    contentVerified: true,
+    verificationStatus: 'verified_snapshot_only',
+    data: verifiedProblem,
+    confirmedVersion,
+    confirmedSnapshot: verifiedSnapshot,
+    latestServerProblem,
+    serverAdvancedBeyondConfirmed: true,
+  };
+}
 
 /**
  * Revises a problem via `public.revise_problem_with_snapshot`:
- * writes a new immutable version in one transaction and binds the returned `data`
- * strictly to the `confirmedVersion` and `confirmedSnapshot` produced by THIS request,
- * while keeping `latestServerProblem` distinct and separating server save success
- * (`savedToServer: true`) from post-save verification failure (`verificationStatus: 'verification_failed'`).
+ * writes a new immutable version in one transaction and verifies BOTH the confirmed
+ * version snapshot and authoritative server content before returning `ok: true`.
  */
 export async function reviseProblem(
   supabase: SupabaseClient,
@@ -987,10 +1218,13 @@ export async function reviseProblem(
   try {
     if (typeof supabase.rpc !== 'function') {
       return {
+        outcome: 'save_failed',
         ok: false,
+        savedToServer: false,
+        contentVerified: false,
+        verificationStatus: 'save_failed',
         error:
           'not_configured:RPC_NOT_CONFIGURED: 문제 수정 RPC(revise_problem_with_snapshot)가 설정되지 않았습니다.',
-        savedToServer: false,
       };
     }
 
@@ -1000,10 +1234,23 @@ export async function reviseProblem(
       p_problem: problem as unknown as Record<string, unknown>,
     });
     if (error) {
+      if (isUncertainTransportError(error)) {
+        return {
+          outcome: 'save_uncertain',
+          ok: false,
+          savedToServer: 'unknown',
+          contentVerified: false,
+          verificationStatus: 'save_uncertain',
+          error: `save_uncertain:${error.message || '네트워크 오류로 서버 반영 여부를 확인할 수 없습니다.'}`,
+        };
+      }
       return {
+        outcome: 'save_failed',
         ok: false,
-        error: `${approvalErrorCode(error)}:${error.message}`,
         savedToServer: false,
+        contentVerified: false,
+        verificationStatus: 'save_failed',
+        error: `${approvalErrorCode(error)}:${error.message}`,
       };
     }
 
@@ -1069,189 +1316,38 @@ export async function reviseProblem(
     // Never guess expectedVersion + 1 when the RPC return value is missing or malformed.
     if (confirmedVersion === null) {
       return {
+        outcome: 'save_failed',
         ok: false,
+        savedToServer: false,
+        contentVerified: false,
+        verificationStatus: 'save_failed',
         error:
           'invalid_rpc_response:INVALID_RPC_RESPONSE: 문제 수정 RPC 응답에 유효한 확정 버전(confirmedVersion)이 없습니다.',
-        savedToServer: false,
       };
     }
 
-    const fallbackSnapshot = buildSnapshotFromProblem(
-      { ...problem, version: confirmedVersion },
-      confirmedVersion
-    );
-
-    // Only issue follow-up queries for pieces not already returned atomically by `revise_problem_with_snapshot`.
-    const [snapRes, latestRes] = await Promise.all([
-      atomicSnapshot
-        ? Promise.resolve(repoOk<ProblemVersionSnapshot | null>(atomicSnapshot))
-        : getProblemVersionSnapshot(supabase, problemId, confirmedVersion),
-      atomicProblem
-        ? Promise.resolve(repoOk<Problem | null>(atomicProblem))
-        : getProblemById(supabase, problemId),
-    ]);
-
-    const immutableSnap = snapRes.ok && snapRes.data ? snapRes.data : null;
-    const latestServerProblem = latestRes.ok && latestRes.data ? latestRes.data : null;
-    const latestServerVer = latestServerProblem?.version ?? confirmedVersion;
-    const serverAdvancedBeyondConfirmed = Boolean(
-      latestServerProblem && latestServerVer > confirmedVersion
-    );
-
-    // If a snapshot was retrieved (atomically or via follow-up) and fails completeness or content verification:
-    // The RPC transaction ALREADY succeeded (`savedToServer: true`), so report `verification_failed`
-    // rather than falsely reporting `savedToServer: false` or `VERSION_CONFLICT`.
-    if (immutableSnap && !snapshotEvaluationMatchesProblem(problem, immutableSnap)) {
-      const confirmedProblem: Problem = {
-        ...problem,
-        id: problemId,
-        subjectId: problem.subjectId || latestServerProblem?.subjectId || '',
-        version: confirmedVersion,
-        serverConfirmedVersion: confirmedVersion,
-        reports: latestServerProblem?.reports ?? problem.reports ?? [],
-      };
-      return {
-        ok: true,
-        data: confirmedProblem,
-        confirmedVersion,
-        confirmedSnapshot: fallbackSnapshot,
-        latestServerProblem,
-        serverAdvancedBeyondConfirmed,
-        savedToServer: true,
-        verificationStatus: 'verification_failed',
-        verificationError: !isCompleteProblemSnapshot(immutableSnap)
-          ? '확정 버전 스냅샷의 필수 평가 필드가 누락되어 검증에 실패했습니다.'
-          : '확정 버전 스냅샷 내용이 요청한 수정본과 일치하지 않습니다.',
-      };
-    }
-
-    // If post-save problem row is unavailable, report `savedToServer: true` with `verification_failed`.
-    if (!latestServerProblem) {
-      const confirmedSnapshot = immutableSnap
-        ? { ...fallbackSnapshot, ...immutableSnap, version: confirmedVersion }
-        : fallbackSnapshot;
-      const confirmedProblem: Problem = {
-        ...problem,
-        ...(immutableSnap ?? {}),
-        id: problemId,
-        version: confirmedVersion,
-        serverConfirmedVersion: confirmedVersion,
-      };
-      return {
-        ok: true,
-        data: confirmedProblem,
-        confirmedVersion,
-        confirmedSnapshot,
-        latestServerProblem: null,
-        serverAdvancedBeyondConfirmed: false,
-        savedToServer: true,
-        verificationStatus: 'verification_failed',
-        verificationError: !latestRes.ok
-          ? latestRes.error
-          : '수정된 문제를 다시 조회하지 못했습니다.',
-      };
-    }
-
-    if (!serverAdvancedBeyondConfirmed) {
-      // Current server row is at `confirmedVersion`
-      if (!snapshotEvaluationMatchesProblem(problem, latestServerProblem)) {
-        const confirmedSnapshot = immutableSnap
-          ? { ...fallbackSnapshot, ...immutableSnap, version: confirmedVersion }
-          : fallbackSnapshot;
-        const confirmedProblem: Problem = {
-          ...problem,
-          ...(immutableSnap ?? {}),
-          id: problemId,
-          subjectId: problem.subjectId || latestServerProblem.subjectId,
-          version: confirmedVersion,
-          serverConfirmedVersion: confirmedVersion,
-          reports: latestServerProblem.reports ?? problem.reports ?? [],
-        };
-        return {
-          ok: true,
-          data: confirmedProblem,
-          confirmedVersion,
-          confirmedSnapshot,
-          latestServerProblem,
-          serverAdvancedBeyondConfirmed: false,
-          savedToServer: true,
-          verificationStatus: 'verification_failed',
-          verificationError: '서버의 현재 버전 내용이 요청한 수정본과 일치하지 않습니다.',
-        };
-      }
-      const confirmedSnapshot: ProblemVersionSnapshot = immutableSnap
-        ? {
-            ...buildSnapshotFromProblem(latestServerProblem, confirmedVersion),
-            ...immutableSnap,
-            version: confirmedVersion,
-          }
-        : buildSnapshotFromProblem(latestServerProblem, confirmedVersion);
-      const confirmedProblem: Problem = {
-        ...latestServerProblem,
-        ...(immutableSnap ?? {}),
-        id: problemId,
-        version: confirmedVersion,
-        serverConfirmedVersion: confirmedVersion,
-        reports: latestServerProblem.reports ?? problem.reports ?? [],
-      };
-      return {
-        ok: true,
-        data: confirmedProblem,
-        confirmedVersion,
-        confirmedSnapshot,
-        latestServerProblem,
-        serverAdvancedBeyondConfirmed: false,
-        savedToServer: true,
-        verificationStatus: 'verified_current',
-      };
-    }
-
-    // Server already advanced beyond `confirmedVersion` (e.g. Request B wrote v3 after Request A wrote v2).
-    // Strictly return Request A's confirmed version & immutable snapshot (`A/v2`) as `data`,
-    // while exposing `latestServerProblem` (`B/v3`) separately!
-    const confirmedSnapshot: ProblemVersionSnapshot = immutableSnap
-      ? { ...fallbackSnapshot, ...immutableSnap, version: confirmedVersion }
-      : fallbackSnapshot;
-    const confirmedProblem: Problem = {
-      ...problem,
-      ...(immutableSnap ?? {}),
-      id: problemId,
-      subjectId: problem.subjectId || latestServerProblem.subjectId,
-      version: confirmedVersion,
-      serverConfirmedVersion: confirmedVersion,
-      reports: latestServerProblem.reports ?? problem.reports ?? [],
-    };
-
-    if (!immutableSnap) {
-      return {
-        ok: true,
-        data: confirmedProblem,
-        confirmedVersion,
-        confirmedSnapshot,
-        latestServerProblem,
-        serverAdvancedBeyondConfirmed: true,
-        savedToServer: true,
-        verificationStatus: 'verification_failed',
-        verificationError:
-          '서버가 후속 버전으로 진행되었으나 확정 버전 스냅샷을 조회하지 못해 검증에 실패했습니다.',
-      };
-    }
-
-    return {
-      ok: true,
-      data: confirmedProblem,
-      confirmedVersion,
-      confirmedSnapshot,
-      latestServerProblem,
-      serverAdvancedBeyondConfirmed: true,
-      savedToServer: true,
-      verificationStatus: 'verified_snapshot_only',
-    };
+    return verifyProblemVersionSnapshotOnServer(supabase, problemId, confirmedVersion, problem, {
+      atomicSnapshot,
+      atomicProblem,
+    });
   } catch (error) {
+    if (isUncertainTransportError(error)) {
+      return {
+        outcome: 'save_uncertain',
+        ok: false,
+        savedToServer: 'unknown',
+        contentVerified: false,
+        verificationStatus: 'save_uncertain',
+        error: `save_uncertain:${message(error, '네트워크 오류로 서버 반영 여부를 확인할 수 없습니다.')}`,
+      };
+    }
     return {
+      outcome: 'save_failed',
       ok: false,
-      error: message(error, '문제 수정에 실패했습니다.'),
       savedToServer: false,
+      contentVerified: false,
+      verificationStatus: 'save_failed',
+      error: message(error, '문제 수정에 실패했습니다.'),
     };
   }
 }

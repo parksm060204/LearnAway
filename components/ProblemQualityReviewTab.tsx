@@ -10,6 +10,7 @@ import {
   RubricCriterion,
   ProblemQualityReviewResult,
   Material,
+  UnsavedProblemRevision,
 } from '../lib/types';
 import { MathFormula } from './MathFormula';
 import { AcademicMathView } from './AcademicMathView';
@@ -74,6 +75,14 @@ interface ProblemQualityReviewTabProps {
   };
   onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
+  unsavedProblemRevisions?: Record<string, UnsavedProblemRevision>;
+  onRetryVerifyProblemRevision?: (problemId: string) => Promise<void>;
+  onResolveProblemRevisionConflict?: (
+    problemId: string,
+    action: 'accept_server' | 'prepare_rebase_edit',
+    expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
+  ) => { ok: boolean; revision?: UnsavedProblemRevision | null; message?: string };
+  onRetrySaveProblemRevision?: (problemId: string, expectedVersion?: number) => Promise<void>;
 }
 
 export function ProblemQualityReviewTab({
@@ -86,6 +95,10 @@ export function ProblemQualityReviewTab({
   onReviseProblem,
   onReapproveProblem,
   onSuspendProblem,
+  unsavedProblemRevisions,
+  onRetryVerifyProblemRevision,
+  onResolveProblemRevisionConflict,
+  onRetrySaveProblemRevision,
 }: ProblemQualityReviewTabProps) {
   const effectiveUserId = userId || activeSubject?.ownerId || 'default_user';
   // Filter problems for active subject
@@ -144,6 +157,8 @@ export function ProblemQualityReviewTab({
   // Version history expansion state
   const [expandedVersionNum, setExpandedVersionNum] = useState<number | null>(null);
   const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(true);
+  const [isVerifyingRevision, setIsVerifyingRevision] = useState(false);
+  const [showConflictDiff, setShowConflictDiff] = useState(false);
 
   // Filtered problems list
   const filteredProblems = useMemo(() => {
@@ -848,6 +863,20 @@ export function ProblemQualityReviewTab({
                       </div>
                     )}
 
+                    {unsavedProblemRevisions?.[p.id]?.syncStatus === 'verification_pending' && (
+                      <div className="flex items-center gap-1 text-[10px] font-academic-mono text-amber-900 bg-amber-50 border border-amber-300 px-1.5 py-0.5 rounded-2xs mt-0.5 font-semibold">
+                        <RotateCcw className="w-3 h-3 text-amber-600" />
+                        <span>서버 저장 후 확인 필요</span>
+                      </div>
+                    )}
+
+                    {unsavedProblemRevisions?.[p.id]?.syncStatus === 'conflict' && (
+                      <div className="flex items-center gap-1 text-[10px] font-academic-mono text-red-900 bg-red-50 border border-red-300 px-1.5 py-0.5 rounded-2xs mt-0.5 font-semibold">
+                        <ShieldAlert className="w-3 h-3 text-red-600" />
+                        <span>내용 불일치 · 충돌 보존</span>
+                      </div>
+                    )}
+
                     {openReportsCount > 0 && (
                       <div className="flex items-center gap-1 text-[10.5px] font-academic-mono text-red-700 bg-red-50 border border-red-200 px-1.5 py-0.5 rounded-2xs mt-0.5">
                         <ShieldAlert className="w-3 h-3 text-red-600" />
@@ -1021,6 +1050,221 @@ export function ProblemQualityReviewTab({
 
             {/* Detail Scrollable Content */}
             <div className="p-4 sm:p-6 space-y-5">
+              {(() => {
+                const activeUnsavedRev = unsavedProblemRevisions?.[activeProblem.id];
+                if (!activeUnsavedRev || activeUnsavedRev.syncStatus === 'synced') return null;
+
+                const serverCompareTarget =
+                  activeUnsavedRev.serverLatestSummary ??
+                  (activeUnsavedRev.serverSnapshotSummary
+                    ? { ...activeProblem, ...activeUnsavedRev.serverSnapshotSummary }
+                    : activeProblem);
+                const isConflict = activeUnsavedRev.syncStatus === 'conflict';
+                const isVerifPending = activeUnsavedRev.syncStatus === 'verification_pending';
+                const isFailed = activeUnsavedRev.syncStatus === 'failed';
+                const isIncompleteOrMissingSnap =
+                  activeUnsavedRev.verificationFailureReason === 'snapshot_missing' ||
+                  activeUnsavedRev.verificationFailureReason === 'snapshot_incomplete';
+
+                const loadProtectedIntoEditor = (rebased: boolean) => {
+                  const sourceRev =
+                    rebased && onResolveProblemRevisionConflict
+                      ? onResolveProblemRevisionConflict(activeProblem.id, 'prepare_rebase_edit', {
+                          revisionId: activeUnsavedRev.revisionId,
+                          generation: activeUnsavedRev.generation,
+                          serverProblem: activeUnsavedRev.serverLatestSummary ?? null,
+                        })?.revision ?? activeUnsavedRev
+                      : activeUnsavedRev;
+                  setEditTitle(sourceRev.title || activeProblem.title);
+                  setEditPrompt(sourceRev.promptText || activeProblem.promptText);
+                  setEditFormula(sourceRev.mathFormula || '');
+                  setEditCodeSnippet(sourceRev.codeSnippet || '');
+                  setEditAppliedConditionNote(sourceRev.appliedConditionNote || '');
+                  setEditHints([...(sourceRev.hints || [])]);
+                  setEditModelAnswer(sourceRev.modelAnswer || '');
+                  setEditRubric([...(sourceRev.rubric || [])]);
+                  setEditTimeMinutes(sourceRev.timeStandardMinutes || activeProblem.timeStandardMinutes || 20);
+                  setEditReasonText(sourceRev.editReason || '');
+                  setEditValidationError(null);
+                  setEditPartialFailure(false);
+                  setIsEditing(true);
+                };
+
+                return (
+                  <div
+                    role="region"
+                    aria-label="문제 수정본 저장 확인 및 충돌 복구"
+                    className={`p-4 rounded-xs border text-xs space-y-3 shadow-2xs ${
+                      isConflict
+                        ? 'bg-red-50 border-red-300 text-red-950'
+                        : 'bg-amber-50 border-amber-300 text-amber-950'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="flex items-start gap-2">
+                        {isConflict ? (
+                          <ShieldAlert className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                        ) : (
+                          <RotateCcw className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                        )}
+                        <div className="space-y-1">
+                          <h4 className="font-bold font-academic-mono text-xs">
+                            {isConflict
+                              ? '서버 확정 내용과 내 보호 수정본 불일치 (충돌 보존)'
+                              : isIncompleteOrMissingSnap
+                                ? '서버 버전 스냅샷 누락·불완전 — 저장 결과 확인 필요'
+                                : activeUnsavedRev.verificationFailureReason === 'save_uncertain'
+                                  ? '서버 저장 응답 미확인 — 저장 결과 확인 필요'
+                                  : isVerifPending
+                                    ? '서버 저장 후 확인 필요'
+                                    : '서버 동기화 실패 (보호 수정본 유지 중)'}
+                          </h4>
+                          <p className="text-[11.5px] leading-relaxed">
+                            {activeUnsavedRev.syncError ||
+                              '보호 수정본이 로컬에 안전하게 보존되어 있습니다. 아래에서 서버 상태를 다시 확인하거나 명시적으로 해결할 수 있습니다.'}
+                          </p>
+                          <p className="text-[10.5px] font-academic-mono opacity-80">
+                            {activeUnsavedRev.confirmedVersion
+                              ? `확인된 서버 버전: v${activeUnsavedRev.confirmedVersion} · `
+                              : ''}
+                            보호 수정본 사유: {activeUnsavedRev.editReason || '수정본'}
+                            {isVerifPending &&
+                              ' · 확인 재시도는 서버 재조회만 수행하며 AI 호출이나 중복 저장을 실행하지 않습니다.'}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5 font-academic-mono text-[11px]">
+                        {onRetryVerifyProblemRevision && (isVerifPending || isConflict) && (
+                          <button
+                            type="button"
+                            disabled={isVerifyingRevision}
+                            onClick={async () => {
+                              setIsVerifyingRevision(true);
+                              try {
+                                await onRetryVerifyProblemRevision(activeProblem.id);
+                              } finally {
+                                setIsVerifyingRevision(false);
+                              }
+                            }}
+                            className="px-2.5 py-1.5 bg-[#191817] hover:bg-[#33302b] text-white font-bold rounded-2xs inline-flex items-center gap-1 disabled:opacity-50"
+                          >
+                            {isVerifyingRevision ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <RotateCcw className="w-3 h-3" />
+                            )}
+                            <span>저장 결과 다시 확인</span>
+                          </button>
+                        )}
+
+                        {isFailed && onRetrySaveProblemRevision && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void onRetrySaveProblemRevision(
+                                activeProblem.id,
+                                activeUnsavedRev.baseVersion
+                              )
+                            }
+                            className="px-2.5 py-1.5 bg-[#191817] hover:bg-[#33302b] text-white font-bold rounded-2xs inline-flex items-center gap-1"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            <span>서버에 다시 저장</span>
+                          </button>
+                        )}
+
+                        {isConflict && (
+                          <button
+                            type="button"
+                            onClick={() => setShowConflictDiff((prev) => !prev)}
+                            className="px-2.5 py-1.5 bg-white hover:bg-[#faf8f4] border border-red-300 text-red-900 font-bold rounded-2xs"
+                          >
+                            {showConflictDiff ? '차이 비교 닫기' : '서버 vs 로컬 차이 비교'}
+                          </button>
+                        )}
+
+                        {(isConflict || isIncompleteOrMissingSnap || isFailed || isVerifPending) && (
+                          <button
+                            type="button"
+                            onClick={() => loadProtectedIntoEditor(isConflict)}
+                            className="px-2.5 py-1.5 bg-white hover:bg-[#faf8f4] border border-[#ded6c8] text-[#191817] font-bold rounded-2xs"
+                          >
+                            {isConflict
+                              ? '내 수정본 편집기에서 열기 (새 버전 저장)'
+                              : '보호 수정본 편집기에서 열기'}
+                          </button>
+                        )}
+
+                        {isConflict && onResolveProblemRevisionConflict && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onResolveProblemRevisionConflict(activeProblem.id, 'accept_server', {
+                                revisionId: activeUnsavedRev.revisionId,
+                                generation: activeUnsavedRev.generation,
+                                serverProblem: serverCompareTarget,
+                              })
+                            }
+                            className="px-2.5 py-1.5 bg-white hover:bg-red-100 border border-red-300 text-red-800 rounded-2xs"
+                          >
+                            서버 확정 내용 채택 (내 수정본 폐기)
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {isConflict && showConflictDiff && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-red-200">
+                        <div className="p-3 bg-white border border-red-200 rounded-xs space-y-1.5">
+                          <div className="font-academic-mono font-bold text-[11px] text-red-900">
+                            서버 확정 내용 (v{serverCompareTarget.version ?? activeUnsavedRev.confirmedVersion ?? '?'})
+                          </div>
+                          <div>
+                            <span className="text-[10.5px] font-academic-mono text-[#827d73]">제목: </span>
+                            <span className="font-bold">{serverCompareTarget.title || '(비어 있음)'}</span>
+                          </div>
+                          <div>
+                            <span className="text-[10.5px] font-academic-mono text-[#827d73] block">지문:</span>
+                            <p className="whitespace-pre-wrap text-[11px] bg-[#faf8f4] p-2 rounded-2xs border border-[#ded6c8]">
+                              {serverCompareTarget.promptText || '(비어 있음)'}
+                            </p>
+                          </div>
+                          <div>
+                            <span className="text-[10.5px] font-academic-mono text-[#827d73] block">모범 답안:</span>
+                            <p className="whitespace-pre-wrap text-[11px] bg-[#faf8f4] p-2 rounded-2xs border border-[#ded6c8]">
+                              {serverCompareTarget.modelAnswer || '(비어 있음)'}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="p-3 bg-white border border-amber-300 rounded-xs space-y-1.5">
+                          <div className="font-academic-mono font-bold text-[11px] text-amber-900">
+                            내 보호 수정본 (목표 v{activeUnsavedRev.revisionVersion})
+                          </div>
+                          <div>
+                            <span className="text-[10.5px] font-academic-mono text-[#827d73]">제목: </span>
+                            <span className="font-bold">{activeUnsavedRev.title}</span>
+                          </div>
+                          <div>
+                            <span className="text-[10.5px] font-academic-mono text-[#827d73] block">지문:</span>
+                            <p className="whitespace-pre-wrap text-[11px] bg-[#faf8f4] p-2 rounded-2xs border border-[#ded6c8]">
+                              {activeUnsavedRev.promptText}
+                            </p>
+                          </div>
+                          <div>
+                            <span className="text-[10.5px] font-academic-mono text-[#827d73] block">모범 답안:</span>
+                            <p className="whitespace-pre-wrap text-[11px] bg-[#faf8f4] p-2 rounded-2xs border border-[#ded6c8]">
+                              {activeUnsavedRev.modelAnswer}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {(activeProblem.needsSourceReview || activeProblem.isOutdated) && (
                 <div className="p-3 bg-amber-50 border border-amber-300 rounded-xs text-xs text-amber-900 flex items-start gap-2 shadow-2xs">
                   <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />

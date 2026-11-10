@@ -726,6 +726,22 @@ export interface ProblemVersionSnapshot {
   sourceVerificationStatus?: SourceVerificationStatus;
 }
 
+export type ProblemRevisionVerificationFailureReason =
+  | 'read_error'
+  | 'snapshot_missing'
+  | 'snapshot_incomplete'
+  | 'content_mismatch'
+  | 'save_uncertain';
+
+export interface UnsavedProblemRevisionPriorVerification {
+  revisionId?: string;
+  generation?: number;
+  confirmedVersion: number;
+  submittedProblem: Problem;
+  editReason?: string;
+  reason: ProblemRevisionVerificationFailureReason;
+}
+
 export interface UnsavedProblemRevision {
   problemId: string;
   revisionId?: string;
@@ -745,8 +761,14 @@ export interface UnsavedProblemRevision {
   appliedConditionNote?: string;
   editReason: string;
   revisedAt: string;
-  syncStatus: 'pending' | 'syncing' | 'failed' | 'conflict' | 'synced';
+  syncStatus: 'pending' | 'syncing' | 'verification_pending' | 'failed' | 'conflict' | 'synced';
   syncError?: string;
+  confirmedVersion?: number;
+  verificationFailureReason?: ProblemRevisionVerificationFailureReason;
+  saveConfirmedOnServer?: boolean;
+  serverSnapshotSummary?: ProblemVersionSnapshot;
+  serverLatestSummary?: Problem;
+  pendingPriorVerification?: UnsavedProblemRevisionPriorVerification;
   baseSnapshot?: ProblemVersionSnapshot;
 }
 

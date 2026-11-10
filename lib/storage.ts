@@ -23,6 +23,8 @@ import {
   toAcademicDifficultyLevel,
   SourceVerificationStatus,
   UnsavedProblemRevision,
+  UnsavedProblemRevisionPriorVerification,
+  ProblemRevisionVerificationFailureReason,
   ConceptScheduleAdjustment,
 } from './types';
 
@@ -2069,8 +2071,46 @@ export function editAndReviseProblem(
   const existingUnsaved = resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved).latest;
   const isUnsyncedEdit = Boolean(
     existingUnsaved &&
-    (existingUnsaved.syncStatus === 'pending' || existingUnsaved.syncStatus === 'failed' || existingUnsaved.syncStatus === 'syncing')
+    (existingUnsaved.syncStatus === 'pending' ||
+      existingUnsaved.syncStatus === 'failed' ||
+      existingUnsaved.syncStatus === 'syncing' ||
+      existingUnsaved.syncStatus === 'verification_pending')
   );
+  const carriedPriorVerification: UnsavedProblemRevisionPriorVerification | undefined = (() => {
+    if (!existingUnsaved) return undefined;
+    if (
+      existingUnsaved.syncStatus === 'verification_pending' &&
+      typeof existingUnsaved.confirmedVersion === 'number' &&
+      existingUnsaved.confirmedVersion > existingUnsaved.baseVersion
+    ) {
+      return {
+        revisionId: existingUnsaved.revisionId,
+        generation: existingUnsaved.generation,
+        confirmedVersion: existingUnsaved.confirmedVersion,
+        submittedProblem: {
+          ...target,
+          title: existingUnsaved.title,
+          promptText: existingUnsaved.promptText,
+          type: existingUnsaved.type ?? target.type,
+          conceptIds: existingUnsaved.conceptIds ?? target.conceptIds,
+          mathFormula: existingUnsaved.mathFormula,
+          codeSnippet: existingUnsaved.codeSnippet,
+          hints: existingUnsaved.hints,
+          modelAnswer: existingUnsaved.modelAnswer,
+          rubric: existingUnsaved.rubric,
+          timeStandardMinutes: existingUnsaved.timeStandardMinutes ?? target.timeStandardMinutes,
+          appliedConditionNote:
+            existingUnsaved.appliedConditionNote !== undefined
+              ? existingUnsaved.appliedConditionNote
+              : target.appliedConditionNote,
+          version: existingUnsaved.confirmedVersion,
+        },
+        editReason: existingUnsaved.editReason,
+        reason: existingUnsaved.verificationFailureReason ?? 'read_error',
+      };
+    }
+    return existingUnsaved.pendingPriorVerification;
+  })();
 
   // Detect if previous attempt was an explicit partial_problem_only save
   // (problem body updated in storage with localUnrecordedBaseVersion, while unsaved revision failed to persist).
@@ -2197,6 +2237,7 @@ export function editAndReviseProblem(
     editReason: trimmedReason,
     revisedAt: now,
     syncStatus: 'pending',
+    pendingPriorVerification: carriedPriorVerification,
     baseSnapshot,
   };
 
@@ -3329,10 +3370,14 @@ function revisionRecordMatches(a: UnsavedProblemRevision, b: UnsavedProblemRevis
     a.baseVersion === b.baseVersion &&
     a.revisionVersion === b.revisionVersion &&
     a.syncStatus === b.syncStatus &&
+    (a.confirmedVersion ?? 0) === (b.confirmedVersion ?? 0) &&
+    (a.verificationFailureReason ?? '') === (b.verificationFailureReason ?? '') &&
+    Boolean(a.saveConfirmedOnServer) === Boolean(b.saveConfirmedOnServer) &&
+    (a.syncError ?? '') === (b.syncError ?? '') &&
     a.title === b.title &&
     a.promptText === b.promptText &&
     a.modelAnswer === b.modelAnswer &&
-    (a.appliedConditionNote ?? '') === (a.appliedConditionNote ?? '') &&
+    (a.appliedConditionNote ?? '') === (b.appliedConditionNote ?? '') &&
     (a.mathFormula ?? '') === (b.mathFormula ?? '') &&
     (a.codeSnippet ?? '') === (b.codeSnippet ?? '') &&
     (a.timeStandardMinutes ?? 0) === (b.timeStandardMinutes ?? 0)
@@ -3496,8 +3541,26 @@ export function confirmProblemRevisionSynced(
     snapshotProblem?: Problem;
     editReason?: string;
     scopeId?: string;
+    verificationStatus?: 'verified_current' | 'verified_snapshot_only' | 'verification_failed';
+    contentVerified?: boolean;
   }
 ): ConfirmProblemRevisionSyncOutcome {
+  // Defensive invariant: verification_failed / unverified results must NEVER mark a revision synced or clear protected edits.
+  if (
+    expected?.verificationStatus === 'verification_failed' ||
+    expected?.contentVerified === false
+  ) {
+    const currentStored = loadStoredProblems();
+    return {
+      status: 'stale_ignored',
+      reconciled: false,
+      advancedInFlightRevision: false,
+      localPersisted: true,
+      revisionCleared: false,
+      updatedProblems: currentStored,
+      message: '서버 내용 검증에 실패한 결과는 동기화 완료로 처리할 수 없어 보호 수정본을 유지했습니다.',
+    };
+  }
   // 0. SCOPE & PROBLEM IDENTITY CHECK:
   if (expected?.scopeId && expected.scopeId !== getStorageScopeId()) {
     const currentStored = loadStoredProblems();
@@ -3709,11 +3772,18 @@ export function confirmProblemRevisionSynced(
     };
     const nextBaseVersion = Math.max(currentUnsaved.baseVersion, confirmedVersion);
     const nextRevVer = Math.max(currentUnsaved.revisionVersion, nextBaseVersion + 1);
+    const clearMatchingPriorVerification =
+      currentUnsaved.pendingPriorVerification &&
+      (!targetRevisionId || currentUnsaved.pendingPriorVerification.revisionId === targetRevisionId) &&
+      currentUnsaved.pendingPriorVerification.confirmedVersion <= confirmedVersion;
     const updatedInFlightRev: UnsavedProblemRevision = {
       ...currentUnsaved,
       baseVersion: nextBaseVersion,
       revisionVersion: nextRevVer,
       baseSnapshot: confirmedSnapshot,
+      pendingPriorVerification: clearMatchingPriorVerification
+        ? undefined
+        : currentUnsaved.pendingPriorVerification,
     };
     setInMemoryProblemRevision(updatedInFlightRev);
 
@@ -3882,6 +3952,337 @@ export function confirmProblemRevisionSynced(
       : hadTargetPersistedUnsaved && !cleared
         ? '서버에는 저장되었으나 로컬 수정본 임시 기록 정리에 실패했습니다.'
         : '문제 수정본이 서버에 안전하게 저장되었습니다.',
+  };
+}
+
+function isMatchingTargetRevision(
+  currentUnsaved: UnsavedProblemRevision | null,
+  targetRevisionId?: string,
+  targetGeneration?: number
+): currentUnsaved is UnsavedProblemRevision {
+  if (!currentUnsaved) return false;
+  if (targetRevisionId && currentUnsaved.revisionId && currentUnsaved.revisionId !== targetRevisionId) {
+    return false;
+  }
+  if (
+    targetGeneration !== undefined &&
+    currentUnsaved.generation !== undefined &&
+    currentUnsaved.generation > targetGeneration
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Records a pending post-save verification (Case A: read/network error or save_uncertain,
+ * Case B: missing/incomplete snapshot) WITHOUT clearing the protected revision, WITHOUT
+ * fabricating snapshots, and WITHOUT overwriting any newer in-flight edit B.
+ */
+export function recordProblemRevisionVerificationPending(
+  problemId: string,
+  params: {
+    scopeId?: string;
+    targetRevisionId?: string;
+    targetGeneration?: number;
+    confirmedVersion?: number;
+    saveConfirmedOnServer: boolean;
+    reason: ProblemRevisionVerificationFailureReason;
+    errorMessage: string;
+    serverSnapshot?: ProblemVersionSnapshot | null;
+    serverLatestProblem?: Problem | null;
+  }
+): {
+  updated: boolean;
+  preservedNewerRevision: boolean;
+  localPersisted: boolean;
+  revision: UnsavedProblemRevision | null;
+} {
+  if (params.scopeId && params.scopeId !== getStorageScopeId()) {
+    return { updated: false, preservedNewerRevision: false, localPersisted: true, revision: null };
+  }
+  const persistedUnsaved = getUnsavedProblemRevision(problemId);
+  const memoryUnsaved = getInMemoryProblemRevision(problemId);
+  const { latest: currentUnsaved } = resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved);
+
+  if (!isMatchingTargetRevision(currentUnsaved, params.targetRevisionId, params.targetGeneration)) {
+    // A newer revision B exists: preserve B completely untouched (never clobber or downgrade it).
+    return {
+      updated: false,
+      preservedNewerRevision: Boolean(currentUnsaved),
+      localPersisted: true,
+      revision: currentUnsaved,
+    };
+  }
+
+  // Never downgrade an already-confirmed content mismatch conflict to verification_pending
+  // unless an explicit retry just discovered a read error (keep serverLatestSummary if present).
+  const nextRevision: UnsavedProblemRevision = {
+    ...currentUnsaved,
+    syncStatus: 'verification_pending',
+    confirmedVersion: params.confirmedVersion ?? currentUnsaved.confirmedVersion,
+    saveConfirmedOnServer: params.saveConfirmedOnServer || Boolean(currentUnsaved.saveConfirmedOnServer),
+    verificationFailureReason: params.reason,
+    syncError: params.errorMessage,
+    serverSnapshotSummary:
+      params.serverSnapshot !== undefined
+        ? (params.serverSnapshot ?? undefined)
+        : currentUnsaved.serverSnapshotSummary,
+    serverLatestSummary:
+      params.serverLatestProblem !== undefined
+        ? (params.serverLatestProblem ?? undefined)
+        : currentUnsaved.serverLatestSummary,
+  };
+
+  setInMemoryProblemRevision(nextRevision);
+  const wrote = saveUnsavedProblemRevision(nextRevision, {
+    onlyIfRevisionId: params.targetRevisionId ?? currentUnsaved.revisionId,
+    onlyIfGeneration: params.targetGeneration ?? currentUnsaved.generation,
+  });
+  return {
+    updated: true,
+    preservedNewerRevision: false,
+    localPersisted: wrote,
+    revision: nextRevision,
+  };
+}
+
+/**
+ * Records a content mismatch or version conflict (Case C) WITHOUT deleting the protected
+ * local revision, WITHOUT marking it synced, and WITHOUT touching newer edit B.
+ * Preserves actual fetched server content separately in `serverSnapshotSummary` /
+ * `serverLatestSummary` for side-by-side diff inspection and explicit resolution.
+ */
+export function recordProblemRevisionMismatchConflict(
+  problemId: string,
+  params: {
+    scopeId?: string;
+    targetRevisionId?: string;
+    targetGeneration?: number;
+    confirmedVersion?: number;
+    saveConfirmedOnServer?: boolean;
+    errorMessage: string;
+    serverSnapshot?: ProblemVersionSnapshot | null;
+    serverLatestProblem?: Problem | null;
+  }
+): {
+  updated: boolean;
+  preservedNewerRevision: boolean;
+  localPersisted: boolean;
+  updatedProblems: Problem[];
+  revision: UnsavedProblemRevision | null;
+} {
+  if (params.scopeId && params.scopeId !== getStorageScopeId()) {
+    return {
+      updated: false,
+      preservedNewerRevision: false,
+      localPersisted: true,
+      updatedProblems: loadStoredProblems(),
+      revision: null,
+    };
+  }
+  const persistedUnsaved = getUnsavedProblemRevision(problemId);
+  const memoryUnsaved = getInMemoryProblemRevision(problemId);
+  const { latest: currentUnsaved } = resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved);
+
+  if (!isMatchingTargetRevision(currentUnsaved, params.targetRevisionId, params.targetGeneration)) {
+    return {
+      updated: false,
+      preservedNewerRevision: Boolean(currentUnsaved),
+      localPersisted: true,
+      updatedProblems: loadStoredProblems(),
+      revision: currentUnsaved,
+    };
+  }
+
+  const nextRevision: UnsavedProblemRevision = {
+    ...currentUnsaved,
+    syncStatus: 'conflict',
+    confirmedVersion: params.confirmedVersion ?? currentUnsaved.confirmedVersion,
+    saveConfirmedOnServer: params.saveConfirmedOnServer ?? currentUnsaved.saveConfirmedOnServer,
+    verificationFailureReason: 'content_mismatch',
+    syncError: params.errorMessage,
+    serverSnapshotSummary:
+      params.serverSnapshot !== undefined
+        ? (params.serverSnapshot ?? undefined)
+        : currentUnsaved.serverSnapshotSummary,
+    serverLatestSummary:
+      params.serverLatestProblem !== undefined
+        ? (params.serverLatestProblem ?? undefined)
+        : currentUnsaved.serverLatestSummary,
+  };
+
+  setInMemoryProblemRevision(nextRevision);
+  const wrote = saveUnsavedProblemRevision(nextRevision, {
+    onlyIfRevisionId: params.targetRevisionId ?? currentUnsaved.revisionId,
+    onlyIfGeneration: params.targetGeneration ?? currentUnsaved.generation,
+  });
+
+  return {
+    updated: true,
+    preservedNewerRevision: false,
+    localPersisted: wrote,
+    updatedProblems: loadStoredProblems(),
+    revision: nextRevision,
+  };
+}
+
+/**
+ * Resolves a preserved conflict revision through explicit user choice:
+ * - `'accept_server'`: Adopts actual server content into local problems (never modifying
+ *   historical snapshots) and conditionally clears ONLY the matching conflict revision.
+ * - `'prepare_rebase_edit'`: Re-anchors the protected local revision onto the server's latest
+ *   version (`baseVersion = serverVersion`, `revisionVersion = serverVersion + 1`) while keeping
+ *   all user edits intact so the user can review and save cleanly.
+ */
+export function resolveProblemRevisionConflict(
+  problemId: string,
+  action: 'accept_server' | 'prepare_rebase_edit',
+  params: {
+    scopeId?: string;
+    revisionId?: string;
+    generation?: number;
+    serverProblem?: Problem | null;
+  }
+): {
+  ok: boolean;
+  updatedProblems: Problem[];
+  revision: UnsavedProblemRevision | null;
+  message: string;
+} {
+  if (params.scopeId && params.scopeId !== getStorageScopeId()) {
+    return {
+      ok: false,
+      updatedProblems: loadStoredProblems(),
+      revision: null,
+      message: '계정 범위가 변경되어 충돌 해결을 중단했습니다.',
+    };
+  }
+  const persistedUnsaved = getUnsavedProblemRevision(problemId);
+  const memoryUnsaved = getInMemoryProblemRevision(problemId);
+  const { latest: currentUnsaved } = resolveLatestProblemRevision(persistedUnsaved, memoryUnsaved);
+
+  if (!isMatchingTargetRevision(currentUnsaved, params.revisionId, params.generation)) {
+    return {
+      ok: false,
+      updatedProblems: loadStoredProblems(),
+      revision: currentUnsaved,
+      message: '더 최신 편집 내용이 존재하여 이전 충돌 해결 요청을 적용하지 않았습니다.',
+    };
+  }
+
+  const targetServerProblem =
+    params.serverProblem ?? currentUnsaved.serverLatestSummary ?? null;
+  const serverSnapshot = currentUnsaved.serverSnapshotSummary;
+
+  if (action === 'accept_server') {
+    const authoritativeSource: Problem | null = (() => {
+      if (targetServerProblem && targetServerProblem.promptText && targetServerProblem.modelAnswer) {
+        return targetServerProblem;
+      }
+      if (serverSnapshot && serverSnapshot.promptText && serverSnapshot.modelAnswer) {
+        const localCurrent = loadStoredProblems().find((p) => p.id === problemId);
+        if (!localCurrent) return null;
+        return {
+          ...localCurrent,
+          ...serverSnapshot,
+          version: serverSnapshot.version,
+          serverConfirmedVersion: serverSnapshot.version,
+        };
+      }
+      return null;
+    })();
+
+    if (!authoritativeSource) {
+      return {
+        ok: false,
+        updatedProblems: loadStoredProblems(),
+        revision: currentUnsaved,
+        message: '서버 확정 내용을 먼저 다시 확인해 주세요.',
+      };
+    }
+
+    const serverVer = authoritativeSource.version ?? currentUnsaved.confirmedVersion ?? 1;
+    const currentList = loadStoredProblems();
+    const updatedList = currentList.map((p) => {
+      if (p.id !== problemId) return p;
+      const cleanedHistory = (p.versionHistory || []).filter(
+        (s) => s && typeof s.version === 'number' && s.version < serverVer
+      );
+      return {
+        ...p,
+        ...authoritativeSource,
+        id: problemId,
+        version: serverVer,
+        serverConfirmedVersion: serverVer,
+        localUnrecordedBaseVersion: undefined,
+        reports: mergeProblemReportLists(p.reports, authoritativeSource.reports),
+        versionHistory: cleanedHistory,
+      };
+    });
+    const probSaved = saveStoredProblems(updatedList);
+    if (probSaved) {
+      clearInMemoryProblem(problemId, { version: serverVer, serverConfirmedVersion: serverVer });
+    }
+    clearUnsavedProblemRevision(problemId, {
+      revisionId: currentUnsaved.revisionId,
+      generation: currentUnsaved.generation,
+    });
+    clearInMemoryProblemRevision(problemId, {
+      revisionId: currentUnsaved.revisionId,
+      generation: currentUnsaved.generation,
+    });
+    return {
+      ok: true,
+      updatedProblems: probSaved ? loadStoredProblems() : updatedList,
+      revision: null,
+      message: `서버 확정 내용(v${serverVer})을 채택하여 동기화했습니다.`,
+    };
+  }
+
+  // 'prepare_rebase_edit': re-anchor local edits onto the latest server version for explicit review/save.
+  const baseSource = targetServerProblem ?? (serverSnapshot ? { ...loadStoredProblems().find((p) => p.id === problemId)!, ...serverSnapshot } : null);
+  const newBaseVer = baseSource?.version ?? currentUnsaved.confirmedVersion ?? currentUnsaved.baseVersion;
+  const newBaseSnapshot: ProblemVersionSnapshot | undefined = baseSource
+    ? {
+        version: newBaseVer,
+        title: baseSource.title,
+        promptText: baseSource.promptText,
+        type: baseSource.type,
+        conceptIds: [...(baseSource.conceptIds || [])],
+        appliedConditionNote: baseSource.appliedConditionNote,
+        mathFormula: baseSource.mathFormula,
+        codeSnippet: baseSource.codeSnippet,
+        timeStandardMinutes: baseSource.timeStandardMinutes,
+        hints: [...(baseSource.hints || [])],
+        modelAnswer: baseSource.modelAnswer,
+        rubric: [...(baseSource.rubric || [])],
+        editedAt: baseSource.lastReviewedAt || new Date().toISOString(),
+        editReason: baseSource.reviewNotes,
+      }
+    : currentUnsaved.baseSnapshot;
+
+  const rebasedRev: UnsavedProblemRevision = {
+    ...currentUnsaved,
+    generation: (currentUnsaved.generation ?? 1) + 1,
+    baseVersion: newBaseVer,
+    revisionVersion: newBaseVer + 1,
+    baseSnapshot: newBaseSnapshot,
+    syncStatus: 'pending',
+    syncError: undefined,
+    verificationFailureReason: undefined,
+    saveConfirmedOnServer: false,
+    confirmedVersion: undefined,
+    serverSnapshotSummary: undefined,
+    serverLatestSummary: undefined,
+  };
+  setInMemoryProblemRevision(rebasedRev);
+  saveUnsavedProblemRevision(rebasedRev);
+  return {
+    ok: true,
+    updatedProblems: loadStoredProblems(),
+    revision: rebasedRev,
+    message: `보호 수정본이 서버 v${newBaseVer} 기준으로 준비되었습니다. 편집기에서 확인 후 새 버전으로 저장할 수 있습니다.`,
   };
 }
 

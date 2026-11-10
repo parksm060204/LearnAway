@@ -1,8 +1,10 @@
 import type { Concept, Problem, ProblemVersionSnapshot, UnsavedProblemRevision, ConceptScheduleAdjustment } from '../types';
 import {
   hasVerifiableConditionNote,
+  isCompleteProblemSnapshot,
   isRevisionMatchingProblem,
   normalizeProblemText as normalizeText,
+  snapshotEvaluationMatchesProblem,
 } from '../problemComparison';
 
 export { isRevisionMatchingProblem } from '../problemComparison';
@@ -193,12 +195,27 @@ export function mergeProblems(
     if (unsaved) {
       const serverVersion = remote.version ?? 1;
       const referenceSnapshots = [...(versionHistory || []), ...(mine?.versionHistory || [])];
-      const isIdentical = isRevisionMatchingProblem(unsaved, remote, referenceSnapshots);
+      const serverSnapAtCurrent = Array.isArray(versionHistory)
+        ? versionHistory.find((s) => s && s.version === serverVersion)
+        : undefined;
+      const snapshotConsistent =
+        !serverSnapAtCurrent ||
+        (isCompleteProblemSnapshot(serverSnapAtCurrent) &&
+          snapshotEvaluationMatchesProblem(remote, serverSnapAtCurrent));
+      const isIdentical =
+        isCompleteProblemSnapshot(remote) &&
+        snapshotConsistent &&
+        isRevisionMatchingProblem(unsaved, remote, referenceSnapshots);
 
       if (serverVersion >= unsaved.baseVersion && isIdentical) {
         // Server already has this exact revised content (idempotent retry / response loss)
         if (unsaved.syncStatus !== 'synced') {
-          const updatedRev: UnsavedProblemRevision = { ...unsaved, syncStatus: 'synced' };
+          const updatedRev: UnsavedProblemRevision = {
+            ...unsaved,
+            syncStatus: 'synced',
+            syncError: undefined,
+            verificationFailureReason: undefined,
+          };
           unsavedRevisions[remote.id] = updatedRev;
           onRevisionChange?.(updatedRev);
         }
@@ -207,8 +224,41 @@ export function mergeProblems(
       } else if (unsaved.syncStatus === 'conflict') {
         // An existing conflict MUST remain conflict across repeated merges/reloads/fetches!
         // Never auto-rebase or convert to pending unless server has identical content (checked above).
+        if (!unsaved.serverLatestSummary) {
+          const enrichedRev: UnsavedProblemRevision = {
+            ...unsaved,
+            serverLatestSummary: remote,
+          };
+          unsavedRevisions[remote.id] = enrichedRev;
+        }
         contentToApply = remote;
         effectiveVersion = serverVersion;
+      } else if (unsaved.syncStatus === 'verification_pending' && serverVersion <= unsaved.baseVersion) {
+        // Verification is pending (e.g., save_uncertain or snapshot missing/read error): keep protected
+        // revision preserved as verification_pending so startup triggers read-only re-check first.
+        contentToApply = {
+          ...remote,
+          title: unsaved.title,
+          promptText: unsaved.promptText,
+          type: unsaved.type ?? remote.type,
+          conceptIds: unsaved.conceptIds ?? remote.conceptIds,
+          mathFormula: unsaved.mathFormula,
+          codeSnippet: unsaved.codeSnippet,
+          hints: unsaved.hints,
+          modelAnswer: unsaved.modelAnswer,
+          rubric: unsaved.rubric,
+          timeStandardMinutes: unsaved.timeStandardMinutes ?? remote.timeStandardMinutes,
+          appliedConditionNote: unsaved.appliedConditionNote !== undefined
+            ? unsaved.appliedConditionNote
+            : remote.appliedConditionNote,
+        };
+        effectiveVersion = unsaved.revisionVersion;
+        hasActiveUnsavedRevision = true;
+        if (unsaved.baseSnapshot) {
+          const existingHist = combinedHistory || [];
+          const alreadyHasBase = existingHist.some((s) => s.version === unsaved.baseSnapshot!.version);
+          combinedHistory = alreadyHasBase ? existingHist : [unsaved.baseSnapshot, ...existingHist];
+        }
       } else if (serverVersion <= unsaved.baseVersion) {
         // Revision branched from this or older server version, and remote hasn't advanced past base: apply revised content!
         const condCheck = hasVerifiableConditionNote(unsaved, referenceSnapshots);
@@ -310,6 +360,10 @@ export function mergeProblems(
           const updatedRev: UnsavedProblemRevision = {
             ...unsaved,
             syncStatus: 'conflict',
+            verificationFailureReason: 'content_mismatch',
+            confirmedVersion: unsaved.confirmedVersion ?? serverVersion,
+            serverLatestSummary: remote,
+            serverSnapshotSummary: serverSnapAtCurrent ?? unsaved.serverSnapshotSummary,
             syncError: conflictReason,
           };
           unsavedRevisions[remote.id] = updatedRev;

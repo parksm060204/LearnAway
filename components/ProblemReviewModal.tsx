@@ -33,7 +33,7 @@ import {
   Plus,
 } from 'lucide-react';
 import { ProblemQualityReviewTab } from './ProblemQualityReviewTab';
-import { ProblemQualityStatus } from '../lib/types';
+import { ProblemQualityStatus, UnsavedProblemRevision } from '../lib/types';
 
 interface ProblemReviewModalProps {
   isOpen: boolean;
@@ -65,6 +65,14 @@ interface ProblemReviewModalProps {
   };
   onReapproveProblem?: (problemId: string, reapprovalNote?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, suspensionReason?: string) => void;
+  unsavedProblemRevisions?: Record<string, UnsavedProblemRevision>;
+  onRetryVerifyProblemRevision?: (problemId: string) => Promise<void>;
+  onResolveProblemRevisionConflict?: (
+    problemId: string,
+    action: 'accept_server' | 'prepare_rebase_edit',
+    expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
+  ) => { ok: boolean; revision?: UnsavedProblemRevision | null; message?: string };
+  onRetrySaveProblemRevision?: (problemId: string, expectedVersion?: number) => Promise<void>;
   initialMode?: 'drafts' | 'quality_reports';
   userId?: string;
 }
@@ -87,6 +95,10 @@ export function ProblemReviewModal({
   onReviseProblem,
   onReapproveProblem,
   onSuspendProblem,
+  unsavedProblemRevisions,
+  onRetryVerifyProblemRevision,
+  onResolveProblemRevisionConflict,
+  onRetrySaveProblemRevision,
   initialMode,
   userId,
 }: ProblemReviewModalProps) {
@@ -386,6 +398,10 @@ export function ProblemReviewModal({
             onReviseProblem={onReviseProblem}
             onReapproveProblem={onReapproveProblem}
             onSuspendProblem={onSuspendProblem}
+            unsavedProblemRevisions={unsavedProblemRevisions}
+            onRetryVerifyProblemRevision={onRetryVerifyProblemRevision}
+            onResolveProblemRevisionConflict={onResolveProblemRevisionConflict}
+            onRetrySaveProblemRevision={onRetrySaveProblemRevision}
           />
         ) : (
           <>

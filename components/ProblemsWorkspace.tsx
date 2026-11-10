@@ -8,6 +8,7 @@ import {
   Concept,
   Material,
   ProblemQualityStatus,
+  UnsavedProblemRevision,
   ACADEMIC_DIFFICULTY_LEVELS,
   toAcademicDifficultyLevel,
 } from '../lib/types';
@@ -62,6 +63,14 @@ export interface ProblemsWorkspaceProps {
   };
   onReapproveProblem?: (problemId: string, note?: string) => { success: boolean; error?: string };
   onSuspendProblem?: (problemId: string, reason?: string) => void;
+  unsavedProblemRevisions?: Record<string, UnsavedProblemRevision>;
+  onRetryVerifyProblemRevision?: (problemId: string) => Promise<void>;
+  onResolveProblemRevisionConflict?: (
+    problemId: string,
+    action: 'accept_server' | 'prepare_rebase_edit',
+    expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
+  ) => { ok: boolean; revision?: UnsavedProblemRevision | null; message?: string };
+  onRetrySaveProblemRevision?: (problemId: string, expectedVersion?: number) => Promise<void>;
 }
 
 export function ProblemsWorkspace({
@@ -85,6 +94,10 @@ export function ProblemsWorkspace({
   onReviseProblem,
   onReapproveProblem,
   onSuspendProblem,
+  unsavedProblemRevisions,
+  onRetryVerifyProblemRevision,
+  onResolveProblemRevisionConflict,
+  onRetrySaveProblemRevision,
 }: ProblemsWorkspaceProps) {
   const [subTab, setSubTab] = useState<'approved' | 'drafts' | 'quality_reports'>('approved');
 
@@ -700,6 +713,10 @@ export function ProblemsWorkspace({
             onReviseProblem={onReviseProblem}
             onReapproveProblem={onReapproveProblem}
             onSuspendProblem={onSuspendProblem}
+            unsavedProblemRevisions={unsavedProblemRevisions}
+            onRetryVerifyProblemRevision={onRetryVerifyProblemRevision}
+            onResolveProblemRevisionConflict={onResolveProblemRevisionConflict}
+            onRetrySaveProblemRevision={onRetrySaveProblemRevision}
           />
         </div>
       )}

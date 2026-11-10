@@ -25,6 +25,7 @@ const compile = spawnSync(
     'lib/cloud/learningMappers.ts',
     'lib/cloud/learningRepository.ts',
     'lib/cloud/mergeLearning.ts',
+    'lib/problemRevisionSync.ts',
     'lib/serviceGuideContent.ts',
     '--jsx',
     'react-jsx',
@@ -774,12 +775,14 @@ async function run() {
         1,
         editA.updatedProblem
       );
-      assert.equal(readFailRes.ok, true, 'RPC commit succeeded so reviseProblem returns ok: true');
+      assert.equal(readFailRes.outcome, 'verification_failed', 'Discriminated outcome is verification_failed');
+      assert.equal(readFailRes.ok, false, 'Post-save read failure sets ok: false so callers cannot treat it as verified completion');
       assert.equal(readFailRes.savedToServer, true, 'savedToServer is true');
+      assert.equal(readFailRes.contentVerified, false, 'contentVerified is false');
       assert.equal(readFailRes.confirmedVersion, 2, 'confirmedVersion is 2');
       assert.equal(readFailRes.verificationStatus, 'verification_failed', 'Explicitly marks verification_failed when post-save read fails');
-      assert.equal(readFailRes.data.version, 2);
-      assert.equal(readFailRes.data.promptText, 'Prompt A v2');
+      assert.equal(readFailRes.verificationFailureReason, 'read_error');
+      assert.equal(readFailRes.data, undefined, 'Does not expose unverified request-derived data');
 
       // -----------------------------------------------------------------------
       // 3. Combined Two-Tab Scenario:
@@ -1244,12 +1247,15 @@ async function run() {
       }),
     };
     const incompleteSnapRes = await learningRepo.reviseProblem(incompleteSnapSupabase, baseProblem.id, 1, baseProblem);
-    assert.equal(incompleteSnapRes.ok, true, 'RPC succeeded so ok is true');
+    assert.equal(incompleteSnapRes.outcome, 'verification_failed');
+    assert.equal(incompleteSnapRes.ok, false, 'Incomplete snapshot verification_failed must set ok: false');
     assert.equal(incompleteSnapRes.savedToServer, true, 'savedToServer is true even when snapshot verification fails');
+    assert.equal(incompleteSnapRes.contentVerified, false);
     assert.equal(incompleteSnapRes.confirmedVersion, 2);
     assert.equal(incompleteSnapRes.verificationStatus, 'verification_failed');
+    assert.equal(incompleteSnapRes.verificationFailureReason, 'snapshot_incomplete');
     assert.ok(incompleteSnapRes.verificationError, 'Provides verificationError reason');
-    assert.equal(incompleteSnapRes.data.title, baseProblem.title, 'Does not clobber local title with incomplete snapshot');
+    assert.equal(incompleteSnapRes.data, undefined, 'Must never fabricate data from request when snapshot is incomplete');
 
     // 3) Invalid RPC return value (missing/zero confirmedVersion) must NEVER guess expectedVersion + 1:
     const badReturnSupabase = {
@@ -1510,6 +1516,465 @@ async function run() {
         throw new Error(`Timezone check failed for TZ=${tz}: ${tzRun.stdout}\n${tzRun.stderr}`);
       }
     }
+  });
+
+  await checkAsync('Reproduction & Verification Failure Recovery: MY EDIT vs SERVER DIFFERENT must never be marked synced or delete protected revision', async () => {
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_verif_fail_repro' });
+    localStorage.clear();
+    storage.clearAllUnsavedProblemRevisions();
+    try {
+      const probId = 'prob-verif-fail-repro';
+      const probV1 = {
+        id: probId,
+        subjectId: 'sub-verif-1',
+        type: 'essay_descriptive',
+        title: 'Original v1',
+        promptText: 'Original prompt v1',
+        modelAnswer: 'Original answer v1',
+        rubric: [{ id: 'r1', label: '기준', maxScore: 100, weight: 1, description: 'Original rubric' }],
+        hints: ['H1'],
+        conceptIds: ['c-1'],
+        timeStandardMinutes: 15,
+        version: 1,
+        serverConfirmedVersion: 1,
+        qualityStatus: 'normal',
+        reports: [],
+      };
+      storage.saveStoredProblems([probV1]);
+
+      const localEdit = storage.editAndReviseProblem(
+        probId,
+        {
+          title: 'MY EDIT',
+          promptText: 'MY EDIT',
+          modelAnswer: 'MY EDIT answer',
+        },
+        'My local edit'
+      );
+      assert.equal(localEdit.success, true);
+      const revBefore = storage.getEffectiveUnsavedProblemRevision(probId);
+      assert.ok(revBefore);
+      assert.equal(revBefore.promptText, 'MY EDIT');
+
+      const mismatchSupabase = {
+        rpc: async () => ({
+          data: {
+            confirmedVersion: 2,
+            confirmedSnapshot: {
+              version: 2,
+              title: 'SERVER DIFFERENT',
+              promptText: 'SERVER DIFFERENT',
+              modelAnswer: 'SERVER DIFFERENT answer',
+              type: 'essay_descriptive',
+              conceptIds: ['c-1'],
+              hints: ['H1'],
+              timeStandardMinutes: 15,
+              rubric: [{ id: 'r1', label: '기준', maxScore: 100, weight: 1, description: 'Original rubric' }],
+            },
+            problemRow: {
+              id: probId,
+              user_id: 'user_verif_fail_repro',
+              subject_id: 'sub-verif-1',
+              type: 'essay_descriptive',
+              title: 'SERVER DIFFERENT',
+              quality_status: 'review_after_edit',
+              is_outdated: false,
+              needs_source_review: false,
+              version: 2,
+              payload: {
+                ...probV1,
+                title: 'SERVER DIFFERENT',
+                promptText: 'SERVER DIFFERENT',
+                modelAnswer: 'SERVER DIFFERENT answer',
+                version: 2,
+                qualityStatus: 'review_after_edit',
+              },
+              created_at: '2026-11-10T10:00:00.000Z',
+              updated_at: '2026-11-10T10:01:00.000Z',
+            },
+          },
+          error: null,
+        }),
+      };
+
+      const repoRes = await learningRepo.reviseProblem(mismatchSupabase, probId, 1, localEdit.updatedProblem);
+      // Pre-fix bug: repoRes.ok was true and repoRes.data held 'MY EDIT', causing DashboardClient's
+      // `if (result.ok) confirmProblemRevisionSynced(...)` to return status:'applied' and delete revBefore!
+      assert.equal(repoRes.ok, false, 'verification_failed must set ok: false so callers cannot enter verified completion path');
+      assert.equal(repoRes.outcome, 'verification_failed');
+      assert.equal(repoRes.savedToServer, true);
+      assert.equal(repoRes.contentVerified, false);
+      assert.equal(repoRes.data, undefined, 'verification_failed must NOT return request-derived data');
+
+      // And through the shared coordinator (used by DashboardClient):
+      const revSync = load(path.join(output, 'lib/problemRevisionSync.js'));
+      const syncOutcome = await revSync.pushProblemRevisionToServer({
+        supabase: mismatchSupabase,
+        problemId: probId,
+        expectedVersion: 1,
+        problem: localEdit.updatedProblem,
+        snapshotProblem: localEdit.updatedProblem,
+        targetRevisionId: revBefore.revisionId,
+        targetGeneration: revBefore.generation,
+        editReason: revBefore.editReason,
+        pinnedScopeId: storageScope.getStorageScopeId(),
+        unsaved: revBefore,
+      });
+      assert.notEqual(syncOutcome.syncOutcomeStatus, 'applied', 'Must NEVER produce status: applied on verification_failed');
+      assert.equal(syncOutcome.needsRecovery, true);
+      const protectedAfter = storage.getEffectiveUnsavedProblemRevision(probId);
+      assert.ok(protectedAfter, 'Protected revision MUST NOT be null after verification_failed');
+      assert.equal(protectedAfter.promptText, 'MY EDIT', 'Protected revision keeps local MY EDIT content');
+      assert.equal(protectedAfter.syncStatus, 'conflict', 'Content mismatch transitions protected revision to conflict');
+      assert.equal(protectedAfter.confirmedVersion, 2);
+      assert.equal(protectedAfter.serverLatestSummary?.promptText, 'SERVER DIFFERENT', 'Server content is preserved for diff/resolution');
+
+      // Defensive guard: confirmProblemRevisionSynced itself must refuse to clear revision on verification_failed
+      const directGuardOutcome = storage.confirmProblemRevisionSynced(
+        probId,
+        { ...localEdit.updatedProblem, version: 2 },
+        {
+          revisionId: revBefore.revisionId,
+          generation: revBefore.generation,
+          verificationStatus: 'verification_failed',
+          contentVerified: false,
+        }
+      );
+      assert.equal(directGuardOutcome.status, 'stale_ignored');
+      assert.ok(storage.getEffectiveUnsavedProblemRevision(probId), 'Protected revision remains after blocked confirm');
+
+      // Read-only retry verification when server STILL mismatches -> keeps conflict, ZERO RPC/AI calls
+      let rpcCallCount = 0;
+      const stillMismatchReadSupabase = {
+        rpc: async () => {
+          rpcCallCount++;
+          throw new Error('Retry verification must never invoke revise RPC');
+        },
+        from: (table) => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () =>
+                table === 'problems'
+                  ? { data: { id: probId, user_id: 'user_verif_fail_repro', subject_id: 'sub-verif-1', type: 'essay_descriptive', title: 'SERVER DIFFERENT', quality_status: 'review_after_edit', version: 2, payload: { ...probV1, title: 'SERVER DIFFERENT', promptText: 'SERVER DIFFERENT', modelAnswer: 'SERVER DIFFERENT answer', version: 2 } }, error: null }
+                  : { data: null, error: null },
+              eq: () => ({
+                maybeSingle: async () => ({
+                  data: { snapshot: { version: 2, title: 'SERVER DIFFERENT', promptText: 'SERVER DIFFERENT', modelAnswer: 'SERVER DIFFERENT answer', type: 'essay_descriptive', conceptIds: ['c-1'], hints: ['H1'], rubric: probV1.rubric } },
+                  error: null,
+                }),
+              }),
+            }),
+          }),
+        }),
+      };
+      const retryStillMismatch = await revSync.verifyProblemRevisionOnServer({
+        supabase: stillMismatchReadSupabase,
+        problemId: probId,
+        pinnedScopeId: storageScope.getStorageScopeId(),
+      });
+      assert.equal(rpcCallCount, 0, 'Retry verification never executes RPC');
+      assert.equal(retryStillMismatch.outcome, 'conflict');
+      assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.syncStatus, 'conflict');
+      assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.promptText, 'MY EDIT');
+
+      // Simulate page refresh (persisted JSON reload via mergeProblems): conflict stays conflict & MY EDIT survives
+      const cloudMerge = load(path.join(output, 'lib/cloud/mergeLearning.js'));
+      const reloadedRevisions = storage.loadUnsavedProblemRevisions();
+      const mergedAfterReload = cloudMerge.mergeProblems(
+        [{ ...probV1, title: 'SERVER DIFFERENT', promptText: 'SERVER DIFFERENT', modelAnswer: 'SERVER DIFFERENT answer', version: 2 }],
+        storage.loadStoredProblems(),
+        {},
+        new Set([probId]),
+        new Set([probId]),
+        reloadedRevisions,
+        (rev) => storage.saveUnsavedProblemRevision(rev)
+      );
+      assert.equal(mergedAfterReload.length, 1);
+      assert.equal(storage.getUnsavedProblemRevision(probId)?.syncStatus, 'conflict');
+      assert.equal(storage.getUnsavedProblemRevision(probId)?.promptText, 'MY EDIT');
+
+      // Explicit conflict resolution: accept_server clears conflict revision and applies SERVER DIFFERENT
+      const acceptRes = revSync.resolveProblemRevisionConflict(probId, 'accept_server', {
+        scopeId: storageScope.getStorageScopeId(),
+        revisionId: revBefore.revisionId,
+        generation: revBefore.generation,
+      });
+      assert.equal(acceptRes.ok, true);
+      assert.equal(storage.getEffectiveUnsavedProblemRevision(probId), null);
+      assert.equal(storage.loadStoredProblems().find((p) => p.id === probId)?.promptText, 'SERVER DIFFERENT');
+    } finally {
+      storageScope.setStorageScope({ kind: 'legacy' });
+    }
+  });
+
+  await checkAsync('Verification Pending Cases (read error, missing/incomplete snapshot, uncertain network error, retry success, concurrent edit B preservation, account switch)', async () => {
+    const revSync = load(path.join(output, 'lib/problemRevisionSync.js'));
+    const probId = 'prob-verif-cases-1';
+    const probV1 = {
+      id: probId,
+      subjectId: 'sub-vc-1',
+      type: 'essay_descriptive',
+      title: 'VC v1',
+      promptText: 'VC Prompt v1',
+      modelAnswer: 'VC Answer v1',
+      rubric: [{ id: 'r1', label: '기준', maxScore: 100, weight: 1, description: 'R1' }],
+      hints: ['H1'],
+      conceptIds: ['c-1'],
+      timeStandardMinutes: 15,
+      version: 1,
+      serverConfirmedVersion: 1,
+      qualityStatus: 'normal',
+      reports: [],
+    };
+
+    // Case 1: Incomplete snapshot -> stays verification_pending, never backfilled or deleted
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_vc_A' });
+    localStorage.clear();
+    storage.clearAllUnsavedProblemRevisions();
+    storage.saveStoredProblems([probV1]);
+    const editInc = storage.editAndReviseProblem(probId, { promptText: 'Edit Incomplete' }, 'Edit inc');
+    const revInc = storage.getEffectiveUnsavedProblemRevision(probId);
+    const incSupabase = {
+      rpc: async () => ({
+        data: { confirmedVersion: 2, confirmedSnapshot: { version: 2 }, problemRow: null },
+        error: null,
+      }),
+      from: () => ({
+        select: () => ({
+          eq: () => ({ maybeSingle: async () => ({ data: null, error: null }) }),
+        }),
+      }),
+    };
+    const incOutcome = await revSync.pushProblemRevisionToServer({
+      supabase: incSupabase,
+      problemId: probId,
+      expectedVersion: 1,
+      problem: editInc.updatedProblem,
+      targetRevisionId: revInc.revisionId,
+      targetGeneration: revInc.generation,
+      editReason: revInc.editReason,
+      pinnedScopeId: storageScope.getStorageScopeId(),
+      unsaved: revInc,
+    });
+    assert.equal(incOutcome.outcome, 'verification_pending');
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.syncStatus, 'verification_pending');
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.promptText, 'Edit Incomplete');
+
+    // Case 2: Post-save read failure -> verification_pending -> read-only retry succeeds & clears ONLY matching revision (0 RPC calls)
+    storage.clearAllUnsavedProblemRevisions();
+    storage.saveStoredProblems([probV1]);
+    const editReadFail = storage.editAndReviseProblem(probId, { promptText: 'Edit Read Retry' }, 'Read retry');
+    const revReadFail = storage.getEffectiveUnsavedProblemRevision(probId);
+    let rpcCallsDuringReadFailAndRetry = 0;
+    const readFailThenOkSupabase = {
+      rpc: async () => {
+        rpcCallsDuringReadFailAndRetry++;
+        return { data: { confirmedVersion: 2 }, error: null };
+      },
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({ data: null, error: { message: 'Temporary read timeout' } }),
+            eq: () => ({
+              maybeSingle: async () => ({ data: null, error: { message: 'Temporary read timeout' } }),
+            }),
+          }),
+        }),
+      }),
+    };
+    const readFailOut = await revSync.pushProblemRevisionToServer({
+      supabase: readFailThenOkSupabase,
+      problemId: probId,
+      expectedVersion: 1,
+      problem: editReadFail.updatedProblem,
+      targetRevisionId: revReadFail.revisionId,
+      targetGeneration: revReadFail.generation,
+      editReason: revReadFail.editReason,
+      pinnedScopeId: storageScope.getStorageScopeId(),
+      unsaved: revReadFail,
+    });
+    assert.equal(rpcCallsDuringReadFailAndRetry, 1);
+    assert.equal(readFailOut.outcome, 'verification_pending');
+    assert.equal(storage.getUnsavedProblemRevision(probId)?.syncStatus, 'verification_pending');
+    assert.equal(storage.getUnsavedProblemRevision(probId)?.confirmedVersion, 2);
+
+    // Retry verification when read succeeds:
+    const v2Row = {
+      id: probId,
+      user_id: 'user_vc_A',
+      subject_id: 'sub-vc-1',
+      type: 'essay_descriptive',
+      title: 'VC v1',
+      quality_status: 'review_after_edit',
+      version: 2,
+      payload: { ...editReadFail.updatedProblem, version: 2 },
+    };
+    const v2Snap = {
+      version: 2,
+      title: 'VC v1',
+      promptText: 'Edit Read Retry',
+      modelAnswer: 'VC Answer v1',
+      type: 'essay_descriptive',
+      conceptIds: ['c-1'],
+      hints: ['H1'],
+      timeStandardMinutes: 15,
+      rubric: probV1.rubric,
+    };
+    const readOkSupabase = {
+      rpc: async () => {
+        rpcCallsDuringReadFailAndRetry++;
+        throw new Error('Retry must NOT call revise RPC');
+      },
+      from: (table) => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({ data: table === 'problems' ? v2Row : null, error: null }),
+            eq: () => ({
+              maybeSingle: async () => ({ data: table === 'problem_versions' ? { snapshot: v2Snap } : null, error: null }),
+            }),
+          }),
+        }),
+      }),
+    };
+    const retryOk = await revSync.verifyProblemRevisionOnServer({
+      supabase: readOkSupabase,
+      problemId: probId,
+      pinnedScopeId: storageScope.getStorageScopeId(),
+    });
+    assert.equal(rpcCallsDuringReadFailAndRetry, 1, 'Retry did NOT re-run RPC or AI');
+    assert.equal(retryOk.outcome, 'verified_synced');
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId), null, 'Matching revision cleared after verified match');
+    assert.equal(storage.loadStoredProblems().find((p) => p.id === probId)?.serverConfirmedVersion, 2);
+
+    // Case 3: Ambiguous network error on RPC -> save_uncertain (not marked definitively failed) -> read-only check handles safely
+    storage.clearAllUnsavedProblemRevisions();
+    storage.saveStoredProblems([probV1]);
+    const editUnc = storage.editAndReviseProblem(probId, { promptText: 'Edit Uncertain' }, 'Uncertain net');
+    const revUnc = storage.getEffectiveUnsavedProblemRevision(probId);
+    const uncertainOutcome = await revSync.pushProblemRevisionToServer({
+      supabase: { rpc: async () => { throw new Error('Failed to fetch'); } },
+      problemId: probId,
+      expectedVersion: 1,
+      problem: editUnc.updatedProblem,
+      targetRevisionId: revUnc.revisionId,
+      targetGeneration: revUnc.generation,
+      editReason: revUnc.editReason,
+      pinnedScopeId: storageScope.getStorageScopeId(),
+      unsaved: revUnc,
+    });
+    assert.equal(uncertainOutcome.outcome, 'verification_pending');
+    assert.equal(uncertainOutcome.savedToServer, 'unknown');
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.verificationFailureReason, 'save_uncertain');
+
+    // Case 4 & 5: Save A -> Edit B while A in flight (or after A is verification_pending) -> A fails verification -> B preserved -> A retry verification succeeds -> B STILL preserved!
+    storage.clearAllUnsavedProblemRevisions();
+    storage.saveStoredProblems([probV1]);
+    const editA = storage.editAndReviseProblem(probId, { promptText: 'Prompt A v2' }, 'Reason A');
+    const revA = storage.getEffectiveUnsavedProblemRevision(probId);
+    // Suppose A commits v2 on server, fails read verification (`verification_pending`):
+    await revSync.pushProblemRevisionToServer({
+      supabase: readFailThenOkSupabase,
+      problemId: probId,
+      expectedVersion: 1,
+      problem: editA.updatedProblem,
+      targetRevisionId: revA.revisionId,
+      targetGeneration: revA.generation,
+      editReason: revA.editReason,
+      pinnedScopeId: storageScope.getStorageScopeId(),
+      unsaved: revA,
+    });
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.syncStatus, 'verification_pending');
+
+    // Now user makes newer local edit B while A is pending verification:
+    const editB = storage.editAndReviseProblem(probId, { promptText: 'Prompt B v3' }, 'Reason B');
+    assert.equal(editB.success, true);
+    const revB = storage.getEffectiveUnsavedProblemRevision(probId);
+    assert.equal(revB.promptText, 'Prompt B v3');
+    assert.ok(revB.pendingPriorVerification, 'B records prior unverified commit A safely');
+
+    // Simulate a late verification_failed response for A arriving AFTER B exists: B must remain intact!
+    const lateAFail = await revSync.applyReviseProblemResult({
+      supabase: readFailThenOkSupabase,
+      problemId: probId,
+      expectedVersion: 1,
+      problem: editA.updatedProblem,
+      snapshotProblem: editA.updatedProblem,
+      result: {
+        outcome: 'verification_failed',
+        ok: false,
+        savedToServer: true,
+        contentVerified: false,
+        verificationStatus: 'verification_failed',
+        verificationFailureReason: 'content_mismatch',
+        verificationError: 'Simulated late mismatch for A',
+        confirmedVersion: 2,
+        serverSnapshot: null,
+        latestServerProblem: null,
+        serverAdvancedBeyondConfirmed: false,
+        error: 'Simulated late mismatch for A',
+      },
+      targetRevisionId: revA.revisionId,
+      targetGeneration: revA.generation,
+      editReason: revA.editReason,
+      pinnedScopeId: storageScope.getStorageScopeId(),
+      unsaved: revA,
+    });
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.revisionId, revB.revisionId, 'B must NOT be overwritten by late A failure');
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.promptText, 'Prompt B v3', 'B promptText stays untouched');
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId)?.syncStatus, 'pending', 'B syncStatus stays pending (not overwritten with A conflict)');
+    assert.ok(lateAFail.message.includes('보존'));
+
+    // Now retry verification for A succeeds (`Prompt A v2` verified at v2): B must STILL be preserved with baseVersion advanced to 2!
+    const v2SnapA = {
+      version: 2,
+      title: 'VC v1',
+      promptText: 'Prompt A v2',
+      modelAnswer: 'VC Answer v1',
+      type: 'essay_descriptive',
+      conceptIds: ['c-1'],
+      hints: ['H1'],
+      timeStandardMinutes: 15,
+      rubric: probV1.rubric,
+    };
+    const v2RowA = { ...v2Row, payload: { ...editA.updatedProblem, version: 2 } };
+    const verifyAOnBRes = await revSync.verifyProblemRevisionOnServer({
+      supabase: {
+        rpc: () => { throw new Error('No RPC on verify'); },
+        from: (table) => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({ data: table === 'problems' ? v2RowA : null, error: null }),
+              eq: () => ({
+                maybeSingle: async () => ({ data: table === 'problem_versions' ? { snapshot: v2SnapA } : null, error: null }),
+              }),
+            }),
+          }),
+        }),
+      },
+      problemId: probId,
+      pinnedScopeId: storageScope.getStorageScopeId(),
+    });
+    assert.equal(verifyAOnBRes.outcome, 'verified_synced');
+    const bAfterAVerified = storage.getEffectiveUnsavedProblemRevision(probId);
+    assert.ok(bAfterAVerified, 'B is preserved after prior A verification succeeded');
+    assert.equal(bAfterAVerified.promptText, 'Prompt B v3');
+    assert.equal(bAfterAVerified.baseVersion, 2, 'B baseVersion cleanly advanced to verified v2');
+    assert.equal(bAfterAVerified.baseSnapshot?.promptText, 'Prompt A v2');
+    assert.equal(bAfterAVerified.pendingPriorVerification, undefined, 'Prior verification cleared once verified');
+
+    // Case 6: Account switch isolation during verification retry
+    const scopeUserA = storageScope.getStorageScopeId();
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_vc_B' });
+    localStorage.clear();
+    const isolatedRes = await revSync.verifyProblemRevisionOnServer({
+      supabase: readOkSupabase,
+      problemId: probId,
+      pinnedScopeId: scopeUserA, // request was started for user A, now in user B!
+    });
+    assert.equal(isolatedRes.outcome, 'scope_changed', 'Verification aborted on account switch');
+    assert.equal(storage.getEffectiveUnsavedProblemRevision(probId), null, 'User B storage untouched');
+    assert.equal(storage.loadStoredProblems().length, 0, 'User B problem list stays empty');
+    storageScope.setStorageScope({ kind: 'legacy' });
   });
 
   console.log(`${passed} concurrency regression checks passed`);

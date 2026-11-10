@@ -22,6 +22,7 @@ import {
   PersonalizationSettings,
   DEFAULT_PERSONALIZATION_SETTINGS,
   RechallengeReservation,
+  UnsavedProblemRevision,
 } from '../lib/types';
 import { notifyTrialCreditsUpdated } from '../lib/trialCreditsClient';
 import { INITIAL_MATERIALS } from '../lib/initialData';
@@ -78,27 +79,29 @@ import {
   setInMemoryProblemRevision,
   clearInMemoryProblemRevision,
   getInMemoryProblem,
-  confirmProblemRevisionSynced,
   reconcileProblemQualitySynced,
   loadConceptScheduleAdjustments,
 } from '../lib/storage';
+import {
+  pushProblemRevisionToServer,
+  verifyProblemRevisionOnServer,
+  resolveProblemRevisionConflict,
+} from '../lib/problemRevisionSync';
 import { AdminAiMetricsModal } from '../components/AdminAiMetricsModal';
 import { loadLearningLibrary } from '../lib/cloud/learningLibrary';
-import { mergeConcepts, mergeDrafts, mergeProblems, isRevisionMatchingProblem } from '../lib/cloud/mergeLearning';
+import { mergeConcepts, mergeDrafts, mergeProblems } from '../lib/cloud/mergeLearning';
 import {
   approveConceptDraft as approveConceptDraftCloud,
   approveProblemDraft as approveProblemDraftCloud,
   getConceptById,
   getConceptDraftById,
   getProblemById,
-  getProblemVersionSnapshot,
   getProblemDraftById,
   deleteProblemDraft as deleteProblemDraftCloud,
   updateProblemDraft as updateProblemDraftCloud,
   deleteConceptDraft as deleteConceptDraftCloud,
   updateConceptDraft as updateConceptDraftCloud,
   updateProblemQuality,
-  reviseProblem,
   type ProblemQualityPatch,
 } from '../lib/cloud/learningRepository';
 import { buildConceptFromDraft } from '../lib/learningApproval';
@@ -252,7 +255,7 @@ import {
   LearningMigrationState,
 } from '../lib/cloud/learningMigration';
 import { applyMaterialEditToProblems } from '../lib/problemFreshness';
-import { setStorageScope, getStorageScopeId } from '../lib/storageScope';
+import { setStorageScope, getStorageScopeId, userIdToScopeId } from '../lib/storageScope';
 import {
   getLegacyImportState,
   importLegacyData,
@@ -351,6 +354,30 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
   } | null>(null);
   const recoveryRequestSeqRef = useRef<number>(0);
   const pushProblemToServerRef = useRef<(problemId: string, opts?: { revise?: boolean; expectedVersion?: number; silent?: boolean }) => Promise<void>>(() => Promise.resolve());
+  const verifyProblemRevisionRecoveryRef = useRef<(problemId: string, opts?: { silent?: boolean }) => Promise<void>>(() => Promise.resolve());
+  const accountScopeId = userIdToScopeId(currentUser.id);
+  const [unsavedProblemRevisionsState, setUnsavedProblemRevisionsState] = useState<{
+    scopeId: string;
+    map: Record<string, UnsavedProblemRevision>;
+  }>(() => ({
+    scopeId: accountScopeId,
+    map: typeof window !== 'undefined' ? loadAllEffectiveUnsavedProblemRevisions() : {},
+  }));
+  const refreshUnsavedProblemRevisions = useCallback((expectedScopeId?: string) => {
+    const activeScope = getStorageScopeId();
+    if (expectedScopeId && activeScope !== expectedScopeId) return;
+    setUnsavedProblemRevisionsState({
+      scopeId: activeScope,
+      map: loadAllEffectiveUnsavedProblemRevisions(),
+    });
+  }, []);
+  const activeUnsavedProblemRevisions = useMemo(
+    () =>
+      unsavedProblemRevisionsState.scopeId === accountScopeId
+        ? unsavedProblemRevisionsState.map
+        : {},
+    [unsavedProblemRevisionsState, accountScopeId]
+  );
 
   const recoveryDbStatus = useMemo(() => {
     if (itemRecoveryError) return itemRecoveryError;
@@ -626,8 +653,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
         setConceptDrafts(mergedConceptDrafts);
         setProblemDrafts(mergedProblemDrafts);
 
-        // Check for synced revisions to clean up and background auto-retry pending revisions
+        // Check for synced revisions to clean up, pending verification retries (read-only), and pending revisions
         let conflictCount = 0;
+        let verificationPendingCount = 0;
         let clearFailedCount = 0;
         for (const [pId, rev] of Object.entries(unsavedRevisions)) {
           if (rev.syncStatus === 'synced') {
@@ -638,6 +666,9 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             }
           } else if (rev.syncStatus === 'conflict') {
             conflictCount++;
+          } else if (rev.syncStatus === 'verification_pending') {
+            verificationPendingCount++;
+            void verifyProblemRevisionRecoveryRef.current(pId, { silent: true });
           } else if (rev.syncStatus === 'pending' || rev.syncStatus === 'failed' || rev.syncStatus === 'syncing') {
             const sProblem = library.data.problems.find((p) => p.id === pId);
             if (sProblem && (sProblem.version ?? 1) <= rev.baseVersion) {
@@ -645,8 +676,11 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             }
           }
         }
+        refreshUnsavedProblemRevisions(userIdToScopeId(currentUser.id));
         if (conflictCount > 0) {
           showToast(`서버 버전과 충돌한 문제 수정본 ${conflictCount}건이 안전하게 보존되었습니다.`);
+        } else if (verificationPendingCount > 0) {
+          showToast(`서버 저장 후 확인이 필요한 문제 수정본 ${verificationPendingCount}건의 결과를 확인하고 있습니다.`);
         } else if (clearFailedCount > 0) {
           showToast(`동기화 완료된 수정본 임시 기록 ${clearFailedCount}건의 로컬 정리에 실패했습니다.`);
         }
@@ -726,7 +760,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     return () => {
       cancelled = true;
     };
-  }, [currentUser.id, cloudReloadToken]);
+  }, [currentUser.id, cloudReloadToken, refreshUnsavedProblemRevisions]);
 
   const reloadCloudLibrary = () => {
     setCloudStatus('loading');
@@ -2912,292 +2946,27 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       const targetExpectedVersion = unsaved?.baseVersion ?? opts.expectedVersion ?? Math.max(1, (problem.version ?? 1) - 1);
 
       if (opts.revise) {
-        const result = await reviseProblem(
+        const outcome = await pushProblemRevisionToServer({
           supabase,
           problemId,
-          targetExpectedVersion,
-          problem
-        );
-        if (getStorageScopeId() !== pinnedScopeId) return;
-
-        if (result.ok) {
-          const confirmedVersion = result.confirmedVersion;
-          const syncOutcome = confirmProblemRevisionSynced(
-            problemId,
-            { ...result.data, version: confirmedVersion },
-            {
-              revisionId: targetRevisionId,
-              generation: targetGeneration,
-              snapshotProblem,
-              editReason: unsaved?.editReason,
-              scopeId: pinnedScopeId,
-            }
-          );
-          if (syncOutcome.status === 'stale_ignored') {
-            return;
-          }
-          if (syncOutcome.status === 'duplicate') {
-            if (!opts.silent) {
-              showToast(syncOutcome.message);
-            }
-            return;
-          }
-          if (syncOutcome.status === 'conflict') {
-            showToast(syncOutcome.message || '서버 버전 충돌이 감지되었습니다.');
-            return;
-          }
-          let nextProblems = syncOutcome.updatedProblems;
-          if (
-            result.serverAdvancedBeyondConfirmed &&
-            result.latestServerProblem &&
-            !syncOutcome.advancedInFlightRevision
-          ) {
-            const latestVer = result.latestServerProblem.version ?? confirmedVersion;
-            if (latestVer > confirmedVersion) {
-              const advanceOutcome = confirmProblemRevisionSynced(
-                problemId,
-                { ...result.latestServerProblem, version: latestVer },
-                { scopeId: pinnedScopeId }
-              );
-              if (advanceOutcome.reconciled) {
-                nextProblems = advanceOutcome.updatedProblems;
-              }
-            }
-          }
-          setAllProblems(nextProblems);
+          expectedVersion: targetExpectedVersion,
+          problem,
+          snapshotProblem,
+          targetRevisionId,
+          targetGeneration,
+          editReason: unsaved?.editReason,
+          pinnedScopeId,
+          localPersisted: opts.localPersisted,
+          unsaved,
+        });
+        if (getStorageScopeId() !== pinnedScopeId || outcome.outcome === 'scope_changed') {
+          return;
+        }
+        setAllProblems(outcome.updatedProblems);
+        refreshUnsavedProblemRevisions(pinnedScopeId);
+        if (!opts.silent || outcome.needsRecovery) {
           if (!opts.silent) {
-            if (result.verificationStatus === 'verification_failed') {
-              showToast(
-                `서버에는 수정본(v${confirmedVersion})이 저장되었으나 저장 직후 재조회 검증에 실패했습니다. 새로고침 시 최신 서버 상태가 반영됩니다.`
-              );
-            } else if (opts.localPersisted === false && !syncOutcome.localPersisted) {
-              showToast('서버에는 수정본이 저장되었으나 브라우저 로컬 영속 저장소 기록에는 실패했습니다. (메모리 상태만 유지됨)');
-            } else {
-              showToast(syncOutcome.message);
-            }
-          }
-        } else {
-          // If version conflict occurred, check if server was already updated to this version (idempotent retry / response loss)
-          // or if a legacy ambiguous baseVersion can be verified against the server's current state.
-          if (result.error && /VERSION_CONFLICT/i.test(result.error)) {
-            const latestServer = await getProblemById(supabase, problemId);
-            if (getStorageScopeId() !== pinnedScopeId) return;
-            if (latestServer.ok && latestServer.data) {
-              const serverVer = latestServer.data.version ?? 1;
-              const expectedConfirmedVer = targetExpectedVersion + 1;
-
-              // Check 1: If server advanced beyond targetExpectedVersion + 1, inspect the immutable snapshot
-              // for targetExpectedVersion + 1 in problem_versions so an earlier request A recovering after B wrote v3
-              // confirms A/v2 (its own snapshot) rather than mistaking B/v3 or failing to recover.
-              if (serverVer > expectedConfirmedVer) {
-                const snapRes = await getProblemVersionSnapshot(supabase, problemId, expectedConfirmedVer);
-                if (getStorageScopeId() !== pinnedScopeId) return;
-                if (snapRes.ok && snapRes.data) {
-                  const candidateAtExpected: Problem & { version: number } = {
-                    ...latestServer.data,
-                    ...snapRes.data,
-                    id: problemId,
-                    version: expectedConfirmedVer,
-                  };
-                  if (isRevisionMatchingProblem(problem, candidateAtExpected)) {
-                    const syncOutcome = confirmProblemRevisionSynced(
-                      problemId,
-                      candidateAtExpected,
-                      {
-                        revisionId: targetRevisionId,
-                        generation: targetGeneration,
-                        snapshotProblem,
-                        editReason: unsaved?.editReason,
-                        scopeId: pinnedScopeId,
-                      }
-                    );
-                    if (syncOutcome.status === 'stale_ignored') return;
-                    if (syncOutcome.status === 'conflict') {
-                      showToast(syncOutcome.message || '서버 버전 충돌: 내용 불일치가 감지되었습니다.');
-                      return;
-                    }
-                    let nextProblems = syncOutcome.updatedProblems;
-                    if (!syncOutcome.advancedInFlightRevision) {
-                      const advanceOutcome = confirmProblemRevisionSynced(
-                        problemId,
-                        { ...latestServer.data, version: serverVer },
-                        { scopeId: pinnedScopeId }
-                      );
-                      if (advanceOutcome.reconciled) {
-                        nextProblems = advanceOutcome.updatedProblems;
-                      }
-                    }
-                    setAllProblems(nextProblems);
-                    if (!opts.silent) {
-                      showToast(
-                        syncOutcome.localPersisted
-                          ? '문제 수정본이 이미 서버에 동기화되어 있습니다.'
-                          : '문제 수정본이 서버에 동기화되어 있으나 브라우저 로컬 영속 저장소 갱신에는 실패했습니다.'
-                      );
-                    }
-                    return;
-                  }
-                }
-              }
-
-              // Check 2: Current server version matches this revision (response loss recovery when no newer edit intervened)
-              if (
-                serverVer >= targetExpectedVersion &&
-                isRevisionMatchingProblem(problem, latestServer.data)
-              ) {
-                const syncOutcome = confirmProblemRevisionSynced(
-                  problemId,
-                  { ...latestServer.data, version: serverVer },
-                  {
-                    revisionId: targetRevisionId,
-                    generation: targetGeneration,
-                    snapshotProblem,
-                    editReason: unsaved?.editReason,
-                    scopeId: pinnedScopeId,
-                  }
-                );
-                if (syncOutcome.status === 'stale_ignored') {
-                  return;
-                }
-                if (syncOutcome.status === 'conflict') {
-                  showToast(syncOutcome.message || '서버 버전 충돌: 내용 불일치가 감지되었습니다.');
-                  return;
-                }
-                if (syncOutcome.status === 'duplicate') {
-                  if (!opts.silent) {
-                    showToast(
-                      syncOutcome.localPersisted
-                        ? '문제 수정본이 이미 서버에 동기화되어 있습니다.'
-                        : '문제 수정본이 서버에 동기화되어 있으나 브라우저 로컬 영속 저장소 갱신에는 실패했습니다.'
-                    );
-                  }
-                  return;
-                }
-                setAllProblems(syncOutcome.updatedProblems);
-                if (!opts.silent) {
-                  showToast(
-                    syncOutcome.localPersisted
-                      ? '문제 수정본이 이미 서버에 동기화되어 있습니다.'
-                      : '문제 수정본이 서버에 동기화되어 있으나 브라우저 로컬 영속 저장소 갱신에는 실패했습니다.'
-                  );
-                }
-                return;
-              }
-
-              // Legacy ambiguous baseVersion recovery: if baseSnapshot matches latestServer.data,
-              // the user's edit was authored directly on top of the server's current version.
-              if (
-                serverVer > targetExpectedVersion &&
-                unsaved?.baseSnapshot &&
-                isRevisionMatchingProblem(unsaved.baseSnapshot, latestServer.data)
-              ) {
-                const rebasedProblem: Problem = {
-                  ...problem,
-                  version: serverVer + 1,
-                };
-                const retryResult = await reviseProblem(
-                  supabase,
-                  problemId,
-                  serverVer,
-                  rebasedProblem
-                );
-                if (getStorageScopeId() !== pinnedScopeId) return;
-                if (retryResult.ok) {
-                  const confirmedVer = retryResult.confirmedVersion;
-                  const syncOutcome = confirmProblemRevisionSynced(
-                    problemId,
-                    { ...retryResult.data, version: confirmedVer },
-                    {
-                      revisionId: targetRevisionId,
-                      generation: targetGeneration,
-                      snapshotProblem: rebasedProblem,
-                      editReason: unsaved?.editReason,
-                      scopeId: pinnedScopeId,
-                    }
-                  );
-                  if (syncOutcome.status === 'stale_ignored') {
-                    return;
-                  }
-                  if (syncOutcome.status === 'conflict') {
-                    showToast(syncOutcome.message || '서버 버전 충돌이 감지되었습니다.');
-                    return;
-                  }
-                  if (syncOutcome.status === 'duplicate') {
-                    if (!opts.silent) showToast(syncOutcome.message);
-                    return;
-                  }
-                  setAllProblems(syncOutcome.updatedProblems);
-                  if (!opts.silent) {
-                    if (retryResult.verificationStatus === 'verification_failed') {
-                      showToast(
-                        `서버에는 수정본(v${confirmedVer})이 저장되었으나 저장 직후 재조회 검증에 실패했습니다. 새로고침 시 최신 서버 상태가 반영됩니다.`
-                      );
-                    } else {
-                      showToast(syncOutcome.message);
-                    }
-                  }
-                  return;
-                }
-              }
-            }
-
-            const currentUnsaved = resolveLatestProblemRevision(
-              getUnsavedProblemRevision(problemId),
-              getInMemoryProblemRevision(problemId)
-            ).latest;
-            const isCurrentTarget = Boolean(
-              currentUnsaved &&
-              (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId) &&
-              (targetGeneration === undefined || (currentUnsaved.generation ?? 0) <= targetGeneration)
-            );
-            if (currentUnsaved && isCurrentTarget) {
-              const conflictRev = {
-                ...currentUnsaved,
-                syncStatus: 'conflict' as const,
-                syncError: `서버 버전 충돌: ${result.error}`,
-              };
-              setInMemoryProblemRevision(conflictRev);
-              saveUnsavedProblemRevision(conflictRev, {
-                onlyIfRevisionId: targetRevisionId,
-                onlyIfGeneration: targetGeneration,
-              });
-              showToast('서버 버전 충돌: 미저장 수정본이 충돌 복구 대상으로 보존되었습니다.');
-            }
-            return;
-          }
-          const currentUnsaved = resolveLatestProblemRevision(
-            getUnsavedProblemRevision(problemId),
-            getInMemoryProblemRevision(problemId)
-          ).latest;
-          const isCurrentTarget = Boolean(
-            currentUnsaved &&
-            currentUnsaved.syncStatus !== 'conflict' &&
-            (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId) &&
-            (targetGeneration === undefined || (currentUnsaved.generation ?? 0) <= targetGeneration)
-          );
-          if (currentUnsaved && isCurrentTarget) {
-            const failedRev = {
-              ...currentUnsaved,
-              syncStatus: 'failed' as const,
-              syncError: result.error,
-            };
-            setInMemoryProblemRevision(failedRev);
-            saveUnsavedProblemRevision(failedRev, {
-              onlyIfRevisionId: targetRevisionId,
-              onlyIfGeneration: targetGeneration,
-            });
-          }
-          if (!opts.silent) {
-            const isConfigOrAuthErr = /^(not_configured|invalid_rpc_response|forbidden):/i.test(
-              result.error
-            );
-            showToast(
-              opts.localPersisted === false
-                ? `로컬 영속 저장과 서버 동기화가 모두 실패했습니다 (${result.error}). 편집기 입력과 메모리 수정본은 유지되었으니 다시 시도해 주세요.`
-                : isConfigOrAuthErr
-                  ? `서버 설정·권한 확인 실패 (${result.error}): 미저장 수정본은 보존되었으며 DB 마이그레이션(0039) 및 RPC 권한 확인 후 다시 시도해 주세요.`
-                  : `서버 동기화 실패: ${result.error}`
-            );
+            showToast(outcome.message);
           }
         }
       } else {
@@ -3232,39 +3001,97 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       }
     } catch (e) {
       if (getStorageScopeId() !== pinnedScopeId) return;
-      const currentUnsaved = resolveLatestProblemRevision(
-        getUnsavedProblemRevision(problemId),
-        getInMemoryProblemRevision(problemId)
-      ).latest;
-      const isCurrentTarget = Boolean(
-        currentUnsaved &&
-        currentUnsaved.syncStatus !== 'conflict' &&
-        (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId) &&
-        (targetGeneration === undefined || (currentUnsaved.generation ?? 0) <= targetGeneration)
-      );
-      if (currentUnsaved && isCurrentTarget) {
-        const failedRev = {
-          ...currentUnsaved,
-          syncStatus: 'failed' as const,
-          syncError: e instanceof Error ? e.message : '알 수 없는 오류',
-        };
-        setInMemoryProblemRevision(failedRev);
-        saveUnsavedProblemRevision(failedRev, {
-          onlyIfRevisionId: targetRevisionId,
-          onlyIfGeneration: targetGeneration,
-        });
+      const errMsg = e instanceof Error ? e.message : '알 수 없는 오류';
+      if (opts.revise) {
+        const currentUnsaved = resolveLatestProblemRevision(
+          getUnsavedProblemRevision(problemId),
+          getInMemoryProblemRevision(problemId)
+        ).latest;
+        const isCurrentTarget = Boolean(
+          currentUnsaved &&
+          currentUnsaved.syncStatus !== 'conflict' &&
+          currentUnsaved.syncStatus !== 'verification_pending' &&
+          (!targetRevisionId || currentUnsaved.revisionId === targetRevisionId) &&
+          (targetGeneration === undefined || (currentUnsaved.generation ?? 0) <= targetGeneration)
+        );
+        if (currentUnsaved && isCurrentTarget) {
+          const pendingOrFailedRev: UnsavedProblemRevision = {
+            ...currentUnsaved,
+            syncStatus: 'verification_pending',
+            verificationFailureReason: 'save_uncertain',
+            saveConfirmedOnServer: false,
+            syncError: `예외 발생으로 서버 저장 결과를 확인할 수 없습니다. [저장 결과 다시 확인]으로 확인해 주세요. (${errMsg})`,
+          };
+          setInMemoryProblemRevision(pendingOrFailedRev);
+          saveUnsavedProblemRevision(pendingOrFailedRev, {
+            onlyIfRevisionId: targetRevisionId,
+            onlyIfGeneration: targetGeneration,
+          });
+          refreshUnsavedProblemRevisions(pinnedScopeId);
+        }
       }
       if (!opts.silent) {
-        const errMsg = e instanceof Error ? e.message : '알 수 없는 오류';
         showToast(
           opts.localPersisted === false
             ? `로컬 영속 저장과 서버 동기화가 모두 실패했습니다 (${errMsg}). 편집기 입력과 메모리 수정본은 유지되었으니 다시 시도해 주세요.`
-            : `서버 동기화 실패: ${errMsg}`
+            : `서버 동기화 확인 필요: ${errMsg}`
         );
       }
     }
   };
   pushProblemToServerRef.current = pushProblemToServer;
+
+  // Read-only verification retry for "서버 저장 후 확인 필요" (Case A/B) and conflict re-check.
+  // Never invokes `revise_problem_with_snapshot` RPC and never invokes AI.
+  const handleRetryVerifyProblemRevision = async (
+    problemId: string,
+    opts: { silent?: boolean } = {}
+  ): Promise<void> => {
+    const pinnedScopeId = getStorageScopeId();
+    try {
+      const supabase = createBrowserSupabaseClient();
+      const outcome = await verifyProblemRevisionOnServer({
+        supabase,
+        problemId,
+        pinnedScopeId,
+      });
+      if (getStorageScopeId() !== pinnedScopeId || outcome.outcome === 'scope_changed') {
+        return;
+      }
+      setAllProblems(outcome.updatedProblems);
+      refreshUnsavedProblemRevisions(pinnedScopeId);
+      if (!opts.silent) {
+        showToast(outcome.message);
+      }
+    } catch (e) {
+      if (getStorageScopeId() !== pinnedScopeId) return;
+      refreshUnsavedProblemRevisions(pinnedScopeId);
+      if (!opts.silent) {
+        showToast(`저장 결과 확인 중 오류: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+      }
+    }
+  };
+  verifyProblemRevisionRecoveryRef.current = handleRetryVerifyProblemRevision;
+
+  // Explicit resolution for Case C mismatches and version conflicts.
+  const handleResolveProblemRevisionConflict = (
+    problemId: string,
+    action: 'accept_server' | 'prepare_rebase_edit',
+    expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
+  ) => {
+    const pinnedScopeId = getStorageScopeId();
+    const res = resolveProblemRevisionConflict(problemId, action, {
+      scopeId: pinnedScopeId,
+      revisionId: expected?.revisionId,
+      generation: expected?.generation,
+      serverProblem: expected?.serverProblem,
+    });
+    if (getStorageScopeId() !== pinnedScopeId) return res;
+    setAllProblems(res.updatedProblems);
+    refreshUnsavedProblemRevisions(pinnedScopeId);
+    showToast(res.message);
+    return res;
+  };
 
   const handleUpdateProblemDraft = async (updatedDraft: ProblemDraft) => {
     // Drafts loaded from the server carry contentVersion; local-only drafts do not.
@@ -3435,6 +3262,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     const fallbackBeforeVersion = unsavedBefore ? unsavedBefore.baseVersion : (allProblems.find((p) => p.id === problemId)?.version ?? 1);
     const res = editAndReviseProblem(problemId, updates, editReason);
     const beforeVersion = res.memoryRevision?.baseVersion ?? fallbackBeforeVersion;
+    refreshUnsavedProblemRevisions(getStorageScopeId());
     if (res.success && res.persisted) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
@@ -3463,13 +3291,21 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       getUnsavedProblemRevision(problemId),
       getInMemoryProblemRevision(problemId)
     ).latest;
-    const hasPendingRevision = Boolean(unsavedBefore && unsavedBefore.syncStatus !== 'conflict');
+    const isVerificationPending = unsavedBefore?.syncStatus === 'verification_pending';
+    const hasPendingRevision = Boolean(
+      unsavedBefore &&
+        unsavedBefore.syncStatus !== 'conflict' &&
+        unsavedBefore.syncStatus !== 'verification_pending'
+    );
     const beforeVersion = unsavedBefore ? unsavedBefore.baseVersion : (allProblems.find((p) => p.id === problemId)?.version ?? 1);
     const res = reapproveProblem(problemId, reapprovalNote, materials);
     if (res.success) {
       const reloadedProblems = loadStoredProblems();
       setAllProblems(reloadedProblems);
       const updatedProb = res.updatedProblem;
+      if (isVerificationPending) {
+        void handleRetryVerifyProblemRevision(problemId, { silent: true });
+      }
       void pushProblemToServer(problemId, {
         revise: hasPendingRevision,
         expectedVersion: hasPendingRevision ? beforeVersion : undefined,
@@ -4398,6 +4234,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
             onReviseProblem={handleReviseProblem}
             onReapproveProblem={handleReapproveProblem}
             onSuspendProblem={handleSuspendProblem}
+            unsavedProblemRevisions={activeUnsavedProblemRevisions}
+            onRetryVerifyProblemRevision={handleRetryVerifyProblemRevision}
+            onResolveProblemRevisionConflict={handleResolveProblemRevisionConflict}
+            onRetrySaveProblemRevision={(problemId, expectedVersion) =>
+              pushProblemToServer(problemId, { revise: true, expectedVersion })
+            }
           />
         )}
 
@@ -5152,6 +4994,12 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
           onReviseProblem={handleReviseProblem}
           onReapproveProblem={handleReapproveProblem}
           onSuspendProblem={handleSuspendProblem}
+          unsavedProblemRevisions={activeUnsavedProblemRevisions}
+          onRetryVerifyProblemRevision={handleRetryVerifyProblemRevision}
+          onResolveProblemRevisionConflict={handleResolveProblemRevisionConflict}
+          onRetrySaveProblemRevision={(problemId, expectedVersion) =>
+            pushProblemToServer(problemId, { revise: true, expectedVersion })
+          }
         />
       )}
 
