@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { Subject } from '../lib/types';
 import { calculateDDay } from '../lib/dateUtils';
 import { X, Plus, Check } from 'lucide-react';
+import { TimeDialPicker } from './TimeDialPicker';
 
 interface AddSubjectModalProps {
   isOpen: boolean;
@@ -46,7 +47,7 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
       return;
     }
 
-    const autoCode = `§${new Date().getFullYear()}-${domain === 'math_stats' ? 'MATH' : 'CS'}-${Math.floor(Math.random() * 90 + 10)}`;
+    const autoCode = `${new Date().getFullYear()}-${domain === 'math_stats' ? 'MATH' : 'CS'}-${Math.floor(Math.random() * 90 + 10)}`;
 
     const newSubject: Subject = {
       id: createSubjectId(),
@@ -190,28 +191,20 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
             </div>
 
             <div>
-              <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-                시작 시각:
-              </label>
-              <input
-                type="time"
+              <TimeDialPicker
+                label="시작 시각:"
                 value={startTime}
-                onChange={(e) => setStartTime(e.target.value)}
+                onChange={setStartTime}
                 disabled={!examDate}
-                className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817] disabled:opacity-50"
               />
             </div>
 
             <div>
-              <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-                종료 시각:
-              </label>
-              <input
-                type="time"
+              <TimeDialPicker
+                label="종료 시각:"
                 value={endTime}
-                onChange={(e) => setEndTime(e.target.value)}
+                onChange={setEndTime}
                 disabled={!examDate}
-                className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817] disabled:opacity-50"
               />
             </div>
           </div>

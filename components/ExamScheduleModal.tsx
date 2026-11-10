@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { Subject } from '../lib/types';
 import { toSeoulDateString, calculateDDay } from '../lib/dateUtils';
 import { X, Calendar, Check } from 'lucide-react';
+import { TimeDialPicker } from './TimeDialPicker';
 
 interface ExamScheduleModalProps {
   isOpen: boolean;
@@ -107,30 +108,17 @@ export function ExamScheduleModal({
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-                시작 시각:
-              </label>
-              <input
-                type="time"
-                value={startTime}
-                onChange={(e) => setStartTime(e.target.value)}
-                required
-                className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817]"
-              />
-            </div>
-            <div>
-              <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-                종료 시각:
-              </label>
-              <input
-                type="time"
-                value={endTime}
-                onChange={(e) => setEndTime(e.target.value)}
-                className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817]"
-              />
-            </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <TimeDialPicker
+              label="시작 시각:"
+              value={startTime}
+              onChange={setStartTime}
+            />
+            <TimeDialPicker
+              label="종료 시각:"
+              value={endTime}
+              onChange={setEndTime}
+            />
           </div>
 
           <div>
