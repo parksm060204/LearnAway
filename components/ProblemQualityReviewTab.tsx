@@ -45,6 +45,12 @@ import {
   clearTaskRecovery,
   type TaskRecoveryRecord,
 } from '../lib/taskRecoveryClient';
+import {
+  isConflictResolutionComplete,
+  isConflictResolutionPartial,
+  canOpenEditorAfterRebasePrepare,
+  type ResolveProblemRevisionConflictResult,
+} from '../lib/problemRevisionSync';
 
 export interface ProblemQualityReviewInputSnapshot {
   problemId: string;
@@ -81,7 +87,7 @@ interface ProblemQualityReviewTabProps {
     problemId: string,
     action: 'accept_server' | 'prepare_rebase_edit',
     expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
-  ) => { ok: boolean; revision?: UnsavedProblemRevision | null; message?: string };
+  ) => ResolveProblemRevisionConflictResult;
   onRetrySaveProblemRevision?: (problemId: string, expectedVersion?: number) => Promise<void>;
 }
 
@@ -159,6 +165,8 @@ export function ProblemQualityReviewTab({
   const [isModelAnswerVisible, setIsModelAnswerVisible] = useState(true);
   const [isVerifyingRevision, setIsVerifyingRevision] = useState(false);
   const [showConflictDiff, setShowConflictDiff] = useState(false);
+  const [conflictResolutionState, setConflictResolutionState] =
+    useState<ResolveProblemRevisionConflictResult | null>(null);
 
   // Filtered problems list
   const filteredProblems = useMemo(() => {
@@ -249,6 +257,7 @@ export function ProblemQualityReviewTab({
       setAiReviewResult(null);
       setReviewedProblemVersion(null);
       setExpandedVersionNum(null);
+      setConflictResolutionState(null);
     }
     setQualityRecovery(
       effectiveUserId ? getTaskRecovery(effectiveUserId, 'review_problem_quality', activeProblem.id) : null
@@ -587,6 +596,7 @@ export function ProblemQualityReviewTab({
       }
 
       setEditPartialFailure(false);
+      setConflictResolutionState(null);
       setIsEditing(false);
       setEditValidationError(null);
     }
@@ -1059,22 +1069,85 @@ export function ProblemQualityReviewTab({
                   (activeUnsavedRev.serverSnapshotSummary
                     ? { ...activeProblem, ...activeUnsavedRev.serverSnapshotSummary }
                     : activeProblem);
+                const verifiedServerProblemForResolution: Problem | null =
+                  activeUnsavedRev.serverLatestSummary ??
+                  (activeUnsavedRev.serverSnapshotSummary
+                    ? ({
+                        ...activeProblem,
+                        ...activeUnsavedRev.serverSnapshotSummary,
+                        id: activeProblem.id,
+                        subjectId: activeProblem.subjectId,
+                        version: activeUnsavedRev.serverSnapshotSummary.version,
+                      } as Problem)
+                    : null);
                 const isConflict = activeUnsavedRev.syncStatus === 'conflict';
                 const isVerifPending = activeUnsavedRev.syncStatus === 'verification_pending';
                 const isFailed = activeUnsavedRev.syncStatus === 'failed';
                 const isIncompleteOrMissingSnap =
                   activeUnsavedRev.verificationFailureReason === 'snapshot_missing' ||
                   activeUnsavedRev.verificationFailureReason === 'snapshot_incomplete';
+                const isPartialCleanupPending =
+                  conflictResolutionState?.status === 'partial_cleanup_failed';
+                const isMemoryOnlyRebase =
+                  conflictResolutionState?.status === 'rebase_persist_failed' &&
+                  conflictResolutionState.memoryOnly;
+
+                const handleAcceptServerResolution = () => {
+                  if (!onResolveProblemRevisionConflict) return;
+                  const res = onResolveProblemRevisionConflict(activeProblem.id, 'accept_server', {
+                    revisionId: activeUnsavedRev.revisionId,
+                    generation: activeUnsavedRev.generation,
+                    serverProblem: verifiedServerProblemForResolution,
+                  });
+                  if (isConflictResolutionComplete(res)) {
+                    setConflictResolutionState(null);
+                    setShowConflictDiff(false);
+                  } else {
+                    setConflictResolutionState(res);
+                  }
+                };
+
+                const handleRetryPersistRebasedRevision = () => {
+                  if (!onResolveProblemRevisionConflict) return;
+                  const res = onResolveProblemRevisionConflict(
+                    activeProblem.id,
+                    'prepare_rebase_edit',
+                    {
+                      revisionId: activeUnsavedRev.revisionId,
+                      generation: activeUnsavedRev.generation,
+                      serverProblem: verifiedServerProblemForResolution,
+                    }
+                  );
+                  if (isConflictResolutionComplete(res)) {
+                    setConflictResolutionState(null);
+                  } else {
+                    setConflictResolutionState(res);
+                  }
+                };
 
                 const loadProtectedIntoEditor = (rebased: boolean) => {
-                  const sourceRev =
-                    rebased && onResolveProblemRevisionConflict
-                      ? onResolveProblemRevisionConflict(activeProblem.id, 'prepare_rebase_edit', {
-                          revisionId: activeUnsavedRev.revisionId,
-                          generation: activeUnsavedRev.generation,
-                          serverProblem: activeUnsavedRev.serverLatestSummary ?? null,
-                        })?.revision ?? activeUnsavedRev
-                      : activeUnsavedRev;
+                  let sourceRev: UnsavedProblemRevision = activeUnsavedRev;
+                  if (rebased && onResolveProblemRevisionConflict) {
+                    const res = onResolveProblemRevisionConflict(
+                      activeProblem.id,
+                      'prepare_rebase_edit',
+                      {
+                        revisionId: activeUnsavedRev.revisionId,
+                        generation: activeUnsavedRev.generation,
+                        serverProblem: verifiedServerProblemForResolution,
+                      }
+                    );
+                    if (!canOpenEditorAfterRebasePrepare(res)) {
+                      setConflictResolutionState(res);
+                      return;
+                    }
+                    sourceRev = res.revision!;
+                    if (isConflictResolutionComplete(res)) {
+                      setConflictResolutionState(null);
+                    } else {
+                      setConflictResolutionState(res);
+                    }
+                  }
                   setEditTitle(sourceRev.title || activeProblem.title);
                   setEditPrompt(sourceRev.promptText || activeProblem.promptText);
                   setEditFormula(sourceRev.mathFormula || '');
@@ -1083,7 +1156,9 @@ export function ProblemQualityReviewTab({
                   setEditHints([...(sourceRev.hints || [])]);
                   setEditModelAnswer(sourceRev.modelAnswer || '');
                   setEditRubric([...(sourceRev.rubric || [])]);
-                  setEditTimeMinutes(sourceRev.timeStandardMinutes || activeProblem.timeStandardMinutes || 20);
+                  setEditTimeMinutes(
+                    sourceRev.timeStandardMinutes || activeProblem.timeStandardMinutes || 20
+                  );
                   setEditReasonText(sourceRev.editReason || '');
                   setEditValidationError(null);
                   setEditPartialFailure(false);
@@ -1109,19 +1184,25 @@ export function ProblemQualityReviewTab({
                         )}
                         <div className="space-y-1">
                           <h4 className="font-bold font-academic-mono text-xs">
-                            {isConflict
-                              ? '서버 확정 내용과 내 보호 수정본 불일치 (충돌 보존)'
-                              : isIncompleteOrMissingSnap
-                                ? '서버 버전 스냅샷 누락·불완전 — 저장 결과 확인 필요'
-                                : activeUnsavedRev.verificationFailureReason === 'save_uncertain'
-                                  ? '서버 저장 응답 미확인 — 저장 결과 확인 필요'
-                                  : isVerifPending
-                                    ? '서버 저장 후 확인 필요'
-                                    : '서버 동기화 실패 (보호 수정본 유지 중)'}
+                            {isPartialCleanupPending
+                              ? '서버 확정 본문 반영 완료 · 보호 기록 정리 대기 (부분 완료)'
+                              : isMemoryOnlyRebase
+                                ? '서버 기준 재편집 상태 메모리 임시 보존 중 (영속 저장 필요)'
+                                : isConflict
+                                  ? '서버 확정 내용과 내 보호 수정본 불일치 (충돌 보존)'
+                                  : isIncompleteOrMissingSnap
+                                    ? '서버 버전 스냅샷 누락·불완전 — 저장 결과 확인 필요'
+                                    : activeUnsavedRev.verificationFailureReason === 'save_uncertain'
+                                      ? '서버 저장 응답 미확인 — 저장 결과 확인 필요'
+                                      : isVerifPending
+                                        ? '서버 저장 후 확인 필요'
+                                        : '서버 동기화 실패 (보호 수정본 유지 중)'}
                           </h4>
                           <p className="text-[11.5px] leading-relaxed">
-                            {activeUnsavedRev.syncError ||
-                              '보호 수정본이 로컬에 안전하게 보존되어 있습니다. 아래에서 서버 상태를 다시 확인하거나 명시적으로 해결할 수 있습니다.'}
+                            {conflictResolutionState && !isConflictResolutionComplete(conflictResolutionState)
+                              ? conflictResolutionState.message
+                              : activeUnsavedRev.syncError ||
+                                '보호 수정본이 로컬에 안전하게 보존되어 있습니다. 아래에서 서버 상태를 다시 확인하거나 명시적으로 해결할 수 있습니다.'}
                           </p>
                           <p className="text-[10.5px] font-academic-mono opacity-80">
                             {activeUnsavedRev.confirmedVersion
@@ -1174,6 +1255,17 @@ export function ProblemQualityReviewTab({
                           </button>
                         )}
 
+                        {isMemoryOnlyRebase && onResolveProblemRevisionConflict && (
+                          <button
+                            type="button"
+                            onClick={handleRetryPersistRebasedRevision}
+                            className="px-2.5 py-1.5 bg-[#191817] hover:bg-[#33302b] text-white font-bold rounded-2xs inline-flex items-center gap-1"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            <span>기준 갱신 영속 저장 재시도</span>
+                          </button>
+                        )}
+
                         {isConflict && (
                           <button
                             type="button"
@@ -1184,7 +1276,11 @@ export function ProblemQualityReviewTab({
                           </button>
                         )}
 
-                        {(isConflict || isIncompleteOrMissingSnap || isFailed || isVerifPending) && (
+                        {(isConflict ||
+                          isIncompleteOrMissingSnap ||
+                          isFailed ||
+                          isVerifPending ||
+                          isMemoryOnlyRebase) && (
                           <button
                             type="button"
                             onClick={() => loadProtectedIntoEditor(isConflict)}
@@ -1199,20 +1295,65 @@ export function ProblemQualityReviewTab({
                         {isConflict && onResolveProblemRevisionConflict && (
                           <button
                             type="button"
-                            onClick={() =>
-                              onResolveProblemRevisionConflict(activeProblem.id, 'accept_server', {
-                                revisionId: activeUnsavedRev.revisionId,
-                                generation: activeUnsavedRev.generation,
-                                serverProblem: serverCompareTarget,
-                              })
-                            }
+                            onClick={handleAcceptServerResolution}
                             className="px-2.5 py-1.5 bg-white hover:bg-red-100 border border-red-300 text-red-800 rounded-2xs"
                           >
-                            서버 확정 내용 채택 (내 수정본 폐기)
+                            {isPartialCleanupPending
+                              ? '보호 기록 정리 재시도 (본문 반영 완료)'
+                              : conflictResolutionState?.status === 'body_save_failed' ||
+                                  conflictResolutionState?.status === 'body_verify_failed'
+                                ? '서버 내용 채택 저장 재시도'
+                                : '서버 확정 내용 채택 (내 수정본 폐기)'}
                           </button>
                         )}
                       </div>
                     </div>
+
+                    {conflictResolutionState &&
+                      !isConflictResolutionComplete(conflictResolutionState) && (
+                        <div
+                          className={`p-3 rounded-xs border text-[11.5px] flex flex-wrap items-center justify-between gap-2 ${
+                            isConflictResolutionPartial(conflictResolutionState)
+                              ? 'bg-amber-100/80 border-amber-400 text-amber-950'
+                              : 'bg-red-100/80 border-red-300 text-red-950'
+                          }`}
+                        >
+                          <div className="space-y-0.5">
+                            <strong className="block font-academic-mono text-[11px]">
+                              {conflictResolutionState.status === 'partial_cleanup_failed'
+                                ? '부분 완료: 서버 확정 본문 로컬 저장·검증 완료 / 보호 수정본 임시 기록 정리 필요'
+                                : conflictResolutionState.status === 'rebase_persist_failed'
+                                  ? '부분 완료: 재편집 상태 메모리 임시 보존 완료 / 브라우저 영속 저장 필요 (기존 영속 수정본은 보존됨)'
+                                  : conflictResolutionState.status === 'body_save_failed'
+                                    ? '로컬 본문 저장 실패: 기존 문제 본문 및 보호 수정본 보존됨'
+                                    : conflictResolutionState.status === 'body_verify_failed'
+                                      ? '로컬 본문 저장 후 재조회 검증 실패: 보호 수정본 보존됨'
+                                      : '충돌 해결 중단 안내'}
+                            </strong>
+                            <span>{conflictResolutionState.message}</span>
+                          </div>
+                          {conflictResolutionState.needsRetry && (
+                            <button
+                              type="button"
+                              onClick={
+                                conflictResolutionState.action === 'prepare_rebase_edit'
+                                  ? handleRetryPersistRebasedRevision
+                                  : handleAcceptServerResolution
+                              }
+                              className="px-2.5 py-1 bg-[#191817] hover:bg-[#33302b] text-white font-academic-mono font-bold rounded-2xs text-[11px] inline-flex items-center gap-1"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              <span>
+                                {conflictResolutionState.status === 'partial_cleanup_failed'
+                                  ? '보호 기록 정리 재시도 (AI·서버 미호출)'
+                                  : conflictResolutionState.status === 'rebase_persist_failed'
+                                    ? '기준 갱신 영속 저장 재시도 (AI·서버 미호출)'
+                                    : '로컬 저장 다시 시도 (AI·서버 미호출)'}
+                              </span>
+                            </button>
+                          )}
+                        </div>
+                      )}
 
                     {isConflict && showConflictDiff && (
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-red-200">

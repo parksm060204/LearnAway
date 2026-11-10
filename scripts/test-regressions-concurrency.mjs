@@ -53,13 +53,23 @@ async function run() {
   fs.symlinkSync(path.join(root, 'node_modules'), path.join(output, 'node_modules'), 'junction');
 
   const data = new Map();
+  let blockedSubstrings = [];
   global.window = { localStorage: {} };
   global.localStorage = {
+    setBlockedKeys: (keys) => {
+      blockedSubstrings = Array.isArray(keys) ? keys : [];
+    },
     getItem: (key) => (data.has(key) ? data.get(key) : null),
     setItem: (key, value) => {
+      if (blockedSubstrings.some((b) => key === b || key.endsWith(b))) {
+        throw new Error(`QuotaExceededError: blocked write to ${key}`);
+      }
       data.set(key, String(value));
     },
     removeItem: (key) => {
+      if (blockedSubstrings.some((b) => key === b || key.endsWith(b))) {
+        throw new Error(`QuotaExceededError: blocked remove from ${key}`);
+      }
       data.delete(key);
     },
     clear: () => {
@@ -1974,6 +1984,412 @@ async function run() {
     assert.equal(isolatedRes.outcome, 'scope_changed', 'Verification aborted on account switch');
     assert.equal(storage.getEffectiveUnsavedProblemRevision(probId), null, 'User B storage untouched');
     assert.equal(storage.loadStoredProblems().length, 0, 'User B problem list stays empty');
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('Conflict resolution (resolveProblemRevisionConflict): local storage failure and partial completion safety', async () => {
+    const storage = load(path.join(output, 'lib/storage.js'));
+    localStorage.clear();
+    storage.clearAllUnsavedProblemRevisions();
+
+    const probId = 'p_conflict_safety_1';
+    const baseRubric = [
+      { id: 'r1', label: 'C1', maxScore: 60, weight: 0.6, description: 'Criterion 1' },
+      { id: 'r2', label: 'C2', maxScore: 40, weight: 0.4, description: 'Criterion 2' },
+    ];
+    const probV1 = {
+      id: probId,
+      subjectId: 'sub-cs-1',
+      type: 'essay_descriptive',
+      categoryLabel: 'Theory',
+      categoryNumber: 1,
+      conceptIds: ['c-1'],
+      sourceRefs: 'S1',
+      timeBreakdownDesc: '15m',
+      coreEvaluationHighlight: 'H1',
+      itemCountDesc: '1',
+      title: 'Title v1',
+      promptText: 'Original Prompt v1',
+      hints: ['Hint 1'],
+      modelAnswer: 'Original Answer v1',
+      rubric: baseRubric,
+      timeStandardMinutes: 15,
+      version: 1,
+      serverConfirmedVersion: 1,
+      versionHistory: [],
+    };
+    storage.saveStoredProblems([probV1]);
+    const initialAttemptV1 = {
+      id: 'att_conflict_hist_1',
+      problemId: probId,
+      subjectId: 'sub-cs-1',
+      conceptId: 'c-1',
+      problemVersion: 1,
+      submittedAnswer: 'Historical student answer at v1',
+      score: 92,
+      feedback: 'Historical evaluation feedback',
+      rubricScores: [{ criterionId: 'r1', score: 55 }, { criterionId: 'r2', score: 37 }],
+      createdAt: '2026-10-01T10:00:00.000Z',
+    };
+    localStorage.setItem('redcall_attempts_v1', JSON.stringify([initialAttemptV1]));
+
+    // 1. Reproduce pre-fix bug: local problem body = v2, server body = v3, conflict revision exists.
+    // Inject localStorage failure when saving problems_v1 during accept_server.
+    const editRes = storage.editAndReviseProblem(
+      probId,
+      { promptText: 'Local Body v2', modelAnswer: 'Local Answer v2' },
+      'Edit v2'
+    );
+    assert.equal(editRes.success, true);
+    const revV2 = storage.getEffectiveUnsavedProblemRevision(probId);
+    assert.ok(revV2, 'Protected revision exists');
+
+    const serverProbV3 = {
+      ...probV1,
+      title: 'Server Title v3',
+      promptText: 'Server Body v3',
+      modelAnswer: 'Server Answer v3',
+      version: 3,
+      serverConfirmedVersion: 3,
+    };
+
+    storage.recordProblemRevisionMismatchConflict(probId, {
+      targetRevisionId: revV2.revisionId,
+      targetGeneration: revV2.generation,
+      confirmedVersion: 3,
+      saveConfirmedOnServer: true,
+      errorMessage: 'Conflict with Server v3',
+      serverLatestProblem: serverProbV3,
+    });
+
+    const conflictRevBefore = storage.getUnsavedProblemRevision(probId);
+    assert.equal(conflictRevBefore?.syncStatus, 'conflict');
+    assert.equal(storage.loadStoredProblems()[0].version, 2);
+    assert.equal(storage.loadStoredProblems()[0].promptText, 'Local Body v2');
+
+    // Inject storage error on problems_v1 write
+    localStorage.setBlockedKeys(['problems_v1']);
+    let acceptFailRes;
+    try {
+      acceptFailRes = storage.resolveProblemRevisionConflict(probId, 'accept_server', {
+        revisionId: conflictRevBefore.revisionId,
+        generation: conflictRevBefore.generation,
+        serverProblem: serverProbV3,
+      });
+    } finally {
+      localStorage.setBlockedKeys([]);
+    }
+
+    // Must NOT report ok:true or sync completion, and must preserve both persisted and memory revision!
+    assert.equal(acceptFailRes.ok, false, 'accept_server must return ok:false when problem body persistence fails');
+    assert.equal(acceptFailRes.status, 'body_save_failed');
+    assert.ok(
+      !acceptFailRes.message.includes('동기화했습니다'),
+      'accept_server must not claim sync completed when body save failed'
+    );
+    assert.equal(storage.loadStoredProblems()[0].version, 2, 'Persisted problem body remains v2');
+    assert.equal(storage.loadStoredProblems()[0].promptText, 'Local Body v2');
+    assert.ok(
+      storage.getUnsavedProblemRevision(probId),
+      'Persisted protected revision must NOT be deleted when problem body save fails'
+    );
+    assert.ok(
+      storage.getInMemoryProblemRevision(probId),
+      'In-memory protected revision must NOT be deleted when problem body save fails'
+    );
+    assert.equal(acceptFailRes.bodyPersisted, false);
+    assert.equal(acceptFailRes.revisionCleared, false);
+    assert.equal(acceptFailRes.needsRetry, true);
+
+    // 2. accept_server: Read-back verification failure (version, body, or identity mismatch on read-back)
+    // must NOT delete the protected revision!
+    const origGetItem = localStorage.getItem;
+    let corruptNextProblemsRead = false;
+    localStorage.getItem = (key) => {
+      const raw = origGetItem(key);
+      if (corruptNextProblemsRead && key.endsWith('problems_v1') && raw) {
+        const parsed = JSON.parse(raw);
+        // Simulate read-back returning stale v2 body or corrupted content even though setItem did not throw
+        parsed[0].promptText = 'Tampered Readback Prompt';
+        return JSON.stringify(parsed);
+      }
+      return raw;
+    };
+    let verifyFailRes;
+    try {
+      // Restore v2 before testing read-back failure
+      storage.saveStoredProblems(editRes.updatedProblems);
+      corruptNextProblemsRead = true;
+      verifyFailRes = storage.resolveProblemRevisionConflict(probId, 'accept_server', {
+        revisionId: conflictRevBefore.revisionId,
+        generation: conflictRevBefore.generation,
+        serverProblem: serverProbV3,
+      });
+    } finally {
+      corruptNextProblemsRead = false;
+      localStorage.getItem = origGetItem;
+      storage.saveStoredProblems(editRes.updatedProblems);
+    }
+    assert.equal(verifyFailRes.ok, false);
+    assert.equal(verifyFailRes.status, 'body_verify_failed');
+    assert.equal(verifyFailRes.bodyVerified, false);
+    assert.equal(verifyFailRes.revisionCleared, false);
+    assert.ok(storage.getUnsavedProblemRevision(probId), 'Protected revision kept on read-back verify failure');
+    assert.ok(storage.getInMemoryProblemRevision(probId), 'In-memory revision kept on read-back verify failure');
+
+    // Also test read-back version mismatch and identity mismatch
+    let mismatchVersionRead = false;
+    localStorage.getItem = (key) => {
+      const raw = origGetItem(key);
+      if (mismatchVersionRead && key.endsWith('problems_v1') && raw) {
+        const parsed = JSON.parse(raw);
+        parsed[0].version = 2; // Stale version on read-back
+        return JSON.stringify(parsed);
+      }
+      return raw;
+    };
+    try {
+      mismatchVersionRead = true;
+      const verVerifyFail = storage.resolveProblemRevisionConflict(probId, 'accept_server', {
+        revisionId: conflictRevBefore.revisionId,
+        generation: conflictRevBefore.generation,
+        serverProblem: serverProbV3,
+      });
+      assert.equal(verVerifyFail.ok, false);
+      assert.equal(verVerifyFail.status, 'body_verify_failed');
+      assert.ok(storage.getUnsavedProblemRevision(probId));
+    } finally {
+      mismatchVersionRead = false;
+      localStorage.getItem = origGetItem;
+      storage.saveStoredProblems(editRes.updatedProblems);
+    }
+
+    // 3. accept_server: Body save + verification succeed, but protected revision cleanup fails
+    // -> partial_cleanup_failed, and retry cleanly finishes without duplication!
+    localStorage.setBlockedKeys(['unsaved_problem_revisions_v1']);
+    let partialRes;
+    try {
+      partialRes = storage.resolveProblemRevisionConflict(probId, 'accept_server', {
+        revisionId: conflictRevBefore.revisionId,
+        generation: conflictRevBefore.generation,
+        serverProblem: serverProbV3,
+      });
+    } finally {
+      localStorage.setBlockedKeys([]);
+    }
+    assert.equal(partialRes.ok, false, 'Partial completion must NOT return ok:true');
+    assert.equal(partialRes.status, 'partial_cleanup_failed');
+    assert.equal(storage.isConflictResolutionComplete(partialRes), false);
+    assert.equal(storage.isConflictResolutionPartial(partialRes), true);
+    assert.equal(partialRes.bodyPersisted, true);
+    assert.equal(partialRes.bodyVerified, true);
+    assert.equal(partialRes.revisionCleared, false);
+    assert.equal(partialRes.needsRetry, true);
+    assert.equal(storage.loadStoredProblems()[0].version, 3, 'Server v3 body is persisted');
+    assert.equal(storage.loadStoredProblems()[0].promptText, 'Server Body v3');
+    assert.ok(storage.getUnsavedProblemRevision(probId), 'Revision still in storage after cleanup failure');
+
+    // Historical v1 snapshot in versionHistory must remain untouched
+    assert.equal(storage.loadStoredProblems()[0].versionHistory.length, 1);
+    assert.equal(storage.loadStoredProblems()[0].versionHistory[0].version, 1);
+    assert.equal(storage.loadStoredProblems()[0].versionHistory[0].promptText, 'Original Prompt v1');
+
+    // Retry accept_server after storage unblocked: cleans up the revision without duplicating versionHistory or reports
+    const retryCleanupRes = storage.resolveProblemRevisionConflict(probId, 'accept_server', {
+      revisionId: conflictRevBefore.revisionId,
+      generation: conflictRevBefore.generation,
+      serverProblem: serverProbV3,
+    });
+    assert.equal(retryCleanupRes.ok, true);
+    assert.equal(retryCleanupRes.status, 'complete');
+    assert.equal(storage.isConflictResolutionComplete(retryCleanupRes), true);
+    assert.equal(retryCleanupRes.bodyPersisted, true);
+    assert.equal(retryCleanupRes.bodyVerified, true);
+    assert.equal(retryCleanupRes.revisionCleared, true);
+    assert.equal(retryCleanupRes.needsRetry, false);
+    assert.equal(storage.getUnsavedProblemRevision(probId), null, 'Persisted revision cleaned up on retry');
+    assert.equal(storage.getInMemoryProblemRevision(probId), null, 'Memory revision cleaned up on retry');
+    assert.equal(storage.loadStoredProblems()[0].version, 3);
+    assert.equal(storage.loadStoredProblems()[0].versionHistory.length, 1, 'No duplicate versionHistory on retry');
+    const attemptsAfterAccept = storage.loadStoredAttempts();
+    assert.equal(attemptsAfterAccept.length, 1, 'Past attempt history preserved');
+    assert.equal(attemptsAfterAccept[0].id, 'att_conflict_hist_1');
+    assert.equal(attemptsAfterAccept[0].problemVersion, 1);
+    assert.equal(attemptsAfterAccept[0].score, 92);
+    assert.equal(attemptsAfterAccept[0].submittedAnswer, 'Historical student answer at v1');
+
+    // 4. prepare_rebase_edit:
+    // Set up a fresh conflict with pendingPriorVerification to test both preserved and superseded prior verification
+    storage.saveStoredProblems([probV1]);
+    storage.editAndReviseProblem(
+      probId,
+      { promptText: 'My Rebase Candidate Prompt', modelAnswer: 'My Rebase Candidate Answer' },
+      'Rebase Reason'
+    );
+    const revBeforeRebase = storage.getEffectiveUnsavedProblemRevision(probId);
+    // Attach a pendingPriorVerification at v2 (which should be cleared when rebasing onto v3,
+    // or kept if confirmedVersion > newBaseVer)
+    const conflictWithPriorV2 = {
+      ...revBeforeRebase,
+      syncStatus: 'conflict',
+      confirmedVersion: 3,
+      saveConfirmedOnServer: true,
+      serverLatestSummary: serverProbV3,
+      pendingPriorVerification: {
+        revisionId: 'prior-rev-v2',
+        generation: 1,
+        confirmedVersion: 2,
+        submittedProblem: { ...probV1, version: 2 },
+        editReason: 'Prior v2',
+        reason: 'read_error',
+      },
+    };
+    storage.saveUnsavedProblemRevision(conflictWithPriorV2);
+
+    // 4a. Reject rebasing onto incomplete server base or wrong problemId / wrong subjectId
+    const wrongIdBase = storage.resolveProblemRevisionConflict(probId, 'prepare_rebase_edit', {
+      revisionId: conflictWithPriorV2.revisionId,
+      generation: conflictWithPriorV2.generation,
+      serverProblem: { ...serverProbV3, id: 'other_problem_id' },
+    });
+    assert.equal(wrongIdBase.ok, false);
+    assert.equal(wrongIdBase.status, 'invalid_server_base');
+    assert.equal(storage.canOpenEditorAfterRebasePrepare(wrongIdBase), false);
+    assert.equal(storage.getUnsavedProblemRevision(probId)?.syncStatus, 'conflict');
+
+    const wrongSubjectBase = storage.resolveProblemRevisionConflict(probId, 'prepare_rebase_edit', {
+      revisionId: conflictWithPriorV2.revisionId,
+      generation: conflictWithPriorV2.generation,
+      serverProblem: { ...serverProbV3, subjectId: 'other_subject_id' },
+    });
+    assert.equal(wrongSubjectBase.ok, false);
+    assert.equal(wrongSubjectBase.status, 'invalid_server_base');
+
+    const incompleteServerBase = storage.resolveProblemRevisionConflict(probId, 'prepare_rebase_edit', {
+      revisionId: conflictWithPriorV2.revisionId,
+      generation: conflictWithPriorV2.generation,
+      serverProblem: { ...serverProbV3, rubric: [] },
+    });
+    assert.equal(incompleteServerBase.ok, false);
+    assert.equal(incompleteServerBase.status, 'invalid_server_base');
+    assert.equal(storage.getUnsavedProblemRevision(probId)?.baseVersion, 1, 'Never rebased onto incomplete server base');
+
+    // 4b. prepare_rebase_edit when persistent storage fails:
+    // Memory state is prepared (memoryOnly: true), status is 'rebase_persist_failed' (NOT 'complete'),
+    // and existing persisted conflict revision in localStorage is preserved intact!
+    localStorage.setBlockedKeys(['unsaved_problem_revisions_v1']);
+    let rebaseMemOnlyRes;
+    try {
+      rebaseMemOnlyRes = storage.resolveProblemRevisionConflict(probId, 'prepare_rebase_edit', {
+        revisionId: conflictWithPriorV2.revisionId,
+        generation: conflictWithPriorV2.generation,
+        serverProblem: serverProbV3,
+      });
+    } finally {
+      localStorage.setBlockedKeys([]);
+    }
+    assert.equal(rebaseMemOnlyRes.ok, false, 'prepare_rebase_edit must return ok:false when localStorage fails');
+    assert.equal(rebaseMemOnlyRes.status, 'rebase_persist_failed');
+    assert.equal(rebaseMemOnlyRes.revisionPersisted, false);
+    assert.equal(rebaseMemOnlyRes.memorySaved, true);
+    assert.equal(rebaseMemOnlyRes.memoryOnly, true);
+    assert.equal(rebaseMemOnlyRes.needsRetry, true);
+    assert.equal(storage.canOpenEditorAfterRebasePrepare(rebaseMemOnlyRes), true);
+    assert.ok(!rebaseMemOnlyRes.message.includes('준비되었습니다'), 'Must not claim rebase persistence completed');
+
+    // Existing persisted conflict revision in localStorage is untouched
+    const persistedStillConflict = storage.getUnsavedProblemRevision(probId);
+    assert.equal(persistedStillConflict?.syncStatus, 'conflict');
+    assert.equal(persistedStillConflict?.baseVersion, 1);
+    assert.equal(persistedStillConflict?.promptText, 'My Rebase Candidate Prompt');
+
+    // In-memory revision has the rebased state
+    const memRebased = storage.getInMemoryProblemRevision(probId);
+    assert.equal(memRebased?.syncStatus, 'pending');
+    assert.equal(memRebased?.baseVersion, 3);
+    assert.equal(memRebased?.revisionVersion, 4);
+    assert.equal(memRebased?.baseSnapshot?.promptText, 'Server Body v3');
+    assert.equal(memRebased?.pendingPriorVerification, undefined, 'Superseded prior v2 cleared against base v3');
+
+    // 4c. Retry prepare_rebase_edit when storage is unblocked -> persists cleanly!
+    const rebaseRetryOk = storage.resolveProblemRevisionConflict(probId, 'prepare_rebase_edit', {
+      revisionId: conflictWithPriorV2.revisionId,
+      generation: conflictWithPriorV2.generation,
+      serverProblem: serverProbV3,
+    });
+    assert.equal(rebaseRetryOk.ok, true);
+    assert.equal(rebaseRetryOk.status, 'complete');
+    assert.equal(rebaseRetryOk.revisionPersisted, true);
+    assert.equal(rebaseRetryOk.memoryOnly, false);
+    assert.equal(rebaseRetryOk.needsRetry, false);
+
+    const persistedAfterRebase = storage.getUnsavedProblemRevision(probId);
+    assert.equal(persistedAfterRebase?.syncStatus, 'pending');
+    assert.equal(persistedAfterRebase?.baseVersion, 3);
+    assert.equal(persistedAfterRebase?.revisionVersion, 4);
+    assert.equal(persistedAfterRebase?.baseSnapshot?.version, 3);
+    assert.equal(persistedAfterRebase?.baseSnapshot?.promptText, 'Server Body v3');
+    assert.equal(persistedAfterRebase?.pendingPriorVerification, undefined);
+
+    // 4d. Test that pendingPriorVerification IS preserved when confirmedVersion > newBaseVer
+    const conflictWithHigherPrior = {
+      ...conflictWithPriorV2,
+      generation: 5,
+      pendingPriorVerification: {
+        revisionId: 'prior-rev-v5',
+        generation: 4,
+        confirmedVersion: 5,
+        submittedProblem: { ...probV1, version: 5 },
+        editReason: 'Prior v5',
+        reason: 'read_error',
+      },
+    };
+    storage.saveUnsavedProblemRevision(conflictWithHigherPrior);
+    const rebaseKeepPrior = storage.resolveProblemRevisionConflict(probId, 'prepare_rebase_edit', {
+      revisionId: conflictWithHigherPrior.revisionId,
+      generation: conflictWithHigherPrior.generation,
+      serverProblem: serverProbV3,
+    });
+    assert.equal(rebaseKeepPrior.ok, true);
+    assert.equal(rebaseKeepPrior.status, 'complete');
+    assert.equal(
+      storage.getUnsavedProblemRevision(probId)?.pendingPriorVerification?.confirmedVersion,
+      5,
+      'pendingPriorVerification with confirmedVersion > newBaseVer must be preserved'
+    );
+
+    // 5. Common invariants:
+    // 5a. Newer revision B (different revisionId or higher generation) must never be deleted or overwritten by stale conflict resolution A
+    storage.editAndReviseProblem(
+      probId,
+      { promptText: 'Brand New Edit B', modelAnswer: 'Brand New Answer B' },
+      'Newer Edit B'
+    );
+    const revBNewer = storage.getEffectiveUnsavedProblemRevision(probId);
+    const staleAcceptRes = storage.resolveProblemRevisionConflict(probId, 'accept_server', {
+      revisionId: 'old-stale-rev-id',
+      generation: 1,
+      serverProblem: serverProbV3,
+    });
+    assert.equal(staleAcceptRes.ok, false);
+    assert.equal(staleAcceptRes.status, 'stale_revision_aborted');
+    assert.equal(storage.getUnsavedProblemRevision(probId)?.revisionId, revBNewer.revisionId);
+    assert.equal(storage.getUnsavedProblemRevision(probId)?.promptText, 'Brand New Edit B');
+
+    // 5b. Account switch isolation
+    const scopeAtRequest = storageScope.getStorageScopeId();
+    storageScope.setStorageScope({ kind: 'user', userId: 'user_conflict_other' });
+    localStorage.clear();
+    const crossScopeRes = storage.resolveProblemRevisionConflict(probId, 'accept_server', {
+      scopeId: scopeAtRequest,
+      revisionId: revBNewer.revisionId,
+      generation: revBNewer.generation,
+      serverProblem: serverProbV3,
+    });
+    assert.equal(crossScopeRes.ok, false);
+    assert.equal(crossScopeRes.status, 'scope_changed');
+    assert.equal(storage.loadStoredProblems().length, 0, 'Other account problems untouched');
+    assert.equal(storage.getUnsavedProblemRevision(probId), null);
     storageScope.setStorageScope({ kind: 'legacy' });
   });
 

@@ -29,8 +29,13 @@ import {
   recordProblemRevisionVerificationPending,
   recordProblemRevisionMismatchConflict,
   resolveProblemRevisionConflict,
+  isConflictResolutionComplete,
+  isConflictResolutionPartial,
+  canOpenEditorAfterRebasePrepare,
   getEffectiveUnsavedProblemRevision,
   type ConfirmProblemRevisionSyncStatus,
+  type ResolveProblemRevisionConflictStatus,
+  type ResolveProblemRevisionConflictResult,
 } from './storage';
 import { getStorageScopeId } from './storageScope';
 
@@ -1189,4 +1194,11 @@ function finalizeReadOnlyVerificationResult(params: {
   });
 }
 
-export { resolveProblemRevisionConflict };
+export {
+  resolveProblemRevisionConflict,
+  isConflictResolutionComplete,
+  isConflictResolutionPartial,
+  canOpenEditorAfterRebasePrepare,
+  type ResolveProblemRevisionConflictStatus,
+  type ResolveProblemRevisionConflictResult,
+};

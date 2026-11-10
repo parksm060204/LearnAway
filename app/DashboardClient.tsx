@@ -86,6 +86,8 @@ import {
   pushProblemRevisionToServer,
   verifyProblemRevisionOnServer,
   resolveProblemRevisionConflict,
+  isConflictResolutionComplete,
+  type ResolveProblemRevisionConflictResult,
 } from '../lib/problemRevisionSync';
 import { AdminAiMetricsModal } from '../components/AdminAiMetricsModal';
 import { loadLearningLibrary } from '../lib/cloud/learningLibrary';
@@ -3078,7 +3080,7 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
     problemId: string,
     action: 'accept_server' | 'prepare_rebase_edit',
     expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
-  ) => {
+  ): ResolveProblemRevisionConflictResult => {
     const pinnedScopeId = getStorageScopeId();
     const res = resolveProblemRevisionConflict(problemId, action, {
       scopeId: pinnedScopeId,
@@ -3086,8 +3088,10 @@ export default function LearnMyWayDashboardPage({ currentUser }: { currentUser: 
       generation: expected?.generation,
       serverProblem: expected?.serverProblem,
     });
-    if (getStorageScopeId() !== pinnedScopeId) return res;
-    setAllProblems(res.updatedProblems);
+    if (getStorageScopeId() !== pinnedScopeId || res.status === 'scope_changed') return res;
+    if (isConflictResolutionComplete(res) || (res.bodyPersisted && res.bodyVerified)) {
+      setAllProblems(res.updatedProblems);
+    }
     refreshUnsavedProblemRevisions(pinnedScopeId);
     showToast(res.message);
     return res;

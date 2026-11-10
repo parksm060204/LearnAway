@@ -189,8 +189,8 @@ export function conceptIdsEqual(
  * Key order inside rubric items does not affect the signature, and code indentation is preserved.
  */
 export function getProblemEvaluationSignature(p: {
-  type: ProblemType;
-  conceptIds: string[];
+  type?: ProblemType;
+  conceptIds?: string[];
   title: string;
   promptText: string;
   appliedConditionNote?: string;
@@ -199,7 +199,7 @@ export function getProblemEvaluationSignature(p: {
   modelAnswer: string;
   hints: string[];
   rubric: RubricCriterion[];
-  timeStandardMinutes: number;
+  timeStandardMinutes?: number;
   designIntent?: string;
 }): string {
   const sortedConcepts = [...(p.conceptIds || [])].map((c) => normalizeProblemText(c)).sort();
@@ -280,7 +280,7 @@ export function isCompleteProblemSnapshot(
   if (typeof candidate.modelAnswer !== 'string' || normalizeProblemText(candidate.modelAnswer).length === 0) {
     return false;
   }
-  if (!Array.isArray(candidate.rubric)) {
+  if (!Array.isArray(candidate.rubric) || candidate.rubric.length === 0) {
     return false;
   }
   return true;

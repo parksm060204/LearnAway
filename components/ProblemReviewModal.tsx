@@ -34,6 +34,7 @@ import {
 } from 'lucide-react';
 import { ProblemQualityReviewTab } from './ProblemQualityReviewTab';
 import { ProblemQualityStatus, UnsavedProblemRevision } from '../lib/types';
+import type { ResolveProblemRevisionConflictResult } from '../lib/problemRevisionSync';
 
 interface ProblemReviewModalProps {
   isOpen: boolean;
@@ -71,7 +72,7 @@ interface ProblemReviewModalProps {
     problemId: string,
     action: 'accept_server' | 'prepare_rebase_edit',
     expected?: { revisionId?: string; generation?: number; serverProblem?: Problem | null }
-  ) => { ok: boolean; revision?: UnsavedProblemRevision | null; message?: string };
+  ) => ResolveProblemRevisionConflictResult;
   onRetrySaveProblemRevision?: (problemId: string, expectedVersion?: number) => Promise<void>;
   initialMode?: 'drafts' | 'quality_reports';
   userId?: string;
