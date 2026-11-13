@@ -130,40 +130,62 @@ function reconstructPageMarkdown(
     lines.push(buildLine(currentLineItems, currentLineY, currentLineHeight, medianFontSize));
   }
 
-  // 6. Detect potential tabular rows
-  let hasTable = false;
-  let alignedRowsCount = 0;
-  for (let i = 1; i < lines.length; i++) {
-    const prev = lines[i - 1].text;
-    const curr = lines[i].text;
-    if (prev.includes('\t') && curr.includes('\t')) {
-      alignedRowsCount++;
-      if (alignedRowsCount >= 2) hasTable = true;
-    }
-  }
-
-  // 7. Group lines into paragraphs with vertical spacing
+  // 6. Group lines into paragraphs and Markdown tables
   const paragraphs: string[] = [];
   let currentPara: string[] = [];
 
-  for (let i = 0; i < lines.length; i++) {
+  const flushPara = () => {
+    if (currentPara.length > 0) {
+      const hasMathLine = currentPara.some((l) => MATH_SYMBOLS_REGEX.test(l));
+      paragraphs.push(currentPara.join(hasMathLine ? '\n' : ' '));
+      currentPara = [];
+    }
+  };
+
+  let hasTable = false;
+  let i = 0;
+  while (i < lines.length) {
     const line = lines[i];
-    if (line.isHeading) {
-      if (currentPara.length > 0) {
-        paragraphs.push(currentPara.join(' '));
-        currentPara = [];
+
+    // Detect consecutive tab-separated tabular rows (2+ rows with >= 2 columns)
+    if (!line.isHeading && !line.isListItem && line.text.includes('\t')) {
+      const firstCols = line.text.split('\t').map((c) => c.trim());
+      if (firstCols.length >= 2) {
+        let j = i + 1;
+        const tableRows: string[][] = [firstCols];
+        while (j < lines.length) {
+          const nextLine = lines[j];
+          if (nextLine.isHeading || nextLine.isListItem || !nextLine.text.includes('\t')) break;
+          const nextCols = nextLine.text.split('\t').map((c) => c.trim());
+          if (nextCols.length !== firstCols.length) break;
+          tableRows.push(nextCols);
+          j++;
+        }
+        if (tableRows.length >= 2) {
+          flushPara();
+          hasTable = true;
+          const header = `| ${tableRows[0].join(' | ')} |`;
+          const sep = `| ${tableRows[0].map(() => '---').join(' | ')} |`;
+          const body = tableRows.slice(1).map((r) => `| ${r.join(' | ')} |`);
+          paragraphs.push([header, sep, ...body].join('\n'));
+          i = j;
+          continue;
+        }
       }
+    }
+
+    if (line.isHeading) {
+      flushPara();
       const prefix = '#'.repeat(line.headingLevel || 2);
       paragraphs.push(`${prefix} ${line.text}`);
+      i++;
       continue;
     }
 
     if (line.isListItem) {
-      if (currentPara.length > 0) {
-        paragraphs.push(currentPara.join(' '));
-        currentPara = [];
-      }
+      flushPara();
       paragraphs.push(line.text);
+      i++;
       continue;
     }
 
@@ -172,23 +194,22 @@ function reconstructPageMarkdown(
       const gap = prevLine.y - line.y;
       const normalGap = Math.max(prevLine.height, line.height) * 1.5;
       if (gap > normalGap && currentPara.length > 0) {
-        paragraphs.push(currentPara.join(' '));
-        currentPara = [];
+        flushPara();
       }
     }
 
+    const cleanText = line.text.replace(/\t+/g, ' ');
     // Handle end-of-line hyphenation (e.g. "com-", "puter")
     if (currentPara.length > 0 && currentPara[currentPara.length - 1].endsWith('-')) {
       const last = currentPara.pop()!;
-      currentPara.push(last.slice(0, -1) + line.text);
+      currentPara.push(last.slice(0, -1) + cleanText);
     } else {
-      currentPara.push(line.text);
+      currentPara.push(cleanText);
     }
+    i++;
   }
 
-  if (currentPara.length > 0) {
-    paragraphs.push(currentPara.join(' '));
-  }
+  flushPara();
 
   return {
     markdown: paragraphs.join('\n\n').trim(),
@@ -214,6 +235,7 @@ function buildLine(
   let maxFontSize = 0;
 
   for (const item of items) {
+    if (!item.str.trim()) continue;
     maxFontSize = Math.max(maxFontSize, item.fontSize);
     if (prevRight >= 0) {
       const gap = item.x - prevRight;

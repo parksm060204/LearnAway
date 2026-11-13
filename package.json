@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:regressions": "node scripts/test-regressions.mjs && node scripts/test-regressions-concurrency.mjs",
+    "test:regressions": "node scripts/test-regressions.mjs && node scripts/test-regressions-concurrency.mjs && node scripts/test-regressions-pdf-convert.mjs && node scripts/test-regressions-drafts-and-library.mjs && node scripts/test-recovery.mjs",
     "test:suite": "node scripts/test-suite.mjs"
   },
   "dependencies": {

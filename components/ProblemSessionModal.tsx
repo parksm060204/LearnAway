@@ -27,10 +27,10 @@ import { AttemptSaveStatus } from '../lib/storage';
 import { isOmissionDiagnosis } from '../lib/evaluationValidation';
 import {
   clearPracticeAnswerDraft,
+  draftContentEquals,
   hasPracticeDraftContent,
-  listOtherTabPracticeDrafts,
-  listPracticeAnswerDraftsForProblem,
-  loadPracticeAnswerDraftForTab,
+  listRecoverablePracticeDraftsWithStatus,
+  loadPracticeAnswerDraftForTabWithStatus,
   refreshPracticeTabLease,
   releasePracticeTabLease,
   resolvePracticeTabId,
@@ -330,21 +330,37 @@ export function ProblemSessionModal({
   // Resolve THIS tab's draft for this exact problem + version ONCE at mount.
   // A different tab's (or an older version's) draft is NEVER auto-applied; it is
   // exposed below as an explicit recovery choice.
-  const [initialDraft] = useState<PracticeAnswerDraft | null>(() => {
-    if (!userId) return null;
-    const candidate = loadPracticeAnswerDraftForTab(userId, problem.id, problem.version || 1, tabId);
-    if (!candidate) return null;
-    return hasPracticeDraftContent(candidate) ? candidate : null;
+  const [initialDraftState] = useState<{
+    draft: PracticeAnswerDraft | null;
+    loadError: boolean;
+  }>(() => {
+    if (!userId) return { draft: null, loadError: false };
+    const res = loadPracticeAnswerDraftForTabWithStatus(userId, problem.id, problem.version || 1, tabId);
+    const candidate = res.draft;
+    const usable = candidate && hasPracticeDraftContent(candidate) ? candidate : null;
+    return {
+      draft: usable,
+      loadError: res.status === 'read_error' || res.status === 'corrupt',
+    };
   });
-  // Recoverable drafts owned by other tabs / older problem versions.
-  const [recoverableDrafts, setRecoverableDrafts] = useState<PracticeAnswerDraft[]>(() => {
-    if (!userId) return [];
-    const otherTabs = listOtherTabPracticeDrafts(userId, problem.id, problem.version || 1, tabId);
-    const olderOrNewerVersions = listPracticeAnswerDraftsForProblem(userId, problem.id).filter(
-      (d) => d.problemVersion !== (problem.version || 1)
-    );
-    return [...otherTabs, ...olderOrNewerVersions];
+  const initialDraft = initialDraftState.draft;
+
+  // Recoverable drafts owned by other tabs / older problem versions (single-pass snapshot).
+  const [recoverableDraftState] = useState<{
+    drafts: PracticeAnswerDraft[];
+    loadError: boolean;
+  }>(() => {
+    if (!userId) return { drafts: [], loadError: false };
+    const res = listRecoverablePracticeDraftsWithStatus(userId, problem.id, problem.version || 1, tabId);
+    return { drafts: res.drafts, loadError: res.status === 'read_error' };
   });
+  const [recoverableDrafts, setRecoverableDrafts] = useState<PracticeAnswerDraft[]>(
+    recoverableDraftState.drafts
+  );
+  const draftLoadError = initialDraftState.loadError || recoverableDraftState.loadError;
+  const [draftReadBlocked, setDraftReadBlocked] = useState(draftLoadError);
+  const draftReadBlockedRef = useRef(draftLoadError);
+  const [draftReadVerified, setDraftReadVerified] = useState(!draftLoadError);
 
   const [answerText, setAnswerText] = useState(initialDraft?.answerText ?? '');
   const [activeTab, setActiveTab] = useState<'editor' | 'preview'>('editor');
@@ -371,6 +387,8 @@ export function ProblemSessionModal({
   // Once the attempt is durably recorded, later unmount flushes must not
   // re-create the draft that was just cleared.
   const recordSucceededRef = useRef(false);
+  const isInitialMountRef = useRef(true);
+  const hasEditedSinceMountRef = useRef(false);
 
   const problemVersion = problem.version || 1;
 
@@ -390,6 +408,7 @@ export function ProblemSessionModal({
   });
 
   const persistDraftNow = (): boolean => {
+    if (draftReadBlockedRef.current) return false;
     const draft = draftSnapshotRef.current;
     if (!draft) return true;
     // Always persist (even an emptied answer) so a cleared answer is not
@@ -400,8 +419,14 @@ export function ProblemSessionModal({
     return ok;
   };
 
+  const allowDraftSaving = () => {
+    draftReadBlockedRef.current = false;
+    setDraftReadBlocked(false);
+  };
+
   // Applies an explicitly chosen draft (another tab / older version).
   const applyRecoveredDraft = (draft: PracticeAnswerDraft) => {
+    hasEditedSinceMountRef.current = true;
     setAnswerText(draft.answerText);
     setRevealedHints(Array.isArray(draft.revealedHints) ? draft.revealedHints : []);
     setConfidence(typeof draft.confidence === 'number' ? draft.confidence : 3);
@@ -412,6 +437,29 @@ export function ProblemSessionModal({
     setReasonNotApplicableJustification(draft.reasonNotApplicableJustification || '');
     setRecoverableDrafts((prev) => prev.filter((d) => d !== draft));
     setRecoveryNotice('선택한 답안을 이 탭으로 복구했습니다. 저장하면 현재 문제 버전 기준으로 반영됩니다.');
+    if (draftReadVerified) allowDraftSaving();
+  };
+
+  const retryDraftRead = () => {
+    if (!userId) return;
+    const tabRes = loadPracticeAnswerDraftForTabWithStatus(userId, problem.id, problemVersion, tabId);
+    const recRes = listRecoverablePracticeDraftsWithStatus(userId, problem.id, problemVersion, tabId);
+    const ok =
+      tabRes.status !== 'read_error' &&
+      tabRes.status !== 'corrupt' &&
+      recRes.status !== 'read_error';
+    setDraftReadVerified(ok);
+    if (!ok) return;
+    const loadedDraft = tabRes.draft && hasPracticeDraftContent(tabRes.draft) ? tabRes.draft : null;
+    const current = buildDraft();
+    if (loadedDraft && !draftContentEquals(current, loadedDraft)) {
+      setRecoverableDrafts([loadedDraft, ...recRes.drafts]);
+      setRecoveryNotice('저장된 답안과 현재 입력이 다릅니다. 기존 답안을 복구하거나 현재 입력으로 저장을 선택해 주세요.');
+      return;
+    }
+    setRecoverableDrafts(recRes.drafts);
+    if (loadedDraft) applyRecoveredDraft(loadedDraft);
+    allowDraftSaving();
   };
 
   // Autosave the unsaved input (debounced), so a refresh or tab move never
@@ -419,9 +467,16 @@ export function ProblemSessionModal({
   // termination: pagehide/visibilitychange flush the last snapshot immediately.
   useEffect(() => {
     if (!isOpen || !userId) return;
+    if (isInitialMountRef.current) {
+      isInitialMountRef.current = false;
+      if (draftLoadError) return;
+    } else {
+      hasEditedSinceMountRef.current = true;
+    }
     const draft = buildDraft();
     draftSnapshotRef.current = draft;
     if (draftTimerRef.current !== null) window.clearTimeout(draftTimerRef.current);
+    if (draftReadBlocked) return;
     draftTimerRef.current = window.setTimeout(() => {
       draftTimerRef.current = null;
       const ok = savePracticeAnswerDraft(userId, draft);
@@ -437,6 +492,7 @@ export function ProblemSessionModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     isOpen,
+    draftReadBlocked,
     userId,
     problem.id,
     tabId,
@@ -1017,7 +1073,7 @@ export function ProblemSessionModal({
         window.clearTimeout(draftTimerRef.current);
         draftTimerRef.current = null;
       }
-      if (userId) {
+      if (userId && !draftReadBlockedRef.current) {
         clearPracticeAnswerDraft(userId, problem.id, problemVersion, tabId, buildDraft());
       }
       onClose();
@@ -1330,6 +1386,38 @@ export function ProblemSessionModal({
 
           {/* Dual Input Workspace Area: 1. Solution & Conclusion, 2. Method Selection Reason */}
           <div className="space-y-4">
+            {draftReadBlocked && (
+              <div
+                role="alert"
+                className="p-2.5 bg-amber-50 border border-amber-300 text-amber-900 rounded-xs text-[11px] space-y-2"
+              >
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    저장된 초안을 확인하지 못해 자동저장을 중지했습니다. 현재 입력은 화면에 유지되지만 새로고침하면 사라질 수 있습니다.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={retryDraftRead}
+                    className="border border-amber-400 bg-white px-2 py-1 rounded-xs font-medium hover:bg-amber-100"
+                  >
+                    초안 확인 다시 시도
+                  </button>
+                  {draftReadVerified && (
+                    <button
+                      type="button"
+                      onClick={allowDraftSaving}
+                      className="border border-amber-400 bg-white px-2 py-1 rounded-xs font-medium hover:bg-amber-100"
+                    >
+                      현재 입력으로 저장
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
             {draftSaveFailed && (
               <div
                 role="alert"

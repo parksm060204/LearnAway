@@ -2864,6 +2864,251 @@ async function run() {
     storageScope.setStorageScope({ kind: 'legacy' });
   });
 
+  await checkAsync('Reproduction A (Req 1): Protected revision key read failure or corruption must never wipe sibling problem B or report deletion complete', async () => {
+    const storage = load(path.join(output, 'lib/storage.js'));
+    const storageScope = load(path.join(output, 'lib/storageScope.js'));
+    localStorage.clear();
+    storage.clearAllUnsavedProblemRevisions();
+
+    const makeRev = (problemId, revisionId, promptText) => ({
+      problemId,
+      revisionId,
+      generation: 1,
+      baseVersion: 1,
+      revisionVersion: 2,
+      title: `Title ${problemId}`,
+      promptText,
+      type: 'essay_descriptive',
+      conceptIds: ['c-1'],
+      hints: ['H1'],
+      modelAnswer: `Answer ${problemId}`,
+      rubric: [{ id: 'r1', label: 'C1', maxScore: 100, weight: 1, description: 'C1' }],
+      timeStandardMinutes: 15,
+      editReason: 'Edit',
+      revisedAt: new Date().toISOString(),
+      syncStatus: 'pending',
+    });
+
+    const revA = makeRev('prob_repro_A', 'rev_A_1', 'Prompt A v2');
+    const revB = makeRev('prob_repro_B', 'rev_B_1', 'Prompt B v2');
+    assert.equal(storage.saveUnsavedProblemRevision(revA), true);
+    assert.equal(storage.saveUnsavedProblemRevision(revB), true);
+    const rawBefore = localStorage.getItem('redcall_unsaved_problem_revisions_v1');
+
+    // 1. Fail ONLY the first getItem on unsaved_problem_revisions_v1 when updating A, while writes remain unblocked
+    const origGetItem = localStorage.getItem;
+    let failFirstRevRead = true;
+    localStorage.getItem = (key) => {
+      if (failFirstRevRead && key.endsWith('unsaved_problem_revisions_v1')) {
+        failFirstRevRead = false;
+        throw new Error('Transient read error on unsaved_problem_revisions_v1');
+      }
+      return origGetItem(key);
+    };
+    localStorage.resetWriteCounts();
+    let saveResOnReadFail;
+    try {
+      saveResOnReadFail = storage.saveUnsavedProblemRevision({
+        ...revA,
+        generation: 2,
+        promptText: 'Prompt A v3',
+      });
+    } finally {
+      localStorage.getItem = origGetItem;
+    }
+
+    assert.equal(saveResOnReadFail, false, 'saveUnsavedProblemRevision must return false when initial read fails');
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 0, 'Must perform 0 writes when read fails');
+    assert.equal(localStorage.getItem('redcall_unsaved_problem_revisions_v1'), rawBefore, 'Persisted JSON string must be unchanged');
+    assert.equal(storage.getUnsavedProblemRevision('prob_repro_B')?.promptText, 'Prompt B v2', 'Sibling revision B must be preserved');
+
+    // 2. Corrupted JSON / non-object in unsaved_problem_revisions_v1 must not be overwritten with {} on save or clear
+    localStorage.setItem('redcall_unsaved_problem_revisions_v1', '{corrupt');
+    localStorage.resetWriteCounts();
+    assert.equal(storage.saveUnsavedProblemRevision({ ...revA, generation: 2 }), false);
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 0);
+    assert.equal(localStorage.getItem('redcall_unsaved_problem_revisions_v1'), '{corrupt');
+    assert.equal(storage.clearUnsavedProblemRevision('prob_repro_A'), false);
+    assert.equal(localStorage.getWriteCount('unsaved_problem_revisions_v1'), 0);
+    assert.equal(localStorage.getItem('redcall_unsaved_problem_revisions_v1'), '{corrupt');
+
+    // Restore valid A & B
+    localStorage.setItem('redcall_unsaved_problem_revisions_v1', rawBefore);
+    storage.setInMemoryProblemRevision(revA);
+
+    // 3. If read-back verification after delete in clearUnsavedProblemRevision fails, must return false AND keep in-memory protection!
+    let failSecondRevRead = 0;
+    localStorage.getItem = (key) => {
+      if (key.endsWith('unsaved_problem_revisions_v1')) {
+        failSecondRevRead += 1;
+        if (failSecondRevRead === 2) {
+          throw new Error('Read-back failed after clear write');
+        }
+      }
+      return origGetItem(key);
+    };
+    let clearReadBackFail;
+    try {
+      clearReadBackFail = storage.clearUnsavedProblemRevision('prob_repro_A', {
+        revisionId: revA.revisionId,
+        generation: revA.generation,
+      });
+    } finally {
+      localStorage.getItem = origGetItem;
+    }
+    assert.equal(clearReadBackFail, false, 'clearUnsavedProblemRevision must return false when read-back verification fails');
+    assert.ok(storage.getInMemoryProblemRevision('prob_repro_A'), 'In-memory protected revision must NOT be deleted when read-back verification fails');
+
+    // 4. New account where key is genuinely absent: first save succeeds, normal delete succeeds, sibling B preserved
+    storageScope.setStorageScope({ kind: 'user', userId: 'new_account_absent_key' });
+    localStorage.clear();
+    const newAccRevA = makeRev('prob_new_A', 'rev_new_A', 'New Account Prompt A');
+    const newAccRevB = makeRev('prob_new_B', 'rev_new_B', 'New Account Prompt B');
+    assert.equal(storage.saveUnsavedProblemRevision(newAccRevA), true, 'First save on absent key succeeds');
+    assert.equal(storage.saveUnsavedProblemRevision(newAccRevB), true, 'Second problem save succeeds');
+    assert.equal(storage.clearUnsavedProblemRevision('prob_new_A', { revisionId: 'rev_new_A', generation: 1 }), true, 'Normal delete succeeds');
+    assert.equal(storage.getUnsavedProblemRevision('prob_new_A'), null);
+    assert.equal(storage.getInMemoryProblemRevision('prob_new_A'), null);
+    assert.equal(storage.getUnsavedProblemRevision('prob_new_B')?.promptText, 'New Account Prompt B', 'Sibling B preserved after A deleted');
+    storageScope.setStorageScope({ kind: 'legacy' });
+  });
+
+  await checkAsync('Reproduction B (Req 2): Cleanup retry after transient read_error must keep cleanup-only state and write problems_v1 ZERO times across retries', async () => {
+    const storage = load(path.join(output, 'lib/storage.js'));
+    const revSync = load(path.join(output, 'lib/problemRevisionSync.js'));
+    const storageScope = load(path.join(output, 'lib/storageScope.js'));
+    localStorage.clear();
+    storage.clearAllUnsavedProblemRevisions();
+    storageScope.setStorageScope({ kind: 'legacy' });
+
+    const probId = 'p_reproB_transient';
+    const baseRubric = [{ id: 'r1', label: 'C1', maxScore: 100, weight: 1, description: 'C1' }];
+    const probV1 = {
+      id: probId,
+      subjectId: 'sub-1',
+      type: 'essay_descriptive',
+      categoryLabel: 'T',
+      categoryNumber: 1,
+      conceptIds: ['c-1'],
+      sourceRefs: 'S1',
+      timeBreakdownDesc: '15m',
+      coreEvaluationHighlight: 'H1',
+      itemCountDesc: '1',
+      title: 'Title v1',
+      promptText: 'Prompt v1',
+      hints: ['H1'],
+      modelAnswer: 'Answer v1',
+      rubric: baseRubric,
+      timeStandardMinutes: 15,
+      version: 1,
+      serverConfirmedVersion: 1,
+      versionHistory: [],
+    };
+    storage.saveStoredProblems([probV1]);
+    storage.editAndReviseProblem(probId, { promptText: 'Edit v2' }, 'Reason v2');
+    const rev = storage.getEffectiveUnsavedProblemRevision(probId);
+    const serverV3 = {
+      ...probV1,
+      title: 'Server Title v3',
+      promptText: 'Server Prompt v3',
+      modelAnswer: 'Server Answer v3',
+      version: 3,
+      serverConfirmedVersion: 3,
+    };
+    storage.recordProblemRevisionMismatchConflict(probId, {
+      targetRevisionId: rev.revisionId,
+      targetGeneration: rev.generation,
+      confirmedVersion: 3,
+      saveConfirmedOnServer: true,
+      errorMessage: 'Conflict v3',
+      serverLatestProblem: serverV3,
+    });
+
+    // Step 1: accept_server saves & verifies body in problems_v1, fails on revision cleanup -> partial_cleanup_failed
+    localStorage.setBlockedKeys(['unsaved_problem_revisions_v1']);
+    let uiResolutionState = null;
+    try {
+      const req0 = revSync.buildConflictResolutionRequest(
+        storage.getEffectiveUnsavedProblemRevision(probId),
+        'accept_server',
+        uiResolutionState
+      );
+      uiResolutionState = storage.resolveProblemRevisionConflict(probId, req0.action, {
+        ...req0.params,
+        scopeId: storageScope.getStorageScopeId(),
+      });
+    } finally {
+      localStorage.setBlockedKeys([]);
+    }
+    assert.equal(uiResolutionState.status, 'partial_cleanup_failed');
+
+    // Step 2: First cleanup retry where ONLY problems_v1 read temporarily fails
+    const origGetItem = localStorage.getItem;
+    let failFirstProblemsRead = true;
+    localStorage.getItem = (key) => {
+      if (failFirstProblemsRead && key.endsWith('problems_v1')) {
+        failFirstProblemsRead = false;
+        throw new Error('Transient read error on problems_v1 during cleanup retry');
+      }
+      return origGetItem(key);
+    };
+    localStorage.resetWriteCounts();
+    const req1 = revSync.buildConflictResolutionRequest(
+      storage.getEffectiveUnsavedProblemRevision(probId),
+      'accept_server',
+      uiResolutionState,
+      { scopeId: storageScope.getStorageScopeId(), problemId: probId }
+    );
+    assert.equal(req1.action, 'retry_cleanup', 'First retry must choose retry_cleanup');
+    try {
+      uiResolutionState = storage.resolveProblemRevisionConflict(probId, req1.action, {
+        ...req1.params,
+        scopeId: storageScope.getStorageScopeId(),
+      });
+    } finally {
+      localStorage.getItem = origGetItem;
+    }
+    assert.equal(uiResolutionState.ok, false);
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0, 'First retry must write problems_v1 ZERO times');
+
+    // Step 3: Second cleanup retry on the same screen -> MUST STILL choose retry_cleanup and write problems_v1 ZERO times!
+    const activeUnsavedNow = storage.getEffectiveUnsavedProblemRevision(probId);
+    const req2 = revSync.buildConflictResolutionRequest(
+      activeUnsavedNow,
+      'accept_server',
+      uiResolutionState,
+      { scopeId: storageScope.getStorageScopeId(), problemId: probId }
+    );
+    assert.equal(req2.action, 'retry_cleanup', 'Second retry after transient error must STILL choose retry_cleanup (not accept_server)');
+    localStorage.resetWriteCounts();
+    const res2 = storage.resolveProblemRevisionConflict(probId, req2.action, {
+      ...req2.params,
+      scopeId: storageScope.getStorageScopeId(),
+    });
+    assert.equal(res2.ok, true);
+    assert.equal(res2.status, 'complete');
+    assert.equal(localStorage.getWriteCount('problems_v1'), 0, 'Second retry must write problems_v1 ZERO times');
+    assert.equal(storage.getUnsavedProblemRevision(probId), null);
+    assert.equal(storage.getInMemoryProblemRevision(probId), null);
+
+    // Step 4: Verify binding to (scopeId, problemId, revisionId, generation): moving to another problem/account/newer revision must NOT reuse retry_cleanup!
+    const wrongProblemReq = revSync.buildConflictResolutionRequest(
+      { ...activeUnsavedNow, problemId: 'other_problem_id' },
+      'accept_server',
+      uiResolutionState,
+      { scopeId: storageScope.getStorageScopeId(), problemId: 'other_problem_id' }
+    );
+    assert.equal(wrongProblemReq.action, 'accept_server', 'Previous problem cleanup state must not carry over to another problem');
+
+    const wrongScopeReq = revSync.buildConflictResolutionRequest(
+      activeUnsavedNow,
+      'accept_server',
+      uiResolutionState,
+      { scopeId: 'user:different_user', problemId: probId }
+    );
+    assert.equal(wrongScopeReq.action, 'accept_server', 'Previous account cleanup state must not carry over to another account');
+  });
+
   console.log(`${passed} concurrency regression checks passed`);
 }
 

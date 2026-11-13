@@ -53,6 +53,7 @@ import {
   type ProblemConflictResolutionAction,
   type ResolveProblemRevisionConflictResult,
 } from '../lib/problemRevisionSync';
+import { getStorageScopeId } from '../lib/storageScope';
 
 export interface ProblemQualityReviewInputSnapshot {
   problemId: string;
@@ -260,6 +261,7 @@ export function ProblemQualityReviewTab({
       setReviewedProblemVersion(null);
       setExpandedVersionNum(null);
       setConflictResolutionState(null);
+      setShowConflictDiff(false);
     }
     setQualityRecovery(
       effectiveUserId ? getTaskRecovery(effectiveUserId, 'review_problem_quality', activeProblem.id) : null
@@ -1066,6 +1068,20 @@ export function ProblemQualityReviewTab({
                 const activeUnsavedRev = unsavedProblemRevisions?.[activeProblem.id];
                 if (!activeUnsavedRev || activeUnsavedRev.syncStatus === 'synced') return null;
 
+                const currentScopeId = getStorageScopeId();
+                const scopedConflictResolutionState =
+                  conflictResolutionState &&
+                  (!conflictResolutionState.targetScopeId ||
+                    conflictResolutionState.targetScopeId === currentScopeId) &&
+                  (!conflictResolutionState.targetProblemId ||
+                    conflictResolutionState.targetProblemId === activeProblem.id) &&
+                  (!conflictResolutionState.targetRevisionId ||
+                    conflictResolutionState.targetRevisionId === activeUnsavedRev.revisionId) &&
+                  (conflictResolutionState.targetGeneration === undefined ||
+                    conflictResolutionState.targetGeneration === activeUnsavedRev.generation)
+                    ? conflictResolutionState
+                    : null;
+
                 const serverCompareTarget =
                   activeUnsavedRev.serverLatestSummary ??
                   activeUnsavedRev.serverSnapshotSummary ??
@@ -1076,18 +1092,23 @@ export function ProblemQualityReviewTab({
                 const isIncompleteOrMissingSnap =
                   activeUnsavedRev.verificationFailureReason === 'snapshot_missing' ||
                   activeUnsavedRev.verificationFailureReason === 'snapshot_incomplete';
-                const isPartialCleanupPending =
-                  conflictResolutionState?.status === 'partial_cleanup_failed';
+                const isPartialCleanupPending = Boolean(
+                  scopedConflictResolutionState &&
+                    (scopedConflictResolutionState.remainingWork === 'cleanup_only' ||
+                      (scopedConflictResolutionState.remainingWork === undefined &&
+                        scopedConflictResolutionState.status === 'partial_cleanup_failed'))
+                );
                 const isMemoryOnlyRebase =
-                  conflictResolutionState?.status === 'rebase_persist_failed' &&
-                  conflictResolutionState.memoryOnly;
+                  scopedConflictResolutionState?.status === 'rebase_persist_failed' &&
+                  scopedConflictResolutionState.memoryOnly;
 
                 const handleAcceptServerResolution = () => {
                   if (!onResolveProblemRevisionConflict) return;
                   const req = buildConflictResolutionRequest(
                     activeUnsavedRev,
                     'accept_server',
-                    conflictResolutionState
+                    scopedConflictResolutionState,
+                    { scopeId: currentScopeId, problemId: activeProblem.id }
                   );
                   const res = onResolveProblemRevisionConflict(
                     activeProblem.id,
@@ -1107,7 +1128,8 @@ export function ProblemQualityReviewTab({
                   const req = buildConflictResolutionRequest(
                     activeUnsavedRev,
                     'prepare_rebase_edit',
-                    conflictResolutionState
+                    scopedConflictResolutionState,
+                    { scopeId: currentScopeId, problemId: activeProblem.id }
                   );
                   const res = onResolveProblemRevisionConflict(
                     activeProblem.id,
@@ -1127,7 +1149,8 @@ export function ProblemQualityReviewTab({
                     const req = buildConflictResolutionRequest(
                       activeUnsavedRev,
                       'prepare_rebase_edit',
-                      conflictResolutionState
+                      scopedConflictResolutionState,
+                      { scopeId: currentScopeId, problemId: activeProblem.id }
                     );
                     const res = onResolveProblemRevisionConflict(
                       activeProblem.id,
@@ -1196,8 +1219,8 @@ export function ProblemQualityReviewTab({
                                         : '서버 동기화 실패 (보호 수정본 유지 중)'}
                           </h4>
                           <p className="text-[11.5px] leading-relaxed">
-                            {conflictResolutionState && !isConflictResolutionComplete(conflictResolutionState)
-                              ? conflictResolutionState.message
+                            {scopedConflictResolutionState && !isConflictResolutionComplete(scopedConflictResolutionState)
+                              ? scopedConflictResolutionState.message
                               : activeUnsavedRev.syncError ||
                                 '보호 수정본이 로컬에 안전하게 보존되어 있습니다. 아래에서 서버 상태를 다시 확인하거나 명시적으로 해결할 수 있습니다.'}
                           </p>
@@ -1297,8 +1320,8 @@ export function ProblemQualityReviewTab({
                           >
                             {isPartialCleanupPending
                               ? '보호 기록 정리 재시도 (본문 반영 완료)'
-                              : conflictResolutionState?.status === 'body_save_failed' ||
-                                  conflictResolutionState?.status === 'body_verify_failed'
+                              : scopedConflictResolutionState?.status === 'body_save_failed' ||
+                                  scopedConflictResolutionState?.status === 'body_verify_failed'
                                 ? '서버 내용 채택 저장 재시도'
                                 : '서버 확정 내용 채택 (내 수정본 폐기)'}
                           </button>
@@ -1306,34 +1329,34 @@ export function ProblemQualityReviewTab({
                       </div>
                     </div>
 
-                    {conflictResolutionState &&
-                      !isConflictResolutionComplete(conflictResolutionState) && (
+                    {scopedConflictResolutionState &&
+                      !isConflictResolutionComplete(scopedConflictResolutionState) && (
                         <div
                           className={`p-3 rounded-xs border text-[11.5px] flex flex-wrap items-center justify-between gap-2 ${
-                            isConflictResolutionPartial(conflictResolutionState)
+                            isConflictResolutionPartial(scopedConflictResolutionState) || isPartialCleanupPending
                               ? 'bg-amber-100/80 border-amber-400 text-amber-950'
                               : 'bg-red-100/80 border-red-300 text-red-950'
                           }`}
                         >
                           <div className="space-y-0.5">
                             <strong className="block font-academic-mono text-[11px]">
-                              {conflictResolutionState.status === 'partial_cleanup_failed'
+                              {isPartialCleanupPending
                                 ? '부분 완료: 서버 확정 본문 로컬 저장·검증 완료 / 보호 수정본 임시 기록 정리 필요'
-                                : conflictResolutionState.status === 'rebase_persist_failed'
+                                : scopedConflictResolutionState.status === 'rebase_persist_failed'
                                   ? '부분 완료: 재편집 상태 메모리 임시 보존 완료 / 브라우저 영속 저장 필요 (기존 영속 수정본은 보존됨)'
-                                  : conflictResolutionState.status === 'body_save_failed'
+                                  : scopedConflictResolutionState.status === 'body_save_failed'
                                     ? '로컬 본문 저장 실패: 기존 문제 본문 및 보호 수정본 보존됨'
-                                    : conflictResolutionState.status === 'body_verify_failed'
+                                    : scopedConflictResolutionState.status === 'body_verify_failed'
                                       ? '로컬 본문 저장 후 재조회 검증 실패: 보호 수정본 보존됨'
                                       : '충돌 해결 중단 안내'}
                             </strong>
-                            <span>{conflictResolutionState.message}</span>
+                            <span>{scopedConflictResolutionState.message}</span>
                           </div>
-                          {conflictResolutionState.needsRetry && (
+                          {scopedConflictResolutionState.needsRetry && (
                             <button
                               type="button"
                               onClick={
-                                conflictResolutionState.action === 'prepare_rebase_edit'
+                                scopedConflictResolutionState.action === 'prepare_rebase_edit'
                                   ? handleRetryPersistRebasedRevision
                                   : handleAcceptServerResolution
                               }
@@ -1341,9 +1364,9 @@ export function ProblemQualityReviewTab({
                             >
                               <RotateCcw className="w-3 h-3" />
                               <span>
-                                {conflictResolutionState.status === 'partial_cleanup_failed'
+                                {isPartialCleanupPending
                                   ? '보호 기록 정리 재시도 (AI·서버 미호출)'
-                                  : conflictResolutionState.status === 'rebase_persist_failed'
+                                  : scopedConflictResolutionState.status === 'rebase_persist_failed'
                                     ? '기준 갱신 영속 저장 재시도 (AI·서버 미호출)'
                                     : '로컬 저장 다시 시도 (AI·서버 미호출)'}
                               </span>

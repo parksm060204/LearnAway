@@ -108,46 +108,168 @@ export function draftContentEquals(a: PracticeAnswerDraft, b: PracticeAnswerDraf
   );
 }
 
-function isValidDraft(value: unknown): value is PracticeAnswerDraft {
-  if (!value || typeof value !== 'object') return false;
-  const d = value as Partial<PracticeAnswerDraft>;
-  return typeof d.problemId === 'string' && typeof d.problemVersion === 'number' && typeof d.tabId === 'string';
+const VALID_ERROR_TYPES: ReadonlySet<string> = new Set([
+  'none',
+  'concept',
+  'calculation',
+  'logic',
+  'misread',
+  'time',
+]);
+
+function sanitizePracticeDraft(value: unknown): PracticeAnswerDraft | null {
+  if (!value || typeof value !== 'object') return null;
+  const d = value as Record<string, unknown>;
+  if (
+    typeof d.problemId !== 'string' ||
+    !d.problemId ||
+    typeof d.problemVersion !== 'number' ||
+    !Number.isFinite(d.problemVersion) ||
+    typeof d.tabId !== 'string' ||
+    !d.tabId ||
+    typeof d.answerText !== 'string' ||
+    typeof d.savedAt !== 'string'
+  ) {
+    return null;
+  }
+
+  const revealedHints = Array.isArray(d.revealedHints)
+    ? d.revealedHints.filter((h): h is number => typeof h === 'number' && Number.isFinite(h))
+    : [];
+  const confidence =
+    typeof d.confidence === 'number' && Number.isFinite(d.confidence) ? d.confidence : 3;
+  const errorType = (
+    typeof d.errorType === 'string' && VALID_ERROR_TYPES.has(d.errorType) ? d.errorType : 'none'
+  ) as ErrorType;
+
+  return {
+    problemId: d.problemId,
+    problemVersion: d.problemVersion,
+    tabId: d.tabId,
+    answerText: typeof d.answerText === 'string' ? d.answerText : '',
+    revealedHints,
+    confidence,
+    errorType,
+    reasoningNotes: typeof d.reasoningNotes === 'string' ? d.reasoningNotes : '',
+    solvingReason: typeof d.solvingReason === 'string' ? d.solvingReason : '',
+    isReasonNotApplicable: Boolean(d.isReasonNotApplicable),
+    reasonNotApplicableJustification:
+      typeof d.reasonNotApplicableJustification === 'string'
+        ? d.reasonNotApplicableJustification
+        : '',
+    savedAt: typeof d.savedAt === 'string' ? d.savedAt : '',
+  };
 }
 
-/** One-time migration of the previous shared-blob format into per-entry keys. */
-function migrateLegacyBlob(userId: string): void {
+function isValidDraft(value: unknown): value is PracticeAnswerDraft {
+  return sanitizePracticeDraft(value) !== null;
+}
+
+/**
+ * One-time migration of the previous shared-blob format into per-entry keys.
+ * Never overwrites an existing newer/different entry, preserves conflicts in a
+ * dedicated recovery entry, and safely catches storage read errors.
+ */
+function migrateLegacyBlob(userId: string): { ok: boolean } {
   const storage = getStorage();
-  if (!storage) return;
-  const raw = storage.getItem(legacyKey(userId));
-  if (!raw) return;
+  if (!storage) return { ok: false };
+  let raw: string | null;
+  try {
+    raw = storage.getItem(legacyKey(userId));
+  } catch {
+    return { ok: false };
+  }
+  if (!raw) return { ok: true };
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return; // unreadable: keep it untouched
+    return { ok: false }; // unreadable: keep it untouched
   }
-  if (!parsed || typeof parsed !== 'object') return;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false };
+  }
+
   const entries = Object.entries(parsed as Record<string, unknown>);
   const drafts: PracticeAnswerDraft[] = [];
   for (const [storedKey, value] of entries) {
-    if (!value || typeof value !== 'object') return; // malformed: abort, keep original
+    if (!value || typeof value !== 'object') return { ok: false };
     const candidate = value as Partial<PracticeAnswerDraft>;
     const tabIdFromKey = storedKey.includes('::') ? storedKey.split('::')[1] : undefined;
     const tabId = candidate.tabId ?? tabIdFromKey;
-    if (typeof candidate.problemId !== 'string' || typeof candidate.problemVersion !== 'number' || !tabId) {
-      return; // cannot safely migrate: keep the original
+    const normalized = sanitizePracticeDraft({ ...candidate, tabId });
+    if (!normalized) {
+      return { ok: false }; // cannot safely migrate: keep the original
     }
-    drafts.push({ ...(candidate as PracticeAnswerDraft), tabId });
+    drafts.push(normalized);
   }
-  // Write every entry first; only remove the legacy blob once all are verified.
+
+  let hadConflict = false;
   for (const draft of drafts) {
-    if (!writeEntry(userId, draft)) return;
+    const targetKey = entryKey(userId, draft.problemId, draft.problemVersion, draft.tabId);
+    let existingRaw: string | null;
+    try {
+      existingRaw = storage.getItem(targetKey);
+    } catch {
+      return { ok: false };
+    }
+
+    if (existingRaw === null) {
+      if (!writeEntry(userId, draft)) return { ok: false };
+      continue;
+    }
+
+    let existingParsed: unknown;
+    try {
+      existingParsed = JSON.parse(existingRaw);
+    } catch {
+      // Target entry is unreadable/corrupt: do not overwrite it and keep legacy intact
+      return { ok: false };
+    }
+    const existing = sanitizePracticeDraft(existingParsed);
+    if (!existing) return { ok: false };
+
+    if (draftContentEquals(existing, draft)) {
+      // Already migrated identically: safe to skip without overwriting
+      continue;
+    }
+
+    // Conflict: existing entry differs from legacy entry. Keep existing untouched,
+    // preserve legacy entry under a dedicated recovery key, and keep the legacy source.
+    hadConflict = true;
+    const backupTabId = draft.tabId.startsWith('legacy-backup-')
+      ? draft.tabId
+      : `legacy-backup-${draft.tabId}`;
+    const backupKey = entryKey(userId, draft.problemId, draft.problemVersion, backupTabId);
+    let backupRaw: string | null;
+    try {
+      backupRaw = storage.getItem(backupKey);
+    } catch {
+      return { ok: false };
+    }
+    if (backupRaw === null) {
+      if (!writeEntry(userId, { ...draft, tabId: backupTabId })) return { ok: false };
+    } else {
+      try {
+        const parsedBackup = sanitizePracticeDraft(JSON.parse(backupRaw));
+        if (!parsedBackup || !draftContentEquals(parsedBackup, { ...draft, tabId: backupTabId })) {
+          return { ok: false }; // backup slot already holds different data; keep legacy blob
+        }
+      } catch {
+        return { ok: false };
+      }
+    }
   }
-  try {
-    storage.removeItem(legacyKey(userId));
-  } catch {
-    // readable-only storage: entries are already present
+
+  if (!hadConflict) {
+    try {
+      storage.removeItem(legacyKey(userId));
+    } catch {
+      // readable-only storage: entries are already present
+    }
   }
+  return { ok: true };
 }
 
 function writeEntry(userId: string, draft: PracticeAnswerDraft): boolean {
@@ -164,36 +286,130 @@ function writeEntry(userId: string, draft: PracticeAnswerDraft): boolean {
   }
 }
 
-function readAllDrafts(userId: string): PracticeAnswerDraft[] {
-  if (!userId) return [];
-  migrateLegacyBlob(userId);
+export interface PracticeDraftReadResult {
+  status: 'ok' | 'absent' | 'read_error' | 'corrupt';
+  draft: PracticeAnswerDraft | null;
+}
+
+export interface PracticeDraftListResult {
+  status: 'ok' | 'read_error';
+  drafts: PracticeAnswerDraft[];
+  hadCorruptEntry: boolean;
+}
+
+export interface RecoverablePracticeDraftsResult {
+  status: 'ok' | 'read_error';
+  otherTabDrafts: PracticeAnswerDraft[];
+  otherVersionDrafts: PracticeAnswerDraft[];
+  drafts: PracticeAnswerDraft[];
+}
+
+function readAllDraftsWithStatus(userId: string): PracticeDraftListResult {
+  if (!userId) return { status: 'ok', drafts: [], hadCorruptEntry: false };
+  const mig = migrateLegacyBlob(userId);
   const storage = getStorage();
-  if (!storage) return [];
+  if (!storage) return { status: 'read_error', drafts: [], hadCorruptEntry: false };
   const prefix = `${userPrefix(userId)}__`;
   const out: PracticeAnswerDraft[] = [];
+  let hadReadError = !mig.ok;
+  let hadCorruptEntry = false;
   try {
-    for (let i = 0; i < storage.length; i += 1) {
-      const key = storage.key(i);
-      if (!key || !key.startsWith(prefix)) continue;
-      const raw = storage.getItem(key);
+    const len = storage.length;
+    for (let i = 0; i < len; i += 1) {
+      let key: string | null;
+      let raw: string | null;
+      try {
+        key = storage.key(i);
+        if (!key || !key.startsWith(prefix)) continue;
+        raw = storage.getItem(key);
+      } catch {
+        hadReadError = true;
+        continue;
+      }
       if (!raw) continue;
       try {
         const parsed: unknown = JSON.parse(raw);
-        if (isValidDraft(parsed)) out.push(parsed);
+        const sanitized = sanitizePracticeDraft(parsed);
+        if (sanitized) out.push(sanitized);
+        else hadCorruptEntry = true;
       } catch {
-        // ignore a corrupt entry rather than losing the others
+        hadCorruptEntry = true;
       }
     }
   } catch {
-    return out;
+    return { status: 'read_error', drafts: out, hadCorruptEntry };
   }
-  return out;
+  return {
+    status: hadReadError ? 'read_error' : 'ok',
+    drafts: out,
+    hadCorruptEntry,
+  };
+}
+
+function readAllDrafts(userId: string): PracticeAnswerDraft[] {
+  return readAllDraftsWithStatus(userId).drafts;
+}
+
+/** Single-pass snapshot for the editor's own draft and all explicit recovery choices. */
+export function loadPracticeDraftState(
+  userId: string,
+  problemId: string,
+  problemVersion: number,
+  tabId: string
+): {
+  ok: boolean;
+  draft: PracticeAnswerDraft | null;
+  recoverable: PracticeAnswerDraft[];
+} {
+  const res = readAllDraftsWithStatus(userId);
+  const matching = res.drafts.filter((d) => d.problemId === problemId);
+  return {
+    ok: res.status === 'ok' && !res.hadCorruptEntry,
+    draft:
+      matching.find((d) => d.problemVersion === problemVersion && d.tabId === tabId) ?? null,
+    recoverable: matching
+      .filter((d) => d.problemVersion !== problemVersion || d.tabId !== tabId)
+      .sort((a, b) => b.savedAt.localeCompare(a.savedAt)),
+  };
 }
 
 /** Saves (or replaces) THIS tab's draft for one problem. */
 export function savePracticeAnswerDraft(userId: string, draft: PracticeAnswerDraft): boolean {
   if (!userId || !draft?.tabId) return false;
-  return writeEntry(userId, draft);
+  const sanitized = sanitizePracticeDraft(draft);
+  if (!sanitized) return false;
+  return writeEntry(userId, sanitized);
+}
+
+/** This tab's own draft for one problem + version with explicit read status. */
+export function loadPracticeAnswerDraftForTabWithStatus(
+  userId: string,
+  problemId: string,
+  problemVersion: number,
+  tabId: string
+): PracticeDraftReadResult {
+  if (!userId || !tabId) return { status: 'absent', draft: null };
+  const mig = migrateLegacyBlob(userId);
+  const storage = getStorage();
+  if (!storage) return { status: 'read_error', draft: null };
+  let raw: string | null;
+  try {
+    raw = storage.getItem(entryKey(userId, problemId, problemVersion, tabId));
+  } catch {
+    return { status: 'read_error', draft: null };
+  }
+  if (raw === null) {
+    return { status: mig.ok ? 'absent' : 'read_error', draft: null };
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    const sanitized = sanitizePracticeDraft(parsed);
+    return sanitized
+      ? { status: 'ok', draft: sanitized }
+      : { status: 'corrupt', draft: null };
+  } catch {
+    return { status: 'corrupt', draft: null };
+  }
 }
 
 /** This tab's own draft for one problem + version (never another tab's). */
@@ -203,18 +419,37 @@ export function loadPracticeAnswerDraftForTab(
   problemVersion: number,
   tabId: string
 ): PracticeAnswerDraft | null {
-  if (!userId || !tabId) return null;
-  migrateLegacyBlob(userId);
-  const storage = getStorage();
-  if (!storage) return null;
-  try {
-    const raw = storage.getItem(entryKey(userId, problemId, problemVersion, tabId));
-    if (!raw) return null;
-    const parsed: unknown = JSON.parse(raw);
-    return isValidDraft(parsed) ? parsed : null;
-  } catch {
-    return null;
+  return loadPracticeAnswerDraftForTabWithStatus(userId, problemId, problemVersion, tabId).draft;
+}
+
+/** Single-pass classification of recoverable drafts (other tabs + other versions). */
+export function listRecoverablePracticeDraftsWithStatus(
+  userId: string,
+  problemId: string,
+  problemVersion: number,
+  tabId: string
+): RecoverablePracticeDraftsResult {
+  const all = readAllDraftsWithStatus(userId);
+  const otherTabDrafts: PracticeAnswerDraft[] = [];
+  const otherVersionDrafts: PracticeAnswerDraft[] = [];
+  for (const d of all.drafts) {
+    if (d.problemId !== problemId) continue;
+    if (d.problemVersion === problemVersion) {
+      if (d.tabId !== tabId) otherTabDrafts.push(d);
+    } else {
+      otherVersionDrafts.push(d);
+    }
   }
+  const byNewest = (a: PracticeAnswerDraft, b: PracticeAnswerDraft) =>
+    b.savedAt.localeCompare(a.savedAt);
+  otherTabDrafts.sort(byNewest);
+  otherVersionDrafts.sort(byNewest);
+  return {
+    status: all.status,
+    otherTabDrafts,
+    otherVersionDrafts,
+    drafts: [...otherTabDrafts, ...otherVersionDrafts],
+  };
 }
 
 /** All drafts for one problem + version across tabs (newest first). */
@@ -273,11 +508,11 @@ export function clearPracticeAnswerDraft(
   if (expected) {
     try {
       const stored: unknown = JSON.parse(raw);
-      if (isValidDraft(stored) && !draftContentEquals(stored, expected)) {
+      if (!isValidDraft(stored) || !draftContentEquals(stored, expected)) {
         return false; // a newer/different draft is preserved
       }
     } catch {
-      // fall through and attempt the removal
+      return false; // unreadable content is not proof that this is the submitted draft
     }
   }
   try {

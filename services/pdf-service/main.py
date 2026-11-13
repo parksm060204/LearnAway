@@ -35,10 +35,35 @@ app = FastAPI(
 
 MAX_FILE_BYTES = int(os.getenv("MAX_PDF_BYTES", 20 * 1024 * 1024))  # 20MB
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_CONVERSIONS", 3))
-CONVERSION_TIMEOUT_SECONDS = int(os.getenv("CONVERSION_TIMEOUT_SECONDS", 60))
+CONVERSION_TIMEOUT_SECONDS = float(os.getenv("CONVERSION_TIMEOUT_SECONDS", 52.0))
+CONVERSION_QUEUE_TIMEOUT_SECONDS = float(os.getenv("CONVERSION_QUEUE_TIMEOUT_SECONDS", 10.0))
+DIRECT_REQUEST_BUDGET_SECONDS = float(os.getenv("DIRECT_REQUEST_BUDGET_SECONDS", 52.0))
+STORAGE_REQUEST_BUDGET_SECONDS = float(os.getenv("STORAGE_REQUEST_BUDGET_SECONDS", 48.0))
+CLEANUP_AND_RESPONSE_MARGIN_SECONDS = float(os.getenv("CLEANUP_AND_RESPONSE_MARGIN_SECONDS", 3.5))
+MIN_CONVERSION_BUDGET_SECONDS = float(os.getenv("MIN_CONVERSION_BUDGET_SECONDS", 1.5))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 3))
 DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", 30.0))
 DOWNLOAD_QUEUE_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_QUEUE_TIMEOUT_SECONDS", 10.0))
+
+
+def compute_work_deadline(
+    request_started_mono: float,
+    default_budget_seconds: float,
+    x_request_budget_ms: Optional[str] = None,
+) -> float:
+    """
+    Computes a single monotonic deadline for queue wait (+ download) + conversion,
+    reserving CLEANUP_AND_RESPONSE_MARGIN_SECONDS for process cleanup and HTTP response.
+    """
+    budget_seconds = default_budget_seconds
+    if x_request_budget_ms is not None:
+        try:
+            header_seconds = float(x_request_budget_ms) / 1000.0
+            if header_seconds > 0:
+                budget_seconds = min(budget_seconds, header_seconds)
+        except (TypeError, ValueError):
+            pass
+    return request_started_mono + budget_seconds - CLEANUP_AND_RESPONSE_MARGIN_SECONDS
 
 # Concurrency semaphore to protect CPU/memory on container instances
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -342,20 +367,38 @@ async def _async_http_download(
                 pass
 
 
-async def download_storage_file_async(signed_url: str) -> bytes:
+async def download_storage_file_async(
+    signed_url: str,
+    deadline_monotonic: Optional[float] = None,
+) -> bytes:
     """
     Asynchronously streams storage file downloads natively in the event loop with:
     - Bounded concurrency queue (429 on saturation)
-    - Total execution timeout (504 on timeout)
+    - Single request budget / total execution timeout (504 on timeout)
     - Max size limits (413 on exceed)
     - Immediate native cancellation and socket closure on abort/timeout/cancel
     - Preserved SSRF domain and redirect validation
     - Real-time active download counter tracking
     """
+    queue_timeout = DOWNLOAD_QUEUE_TIMEOUT_SECONDS
+    if deadline_monotonic is not None:
+        available_for_dl = (deadline_monotonic - time.monotonic()) - MIN_CONVERSION_BUDGET_SECONDS
+        if available_for_dl <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="남은 요청 처리 시간이 부족하여 스토리지 다운로드를 시작하지 못했습니다.",
+            )
+        queue_timeout = min(queue_timeout, available_for_dl)
+
     try:
-        async with asyncio.timeout(DOWNLOAD_QUEUE_TIMEOUT_SECONDS):
+        async with asyncio.timeout(queue_timeout):
             await download_semaphore.acquire()
     except (TimeoutError, asyncio.TimeoutError):
+        if deadline_monotonic is not None and ((deadline_monotonic - time.monotonic()) - MIN_CONVERSION_BUDGET_SECONDS) <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="다운로드 대기 중 남은 요청 처리 시간이 부족해졌습니다.",
+            )
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="다운로드 대기열이 가득 찼습니다. 잠시 후 다시 시도해 주세요.",
@@ -366,7 +409,17 @@ async def download_storage_file_async(signed_url: str) -> bytes:
         active_downloads_count += 1
 
     try:
-        async with asyncio.timeout(DOWNLOAD_TIMEOUT_SECONDS):
+        dl_timeout = DOWNLOAD_TIMEOUT_SECONDS
+        if deadline_monotonic is not None:
+            remaining_for_dl = (deadline_monotonic - time.monotonic()) - MIN_CONVERSION_BUDGET_SECONDS
+            if remaining_for_dl <= 0:
+                raise HTTPException(
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                    detail="남은 요청 처리 시간이 부족하여 스토리지 다운로드를 시작하지 못했습니다.",
+                )
+            dl_timeout = min(dl_timeout, remaining_for_dl)
+
+        async with asyncio.timeout(dl_timeout):
             content = await _async_http_download(signed_url)
             return content
     except (TimeoutError, asyncio.TimeoutError):
@@ -406,17 +459,37 @@ async def execute_conversion_with_killable_process(
     pdf_bytes: bytes,
     max_pages: int,
     timeout_seconds: float,
+    deadline_monotonic: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Executes PDF conversion in an isolated, killable subprocess.
-    If timeout occurs, terminates the worker process and confirms process exit
-    BEFORE releasing the concurrency slot back to the semaphore.
+    Executes PDF conversion in an isolated, killable subprocess within a single request budget.
+    If remaining budget after queue wait is below MIN_CONVERSION_BUDGET_SECONDS, skips spawning
+    the subprocess and returns 504. Always terminates worker, deletes temp files, and releases
+    the concurrency slot on exit or timeout.
     """
-    # 1. Bounded queue wait timeout (15s) to prevent unbounded memory queuing
+    queue_timeout = CONVERSION_QUEUE_TIMEOUT_SECONDS
+    if deadline_monotonic is not None:
+        available_before_queue = deadline_monotonic - time.monotonic()
+        if available_before_queue < MIN_CONVERSION_BUDGET_SECONDS:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="남은 요청 처리 시간이 부족하여 PDF 변환을 시작하지 못했습니다.",
+            )
+        queue_timeout = min(
+            CONVERSION_QUEUE_TIMEOUT_SECONDS,
+            max(0.01, available_before_queue - MIN_CONVERSION_BUDGET_SECONDS),
+        )
+
+    # 1. Bounded queue wait timeout within remaining request budget
     try:
-        async with asyncio.timeout(15.0):
+        async with asyncio.timeout(queue_timeout):
             await concurrency_semaphore.acquire()
     except (TimeoutError, asyncio.TimeoutError):
+        if deadline_monotonic is not None and (deadline_monotonic - time.monotonic()) < MIN_CONVERSION_BUDGET_SECONDS:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="대기 중 남은 요청 처리 시간이 부족하여 PDF 변환을 시작하지 못했습니다.",
+            )
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="변환 대기열이 가득 찼습니다. 잠시 후 다시 시도해 주세요.",
@@ -425,7 +498,17 @@ async def execute_conversion_with_killable_process(
     temp_path = None
     proc = None
     res_queue = None
+    effective_timeout = timeout_seconds
     try:
+        if deadline_monotonic is not None:
+            remaining_after_wait = deadline_monotonic - time.monotonic()
+            if remaining_after_wait < MIN_CONVERSION_BUDGET_SECONDS:
+                raise HTTPException(
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                    detail="대기 후 남은 변환 시간이 부족하여 PDF 변환을 시작하지 못했습니다.",
+                )
+            effective_timeout = min(timeout_seconds, remaining_after_wait)
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(pdf_bytes)
             temp_path = tmp.name
@@ -438,9 +521,9 @@ async def execute_conversion_with_killable_process(
         )
         proc.start()
 
-        start_time = time.time()
+        start_time = time.monotonic()
         result = None
-        while time.time() - start_time < timeout_seconds:
+        while time.monotonic() - start_time < effective_timeout:
             if not res_queue.empty():
                 result = res_queue.get_nowait()
                 break
@@ -448,9 +531,9 @@ async def execute_conversion_with_killable_process(
                 if not res_queue.empty():
                     result = res_queue.get_nowait()
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
 
-        if result is None and (time.time() - start_time >= timeout_seconds):
+        if result is None and (time.monotonic() - start_time >= effective_timeout):
             raise TimeoutError("Conversion timeout exceeded")
 
         if result is None:
@@ -466,7 +549,7 @@ async def execute_conversion_with_killable_process(
                 proc.join(timeout=1.0)
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=f"PDF 변환 처리 시간이 제한({timeout_seconds}초)을 초과했습니다.",
+            detail=f"PDF 변환 처리 시간이 제한({effective_timeout:.1f}초)을 초과했습니다.",
         )
     except HTTPException:
         raise
@@ -504,12 +587,19 @@ async def convert_direct_file(
     file: UploadFile = File(...),
     x_service_token: Optional[str] = Header(None, alias="X-Service-Token"),
     x_job_token: Optional[str] = Header(None, alias="X-Job-Token"),
+    x_request_budget_ms: Optional[str] = Header(None, alias="X-Request-Budget-Ms"),
 ):
     """
     Converts directly uploaded PDF multipart file stream into Markdown.
-    Used for files up to 20MB. Reads in bounded chunks.
+    Used for files up to 20MB. Reads in bounded chunks within a single request budget.
     """
+    request_started_mono = time.monotonic()
     authenticate_request(x_service_token, x_job_token)
+    deadline_monotonic = compute_work_deadline(
+        request_started_mono,
+        DIRECT_REQUEST_BUDGET_SECONDS,
+        x_request_budget_ms,
+    )
 
     content_chunks = []
     total_read = 0
@@ -540,6 +630,7 @@ async def convert_direct_file(
         content,
         MAX_PAGES_DEFAULT,
         CONVERSION_TIMEOUT_SECONDS,
+        deadline_monotonic=deadline_monotonic,
     )
 
     if not result.get("success"):
@@ -559,11 +650,13 @@ async def convert_storage_file(
     req: StorageConvertRequest,
     x_service_token: Optional[str] = Header(None, alias="X-Service-Token"),
     x_job_token: Optional[str] = Header(None, alias="X-Job-Token"),
+    x_request_budget_ms: Optional[str] = Header(None, alias="X-Request-Budget-Ms"),
 ):
     """
     Converts a PDF from a pre-authenticated storage signed URL.
-    Validates token claims, SSRF boundaries, and executes in killable worker.
+    Validates token claims, SSRF boundaries, and executes in killable worker within a single request budget.
     """
+    request_started_mono = time.monotonic()
     authenticate_request(
         x_service_token,
         x_job_token,
@@ -571,15 +664,24 @@ async def convert_storage_file(
         expected_job_id=req.jobId,
         expected_storage_path=req.storagePath,
     )
+    deadline_monotonic = compute_work_deadline(
+        request_started_mono,
+        STORAGE_REQUEST_BUDGET_SECONDS,
+        x_request_budget_ms,
+    )
 
     validate_storage_url(req.signedUrl)
 
-    content = await download_storage_file_async(req.signedUrl)
+    content = await download_storage_file_async(
+        req.signedUrl,
+        deadline_monotonic=deadline_monotonic,
+    )
 
     result = await execute_conversion_with_killable_process(
         content,
         MAX_PAGES_DEFAULT,
         CONVERSION_TIMEOUT_SECONDS,
+        deadline_monotonic=deadline_monotonic,
     )
 
     if not result.get("success"):

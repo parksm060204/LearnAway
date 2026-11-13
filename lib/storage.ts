@@ -3454,6 +3454,81 @@ function revisionRecordMatches(a: UnsavedProblemRevision, b: UnsavedProblemRevis
   );
 }
 
+type UnsavedProblemRevisionsReadForWriteResult =
+  | { status: 'ok'; revisions: Record<string, UnsavedProblemRevision>; keyAbsent: false }
+  | { status: 'absent'; revisions: Record<string, UnsavedProblemRevision>; keyAbsent: true }
+  | { status: 'read_error'; error: string };
+
+/**
+ * Strictly distinguishes `'ok'` (valid persisted map), `'absent'` (key genuinely
+ * does not exist in `localStorage`), and `'read_error'` (storage unavailable,
+ * `getItem` threw, corrupted JSON, or non-object JSON) before any write or
+ * deletion-verification on `unsaved_problem_revisions_v1`.
+ */
+function readUnsavedProblemRevisionsForWrite(): UnsavedProblemRevisionsReadForWriteResult {
+  const storage = getLocalStorage();
+  if (!storage) {
+    return {
+      status: 'read_error',
+      error: '브라우저 영속 저장소(localStorage)에 접근할 수 없습니다.',
+    };
+  }
+  const revisionsKey = scopedStorageKey(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS);
+  let raw: string | null;
+  try {
+    raw = storage.getItem(revisionsKey);
+  } catch (e) {
+    console.error(`Failed to read localStorage key ${revisionsKey}`, e);
+    return {
+      status: 'read_error',
+      error: '보호 수정본 목록을 읽는 중 브라우저 저장소 읽기 오류가 발생했습니다.',
+    };
+  }
+  if (raw === null) {
+    return { status: 'absent', revisions: {}, keyAbsent: true };
+  }
+  if (raw.trim() === '') {
+    return {
+      status: 'read_error',
+      error: '저장된 보호 수정본 JSON 데이터가 비어 있거나 손상되었습니다.',
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.error(`Failed to parse JSON for localStorage key ${revisionsKey}`, e);
+    return {
+      status: 'read_error',
+      error: '저장된 보호 수정본 JSON이 손상되어 파싱할 수 없습니다.',
+    };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      status: 'read_error',
+      error: '저장된 보호 수정본 데이터가 유효한 객체 형식이 아닙니다.',
+    };
+  }
+  for (const [id, value] of Object.entries(parsed)) {
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      (value as UnsavedProblemRevision).problemId !== id
+    ) {
+      return {
+        status: 'read_error',
+        error: '저장된 보호 수정본 항목 형식이 손상되었습니다.',
+      };
+    }
+  }
+  return {
+    status: 'ok',
+    revisions: parsed as Record<string, UnsavedProblemRevision>,
+    keyAbsent: false,
+  };
+}
+
 export function loadUnsavedProblemRevisions(): Record<string, UnsavedProblemRevision> {
   return safeGetItem<Record<string, UnsavedProblemRevision>>(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
 }
@@ -3467,7 +3542,11 @@ export function saveUnsavedProblemRevision(
   revision: UnsavedProblemRevision,
   options?: { onlyIfRevisionId?: string; onlyIfGeneration?: number }
 ): boolean {
-  const all = loadUnsavedProblemRevisions();
+  const readRes = readUnsavedProblemRevisionsForWrite();
+  if (readRes.status === 'read_error') {
+    return false;
+  }
+  const all = { ...readRes.revisions };
   const existing = all[revision.problemId];
   if (existing) {
     if (options?.onlyIfRevisionId && existing.revisionId !== options.onlyIfRevisionId) {
@@ -3498,7 +3577,11 @@ export function saveUnsavedProblemRevision(
   all[revision.problemId] = revision;
   const wrote = safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
   if (!wrote) return false;
-  const readBack = getUnsavedProblemRevision(revision.problemId);
+  const readBackRes = readUnsavedProblemRevisionsForWrite();
+  if (readBackRes.status !== 'ok') {
+    return false;
+  }
+  const readBack = readBackRes.revisions[revision.problemId];
   if (!readBack || !revisionRecordMatches(readBack, revision)) {
     return false;
   }
@@ -3510,7 +3593,14 @@ export function clearUnsavedProblemRevision(
   problemId: string,
   expected?: { revisionId?: string; generation?: number }
 ): boolean {
-  const all = loadUnsavedProblemRevisions();
+  const readRes = readUnsavedProblemRevisionsForWrite();
+  if (readRes.status === 'read_error') {
+    return false;
+  }
+  if (readRes.status === 'absent') {
+    return false;
+  }
+  const all = { ...readRes.revisions };
   const existing = all[problemId];
   if (!existing) return false;
   if (expected) {
@@ -3524,7 +3614,12 @@ export function clearUnsavedProblemRevision(
   delete all[problemId];
   const wrote = safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
   if (!wrote) return false;
-  if (getUnsavedProblemRevision(problemId) !== null) {
+  const readBackRes = readUnsavedProblemRevisionsForWrite();
+  if (readBackRes.status === 'read_error') {
+    // Verification read failed; never clear in-memory protected revision
+    return false;
+  }
+  if (readBackRes.status === 'ok' && readBackRes.revisions[problemId] !== undefined) {
     return false;
   }
   clearInMemoryProblemRevision(problemId, expected);
@@ -3534,8 +3629,9 @@ export function clearUnsavedProblemRevision(
 export function clearAllUnsavedProblemRevisions(): boolean {
   const wrote = safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, {});
   if (!wrote) return false;
-  const remaining = loadUnsavedProblemRevisions();
-  if (Object.keys(remaining).length > 0) return false;
+  const remainingRes = readUnsavedProblemRevisionsForWrite();
+  if (remainingRes.status === 'read_error') return false;
+  if (remainingRes.status === 'ok' && Object.keys(remainingRes.revisions).length > 0) return false;
   const key = scopedStorageKey(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS);
   delete inMemoryRevisionFallback[key];
   return true;
@@ -4222,6 +4318,16 @@ export interface ResolveProblemRevisionConflictResult {
   ok: boolean;
   status: ResolveProblemRevisionConflictStatus;
   action: ProblemConflictResolutionAction;
+  /**
+   * Decoupled from `status`: remains `'cleanup_only'` even if a subsequent
+   * `retry_cleanup` attempt fails with a transient `body_verify_failed` read error,
+   * bound strictly to `(targetScopeId, targetProblemId, targetRevisionId, targetGeneration)`.
+   */
+  remainingWork?: 'cleanup_only' | null;
+  targetScopeId?: string;
+  targetProblemId?: string;
+  targetRevisionId?: string;
+  targetGeneration?: number;
   bodyPersisted: boolean;
   bodyVerified: boolean;
   revisionPersisted: boolean;
@@ -4238,29 +4344,74 @@ export interface ResolveProblemRevisionConflictResult {
  * Shared request builder for UI conflict resolution buttons.
  * - Never mixes or spreads `activeProblem` (local problem) into `serverSnapshotSummary`
  *   or `serverLatestSummary`.
- * - Routes retries after `partial_cleanup_failed` to `'retry_cleanup'` so the already-verified
- *   problem body in `problems_v1` is never rewritten.
+ * - Routes retries to `'retry_cleanup'` whenever `remainingWork === 'cleanup_only'`
+ *   (decoupled from the last error status) AND `(scopeId, problemId, revisionId, generation)`
+ *   all match the target that already completed body persistence & verification.
  */
 export function buildConflictResolutionRequest(
   unsaved: UnsavedProblemRevision | null | undefined,
   desiredAction: 'accept_server' | 'prepare_rebase_edit',
-  lastResolutionResult?: Pick<ResolveProblemRevisionConflictResult, 'status'> | null
+  lastResolutionResult?: Pick<
+    ResolveProblemRevisionConflictResult,
+    | 'status'
+    | 'remainingWork'
+    | 'targetScopeId'
+    | 'targetProblemId'
+    | 'targetRevisionId'
+    | 'targetGeneration'
+  > | null,
+  currentContext?: { scopeId?: string; problemId?: string }
 ): {
   action: ProblemConflictResolutionAction;
   params: {
+    scopeId?: string;
+    targetProblemId?: string;
     revisionId?: string;
     generation?: number;
   };
 } {
+  const hasCleanupOnlyWork = Boolean(
+    lastResolutionResult &&
+      (lastResolutionResult.remainingWork === 'cleanup_only' ||
+        (lastResolutionResult.remainingWork === undefined &&
+          lastResolutionResult.status === 'partial_cleanup_failed'))
+  );
+  const matchesScope =
+    !currentContext?.scopeId ||
+    !lastResolutionResult?.targetScopeId ||
+    currentContext.scopeId === lastResolutionResult.targetScopeId;
+  const matchesProblem =
+    (!currentContext?.problemId ||
+      !lastResolutionResult?.targetProblemId ||
+      currentContext.problemId === lastResolutionResult.targetProblemId) &&
+    (!unsaved?.problemId ||
+      !lastResolutionResult?.targetProblemId ||
+      unsaved.problemId === lastResolutionResult.targetProblemId);
+
   const isCleanupOnlyRetry =
     desiredAction === 'accept_server' &&
-    lastResolutionResult?.status === 'partial_cleanup_failed';
+    hasCleanupOnlyWork &&
+    matchesScope &&
+    matchesProblem;
+
   return {
     action: isCleanupOnlyRetry ? 'retry_cleanup' : desiredAction,
-    params: {
-      revisionId: unsaved?.revisionId,
-      generation: unsaved?.generation,
-    },
+    params: isCleanupOnlyRetry
+      ? {
+          scopeId: lastResolutionResult?.targetScopeId ?? getStorageScopeId(),
+          targetProblemId: lastResolutionResult?.targetProblemId ?? unsaved?.problemId,
+          revisionId: lastResolutionResult?.targetRevisionId ?? unsaved?.revisionId,
+          generation:
+            lastResolutionResult?.targetGeneration !== undefined
+              ? lastResolutionResult.targetGeneration
+              : unsaved?.generation,
+        }
+      : {
+          scopeId: getStorageScopeId(),
+          targetProblemId: unsaved?.problemId,
+          revisionId: unsaved?.revisionId,
+          generation: unsaved?.generation,
+        },
   };
 }
 
@@ -4644,8 +4795,43 @@ function performConditionalRevisionCleanup(
     };
   }
 
-  const persistedBeforeClear = getUnsavedProblemRevision(problemId);
+  const currentScopeId = getStorageScopeId();
+  const persistedBeforeRead = readUnsavedProblemRevisionsForWrite();
   const memoryBeforeClear = getInMemoryProblemRevision(problemId);
+
+  if (persistedBeforeRead.status === 'read_error') {
+    const partialRev: UnsavedProblemRevision = {
+      ...currentUnsaved,
+      serverLatestSummary:
+        currentUnsaved.serverLatestSummary ?? authoritativeSource,
+      serverSnapshotSummary:
+        currentUnsaved.serverSnapshotSummary ?? validatedBaseSnapshot,
+      syncError: `서버 확정 본문(v${serverVer})은 로컬에 반영·검증되었으나, ${persistedBeforeRead.error} 보호 기록 삭제를 보류했습니다. [보호 기록 정리 재시도]를 눌러 완료해 주세요.`,
+    };
+    setInMemoryProblemRevision(partialRev);
+    return {
+      ok: false,
+      status: 'partial_cleanup_failed',
+      action,
+      remainingWork: 'cleanup_only',
+      targetScopeId: currentScopeId,
+      targetProblemId: problemId,
+      targetRevisionId: currentUnsaved.revisionId,
+      targetGeneration: currentUnsaved.generation,
+      bodyPersisted: true,
+      bodyVerified: true,
+      revisionPersisted: true,
+      memorySaved: true,
+      memoryOnly: false,
+      revisionCleared: false,
+      needsRetry: true,
+      updatedProblems: verifiedProblemsList,
+      revision: partialRev,
+      message: `서버 확정 본문(v${serverVer})은 로컬에 반영·검증되었으나 보호 수정본 목록 읽기에 실패하여 삭제를 보류했습니다. 다시 시도하면 본문을 다시 쓰지 않고 보호 기록만 안전하게 정리됩니다.`,
+    };
+  }
+
+  const persistedBeforeClear = persistedBeforeRead.revisions[problemId] || null;
   const latestBeforeClear = resolveLatestProblemRevision(
     persistedBeforeClear,
     memoryBeforeClear
@@ -4663,6 +4849,7 @@ function performConditionalRevisionCleanup(
       ok: false,
       status: 'stale_revision_aborted',
       action,
+      remainingWork: null,
       bodyPersisted: true,
       bodyVerified: true,
       revisionPersisted: Boolean(persistedBeforeClear),
@@ -4688,6 +4875,7 @@ function performConditionalRevisionCleanup(
       ok: false,
       status: 'stale_revision_aborted',
       action,
+      remainingWork: null,
       bodyPersisted: true,
       bodyVerified: true,
       revisionPersisted: true,
@@ -4719,11 +4907,14 @@ function performConditionalRevisionCleanup(
       generation: targetGen,
     });
   }
-  const remainingPersisted = getUnsavedProblemRevision(problemId);
+  const remainingRead = readUnsavedProblemRevisionsForWrite();
+  const remainingPersisted =
+    remainingRead.status === 'ok' ? remainingRead.revisions[problemId] || null : null;
   const stillHasTargetPersisted = Boolean(
-    remainingPersisted &&
-      (!targetRevId || remainingPersisted.revisionId === targetRevId) &&
-      (targetGen === undefined || (remainingPersisted.generation ?? 0) <= targetGen)
+    remainingRead.status === 'read_error' ||
+      (remainingPersisted &&
+        (!targetRevId || remainingPersisted.revisionId === targetRevId) &&
+        (targetGen === undefined || (remainingPersisted.generation ?? 0) <= targetGen))
   );
 
   if (!clearOk || stillHasTargetPersisted) {
@@ -4740,6 +4931,11 @@ function performConditionalRevisionCleanup(
       ok: false,
       status: 'partial_cleanup_failed',
       action,
+      remainingWork: 'cleanup_only',
+      targetScopeId: currentScopeId,
+      targetProblemId: problemId,
+      targetRevisionId: currentUnsaved.revisionId,
+      targetGeneration: currentUnsaved.generation,
       bodyPersisted: true,
       bodyVerified: true,
       revisionPersisted: true,
@@ -4762,6 +4958,7 @@ function performConditionalRevisionCleanup(
     ok: true,
     status: 'complete',
     action,
+    remainingWork: null,
     bodyPersisted: true,
     bodyVerified: true,
     revisionPersisted: false,
@@ -4794,11 +4991,30 @@ export function resolveProblemRevisionConflict(
   action: ProblemConflictResolutionAction,
   params: {
     scopeId?: string;
+    targetProblemId?: string;
     revisionId?: string;
     generation?: number;
     serverProblem?: Problem | null;
   }
 ): ResolveProblemRevisionConflictResult {
+  if (params.targetProblemId && params.targetProblemId !== problemId) {
+    return {
+      ok: false,
+      status: 'stale_revision_aborted',
+      action,
+      remainingWork: null,
+      bodyPersisted: false,
+      bodyVerified: false,
+      revisionPersisted: false,
+      memorySaved: false,
+      memoryOnly: false,
+      revisionCleared: false,
+      needsRetry: false,
+      updatedProblems: Object.values(getScopedLastKnownProblemsMap()),
+      revision: null,
+      message: '다른 문제에 속한 충돌 해결 요청은 적용하지 않았습니다.',
+    };
+  }
   if (params.scopeId && params.scopeId !== getStorageScopeId()) {
     return {
       ok: false,
@@ -4858,7 +5074,12 @@ export function resolveProblemRevisionConflict(
       ok: false,
       status: action === 'retry_cleanup' ? 'body_verify_failed' : 'body_save_failed',
       action,
-      bodyPersisted: false,
+      remainingWork: action === 'retry_cleanup' ? 'cleanup_only' : null,
+      targetScopeId: action === 'retry_cleanup' ? getStorageScopeId() : undefined,
+      targetProblemId: action === 'retry_cleanup' ? problemId : undefined,
+      targetRevisionId: action === 'retry_cleanup' ? currentUnsaved.revisionId : undefined,
+      targetGeneration: action === 'retry_cleanup' ? currentUnsaved.generation : undefined,
+      bodyPersisted: action === 'retry_cleanup',
       bodyVerified: false,
       revisionPersisted: Boolean(persistedUnsaved),
       memorySaved: Boolean(memoryUnsaved),
@@ -5140,11 +5361,14 @@ export function resolveProblemRevisionConflict(
   if (!isRebasePersisted) {
     // Ensure any previously persisted protected revision in localStorage is preserved intact
     if (persistedUnsaved) {
-      const currentPersistedNow = getUnsavedProblemRevision(problemId);
-      if (!currentPersistedNow || !revisionRecordMatches(currentPersistedNow, persistedUnsaved)) {
-        const all = loadUnsavedProblemRevisions();
-        all[problemId] = persistedUnsaved;
-        safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+      const currentPersistedRead = readUnsavedProblemRevisionsForWrite();
+      if (currentPersistedRead.status === 'ok' || currentPersistedRead.status === 'absent') {
+        const currentPersistedNow = currentPersistedRead.revisions[problemId] || null;
+        if (!currentPersistedNow || !revisionRecordMatches(currentPersistedNow, persistedUnsaved)) {
+          const all = { ...currentPersistedRead.revisions };
+          all[problemId] = persistedUnsaved;
+          safeSetItem(STORAGE_KEYS.UNSAVED_PROBLEM_REVISIONS, all);
+        }
       }
     }
 

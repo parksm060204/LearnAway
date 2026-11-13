@@ -12,9 +12,243 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20MB
 const MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 128 * 1024;
 const MAX_PDF_PAGES = 250;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
-const CONVERSION_TIMEOUT_MS = 60_000;
+const ROUTE_MAX_DURATION_MS = maxDuration * 1000;
+const DIRECT_RESPONSE_HEADROOM_MS = 8_000;
+const STORAGE_CLEANUP_HEADROOM_MS = 12_000;
+const CONVERSION_TIMEOUT_MS = ROUTE_MAX_DURATION_MS - DIRECT_RESPONSE_HEADROOM_MS; // 52s
+const STORAGE_CONVERSION_TIMEOUT_MS = ROUTE_MAX_DURATION_MS - STORAGE_CLEANUP_HEADROOM_MS; // 48s
+const MIN_UPSTREAM_BUDGET_MS = 3_000;
 const MAX_CONCURRENT_CONVERSIONS = 3;
 let activeConversions = 0;
+
+function mapExternalConversionFailure(
+  extStatus: number,
+  rawCode?: string
+): { status: number; code: string; error: string } {
+  if (extStatus === 429 || rawCode === 'CONVERSION_BUSY') {
+    return {
+      status: 429,
+      code: 'CONVERSION_BUSY',
+      error: '변환 요청이 많습니다. 잠시 후 다시 시도해 주세요.',
+    };
+  }
+  if (extStatus === 504 || rawCode === 'CONVERSION_TIMEOUT') {
+    return {
+      status: 504,
+      code: 'CONVERSION_TIMEOUT',
+      error: 'PDF 변환 서비스 응답 시간이 초과되었습니다.',
+    };
+  }
+  if (extStatus === 503) {
+    return {
+      status: 502,
+      code: rawCode || 'PDF_SERVICE_UNAVAILABLE',
+      error: '정밀 PDF 변환 서비스가 일시적으로 준비되지 않았습니다. 잠시 후 다시 시도하거나 브라우저 내 변환을 이용해 주세요.',
+    };
+  }
+  if (extStatus >= 500) {
+    return {
+      status: 502,
+      code: rawCode || 'SERVICE_ERROR',
+      error: '정밀 PDF 변환 서비스 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+    };
+  }
+  if (extStatus === 401 || extStatus === 403) {
+    return {
+      status: 502,
+      code: 'SERVICE_AUTH_FAILED',
+      error: '정밀 PDF 변환 서비스 인증에 실패했습니다. 서비스 설정을 확인해 주세요.',
+    };
+  }
+  if (extStatus === 413 || rawCode === 'PDF_PAGE_LIMIT' || rawCode === 'PDF_TOO_LARGE' || rawCode === 'OUTPUT_TOO_LARGE') {
+    const code = rawCode || 'PDF_TOO_LARGE';
+    const error =
+      code === 'PDF_PAGE_LIMIT'
+        ? `PDF는 ${MAX_PDF_PAGES}페이지 이하만 변환할 수 있습니다.`
+        : code === 'OUTPUT_TOO_LARGE'
+          ? '변환된 Markdown 결과의 크기가 허용치(8MB)를 초과했습니다.'
+          : 'PDF는 20MB 이하만 변환할 수 있습니다.';
+    return { status: 413, code, error };
+  }
+  if (extStatus === 415 || rawCode === 'PDF_SIGNATURE_INVALID' || rawCode === 'PDF_EXTENSION_INVALID') {
+    return {
+      status: 415,
+      code: rawCode || 'PDF_SIGNATURE_INVALID',
+      error: '파일 내용이 올바른 PDF 형식이 아닙니다.',
+    };
+  }
+  if (
+    extStatus === 422 ||
+    rawCode === 'PDF_NO_TEXT' ||
+    rawCode === 'PDF_ENCRYPTED' ||
+    rawCode === 'PDF_EMPTY' ||
+    rawCode === 'PDF_CORRUPT' ||
+    rawCode === 'PDF_TEXT_EXTRACTION_FAILED'
+  ) {
+    const code = rawCode || 'PDF_TEXT_EXTRACTION_FAILED';
+    const error =
+      code === 'PDF_NO_TEXT'
+        ? '스캔된 이미지 기반 PDF이거나 텍스트 레이어가 없어 텍스트를 추출하지 못했습니다 (OCR 미지원). 텍스트가 포함된 원본 PDF를 등록해 주세요.'
+        : code === 'PDF_ENCRYPTED'
+          ? '암호로 보호된 PDF 문서입니다. 암호를 해제한 후 다시 등록해 주세요.'
+          : code === 'PDF_EMPTY'
+            ? '페이지가 없는 빈 PDF 문서입니다.'
+            : 'PDF에서 텍스트를 추출하지 못했습니다. 원본을 확인해 주세요.';
+    return { status: 422, code, error };
+  }
+  if (extStatus >= 200 && extStatus < 300) {
+    return {
+      status: 502,
+      code: rawCode || 'PDF_CONVERSION_FAILED',
+      error: 'PDF 변환에 실패했습니다. 파일을 확인한 뒤 다시 시도해 주세요.',
+    };
+  }
+  return {
+    status: 400,
+    code: rawCode || 'CONVERSION_REQUEST_INVALID',
+    error: 'PDF 변환 요청을 처리할 수 없습니다. 파일을 확인한 뒤 다시 시도해 주세요.',
+  };
+}
+
+function parseValidRetryAfterHeader(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || /[\r\n]/.test(trimmed)) return null;
+  if (/^\d+$/.test(trimmed)) {
+    const secs = Number.parseInt(trimmed, 10);
+    if (Number.isFinite(secs) && secs >= 1) {
+      return String(Math.min(300, secs));
+    }
+    return null;
+  }
+  const parsedMs = Date.parse(trimmed);
+  if (Number.isFinite(parsedMs)) {
+    const deltaSec = Math.ceil((parsedMs - Date.now()) / 1000);
+    if (deltaSec >= 1) {
+      return String(Math.min(300, deltaSec));
+    }
+  }
+  return null;
+}
+
+function buildExternalConversionResponse(
+  extStatus: number,
+  rawData: Record<string, unknown> | null,
+  rawRetryAfter?: string | null
+): NextResponse {
+  const validRetryAfter = extStatus === 429 ? parseValidRetryAfterHeader(rawRetryAfter) : null;
+  const retryHeaders = validRetryAfter ? { 'Retry-After': validRetryAfter } : undefined;
+
+  if (!rawData || typeof rawData !== 'object') {
+    if (extStatus === 429 || extStatus === 504) {
+      const mapped = mapExternalConversionFailure(extStatus);
+      return NextResponse.json(
+        {
+          success: false,
+          code: mapped.code,
+          errorCode: mapped.code,
+          hasText: false,
+          pageCount: 0,
+          pages: [],
+          fullMarkdown: '',
+          markdown: '',
+          error: mapped.error,
+        },
+        { status: mapped.status, headers: retryHeaders }
+      );
+    }
+    return NextResponse.json(
+      {
+        success: false,
+        code: 'SERVICE_RESPONSE_INVALID',
+        errorCode: 'SERVICE_RESPONSE_INVALID',
+        hasText: false,
+        pageCount: 0,
+        pages: [],
+        fullMarkdown: '',
+        markdown: '',
+        error: 'PDF 변환 서비스 응답을 해석하지 못했습니다.',
+      },
+      { status: 502 }
+    );
+  }
+
+  const rawCode =
+    (typeof rawData.code === 'string' && rawData.code) ||
+    (typeof rawData.errorCode === 'string' && rawData.errorCode) ||
+    undefined;
+  const isSuccess = extStatus >= 200 && extStatus < 300 && rawData.success !== false;
+
+  if (!isSuccess) {
+    const mapped = mapExternalConversionFailure(extStatus, rawCode);
+    return NextResponse.json(
+      {
+        success: false,
+        code: mapped.code,
+        errorCode: mapped.code,
+        hasText: false,
+        pageCount: 0,
+        pages: [],
+        fullMarkdown: '',
+        markdown: '',
+        error: mapped.error,
+      },
+      {
+        status: mapped.status,
+        headers: mapped.status === 429 ? retryHeaders : undefined,
+      }
+    );
+  }
+
+  const fullMarkdown =
+    typeof rawData.fullMarkdown === 'string'
+      ? rawData.fullMarkdown
+      : typeof rawData.markdown === 'string'
+        ? rawData.markdown
+        : '';
+  const pageCount =
+    Number.isInteger(rawData.pageCount) && (rawData.pageCount as number) > 0
+      ? (rawData.pageCount as number)
+      : 1;
+  const pages =
+    Array.isArray(rawData.pages) && rawData.pages.length === pageCount
+      ? (rawData.pages as { pageNumber: number; markdown: string; hasText: boolean }[])
+      : [{ pageNumber: 1, markdown: fullMarkdown, hasText: Boolean(fullMarkdown.trim()) }];
+
+  if (
+    !Number.isInteger(pageCount) ||
+    pageCount < 1 ||
+    pageCount > MAX_PDF_PAGES ||
+    !Array.isArray(pages) ||
+    pages.length !== pageCount ||
+    fullMarkdown.length > MAX_OUTPUT_BYTES
+  ) {
+    return NextResponse.json(
+      {
+        success: false,
+        code: 'CONVERSION_OUTPUT_INVALID',
+        errorCode: 'CONVERSION_OUTPUT_INVALID',
+        hasText: false,
+        pageCount: 0,
+        pages: [],
+        fullMarkdown: '',
+        markdown: '',
+        error: '변환 결과를 검증하지 못했습니다.',
+      },
+      { status: 502 }
+    );
+  }
+
+  return NextResponse.json({
+    success: true,
+    hasText: rawData.hasText !== undefined ? Boolean(rawData.hasText) : Boolean(fullMarkdown.trim()),
+    pageCount,
+    pages,
+    fullMarkdown,
+    markdown: fullMarkdown,
+    error: null,
+  });
+}
 
 async function readBoundedFormData(req: NextRequest): Promise<FormData> {
   const declaredLength = Number(req.headers.get('content-length'));
@@ -121,6 +355,7 @@ export async function GET() {
  * Handles both direct multipart uploads and Storage-backed ticket conversions.
  */
 export async function POST(req: NextRequest) {
+  const requestStartedAt = Date.now();
   const auth = await requireApiUser();
   if (!auth.ok) return auth.response;
 
@@ -385,58 +620,59 @@ export async function POST(req: NextRequest) {
           }, { status: 502 });
         }
 
+        const elapsedMs = Date.now() - requestStartedAt;
+        const remainingStorageBudgetMs = Math.min(
+          STORAGE_CONVERSION_TIMEOUT_MS,
+          ROUTE_MAX_DURATION_MS - STORAGE_CLEANUP_HEADROOM_MS - elapsedMs
+        );
+        if (remainingStorageBudgetMs < MIN_UPSTREAM_BUDGET_MS) {
+          return NextResponse.json(
+            { success: false, code: 'CONVERSION_TIMEOUT', error: '남은 요청 처리 시간이 부족하여 PDF 변환을 시작하지 못했습니다.' },
+            { status: 504 }
+          );
+        }
+
         const headers: Record<string, string> = {
           'Content-Type': 'application/json',
           'X-Service-Token': serviceToken,
+          'X-Request-Budget-Ms': String(Math.floor(remainingStorageBudgetMs)),
         };
         const jobToken = createPdfJobToken(auth.user.id, jobId, MAX_PDF_PAGES, 300, validatedStoragePath);
         if (jobToken) {
           headers['X-Job-Token'] = jobToken;
         }
 
-        const extRes = await fetch(`${externalServiceUrl}/convert/storage`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            signedUrl,
-            jobId,
-            userId: auth.user.id,
-            storagePath: validatedStoragePath,
-          }),
-        });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), remainingStorageBudgetMs);
+        req.signal.addEventListener('abort', () => controller.abort(), { once: true });
 
-        const rawData = (await extRes.json().catch(() => null)) as Record<string, unknown> | null;
-        if (!rawData || typeof rawData !== 'object') {
-          return NextResponse.json(
-            { success: false, code: 'SERVICE_RESPONSE_INVALID', error: 'PDF 변환 서비스 응답을 해석하지 못했습니다.' },
-            { status: 502 }
-          );
+        let extRes: Response;
+        try {
+          extRes = await fetch(`${externalServiceUrl}/convert/storage`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              signedUrl,
+              jobId,
+              userId: auth.user.id,
+              storagePath: validatedStoragePath,
+            }),
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timer);
         }
 
-        const fullMarkdown = typeof rawData.fullMarkdown === 'string'
-          ? rawData.fullMarkdown
-          : typeof rawData.markdown === 'string'
-          ? rawData.markdown
-          : '';
-        const pageCount = Number.isInteger(rawData.pageCount) && (rawData.pageCount as number) > 0
-          ? (rawData.pageCount as number)
-          : 1;
-        const pages = Array.isArray(rawData.pages) && rawData.pages.length === pageCount
-          ? (rawData.pages as { pageNumber: number; markdown: string; hasText: boolean }[])
-          : [{ pageNumber: 1, markdown: fullMarkdown, hasText: Boolean(fullMarkdown.trim()) }];
-
-        return NextResponse.json({
-          success: rawData.success !== undefined ? Boolean(rawData.success) : extRes.ok,
-          hasText: rawData.hasText !== undefined ? Boolean(rawData.hasText) : Boolean(fullMarkdown.trim()),
-          pageCount,
-          pages,
-          fullMarkdown,
-          markdown: fullMarkdown,
-          error: (rawData.error as string) || null,
-          code: (rawData.code as string) || (rawData.errorCode as string) || undefined,
-          errorCode: (rawData.errorCode as string) || (rawData.code as string) || undefined,
-        });
+        const rawData = (await extRes.json().catch(() => null)) as Record<string, unknown> | null;
+        return buildExternalConversionResponse(extRes.status, rawData, extRes.headers.get('retry-after'));
       } catch (extErr) {
+        if (extErr instanceof Error && extErr.name === 'AbortError') {
+          return NextResponse.json({
+            success: false,
+            code: 'CONVERSION_TIMEOUT',
+            error: 'PDF 변환 서비스 응답 시간이 초과되었습니다.',
+          }, { status: 504 });
+        }
         return NextResponse.json({
           success: false,
           code: 'SERVICE_CONNECTION_FAILED',
@@ -575,7 +811,21 @@ export async function POST(req: NextRequest) {
     const extForm = new FormData();
     extForm.append('file', new Blob([buffer], { type: 'application/pdf' }), candidate.name);
 
-    const headers: Record<string, string> = {};
+    const elapsedMs = Date.now() - requestStartedAt;
+    const remainingDirectBudgetMs = Math.min(
+      CONVERSION_TIMEOUT_MS,
+      ROUTE_MAX_DURATION_MS - DIRECT_RESPONSE_HEADROOM_MS - elapsedMs
+    );
+    if (remainingDirectBudgetMs < MIN_UPSTREAM_BUDGET_MS) {
+      return NextResponse.json(
+        { success: false, code: 'CONVERSION_TIMEOUT', error: '남은 요청 처리 시간이 부족하여 PDF 변환을 시작하지 못했습니다.' },
+        { status: 504 }
+      );
+    }
+
+    const headers: Record<string, string> = {
+      'X-Request-Budget-Ms': String(Math.floor(remainingDirectBudgetMs)),
+    };
     const serviceToken = (process.env.PDF_CONVERT_SERVICE_TOKEN || '').trim();
     if (serviceToken) {
       headers['X-Service-Token'] = serviceToken;
@@ -587,11 +837,12 @@ export async function POST(req: NextRequest) {
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CONVERSION_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), remainingDirectBudgetMs);
     req.signal.addEventListener('abort', () => controller.abort(), { once: true });
 
     let rawData: Record<string, unknown> | null = null;
     let extStatus = 200;
+    let extRetryAfter: string | null = null;
 
     try {
       const extRes = await fetch(`${externalServiceUrl}/convert`, {
@@ -602,6 +853,7 @@ export async function POST(req: NextRequest) {
       });
       clearTimeout(timer);
       extStatus = extRes.status;
+      extRetryAfter = extRes.headers.get('retry-after');
       rawData = (await extRes.json().catch(() => null)) as Record<string, unknown> | null;
     } catch (extErr) {
       clearTimeout(timer);
@@ -621,63 +873,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!rawData || typeof rawData !== 'object') {
-      return NextResponse.json(
-        { success: false, code: 'SERVICE_RESPONSE_INVALID', error: 'PDF 변환 서비스 응답을 해석하지 못했습니다.' },
-        { status: 502 }
-      );
-    }
-
-    const fullMarkdown = typeof rawData.fullMarkdown === 'string'
-      ? rawData.fullMarkdown
-      : typeof rawData.markdown === 'string'
-      ? rawData.markdown
-      : '';
-    const pageCount = Number.isInteger(rawData.pageCount) && (rawData.pageCount as number) > 0
-      ? (rawData.pageCount as number)
-      : 1;
-    const pages = Array.isArray(rawData.pages) && rawData.pages.length === pageCount
-      ? (rawData.pages as { pageNumber: number; markdown: string; hasText: boolean }[])
-      : [{ pageNumber: 1, markdown: fullMarkdown, hasText: Boolean(fullMarkdown.trim()) }];
-
-    const result = {
-      success: rawData.success !== undefined ? Boolean(rawData.success) : extStatus >= 200 && extStatus < 300,
-      hasText: rawData.hasText !== undefined ? Boolean(rawData.hasText) : Boolean(fullMarkdown.trim()),
-      pageCount,
-      pages,
-      fullMarkdown,
-      markdown: fullMarkdown,
-      error: (rawData.error as string) || null,
-      code: (rawData.code as string) || (rawData.errorCode as string) || undefined,
-      errorCode: (rawData.errorCode as string) || (rawData.code as string) || undefined,
-    };
-
-    if (!result.success) {
-      const status = result.code === 'PDF_PAGE_LIMIT' ? 413 : 422;
-      const errCode = result.code ?? 'PDF_TEXT_EXTRACTION_FAILED';
-      return NextResponse.json({
-        success: false,
-        code: errCode,
-        errorCode: errCode,
-        hasText: result.hasText,
-        pageCount: result.pageCount,
-        pages: result.pages || [],
-        fullMarkdown: '',
-        markdown: '',
-        error: result.code === 'PDF_PAGE_LIMIT'
-          ? `PDF는 ${MAX_PDF_PAGES}페이지 이하만 변환할 수 있습니다.`
-          : result.code === 'PDF_NO_TEXT'
-          ? '스캔된 이미지 기반 PDF이거나 텍스트 레이어가 없어 텍스트를 추출하지 못했습니다 (OCR 미지원). 텍스트가 포함된 원본 PDF를 등록해 주세요.'
-          : result.error || 'PDF에서 텍스트를 추출하지 못했습니다. 원본을 확인해 주세요.',
-      }, { status });
-    }
-
-    if (!Number.isInteger(result.pageCount) || result.pageCount < 1 || result.pageCount > MAX_PDF_PAGES ||
-        !Array.isArray(result.pages) || result.pages.length !== result.pageCount || result.fullMarkdown.length > MAX_OUTPUT_BYTES) {
-      return NextResponse.json({ success: false, code: 'CONVERSION_OUTPUT_INVALID', errorCode: 'CONVERSION_OUTPUT_INVALID', error: '변환 결과를 검증하지 못했습니다.' }, { status: 502 });
-    }
-
-    return NextResponse.json(result);
+    return buildExternalConversionResponse(extStatus, rawData, extRetryAfter);
   } catch (error) {
     const code = error instanceof Error ? error.message : 'CONVERSION_FAILED';
     const tooLarge = code === 'UPLOAD_TOO_LARGE';
