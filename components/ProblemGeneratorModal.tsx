@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Subject,
   Concept,
@@ -15,6 +15,13 @@ import { collectProblemSources } from '../lib/problemSources';
 import { getStorageScopeId } from '../lib/storageScope';
 import { X, Sparkles, AlertCircle, BrainCircuit, Loader2 } from 'lucide-react';
 import { useTrialCredits, notifyTrialCreditsUpdated } from '../lib/trialCreditsClient';
+import { Button, Select } from './ui/WorkspacePrimitives';
+import {
+  DEFAULT_SCHOOL_MODEL_OPTIONS,
+  applyAiConnectionLookup,
+  type ModelLookupStatus,
+  type SchoolModelOption,
+} from '../lib/aiModelSelectionClient';
 
 interface ProblemGeneratorModalProps {
   isOpen: boolean;
@@ -166,8 +173,89 @@ export function ProblemGeneratorModal({
   const [difficultyLevel, setDifficultyLevel] = useState<AcademicDifficultyLevel>(4);
   const [difficulty, setDifficulty] = useState<ProblemDifficulty>('advanced_college');
   const [problemCount, setProblemCount] = useState<number>(1);
+  const [availableModels, setAvailableModels] = useState<SchoolModelOption[]>(DEFAULT_SCHOOL_MODEL_OPTIONS);
+  const [selectedModel, setSelectedModel] = useState<string>('deepseek-v4.1-flash');
+  const [savedDefaultModel, setSavedDefaultModel] = useState<string>('deepseek-v4.1-flash');
+  const [nonSchoolProviderInfo, setNonSchoolProviderInfo] = useState<{ provider: string; model?: string } | null>(null);
+  const [modelLookupStatus, setModelLookupStatus] = useState<ModelLookupStatus>('loading');
+  const [modelLookupError, setModelLookupError] = useState<string | null>(null);
+  const [modelLookupRetryCount, setModelLookupRetryCount] = useState<number>(0);
+  const userModifiedModelRef = useRef(false);
+  const selectedModelRef = useRef(selectedModel);
+  const lookupSeqRef = useRef(0);
+  const prevLookupContextRef = useRef('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const scopeId = getStorageScopeId();
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  const [prevScopeId, setPrevScopeId] = useState(scopeId);
+  if (isOpen !== prevIsOpen || scopeId !== prevScopeId) {
+    setPrevIsOpen(isOpen);
+    setPrevScopeId(scopeId);
+    if (isOpen) {
+      setModelLookupStatus('loading');
+      setModelLookupError(null);
+    }
+  }
+
+  useEffect(() => {
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      prevLookupContextRef.current = '';
+      return;
+    }
+    const contextKey = `${scopeId}:${activeSubject.id}`;
+    if (prevLookupContextRef.current !== contextKey) {
+      prevLookupContextRef.current = contextKey;
+      userModifiedModelRef.current = false;
+    }
+
+    const seq = ++lookupSeqRef.current;
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const res = await fetch('/api/ai-connection', {
+          method: 'GET',
+          signal: controller.signal,
+        });
+        const data = await res.json();
+        if (controller.signal.aborted || seq !== lookupSeqRef.current) return;
+        if (!res.ok || !data.success) {
+          setModelLookupStatus('error');
+          setModelLookupError(data.error || '저장된 기본 모델 정보를 불러오지 못했습니다.');
+          return;
+        }
+        const applied = applyAiConnectionLookup(
+          data,
+          selectedModelRef.current,
+          userModifiedModelRef.current
+        );
+        setAvailableModels(applied.availableModels);
+        setNonSchoolProviderInfo(applied.nonSchoolProviderInfo);
+        setSavedDefaultModel(applied.savedDefaultModel);
+        if (!userModifiedModelRef.current) {
+          setSelectedModel(applied.nextSelectedModel);
+          selectedModelRef.current = applied.nextSelectedModel;
+        }
+        setModelLookupError(null);
+        setModelLookupStatus('ready');
+      } catch {
+        if (!controller.signal.aborted && seq === lookupSeqRef.current) {
+          setModelLookupStatus('error');
+          setModelLookupError('네트워크 오류로 기본 모델 정보를 확인하지 못했습니다.');
+        }
+      }
+    })();
+
+    return () => {
+      controller.abort();
+    };
+  }, [isOpen, activeSubject.id, scopeId, modelLookupRetryCount]);
 
   if (activeSubject.id !== prevSubjectId) {
     setPrevSubjectId(activeSubject.id);
@@ -176,6 +264,8 @@ export function ProblemGeneratorModal({
     setDifficultyLevel(4);
     setDifficulty('advanced_college');
     setErrorMessage(null);
+    setModelLookupStatus('loading');
+    setModelLookupError(null);
   }
 
   // Materials actually linked to the currently selected concepts (same subject only).
@@ -221,6 +311,7 @@ export function ProblemGeneratorModal({
     const targetConcepts = eligibleConcepts.filter((c) => selectedConceptIds.includes(c.id));
 
     const scopeAtStart = getStorageScopeId();
+    const modelAtStart = nonSchoolProviderInfo ? undefined : selectedModel;
     setIsGenerating(true);
     setErrorMessage(null);
 
@@ -246,6 +337,7 @@ export function ProblemGeneratorModal({
           difficulty,
           difficultyLevel,
           problemCount,
+          selectedModel: modelAtStart,
           sources: collected.sources,
         }),
       });
@@ -299,24 +391,27 @@ export function ProblemGeneratorModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/60 backdrop-blur-xs overflow-y-auto">
-      <div className="w-full max-w-2xl bg-white border border-[#c8c2b5] rounded-xs shadow-2xl my-auto overflow-hidden flex flex-col max-h-[92vh] animate-fade-in font-sans">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`AI 시험 문제 출제 (${activeSubject.name})`}
+    >
+      <div className="w-full max-w-2xl bg-white border border-[#c8c2b5] rounded-xs shadow-xl my-auto overflow-hidden flex flex-col max-h-[92vh] font-sans">
         {/* Header */}
-        <div className="bg-[#191817] text-white px-5 py-3.5 flex items-center justify-between border-b border-[#33302b]">
-          <div className="flex items-center gap-2.5">
-            <span className="w-2.5 h-2.5 bg-[#c52828] inline-block shrink-0" />
-            <span className="font-academic-mono text-xs text-[#ded6c8]">EXAM PROBLEM GENERATOR</span>
-            <span className="text-[#827d73]">|</span>
-            <span className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5">
-              <Sparkles className="w-4 h-4 text-amber-400" />
-              <span>AI 시험 문제 출제 ({activeSubject.name})</span>
-            </span>
+        <div className="bg-[#191817] text-white px-5 py-3.5 flex items-center justify-between gap-3 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <Sparkles className="w-4 h-4 text-[#c52828] shrink-0" />
+            <h3 className="font-academic-serif text-sm sm:text-[15px] font-bold text-white truncate">
+              AI 시험 문제 출제 ({activeSubject.name})
+            </h3>
           </div>
 
           <button
+            type="button"
             onClick={onClose}
             disabled={isGenerating}
-            className="text-[#ded6c8] hover:text-white p-1 rounded-xs transition-colors disabled:opacity-50"
+            className="text-[#ded6c8] hover:text-white p-1 rounded-xs transition-colors disabled:opacity-50 shrink-0"
             aria-label="닫기"
           >
             <X className="w-5 h-5" />
@@ -331,7 +426,7 @@ export function ProblemGeneratorModal({
               <BrainCircuit className="w-4 h-4 text-[#c52828]" />
               <span>고난도 대학 시험형 AI 출제 엔진</span>
             </div>
-            <p className="text-[11.5px] text-[#57544e] leading-relaxed">
+            <p className="text-xs text-[#57544e] leading-relaxed break-keep">
               승인된 학술 개념을 바탕으로 대학 시험 수준의 고난도 서술형 문제를 출제합니다. 단순 수치
               치환이 아닌 심화 제약, 경계 조건, 개념 간 복합 연계를 설계하며, 총점 100점의 세부
               루브릭과 단계별 힌트를 함께 제공합니다.
@@ -603,6 +698,9 @@ export function ProblemGeneratorModal({
                   </button>
                 ))}
               </div>
+              <p className="text-[11px] text-[#57544e] pt-1">
+                난이도는 출제 수준과 루브릭 기준만 결정하며 AI 모델을 자동으로 강제 전환하지 않습니다.
+              </p>
             </div>
 
             <div className="space-y-1.5">
@@ -637,34 +735,94 @@ export function ProblemGeneratorModal({
               </div>
             </div>
           </div>
+
+          {/* Section 4: AI Model Selection */}
+          <div className="space-y-2 pt-1 border-t border-[#e5dfd3]">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label htmlFor="problem-gen-model-select" className="text-xs font-bold font-academic-mono text-[#57544e] uppercase">
+                4. 이번 출제에 사용할 AI 모델
+              </label>
+              {modelLookupStatus === 'loading' ? (
+                <span className="text-[11px] text-[#827d73] inline-flex items-center gap-1">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  기본 설정 확인 중...
+                </span>
+              ) : !nonSchoolProviderInfo ? (
+                <span className="text-[11px] text-[#827d73]">
+                  기본값: <span className="font-academic-mono text-[#191817]">{savedDefaultModel}</span>
+                </span>
+              ) : null}
+            </div>
+
+            {nonSchoolProviderInfo ? (
+              <div className="p-2.5 bg-[#faf8f4] border border-[#ded6c8] rounded-xs text-[11px] text-[#57544e]">
+                현재 비학교 제공자(<strong className="font-academic-mono text-[#191817]">{nonSchoolProviderInfo.provider}</strong>
+                {nonSchoolProviderInfo.model ? ` · ${nonSchoolProviderInfo.model}` : ''})가 설정되어 있어 학교 BAZE 모델을 선택할 수 없으며 기존 제공자 모델로 출제됩니다.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <Select
+                  id="problem-gen-model-select"
+                  aria-label="출제 AI 모델 선택"
+                  value={selectedModel}
+                  onChange={(e) => {
+                    userModifiedModelRef.current = true;
+                    setSelectedModel(e.target.value);
+                  }}
+                  disabled={isGenerating}
+                  className="w-full font-academic-mono bg-white"
+                >
+                  {availableModels.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label}{opt.id === savedDefaultModel ? ' (기본 설정)' : ''}
+                    </option>
+                  ))}
+                </Select>
+                {modelLookupStatus === 'error' && modelLookupError && (
+                  <div className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-xs p-2 flex flex-wrap items-center justify-between gap-2">
+                    <span>
+                      {modelLookupError} (현재 선택: <span className="font-academic-mono">{selectedModel}</span>)
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setModelLookupStatus('loading');
+                        setModelLookupError(null);
+                        setModelLookupRetryCount((c) => c + 1);
+                      }}
+                      className="px-2 py-1 text-[11px] font-semibold bg-white border border-amber-300 rounded-xs hover:bg-amber-100 transition-colors"
+                    >
+                      다시 조회
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-3.5 bg-[#faf8f4] border-t border-[#ded6c8] flex items-center justify-between gap-3">
-          <div className="text-[11px] font-academic-mono text-[#827d73]">
-            API: {activeSubject.domain === 'math_stats' ? '수리통계 수식 생성' : '알고리즘 코드 검증'}
+        <div className="px-5 py-3.5 bg-[#faf8f4] border-t border-[#e2ded6] flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <div className="text-xs text-[#57544e]">
+            {activeSubject.domain === 'math_stats' ? '수리통계 수식 생성' : '알고리즘 코드 검증'}
           </div>
 
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onClose}
-              disabled={isGenerating}
-              className="px-4 py-2 text-xs border border-[#ded6c8] text-[#57544e] hover:bg-white rounded-xs transition-colors disabled:opacity-50"
-            >
+            <Button variant="secondary" size="md" onClick={onClose} disabled={isGenerating}>
               취소
-            </button>
+            </Button>
 
-            <button
-              type="button"
+            <Button
+              variant="accent"
+              size="md"
               onClick={handleGenerate}
               disabled={
                 isGenerating ||
+                modelLookupStatus === 'loading' ||
                 eligibleConcepts.length === 0 ||
                 selectedSourceMaterials.length === 0 ||
                 (!trialCredits.hasPersonalKey && trialCredits.balance <= 0)
               }
-              className="flex items-center gap-2 px-5 py-2 bg-[#c52828] hover:bg-[#a82020] text-white text-xs font-bold rounded-xs shadow-xs transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isGenerating ? (
                 <>
@@ -673,11 +831,11 @@ export function ProblemGeneratorModal({
                 </>
               ) : (
                 <>
-                  <Sparkles className="w-4 h-4 text-amber-300" />
+                  <Sparkles className="w-4 h-4" />
                   <span>AI 고난도 문제 생성 실행 ({problemCount}문항)</span>
                 </>
               )}
-            </button>
+            </Button>
           </div>
         </div>
       </div>

@@ -1,7 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
+import { createClient } from '../../../lib/supabase/server';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
-import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { resolveAiConfigForUser, resolveOperatorAiConfig, DEFAULT_SCHOOL_MODEL } from '../../../lib/aiCredentials';
+import {
+  getAllowedSchoolModels,
+  resolveAndVerifyManualModelConfig,
+  resolveDifficultyLevelFromInput,
+  resolveEffectiveModelForRequest,
+  resolveProblemDifficultyForRoute,
+  validateRequestedModelInput,
+  type EffectiveModelResolutionSuccess,
+} from '../../../lib/aiModelPolicy';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 import { ProblemDifficulty, ProblemType, RubricCriterion } from '../../../lib/types';
 import { validateTransferProblemOutput } from '../../../lib/transferValidation';
@@ -164,23 +174,121 @@ export async function POST(req: NextRequest) {
       rawTaskId === `trans_${auth.user.id}_${legacyOlderInputIdentifier}` ||
       rawTaskId === `trans_${auth.user.id}_${legacy2a16e49InputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
-    const taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'trans', inputIdentifier);
     const legacyTaskId = legacyOlderTaskId;
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
     const signedRecoveryToken = asString(payload.signedRecoveryToken).trim();
     const clientRecoveryData = payload.recoveryData || (payload.draft ? { draft: payload.draft, model: payload.model } : null);
 
+    let resolvedRequestedModel: string | undefined;
+    let effectiveModel = DEFAULT_SCHOOL_MODEL;
+    let pinnedModelResolution: EffectiveModelResolutionSuccess | undefined;
+    if (isSaveRetry) {
+      const val = validateRequestedModelInput(payload.selectedModel ?? (clientRecoveryData as { model?: unknown } | null)?.model);
+      if (val.ok && val.model) {
+        resolvedRequestedModel = val.model;
+        effectiveModel = val.model;
+      }
+    } else {
+      const modelRes = await resolveEffectiveModelForRequest({
+        userId: auth.user.id,
+        requestedModel: payload.selectedModel,
+      });
+      if (!modelRes.ok) {
+        return NextResponse.json(
+          { success: false, error: modelRes.message, errorCode: modelRes.code },
+          { status: modelRes.status }
+        );
+      }
+      resolvedRequestedModel = modelRes.requestedModel;
+      effectiveModel = modelRes.effectiveModel;
+      pinnedModelResolution = modelRes;
+    }
+
+    const problemId = asString(payload.problemId).trim();
+    const isProvisionalLocal = payload.isProvisionalLocal === true;
+    const diffRes = await resolveProblemDifficultyForRoute({
+      createClientFn: createClient,
+      userId: auth.user.id,
+      problemId,
+      isProvisionalLocal,
+      fallbackDifficultyLevel: payload.difficultyLevel,
+      fallbackDifficulty: difficulty,
+    });
+    if (!diffRes.ok && !isSaveRetry) {
+      const errRes = diffRes as { ok: false; status: number; error: string };
+      return NextResponse.json({ success: false, error: errRes.error }, { status: errRes.status });
+    }
+    const resolvedDifficultyLevel = diffRes.ok
+      ? diffRes.difficultyLevel
+      : resolveDifficultyLevelFromInput({
+          difficultyLevel: payload.difficultyLevel,
+          difficulty,
+          fallbackLevel: 3,
+        }).level;
+
+    const noModelEffectiveInputIdentifier =
+      problemId || payload.difficultyLevel !== undefined
+        ? computeAiTaskInputIdentifier(
+            { ...normalizedInput, problemId, difficultyLevel: resolvedDifficultyLevel },
+            'v1'
+          )
+        : inputIdentifier;
+    const effectiveInputIdentifier = computeAiTaskInputIdentifier(
+      { ...normalizedInput, problemId, difficultyLevel: resolvedDifficultyLevel, model: effectiveModel },
+      'v1'
+    );
+    const effectiveLegacyInputIdentifiers = Array.from(
+      new Set([noModelEffectiveInputIdentifier, inputIdentifier, ...legacyInputIdentifiers])
+    ).filter((id) => id && id !== effectiveInputIdentifier);
+    const taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'trans', effectiveInputIdentifier);
+
     // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved or server-signed results.
     if (isSaveRetry) {
-      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'transfer_problem', inputIdentifier, legacyInputIdentifiers);
-      if (!saved.success && explicitTaskId) {
-        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'transfer_problem', inputIdentifier, legacyInputIdentifiers);
-      }
-      if (!saved.success) {
-        saved = await lookupSavedTaskResult(auth.user.id, legacy2a16e49TaskId, 'transfer_problem', inputIdentifier, legacyInputIdentifiers);
-      }
-      if (!saved.success) {
-        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'transfer_problem', legacyOlderInputIdentifier, legacyInputIdentifiers);
+      // Include all difficulty levels and allowed models for the same problemId only on save-retry so DB problem version/difficulty or default model changes never lose an existing AI result.
+      const retryModels = Array.from(new Set([...getAllowedSchoolModels(), resolveOperatorAiConfig()?.model || '', effectiveModel].filter(Boolean)));
+      const retryVersionInputIdentifiers = problemId
+        ? ([1, 2, 3, 4, 5] as const).flatMap((lvl) => [
+            computeAiTaskInputIdentifier({ ...normalizedInput, problemId, difficultyLevel: lvl }, 'v1'),
+            ...retryModels.map((m) =>
+              computeAiTaskInputIdentifier({ ...normalizedInput, problemId, difficultyLevel: lvl, model: m }, 'v1')
+            ),
+          ])
+        : retryModels.map((m) =>
+            computeAiTaskInputIdentifier({ ...normalizedInput, problemId: '', difficultyLevel: resolvedDifficultyLevel, model: m }, 'v1')
+          );
+      const retryLegacyInputIdentifiers = Array.from(
+        new Set([...effectiveLegacyInputIdentifiers, ...retryVersionInputIdentifiers])
+      ).filter((id) => id && id !== effectiveInputIdentifier);
+      const retryCandidateTaskIds = Array.from(
+        new Set([
+          taskId,
+          ...(explicitTaskId ? [explicitTaskId] : []),
+          ...[effectiveInputIdentifier, ...retryLegacyInputIdentifiers].map((id) =>
+            buildUserScopedTaskId(auth.user.id, 'trans', id)
+          ),
+          ...legacyTaskIds,
+        ])
+      );
+
+      let saved = await lookupSavedTaskResult(
+        auth.user.id,
+        taskId,
+        'transfer_problem',
+        effectiveInputIdentifier,
+        retryLegacyInputIdentifiers
+      );
+      for (const candidateTaskId of retryCandidateTaskIds) {
+        if (saved.success) break;
+        if (candidateTaskId === taskId) continue;
+        const primaryIdForCandidate =
+          candidateTaskId === legacyTaskId ? legacyOlderInputIdentifier : effectiveInputIdentifier;
+        saved = await lookupSavedTaskResult(
+          auth.user.id,
+          candidateTaskId,
+          'transfer_problem',
+          primaryIdForCandidate,
+          retryLegacyInputIdentifiers
+        );
       }
 
       const cached = saved.cachedResult as { draft?: unknown; model?: string } | null;
@@ -216,10 +324,10 @@ export async function POST(req: NextRequest) {
         const verifyRes = verifyTaskRecoveryToken(signedRecoveryToken, {
           userId: auth.user.id,
           taskId,
-          legacyTaskId: legacyTaskIds,
+          legacyTaskId: retryCandidateTaskIds.filter((id) => id !== taskId),
           taskType: 'transfer_problem',
-          inputIdentifier,
-          legacyInputIdentifier: legacyInputIdentifiers,
+          inputIdentifier: effectiveInputIdentifier,
+          legacyInputIdentifier: retryLegacyInputIdentifiers,
           result: clientRecoveryData,
         });
 
@@ -321,8 +429,8 @@ export async function POST(req: NextRequest) {
     const cred = await resolveAiConfigForUser(auth.user.id, {
       taskId,
       taskType: 'transfer_problem',
-      inputIdentifier,
-      legacyInputIdentifier: legacyInputIdentifiers,
+      inputIdentifier: effectiveInputIdentifier,
+      legacyInputIdentifier: effectiveLegacyInputIdentifiers,
       isSaveRetry,
     });
 
@@ -379,6 +487,23 @@ export async function POST(req: NextRequest) {
         { status: needsAiConnection ? 400 : 502 }
       );
     }
+
+    const routed = await resolveAndVerifyManualModelConfig({
+      baseConfig: cred.config,
+      requestedModel: resolvedRequestedModel,
+      pinnedResolution: pinnedModelResolution,
+      credSource: cred.source,
+    });
+    if (!routed.ok) {
+      if (cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'model_unavailable', cred.leaseToken);
+      }
+      return NextResponse.json(
+        { success: false, error: routed.message, errorCode: routed.code },
+        { status: routed.status }
+      );
+    }
+    const targetConfig = routed.config;
 
     const rubricText = rubric
       .map((c) => `- [${c.id}] ${c.label} (배점 ${c.maxScore}): ${c.description}`)
@@ -455,15 +580,15 @@ ${conceptText}
       json: true,
       timeoutMs: 60000,
       label: 'transfer-problem',
-    }, cred.config);
+    }, targetConfig);
     const aiExecutionTimeMs = Date.now() - aiStartTime;
 
     if (!aiCall.ok) {
       await recordAiUsageTelemetry({
         userId: auth.user.id,
         taskType: 'transfer_problem',
-        provider: cred.config.provider,
-        model: cred.config.model,
+        provider: targetConfig.provider,
+        model: targetConfig.model,
         executionTimeMs: aiExecutionTimeMs,
         status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
         errorCode: aiCall.error.code,
@@ -485,8 +610,8 @@ ${conceptText}
     await recordAiUsageTelemetry({
       userId: auth.user.id,
       taskType: 'transfer_problem',
-      provider: cred.config.provider,
-      model: aiCall.model || cred.config.model,
+      provider: targetConfig.provider,
+      model: aiCall.model || targetConfig.model,
       inputTokens: aiCall.usage?.promptTokens,
       outputTokens: aiCall.usage?.completionTokens,
       inputText: userPrompt,
@@ -558,7 +683,7 @@ ${conceptText}
           userId: auth.user.id,
           taskId,
           taskType: 'transfer_problem',
-          inputIdentifier,
+          inputIdentifier: effectiveInputIdentifier,
           result: { draft, model: aiCall.model },
           leaseToken: cred.leaseToken,
           modelId: aiCall.model,

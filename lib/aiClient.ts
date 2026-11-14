@@ -249,11 +249,13 @@ export async function callAiChat(
     clearTimeout(timeoutId);
 
     const data = payload as {
+      model?: unknown;
       choices?: { message?: { content?: unknown }; finish_reason?: string }[];
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     };
     const choice = data.choices?.[0];
     const content = typeof choice?.message?.content === 'string' ? choice.message.content : '';
+    const responseModel = typeof data.model === 'string' && data.model.trim() ? data.model.trim() : config.model;
     const usage: AiUsage | undefined = data.usage
       ? {
           promptTokens: data.usage.prompt_tokens,
@@ -275,7 +277,7 @@ export async function callAiChat(
     if (!content.trim()) {
       return { ok: false, error: { code: 'empty', message: errorMessage('empty') } };
     }
-    return { ok: true, content, model: config.model, usage };
+    return { ok: true, content, model: responseModel, usage };
   }
 
   return { ok: false, error: { code: 'rate_limit', message: errorMessage('rate_limit') } };

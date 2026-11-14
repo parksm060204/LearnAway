@@ -1,8 +1,9 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
-import { createClient } from '@/lib/supabase/server';
-import { isAiConfigured } from '@/lib/aiConfig';
-import { verifyGatewayModelForKey } from '@/lib/aiClient';
+import { createClient } from '../../../lib/supabase/server';
+import { isAiConfigured, AI_CONFIG } from '../../../lib/aiConfig';
+import { verifyGatewayModelForKey } from '../../../lib/aiClient';
+import { getSchoolModelOptions, validateRequestedModelInput } from '../../../lib/aiModelPolicy';
 import {
   DEFAULT_SCHOOL_MODEL,
   SCHOOL_GATEWAY_BASE_URL,
@@ -16,7 +17,7 @@ import {
   reasonToCode,
   selectAvailableModel,
   validateApiKeyInput,
-} from '@/lib/aiCredentials';
+} from '../../../lib/aiCredentials';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,9 +25,6 @@ const SAFE_COLUMNS = 'provider, model, key_hint, status, last_checked_at';
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-}
-function asString(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
 }
 
 interface SafeConnection {
@@ -85,7 +83,7 @@ async function loadStoredKey(supabase: Awaited<ReturnType<typeof createClient>>)
   }
 }
 
-import { getTrialCreditStatus } from '@/lib/trialCredits';
+import { getTrialCreditStatus } from '../../../lib/trialCredits';
 
 /** Connection status + operator fallback, without any secret material. */
 export async function GET() {
@@ -108,8 +106,11 @@ export async function GET() {
       ...connection,
       trialCredits,
       operatorFallback: operatorFallbackAllowed() && isAiConfigured(),
+      operatorProvider: operatorFallbackAllowed() && isAiConfigured() ? AI_CONFIG.provider : undefined,
+      operatorModel: operatorFallbackAllowed() && isAiConfigured() ? AI_CONFIG.model : undefined,
       encryptionConfigured: Boolean(getEncryptionKey()),
       defaultModel: DEFAULT_SCHOOL_MODEL,
+      availableSchoolModels: getSchoolModelOptions(),
     });
   } catch (error) {
     return NextResponse.json(
@@ -119,20 +120,61 @@ export async function GET() {
   }
 }
 
-/** Verifies a key via the model list. Does NOT save and NEVER runs generation. */
+/** Verifies a key (or stored key when useStoredKey=true) via the model list. Does NOT save and NEVER runs generation. */
 export async function POST(req: NextRequest) {
   const auth = await requireApiUser();
   if (!auth.ok) return auth.response;
 
   let body: unknown;
   try { body = await req.json(); } catch { body = null; }
-  const validation = validateApiKeyInput(asRecord(body)?.apiKey);
-  if (!validation.ok) {
-    return NextResponse.json({ success: false, errorCode: validation.code, error: validation.message }, { status: 400 });
-  }
-  const apiKey = validation.apiKey;
+  const record = asRecord(body);
+  const useStoredKey = record?.useStoredKey === true;
 
-  const check = await verifyGatewayModelForKey(apiKey, SCHOOL_GATEWAY_BASE_URL, DEFAULT_SCHOOL_MODEL);
+  let apiKey = '';
+  let storedModel = DEFAULT_SCHOOL_MODEL;
+  let storedKeyHint = '';
+
+  if (useStoredKey) {
+    try {
+      const supabase = await createClient();
+      const read = await readSafeConnection(supabase);
+      if (read.state === 'lookup_failed') {
+        return NextResponse.json(
+          { success: false, verified: false, errorCode: 'LOOKUP_FAILED', error: '연결 상태를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.' },
+          { status: 502 }
+        );
+      }
+      if (read.state !== 'registered') {
+        return NextResponse.json(
+          { success: false, verified: false, errorCode: 'EMPTY_KEY', error: '등록된 API 키가 없습니다. 먼저 키를 등록해 주세요.' },
+          { status: 400 }
+        );
+      }
+      const loaded = await loadStoredKey(supabase);
+      if (!loaded) {
+        return NextResponse.json(
+          { success: false, verified: false, errorCode: 'CREDENTIAL_ERROR', error: '저장된 API 키를 복호화하지 못했습니다. 키를 다시 등록해 주세요.' },
+          { status: 400 }
+        );
+      }
+      apiKey = loaded;
+      storedModel = (read.connection.model || '').trim() || DEFAULT_SCHOOL_MODEL;
+      storedKeyHint = read.connection.keyHint || maskKey(apiKey);
+    } catch {
+      return NextResponse.json(
+        { success: false, verified: false, errorCode: 'LOOKUP_FAILED', error: '저장된 API 연결을 확인하지 못했습니다.' },
+        { status: 502 }
+      );
+    }
+  } else {
+    const validation = validateApiKeyInput(record?.apiKey);
+    if (!validation.ok) {
+      return NextResponse.json({ success: false, errorCode: validation.code, error: validation.message }, { status: 400 });
+    }
+    apiKey = validation.apiKey;
+  }
+
+  const check = await verifyGatewayModelForKey(apiKey, SCHOOL_GATEWAY_BASE_URL, storedModel);
   if (!check.ok) {
     return NextResponse.json(
       { success: false, verified: false, errorCode: reasonToCode(check.reason), error: check.message },
@@ -140,7 +182,7 @@ export async function POST(req: NextRequest) {
     );
   }
   const models = check.modelIds ?? [];
-  const selection = selectAvailableModel(models);
+  const selection = selectAvailableModel(models, undefined, storedModel);
   if (!selection.ok) {
     return NextResponse.json(
       { success: false, verified: false, errorCode: 'NO_MODELS', error: '이 키로 사용할 수 있는 모델이 없습니다.' },
@@ -152,8 +194,8 @@ export async function POST(req: NextRequest) {
     verified: true,
     models,
     defaultModel: selection.model,
-    keyHint: maskKey(apiKey),
-    warning: check.hasModel ? undefined : `기본 모델 '${DEFAULT_SCHOOL_MODEL}'을(를) 사용할 수 없어 다른 모델을 선택해야 합니다.`,
+    keyHint: storedKeyHint || maskKey(apiKey),
+    warning: check.hasModel ? undefined : `기본 모델 '${storedModel}'을(를) 사용할 수 없어 다른 모델을 선택해야 합니다.`,
   });
 }
 
@@ -182,7 +224,11 @@ export async function PUT(req: NextRequest) {
     return NextResponse.json({ success: false, errorCode: providedKey.code, error: providedKey.message }, { status: 400 });
   }
   const newKey = providedKey.ok ? providedKey.apiKey : '';
-  const requestedModel = asString(record?.model);
+  const modelValidation = validateRequestedModelInput(record?.model);
+  if (!modelValidation.ok) {
+    return NextResponse.json({ success: false, errorCode: modelValidation.code, error: modelValidation.message }, { status: 400 });
+  }
+  const requestedModel = modelValidation.model || '';
 
   try {
     const supabase = await createClient();

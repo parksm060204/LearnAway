@@ -1,7 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
+import { createClient } from '../../../lib/supabase/server';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
-import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { resolveAiConfigForUser, resolveOperatorAiConfig, DEFAULT_SCHOOL_MODEL } from '../../../lib/aiCredentials';
+import {
+  getAllowedSchoolModels,
+  resolveAndVerifyManualModelConfig,
+  resolveDifficultyLevelFromInput,
+  resolveEffectiveModelForRequest,
+  resolveProblemDifficultyForRoute,
+  validateRequestedModelInput,
+  type EffectiveModelResolutionSuccess,
+} from '../../../lib/aiModelPolicy';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 import { RubricCriterion } from '../../../lib/types';
 import { LOGIC_QUESTION_MAX, LOGIC_QUESTION_MIN, validateLogicQuestionsOutput } from '../../../lib/logicValidation';
@@ -144,23 +154,121 @@ export async function POST(req: NextRequest) {
       rawTaskId === `logic_${auth.user.id}_${legacyOlderInputIdentifier}` ||
       rawTaskId === `logic_${auth.user.id}_${legacy2a16e49InputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
-    const taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'logic', inputIdentifier);
     const legacyTaskId = legacyOlderTaskId;
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
     const signedRecoveryToken = asString(payload.signedRecoveryToken).trim();
     const clientRecoveryData = payload.recoveryData || (payload.questions ? { questions: payload.questions, model: payload.model } : null);
 
+    let resolvedRequestedModel: string | undefined;
+    let effectiveModel = DEFAULT_SCHOOL_MODEL;
+    let pinnedModelResolution: EffectiveModelResolutionSuccess | undefined;
+    if (isSaveRetry) {
+      const val = validateRequestedModelInput(payload.selectedModel ?? (clientRecoveryData as { model?: unknown } | null)?.model);
+      if (val.ok && val.model) {
+        resolvedRequestedModel = val.model;
+        effectiveModel = val.model;
+      }
+    } else {
+      const modelRes = await resolveEffectiveModelForRequest({
+        userId: auth.user.id,
+        requestedModel: payload.selectedModel,
+      });
+      if (!modelRes.ok) {
+        return NextResponse.json(
+          { success: false, error: modelRes.message, errorCode: modelRes.code },
+          { status: modelRes.status }
+        );
+      }
+      resolvedRequestedModel = modelRes.requestedModel;
+      effectiveModel = modelRes.effectiveModel;
+      pinnedModelResolution = modelRes;
+    }
+
+    const problemId = asString(payload.problemId).trim();
+    const isProvisionalLocal = payload.isProvisionalLocal === true;
+    const diffRes = await resolveProblemDifficultyForRoute({
+      createClientFn: createClient,
+      userId: auth.user.id,
+      problemId,
+      isProvisionalLocal,
+      fallbackDifficultyLevel: payload.difficultyLevel,
+      fallbackDifficulty: payload.difficulty,
+    });
+    if (!diffRes.ok && !isSaveRetry) {
+      const errRes = diffRes as { ok: false; status: number; error: string };
+      return NextResponse.json({ success: false, error: errRes.error }, { status: errRes.status });
+    }
+    const resolvedDifficultyLevel = diffRes.ok
+      ? diffRes.difficultyLevel
+      : resolveDifficultyLevelFromInput({
+          difficultyLevel: payload.difficultyLevel,
+          difficulty: payload.difficulty,
+          fallbackLevel: 3,
+        }).level;
+
+    const noModelEffectiveInputIdentifier =
+      problemId || payload.difficultyLevel !== undefined || payload.difficulty !== undefined
+        ? computeAiTaskInputIdentifier(
+            { ...normalizedInput, problemId, difficultyLevel: resolvedDifficultyLevel },
+            'v1'
+          )
+        : inputIdentifier;
+    const effectiveInputIdentifier = computeAiTaskInputIdentifier(
+      { ...normalizedInput, problemId, difficultyLevel: resolvedDifficultyLevel, model: effectiveModel },
+      'v1'
+    );
+    const effectiveLegacyInputIdentifiers = Array.from(
+      new Set([noModelEffectiveInputIdentifier, inputIdentifier, ...legacyInputIdentifiers])
+    ).filter((id) => id && id !== effectiveInputIdentifier);
+    const taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'logic', effectiveInputIdentifier);
+
     // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved or server-signed results.
     if (isSaveRetry) {
-      let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'logic_questions', inputIdentifier, legacyInputIdentifiers);
-      if (!saved.success && explicitTaskId) {
-        saved = await lookupSavedTaskResult(auth.user.id, explicitTaskId, 'logic_questions', inputIdentifier, legacyInputIdentifiers);
-      }
-      if (!saved.success) {
-        saved = await lookupSavedTaskResult(auth.user.id, legacy2a16e49TaskId, 'logic_questions', inputIdentifier, legacyInputIdentifiers);
-      }
-      if (!saved.success) {
-        saved = await lookupSavedTaskResult(auth.user.id, legacyTaskId, 'logic_questions', legacyOlderInputIdentifier, legacyInputIdentifiers);
+      // Include all difficulty levels and allowed models for the same problemId only on save-retry so DB problem version/difficulty or default model changes never lose an existing AI result.
+      const retryModels = Array.from(new Set([...getAllowedSchoolModels(), resolveOperatorAiConfig()?.model || '', effectiveModel].filter(Boolean)));
+      const retryVersionInputIdentifiers = problemId
+        ? ([1, 2, 3, 4, 5] as const).flatMap((lvl) => [
+            computeAiTaskInputIdentifier({ ...normalizedInput, problemId, difficultyLevel: lvl }, 'v1'),
+            ...retryModels.map((m) =>
+              computeAiTaskInputIdentifier({ ...normalizedInput, problemId, difficultyLevel: lvl, model: m }, 'v1')
+            ),
+          ])
+        : retryModels.map((m) =>
+            computeAiTaskInputIdentifier({ ...normalizedInput, problemId: '', difficultyLevel: resolvedDifficultyLevel, model: m }, 'v1')
+          );
+      const retryLegacyInputIdentifiers = Array.from(
+        new Set([...effectiveLegacyInputIdentifiers, ...retryVersionInputIdentifiers])
+      ).filter((id) => id && id !== effectiveInputIdentifier);
+      const retryCandidateTaskIds = Array.from(
+        new Set([
+          taskId,
+          ...(explicitTaskId ? [explicitTaskId] : []),
+          ...[effectiveInputIdentifier, ...retryLegacyInputIdentifiers].map((id) =>
+            buildUserScopedTaskId(auth.user.id, 'logic', id)
+          ),
+          ...legacyTaskIds,
+        ])
+      );
+
+      let saved = await lookupSavedTaskResult(
+        auth.user.id,
+        taskId,
+        'logic_questions',
+        effectiveInputIdentifier,
+        retryLegacyInputIdentifiers
+      );
+      for (const candidateTaskId of retryCandidateTaskIds) {
+        if (saved.success) break;
+        if (candidateTaskId === taskId) continue;
+        const primaryIdForCandidate =
+          candidateTaskId === legacyTaskId ? legacyOlderInputIdentifier : effectiveInputIdentifier;
+        saved = await lookupSavedTaskResult(
+          auth.user.id,
+          candidateTaskId,
+          'logic_questions',
+          primaryIdForCandidate,
+          retryLegacyInputIdentifiers
+        );
       }
 
       const cached = saved.cachedResult as { questions?: unknown; model?: string } | null;
@@ -196,10 +304,10 @@ export async function POST(req: NextRequest) {
         const verifyRes = verifyTaskRecoveryToken(signedRecoveryToken, {
           userId: auth.user.id,
           taskId,
-          legacyTaskId: legacyTaskIds,
+          legacyTaskId: retryCandidateTaskIds.filter((id) => id !== taskId),
           taskType: 'logic_questions',
-          inputIdentifier,
-          legacyInputIdentifier: legacyInputIdentifiers,
+          inputIdentifier: effectiveInputIdentifier,
+          legacyInputIdentifier: retryLegacyInputIdentifiers,
           result: clientRecoveryData,
         });
 
@@ -301,8 +409,8 @@ export async function POST(req: NextRequest) {
     const cred = await resolveAiConfigForUser(auth.user.id, {
       taskId,
       taskType: 'logic_questions',
-      inputIdentifier,
-      legacyInputIdentifier: legacyInputIdentifiers,
+      inputIdentifier: effectiveInputIdentifier,
+      legacyInputIdentifier: effectiveLegacyInputIdentifiers,
       isSaveRetry,
     });
 
@@ -359,6 +467,23 @@ export async function POST(req: NextRequest) {
         { status: needsAiConnection ? 400 : 502 }
       );
     }
+
+    const routed = await resolveAndVerifyManualModelConfig({
+      baseConfig: cred.config,
+      requestedModel: resolvedRequestedModel,
+      pinnedResolution: pinnedModelResolution,
+      credSource: cred.source,
+    });
+    if (!routed.ok) {
+      if (cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'model_unavailable', cred.leaseToken);
+      }
+      return NextResponse.json(
+        { success: false, error: routed.message, errorCode: routed.code },
+        { status: routed.status }
+      );
+    }
+    const targetConfig = routed.config;
 
     const rubricText = rubric
       .map((c) => `- [${c.id}] ${c.label} (배점 ${c.maxScore}): ${c.description}`)
@@ -421,15 +546,15 @@ ${diagnosisSummary || '(요약 없음)'}
       json: true,
       timeoutMs: 45000,
       label: 'logic-questions',
-    }, cred.config);
+    }, targetConfig);
     const aiExecutionTimeMs = Date.now() - aiStartTime;
 
     if (!aiCall.ok) {
       await recordAiUsageTelemetry({
         userId: auth.user.id,
         taskType: 'logic_questions',
-        provider: cred.config.provider,
-        model: cred.config.model,
+        provider: targetConfig.provider,
+        model: targetConfig.model,
         executionTimeMs: aiExecutionTimeMs,
         status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
         errorCode: aiCall.error.code,
@@ -451,8 +576,8 @@ ${diagnosisSummary || '(요약 없음)'}
     await recordAiUsageTelemetry({
       userId: auth.user.id,
       taskType: 'logic_questions',
-      provider: cred.config.provider,
-      model: aiCall.model || cred.config.model,
+      provider: targetConfig.provider,
+      model: aiCall.model || targetConfig.model,
       inputTokens: aiCall.usage?.promptTokens,
       outputTokens: aiCall.usage?.completionTokens,
       inputText: userPrompt,
@@ -511,7 +636,7 @@ ${diagnosisSummary || '(요약 없음)'}
           userId: auth.user.id,
           taskId,
           taskType: 'logic_questions',
-          inputIdentifier,
+          inputIdentifier: effectiveInputIdentifier,
           result: { questions, model: aiCall.model },
           leaseToken: cred.leaseToken,
           modelId: aiCall.model,

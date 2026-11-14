@@ -86,6 +86,13 @@ export interface CostCalculationResult {
   effectiveDate: string;
 }
 
+export function hasVerifiedModelPricing(model: string): boolean {
+  const normModel = (model || '').trim().toLowerCase();
+  if (!normModel) return false;
+  if (MODEL_PRICING_TABLE[normModel]) return true;
+  return Object.keys(MODEL_PRICING_TABLE).some((k) => normModel.includes(k));
+}
+
 /**
  * Calculates estimated AI API cost from input/output tokens.
  * Prioritizes exact model match, falls back to normalized prefix match, then default pricing.
@@ -103,6 +110,18 @@ export function calculateAiCost(
     pricing = matchingKey ? MODEL_PRICING_TABLE[matchingKey] : DEFAULT_FALLBACK_PRICING;
   }
 
+  const pricingModelFound = pricing !== DEFAULT_FALLBACK_PRICING;
+  if (!pricingModelFound) {
+    // Do not fabricate or store unverified pricing (e.g. for unlisted Sonnet models).
+    return {
+      estimatedCostUsd: 0,
+      estimatedCostKrw: 0,
+      pricingModelFound: false,
+      currency: 'USD',
+      effectiveDate: pricing.effectiveDate,
+    };
+  }
+
   const safeInput = Math.max(0, inputTokens || 0);
   const safeOutput = Math.max(0, outputTokens || 0);
 
@@ -114,7 +133,7 @@ export function calculateAiCost(
   return {
     estimatedCostUsd: totalUsd,
     estimatedCostKrw: totalKrw,
-    pricingModelFound: pricing !== DEFAULT_FALLBACK_PRICING,
+    pricingModelFound: true,
     currency: 'USD',
     effectiveDate: pricing.effectiveDate,
   };
@@ -296,9 +315,10 @@ export interface AiUsageSummary {
   failureRatePercent: number;
   requestsByTask: Record<string, number>;
   tokensByModel: Record<string, { input: number; output: number; total: number }>;
-  costByModel: Record<string, { usd: number; krw: number }>;
+  costByModel: Record<string, { usd: number; krw: number; pricingVerified?: boolean }>;
   totalCostUsd: number;
   totalCostKrw: number;
+  unverifiedPricingRequests?: number;
   operatorTrialConsumption: {
     requests: number;
     tokens: number;
@@ -347,10 +367,11 @@ export function getAiUsageSummary(
   let failedRequests = 0;
   let totalCostUsd = 0;
   let totalCostKrw = 0;
+  let unverifiedPricingRequests = 0;
 
   const requestsByTask: Record<string, number> = {};
   const tokensByModel: Record<string, { input: number; output: number; total: number }> = {};
-  const costByModel: Record<string, { usd: number; krw: number }> = {};
+  const costByModel: Record<string, { usd: number; krw: number; pricingVerified?: boolean }> = {};
 
   const operatorTrialConsumption = {
     requests: 0,
@@ -391,11 +412,17 @@ export function getAiUsageSummary(
     tokensByModel[r.model].total += r.totalTokens;
 
     // Cost by model
-    if (!costByModel[r.model]) {
-      costByModel[r.model] = { usd: 0, krw: 0 };
+    const modelPricingVerified = hasVerifiedModelPricing(r.model);
+    if (!modelPricingVerified) {
+      unverifiedPricingRequests += 1;
     }
-    costByModel[r.model].usd = Math.round((costByModel[r.model].usd + r.estimatedCostUsd) * 1_000_000) / 1_000_000;
-    costByModel[r.model].krw = Math.round((costByModel[r.model].krw + r.estimatedCostKrw) * 100) / 100;
+    if (!costByModel[r.model]) {
+      costByModel[r.model] = { usd: 0, krw: 0, pricingVerified: modelPricingVerified };
+    }
+    if (modelPricingVerified) {
+      costByModel[r.model].usd = Math.round((costByModel[r.model].usd + r.estimatedCostUsd) * 1_000_000) / 1_000_000;
+      costByModel[r.model].krw = Math.round((costByModel[r.model].krw + r.estimatedCostKrw) * 100) / 100;
+    }
 
     // Credit source consumption
     if (r.creditSource === 'operator_trial') {
@@ -469,6 +496,7 @@ export function getAiUsageSummary(
     costByModel,
     totalCostUsd: Math.round(totalCostUsd * 1_000_000) / 1_000_000,
     totalCostKrw: Math.round(totalCostKrw * 100) / 100,
+    unverifiedPricingRequests,
     operatorTrialConsumption: {
       requests: operatorTrialConsumption.requests,
       tokens: operatorTrialConsumption.tokens,

@@ -23,6 +23,13 @@ import { createClient as createBrowserSupabaseClient } from '../lib/supabase/cli
 import { MathFormula } from './MathFormula';
 import { AcademicMathView } from './AcademicMathView';
 import { ProblemReportModal } from './ProblemReportModal';
+import { Select } from './ui/WorkspacePrimitives';
+import {
+  DEFAULT_SCHOOL_MODEL_OPTIONS,
+  applyAiConnectionLookup,
+  type ModelLookupStatus,
+  type SchoolModelOption,
+} from '../lib/aiModelSelectionClient';
 import { AttemptSaveStatus } from '../lib/storage';
 import { isOmissionDiagnosis } from '../lib/evaluationValidation';
 import {
@@ -86,6 +93,7 @@ export interface EvaluateAnswerInputSnapshot {
   domain?: string;
   isProvisionalLocal?: boolean;
   sourceProvenance?: ProblemSourceProvenance;
+  selectedModel?: string;
 }
 
 
@@ -544,8 +552,86 @@ export function ProblemSessionModal({
   // Stage 4: AI Evaluation State
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [isRetryingSave, setIsRetryingSave] = useState(false);
+  const [availableModels, setAvailableModels] = useState<SchoolModelOption[]>(DEFAULT_SCHOOL_MODEL_OPTIONS);
+  const [selectedModel, setSelectedModel] = useState<string>('deepseek-v4.1-flash');
+  const [savedDefaultModel, setSavedDefaultModel] = useState<string>('deepseek-v4.1-flash');
+  const [nonSchoolProviderInfo, setNonSchoolProviderInfo] = useState<{ provider: string; model?: string } | null>(null);
+  const [modelLookupStatus, setModelLookupStatus] = useState<ModelLookupStatus>('loading');
+  const [modelLookupError, setModelLookupError] = useState<string | null>(null);
+  const [modelLookupRetryCount, setModelLookupRetryCount] = useState<number>(0);
+  const userModifiedModelRef = useRef(false);
+  const selectedModelRef = useRef(selectedModel);
+  const lookupSeqRef = useRef(0);
+  const prevLookupContextRef = useRef('');
   const evalRequestIdRef = useRef(0);
   const mountedRef = useRef(true);
+
+  const sessionProblemKey = `${userId || ''}:${subject.id}:${problem.id}:v${problem.version ?? 1}`;
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  if (isOpen !== prevIsOpen) {
+    setPrevIsOpen(isOpen);
+    if (isOpen) {
+      setModelLookupStatus('loading');
+      setModelLookupError(null);
+    }
+  }
+
+  useEffect(() => {
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      prevLookupContextRef.current = '';
+      return;
+    }
+    if (prevLookupContextRef.current !== sessionProblemKey) {
+      prevLookupContextRef.current = sessionProblemKey;
+      userModifiedModelRef.current = false;
+    }
+
+    const seq = ++lookupSeqRef.current;
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const res = await fetch('/api/ai-connection', {
+          method: 'GET',
+          signal: controller.signal,
+        });
+        const data = await res.json();
+        if (controller.signal.aborted || seq !== lookupSeqRef.current) return;
+        if (!res.ok || !data.success) {
+          setModelLookupStatus('error');
+          setModelLookupError(data.error || '저장된 기본 모델 정보를 불러오지 못했습니다.');
+          return;
+        }
+        const applied = applyAiConnectionLookup(
+          data,
+          selectedModelRef.current,
+          userModifiedModelRef.current
+        );
+        setAvailableModels(applied.availableModels);
+        setNonSchoolProviderInfo(applied.nonSchoolProviderInfo);
+        setSavedDefaultModel(applied.savedDefaultModel);
+        if (!userModifiedModelRef.current) {
+          setSelectedModel(applied.nextSelectedModel);
+          selectedModelRef.current = applied.nextSelectedModel;
+        }
+        setModelLookupError(null);
+        setModelLookupStatus('ready');
+      } catch {
+        if (!controller.signal.aborted && seq === lookupSeqRef.current) {
+          setModelLookupStatus('error');
+          setModelLookupError('네트워크 오류로 기본 모델 정보를 확인하지 못했습니다.');
+        }
+      }
+    })();
+
+    return () => {
+      controller.abort();
+    };
+  }, [isOpen, sessionProblemKey, modelLookupRetryCount]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -570,12 +656,13 @@ export function ProblemSessionModal({
     };
   });
 
-  const sessionProblemKey = `${userId || ''}:${subject.id}:${problem.id}:v${problem.version ?? 1}`;
   const [prevSessionProblemKey, setPrevSessionProblemKey] = useState(sessionProblemKey);
   if (sessionProblemKey !== prevSessionProblemKey) {
     setPrevSessionProblemKey(sessionProblemKey);
     setIsEvaluating(false);
     setIsRetryingSave(false);
+    setModelLookupStatus('loading');
+    setModelLookupError(null);
   }
 
   useEffect(() => {
@@ -725,8 +812,10 @@ export function ProblemSessionModal({
         ? reasonNotApplicableJustification.trim()
         : undefined,
       isProvisionalLocal: Boolean((problem as { isProvisionalLocal?: boolean }).isProvisionalLocal),
+      selectedModel: nonSchoolProviderInfo ? undefined : selectedModel,
     };
 
+    const modelAtStart = nonSchoolProviderInfo ? undefined : selectedModel;
     setIsEvaluating(true);
     setEvaluationError(null);
 
@@ -751,6 +840,7 @@ export function ProblemSessionModal({
           userAnswer: trimmed,
           revealedHintCount: revealedHints.length,
           hints: revealedHints.map((index) => problem.hints[index]),
+          selectedModel: modelAtStart,
           // Stage 8 fields
           solvingReason: isReasonNotApplicable ? undefined : solvingReason.trim(),
           isReasonNotApplicable,
@@ -886,6 +976,7 @@ export function ProblemSessionModal({
           ? snap.reasonNotApplicableJustification
           : (isReasonNotApplicable ? reasonNotApplicableJustification.trim() : undefined),
         isProvisionalLocal: snap?.isProvisionalLocal ?? Boolean((problem as { isProvisionalLocal?: boolean }).isProvisionalLocal),
+        selectedModel: snap?.selectedModel,
         isSaveRetry: true,
         action: 'retry_save',
         taskId: recoveryRecord.taskId,
@@ -1727,13 +1818,82 @@ export function ProblemSessionModal({
 
           {/* Evaluation Trigger Button or Loading / Error / Results */}
           {!evaluationResult && !isEvaluating && !evaluationError && (
-            <div className="pt-2">
+            <div className="pt-2 space-y-3">
+              <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label htmlFor="eval-model-select" className="text-xs font-bold font-academic-mono text-[#57544e] uppercase">
+                    채점 AI 모델 선택
+                  </label>
+                  {modelLookupStatus === 'loading' ? (
+                    <span className="text-[11px] text-[#827d73] inline-flex items-center gap-1">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      기본 설정 확인 중...
+                    </span>
+                  ) : !nonSchoolProviderInfo ? (
+                    <span className="text-[11px] text-[#827d73]">
+                      기본값: <span className="font-academic-mono text-[#191817]">{savedDefaultModel}</span>
+                    </span>
+                  ) : null}
+                </div>
+
+                {nonSchoolProviderInfo ? (
+                  <p className="text-[11px] text-[#57544e]">
+                    현재 비학교 제공자(<strong className="font-academic-mono text-[#191817]">{nonSchoolProviderInfo.provider}</strong>
+                    {nonSchoolProviderInfo.model ? ` · ${nonSchoolProviderInfo.model}` : ''})가 설정되어 있어 학교 BAZE 모델을 선택할 수 없으며 기존 제공자 모델로 채점됩니다.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    <Select
+                      id="eval-model-select"
+                      aria-label="채점 AI 모델 선택"
+                      value={selectedModel}
+                      onChange={(e) => {
+                        userModifiedModelRef.current = true;
+                        setSelectedModel(e.target.value);
+                      }}
+                      disabled={isEvaluating}
+                      className="w-full font-academic-mono bg-white"
+                    >
+                      {availableModels.map((opt) => (
+                        <option key={opt.id} value={opt.id}>
+                          {opt.label}{opt.id === savedDefaultModel ? ' (기본 설정)' : ''}
+                        </option>
+                      ))}
+                    </Select>
+                    {modelLookupStatus === 'error' && modelLookupError && (
+                      <div className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-xs p-2 flex flex-wrap items-center justify-between gap-2">
+                        <span>
+                          {modelLookupError} (현재 선택: <span className="font-academic-mono">{selectedModel}</span>)
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setModelLookupStatus('loading');
+                            setModelLookupError(null);
+                            setModelLookupRetryCount((c) => c + 1);
+                          }}
+                          className="px-2 py-1 text-[11px] font-semibold bg-white border border-amber-300 rounded-xs hover:bg-amber-100 transition-colors"
+                        >
+                          다시 조회
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <button
                 type="button"
                 onClick={handleRequestEvaluation}
-                disabled={!answerText.trim() || (!trialCredits.hasPersonalKey && trialCredits.balance <= 0)}
+                disabled={
+                  modelLookupStatus === 'loading' ||
+                  !answerText.trim() ||
+                  (!trialCredits.hasPersonalKey && trialCredits.balance <= 0)
+                }
                 className={`w-full flex items-center justify-center gap-2 py-3 px-4 text-xs sm:text-sm font-bold rounded-xs shadow-xs transition-all ${
-                  !answerText.trim() || (!trialCredits.hasPersonalKey && trialCredits.balance <= 0)
+                  modelLookupStatus === 'loading' ||
+                  !answerText.trim() ||
+                  (!trialCredits.hasPersonalKey && trialCredits.balance <= 0)
                     ? 'bg-[#ded6c8] text-[#827d73] cursor-not-allowed'
                     : 'bg-[#c52828] hover:bg-[#a82020] text-white cursor-pointer'
                 }`}

@@ -18789,16 +18789,20 @@ exports.requireApiUser = async () => {
     };
 
     try {
-      await withFakeSupabase({ user: testUser, rpcImpl: rpcSpy }, async () => {
-        const problemPayload = {
-          id: 'prob-qual-1',
-          version: 1,
-          title: '선형대수 고유값 문제',
-          promptText: '행렬 A의 특성다항식을 구하시오.',
-          modelAnswer: 'det(A - lambda I) = 0',
-          rubric: [{ id: 'r1', label: '행렬식 계산', maxScore: 100, description: '전개 과정' }],
-          categoryLabel: '선형대수',
-        };
+      const problemPayload = {
+        id: 'prob-qual-1',
+        version: 1,
+        title: '선형대수 고유값 문제',
+        promptText: '행렬 A의 특성다항식을 구하시오.',
+        modelAnswer: 'det(A - lambda I) = 0',
+        rubric: [{ id: 'r1', label: '행렬식 계산', maxScore: 100, description: '전개 과정' }],
+        categoryLabel: '선형대수',
+      };
+      await withFakeSupabase({
+        user: testUser,
+        problems: [{ id: 'prob-qual-1', user_id: testUser.id, is_demo: false, payload: problemPayload }],
+        rpcImpl: rpcSpy,
+      }, async () => {
 
         const initialReq = new NextRequest('http://localhost/api/review-problem-quality', {
           method: 'POST',

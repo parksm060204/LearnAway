@@ -1,7 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
+import { createClient } from '../../../lib/supabase/server';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
-import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { resolveAiConfigForUser, resolveOperatorAiConfig, DEFAULT_SCHOOL_MODEL } from '../../../lib/aiCredentials';
+import {
+  getAllowedSchoolModels,
+  resolveAndVerifyManualModelConfig,
+  resolveEffectiveModelForRequest,
+  resolveProblemDifficultyForRoute,
+  validateRequestedModelInput,
+  type EffectiveModelResolutionSuccess,
+} from '../../../lib/aiModelPolicy';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 import {
   recordTrialResultReady,
@@ -115,7 +124,34 @@ export async function POST(req: NextRequest) {
       description: r.description || '',
     }));
 
-    const normalizedInput = {
+    const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+    let resolvedRequestedModel: string | undefined;
+    let effectiveModel = DEFAULT_SCHOOL_MODEL;
+    let pinnedModelResolution: EffectiveModelResolutionSuccess | undefined;
+
+    if (isSaveRetry) {
+      const val = validateRequestedModelInput(payload.selectedModel);
+      if (val.ok && val.model) {
+        resolvedRequestedModel = val.model;
+        effectiveModel = val.model;
+      }
+    } else {
+      const modelRes = await resolveEffectiveModelForRequest({
+        userId: auth.user.id,
+        requestedModel: payload.selectedModel,
+      });
+      if (!modelRes.ok) {
+        return NextResponse.json(
+          { success: false, error: modelRes.message, errorCode: modelRes.code },
+          { status: modelRes.status }
+        );
+      }
+      resolvedRequestedModel = modelRes.requestedModel;
+      effectiveModel = modelRes.effectiveModel;
+      pinnedModelResolution = modelRes;
+    }
+
+    const normalizedInputBase = {
       version: REVIEW_PROBLEM_QUALITY_PROMPT_VERSION,
       problemId: problem.id,
       problemVersion: problem.version ?? 1,
@@ -131,8 +167,13 @@ export async function POST(req: NextRequest) {
       reports: openReports.map((r) => ({ type: r.type, details: r.details, createdAt: r.createdAt || '' })),
       sourceMarkdown: sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '',
     };
+    const normalizedInput = {
+      ...normalizedInputBase,
+      model: effectiveModel,
+    };
     const inputIdentifier = computeAiTaskInputIdentifier(normalizedInput, 'v1');
-    const legacy2a16e49InputIdentifier = computeMarkdownHash(JSON.stringify(normalizedInput));
+    const legacyNoModelInputIdentifier = computeAiTaskInputIdentifier(normalizedInputBase, 'v1');
+    const legacy2a16e49InputIdentifier = computeMarkdownHash(JSON.stringify(normalizedInputBase));
     const legacyOlderInputIdentifier = computeMarkdownHash(
       JSON.stringify({
         problemId: problem.id,
@@ -146,22 +187,42 @@ export async function POST(req: NextRequest) {
         sourceMarkdown: sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '',
       })
     );
-    const legacyInputIdentifiers = [legacy2a16e49InputIdentifier, legacyOlderInputIdentifier];
+    const retryCandidateModels = Array.from(
+      new Set([...getAllowedSchoolModels(), resolveOperatorAiConfig()?.model || '', effectiveModel].filter(Boolean))
+    );
+    const retryModelInputIdentifiers = isSaveRetry
+      ? retryCandidateModels
+          .map((m) => computeAiTaskInputIdentifier({ ...normalizedInputBase, model: m }, 'v1'))
+          .filter((id) => id !== inputIdentifier)
+      : [];
+    const legacyInputIdentifiers = Array.from(
+      new Set([
+        legacyNoModelInputIdentifier,
+        ...retryModelInputIdentifiers,
+        legacy2a16e49InputIdentifier,
+        legacyOlderInputIdentifier,
+      ])
+    ).filter((id) => id && id !== inputIdentifier);
     const legacy2a16e49TaskId = buildUserScopedTaskId(auth.user.id, 'qual', legacy2a16e49InputIdentifier);
     const legacyOlderTaskId = buildLegacyTaskId('qual', legacyOlderInputIdentifier);
-    const legacyTaskIds = [legacy2a16e49TaskId, legacyOlderTaskId];
+    const legacyTaskIds = [
+      buildUserScopedTaskId(auth.user.id, 'qual', legacyNoModelInputIdentifier),
+      ...retryModelInputIdentifiers.map((id) => buildUserScopedTaskId(auth.user.id, 'qual', id)),
+      legacy2a16e49TaskId,
+      legacyOlderTaskId,
+    ];
 
     const rawTaskId = (typeof payload.taskId === 'string' && payload.taskId.trim()) ? payload.taskId.trim() : '';
     const isLegacyDefault =
       rawTaskId === `qual_${legacyOlderInputIdentifier}` ||
       rawTaskId === `qual_${legacy2a16e49InputIdentifier}` ||
+      rawTaskId === `qual_${legacyNoModelInputIdentifier}` ||
       rawTaskId === `qual_${inputIdentifier}` ||
       rawTaskId === `qual_${auth.user.id}_${legacyOlderInputIdentifier}` ||
       rawTaskId === `qual_${auth.user.id}_${legacy2a16e49InputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
     let taskId = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'qual', inputIdentifier);
     const legacyTaskId = legacyOlderTaskId;
-    const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
     const signedRecoveryToken = (typeof payload.signedRecoveryToken === 'string' && payload.signedRecoveryToken.trim()) ? payload.signedRecoveryToken.trim() : '';
     const clientRecoveryData = payload.recoveryData || payload.review || null;
 
@@ -334,6 +395,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const isProvisionalLocal = payload.isProvisionalLocal === true;
+    const diffRes = await resolveProblemDifficultyForRoute({
+      createClientFn: createClient,
+      userId: auth.user.id,
+      problemId: problem.id,
+      isProvisionalLocal,
+      fallbackDifficultyLevel: problem.difficultyLevel,
+      fallbackDifficulty: problem.difficulty,
+    });
+    if (!diffRes.ok) {
+      const errRes = diffRes as { ok: false; status: number; error: string };
+      return NextResponse.json({ success: false, error: errRes.error }, { status: errRes.status });
+    }
+
     let persisted = false;
     let settled = false;
     let settlementError: string | undefined;
@@ -351,6 +426,23 @@ export async function POST(req: NextRequest) {
     }
 
     if (cred.ok) {
+      const routed = await resolveAndVerifyManualModelConfig({
+        baseConfig: cred.config,
+        requestedModel: resolvedRequestedModel,
+        pinnedResolution: pinnedModelResolution,
+        credSource: cred.source,
+      });
+      if (!routed.ok) {
+        if (cred.leaseToken) {
+          await releaseTrialCredit(auth.user.id, taskId, 'model_unavailable', cred.leaseToken);
+        }
+        return NextResponse.json(
+          { success: false, error: routed.message, errorCode: routed.code },
+          { status: routed.status }
+        );
+      }
+      const targetConfig = routed.config;
+
       try {
         const prompt = `당신은 대학 학부/대학원 수준의 수리통계 및 알고리즘 시험 문제 검증 및 학술 품질 관리관입니다.
 신고된 문제와 사용자의 신고 사유를 원문 근거와 비교하여 엄밀히 검토해 주십시오.
@@ -399,15 +491,15 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
           json: false,
           timeoutMs: 45000,
           label: 'review-problem-quality',
-        }, cred.config);
+        }, targetConfig);
         const aiExecutionTimeMs = Date.now() - aiStartTime;
 
         if (!aiCall.ok) {
           await recordAiUsageTelemetry({
             userId: auth.user.id,
             taskType: 'review_problem_quality',
-            provider: cred.config.provider,
-            model: cred.config.model,
+            provider: targetConfig.provider,
+            model: targetConfig.model,
             executionTimeMs: aiExecutionTimeMs,
             status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
             errorCode: aiCall.error.code,
@@ -431,8 +523,8 @@ ${sourceMarkdown ? sourceMarkdown.slice(0, 1500) : '제공되지 않음'}
         await recordAiUsageTelemetry({
           userId: auth.user.id,
           taskType: 'review_problem_quality',
-          provider: cred.config.provider,
-          model: aiCall.model || cred.config.model,
+          provider: targetConfig.provider,
+          model: aiCall.model || targetConfig.model,
           inputTokens: aiCall.usage?.promptTokens,
           outputTokens: aiCall.usage?.completionTokens,
           inputText: prompt,

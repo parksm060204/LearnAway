@@ -76,14 +76,16 @@ export function maskKey(key: string): string {
 
 /** Builds the AI config for a user's decrypted key. Base URL is fixed here. */
 export function buildSchoolConfig(apiKey: string, model?: string): AiConfig {
+  const resolvedModel = (model || '').trim() || DEFAULT_SCHOOL_MODEL;
+  const isDeepSeek = resolvedModel.toLowerCase().includes('deepseek');
   const minRaw = Number(process.env.BAZE_MIN_OUTPUT_TOKENS);
   return {
     provider: SCHOOL_GATEWAY_PROVIDER,
     apiKey,
-    model: (model || '').trim() || DEFAULT_SCHOOL_MODEL,
+    model: resolvedModel,
     apiBase: SCHOOL_GATEWAY_BASE_URL,
-    minOutputTokens: Number.isFinite(minRaw) && minRaw > 0 ? minRaw : 16000,
-    jsonMode: process.env.BAZE_JSON_MODE === 'json_object' ? 'json_object' : 'none',
+    minOutputTokens: isDeepSeek ? (Number.isFinite(minRaw) && minRaw > 0 ? minRaw : 16000) : 0,
+    jsonMode: isDeepSeek && process.env.BAZE_JSON_MODE === 'json_object' ? 'json_object' : 'none',
   };
 }
 

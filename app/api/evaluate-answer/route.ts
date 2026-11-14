@@ -2,7 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { createClient } from '../../../lib/supabase/server';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
-import { resolveAiConfigForUser, lookupConnectionSecret, operatorFallbackAllowed, type TrialContext } from '../../../lib/aiCredentials';
+import { resolveAiConfigForUser, lookupConnectionSecret, operatorFallbackAllowed, resolveOperatorAiConfig, DEFAULT_SCHOOL_MODEL, type TrialContext } from '../../../lib/aiCredentials';
+import {
+  getAllowedSchoolModels,
+  resolveAndVerifyManualModelConfig,
+  resolveEffectiveModelForRequest,
+  validateRequestedModelInput,
+  type EffectiveModelResolutionSuccess,
+} from '../../../lib/aiModelPolicy';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
@@ -38,6 +45,7 @@ export interface EvaluateAnswerRequest {
   problemType?: string;
   mockExamSessionId?: string;
   isProvisionalLocal?: boolean;
+  selectedModel?: unknown;
   conceptId: string;
   conceptIds?: string[];
   subjectId: string;
@@ -497,7 +505,34 @@ export async function POST(req: NextRequest) {
     const isMockExam = Boolean(body.mockExamSessionId);
     let trialContext: TrialContext | undefined = undefined;
 
-    const normalizedEvaluationInput = {
+    const isSaveRetry = Boolean(body?.isSaveRetry || body?.action === 'retry_save');
+    let resolvedRequestedModel: string | undefined;
+    let effectiveModel = DEFAULT_SCHOOL_MODEL;
+    let pinnedModelResolution: EffectiveModelResolutionSuccess | undefined;
+
+    if (isSaveRetry) {
+      const val = validateRequestedModelInput(body?.selectedModel);
+      if (val.ok && val.model) {
+        resolvedRequestedModel = val.model;
+        effectiveModel = val.model;
+      }
+    } else {
+      const modelRes = await resolveEffectiveModelForRequest({
+        userId: auth.user.id,
+        requestedModel: body?.selectedModel,
+      });
+      if (!modelRes.ok) {
+        return NextResponse.json(
+          { success: false, error: modelRes.message, errorCode: modelRes.code },
+          { status: modelRes.status }
+        );
+      }
+      resolvedRequestedModel = modelRes.requestedModel;
+      effectiveModel = modelRes.effectiveModel;
+      pinnedModelResolution = modelRes;
+    }
+
+    const normalizedEvaluationBase = {
       version: EVALUATE_ANSWER_PROMPT_VERSION,
       domain,
       problemId: problemId || '',
@@ -525,16 +560,37 @@ export async function POST(req: NextRequest) {
       hints: Array.isArray(hints) ? hints.slice(0, Number(revealedHintCount) || 0) : [],
       isMockExam,
     };
+    const normalizedEvaluationInput = {
+      ...normalizedEvaluationBase,
+      model: effectiveModel,
+    };
     const inputIdentifier = computeAiTaskInputIdentifier(normalizedEvaluationInput, 'v1');
+    const legacyNoModelInputIdentifier = computeAiTaskInputIdentifier(normalizedEvaluationBase, 'v1');
     const legacyInputIdentifier = isMockExam
       ? computeMarkdownHash(`mock_exam:${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`)
       : computeMarkdownHash(`${problemId}:${body.problemVersion ?? 1}:${userAnswer.trim()}`);
-    const legacyJsonInputIdentifier = computeMarkdownHash(JSON.stringify(normalizedEvaluationInput));
+    const legacyJsonInputIdentifier = computeMarkdownHash(JSON.stringify(normalizedEvaluationBase));
 
-    const legacyInputIdentifiers = [legacyInputIdentifier, legacyJsonInputIdentifier];
+    const retryCandidateModels = Array.from(
+      new Set([
+        ...getAllowedSchoolModels(),
+        resolveOperatorAiConfig()?.model || '',
+        effectiveModel,
+      ].filter(Boolean))
+    );
+    const retryModelInputIdentifiers = isSaveRetry
+      ? retryCandidateModels
+          .map((m) => computeAiTaskInputIdentifier({ ...normalizedEvaluationBase, model: m }, 'v1'))
+          .filter((id) => id !== inputIdentifier)
+      : [];
+    const legacyInputIdentifiers = Array.from(
+      new Set([legacyNoModelInputIdentifier, ...retryModelInputIdentifiers, legacyInputIdentifier, legacyJsonInputIdentifier])
+    ).filter((id) => id && id !== inputIdentifier);
     const legacyTaskId = buildLegacyTaskId('eval', legacyInputIdentifier);
     const legacyTaskIds = [
       legacyTaskId,
+      buildUserScopedTaskId(auth.user.id, 'eval', legacyNoModelInputIdentifier),
+      ...retryModelInputIdentifiers.map((id) => buildUserScopedTaskId(auth.user.id, 'eval', id)),
       buildUserScopedTaskId(auth.user.id, 'eval', legacyJsonInputIdentifier),
       buildUserScopedTaskId(auth.user.id, 'eval', legacyInputIdentifier),
     ];
@@ -543,12 +599,12 @@ export async function POST(req: NextRequest) {
     const isLegacyDefault =
       rawTaskId === `eval_${legacyInputIdentifier}` ||
       rawTaskId === `eval_${legacyJsonInputIdentifier}` ||
+      rawTaskId === `eval_${legacyNoModelInputIdentifier}` ||
       rawTaskId === `eval_${inputIdentifier}` ||
       rawTaskId === `eval_${auth.user.id}_${legacyInputIdentifier}` ||
       rawTaskId === `eval_${auth.user.id}_${legacyJsonInputIdentifier}`;
     const explicitTaskId = (rawTaskId && !isLegacyDefault) ? rawTaskId : null;
     let taskId: string = explicitTaskId || buildUserScopedTaskId(auth.user.id, 'eval', inputIdentifier);
-    const isSaveRetry = Boolean(body?.isSaveRetry || body?.action === 'retry_save');
 
     if (isSaveRetry) {
       let saved = await lookupSavedTaskResult(auth.user.id, taskId, 'evaluate_answer', inputIdentifier, legacyInputIdentifiers);
@@ -854,6 +910,23 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const routed = await resolveAndVerifyManualModelConfig({
+      baseConfig: cred.config,
+      requestedModel: resolvedRequestedModel,
+      pinnedResolution: pinnedModelResolution,
+      credSource: cred.source,
+    });
+    if (!routed.ok) {
+      if (taskId && cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'model_unavailable', cred.leaseToken);
+      }
+      return NextResponse.json(
+        { success: false, error: routed.message, errorCode: routed.code },
+        { status: routed.status }
+      );
+    }
+    const targetConfig = routed.config;
+
     const { data: budgetData, error: budgetError } = await supabase.rpc('consume_ai_call_budget');
     if (budgetError || !budgetData || typeof budgetData !== 'object') {
       if (taskId && cred.leaseToken) {
@@ -1074,7 +1147,7 @@ ${
       outputTokenCeiling: cred.isTrial ? MAX_TRIAL_OUTPUT_TOKENS : 16_000,
       timeoutMs: cred.isTrial ? MAX_TRIAL_EXECUTION_TIMEOUT_MS : 45000,
       label: 'evaluate-answer',
-    }, cred.config);
+    }, targetConfig);
     const aiExecutionTimeMs = Date.now() - aiStartTime;
 
     if (!aiCall.ok) {
@@ -1082,8 +1155,8 @@ ${
         requestId: taskId || undefined,
         userId: auth.user.id,
         taskType: 'evaluate_answer',
-        provider: cred.config.provider,
-        model: cred.config.model,
+        provider: targetConfig.provider,
+        model: targetConfig.model,
         executionTimeMs: aiExecutionTimeMs,
         status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
         errorCode: aiCall.error.code,
@@ -1105,8 +1178,8 @@ ${
       requestId: taskId || undefined,
       userId: auth.user.id,
       taskType: 'evaluate_answer',
-      provider: cred.config.provider,
-      model: aiCall.model || cred.config.model,
+      provider: targetConfig.provider,
+      model: aiCall.model || targetConfig.model,
       inputTokens: aiCall.usage?.promptTokens,
       outputTokens: aiCall.usage?.completionTokens,
       inputText: userPrompt,
@@ -1323,7 +1396,7 @@ ${
           inputIdentifier,
           result: recoveryData,
           leaseToken: cred.leaseToken,
-          modelId: cred.config.model,
+          modelId: targetConfig.model,
         });
         return NextResponse.json(
           {

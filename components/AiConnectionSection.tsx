@@ -6,6 +6,12 @@ import { useTrialCredits, notifyTrialCreditsUpdated } from '../lib/trialCreditsC
 
 type ConnectionStatus = 'unregistered' | 'checking' | 'checked' | 'connected' | 'failed';
 
+interface SchoolModelOption {
+  id: string;
+  label: string;
+  shortName: string;
+}
+
 interface ConnectionState {
   connected: boolean;
   provider?: string;
@@ -14,12 +20,26 @@ interface ConnectionState {
   status?: string;
   lastCheckedAt?: string | null;
   operatorFallback?: boolean;
+  operatorProvider?: string;
+  operatorModel?: string;
   encryptionConfigured?: boolean;
   defaultModel?: string;
+  availableSchoolModels?: SchoolModelOption[];
   models?: string[];
 }
 
 const DEFAULT_MODEL = 'deepseek-v4.1-flash';
+const DEFAULT_SONNET_MODEL = 'claude-sonnet-5-5';
+
+function formatModelOptionLabel(modelId: string, availableSchoolModels?: SchoolModelOption[]): string {
+  const matched = availableSchoolModels?.find((m) => m.id === modelId);
+  if (matched) {
+    return modelId === DEFAULT_MODEL ? `${matched.label} · 기본 권장` : matched.label;
+  }
+  if (modelId === DEFAULT_MODEL) return `DeepSeek (${modelId}) · 기본 권장`;
+  if (modelId === DEFAULT_SONNET_MODEL) return `Sonnet (${modelId})`;
+  return modelId;
+}
 
 function formatWhen(value?: string | null): string {
   if (!value) return '';
@@ -41,6 +61,11 @@ export function AiConnectionSection() {
   const [replacing, setReplacing] = useState(false);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState('');
+  const [modelSaveBusy, setModelSaveBusy] = useState(false);
+  const [modelSaveStatus, setModelSaveStatus] = useState<'idle' | 'saved' | 'error'>('idle');
+  const [modelSaveMessage, setModelSaveMessage] = useState('');
   const trialCredits = useTrialCredits();
 
   const resetInput = () => {
@@ -49,6 +74,37 @@ export function AiConnectionSection() {
     setModels([]);
     setSelectedModel(DEFAULT_MODEL);
     setKeyHint('');
+    setModelsError('');
+    setModelSaveStatus('idle');
+    setModelSaveMessage('');
+  };
+
+  const fetchStoredKeyModels = async () => {
+    setModelsLoading(true);
+    setModelsError('');
+    try {
+      const res = await fetch('/api/ai-connection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ useStoredKey: true }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setModelsError(data.error || '사용 가능한 모델 목록을 불러오지 못했습니다.');
+        return;
+      }
+      const list: string[] = Array.isArray(data.models) ? data.models : [];
+      if (list.length === 0) {
+        setModelsError('이 API 키에서 사용할 수 있는 모델이 확인되지 않았습니다.');
+        return;
+      }
+      setModels(list);
+      setModelsError('');
+    } catch {
+      setModelsError('네트워크 오류로 모델 목록을 불러오지 못했습니다.');
+    } finally {
+      setModelsLoading(false);
+    }
   };
 
   const load = async () => {
@@ -65,6 +121,7 @@ export function AiConnectionSection() {
         setStatus('connected');
         setSelectedModel(data.model || data.defaultModel || DEFAULT_MODEL);
         setMessage('');
+        void fetchStoredKeyModels();
       } else {
         setStatus('unregistered');
       }
@@ -81,6 +138,7 @@ export function AiConnectionSection() {
       void load();
     }, 0);
     return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleCheck = async () => {
@@ -119,6 +177,38 @@ export function AiConnectionSection() {
     }
   };
 
+  const handleSaveDefaultModel = async () => {
+    if (busy || modelSaveBusy || !selectedModel) return;
+    setModelSaveBusy(true);
+    setModelSaveStatus('idle');
+    setModelSaveMessage('');
+    try {
+      const res = await fetch('/api/ai-connection', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: selectedModel }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setModelSaveStatus('error');
+        setModelSaveMessage(data.error || '기본 모델을 저장하지 못했습니다.');
+        return;
+      }
+      setConnection((prev) => ({ ...(prev || { connected: true }), ...data }));
+      if (Array.isArray(data.models) && data.models.length > 0) {
+        setModels(data.models);
+      }
+      setSelectedModel(data.model || selectedModel);
+      setModelSaveStatus('saved');
+      setModelSaveMessage(`기본 모델 '${data.model || selectedModel}'이(가) 서버에 저장되었습니다.`);
+    } catch {
+      setModelSaveStatus('error');
+      setModelSaveMessage('네트워크 오류로 기본 모델을 저장하지 못했습니다.');
+    } finally {
+      setModelSaveBusy(false);
+    }
+  };
+
   const handleSave = async () => {
     if (busy) return;
     setBusy(true);
@@ -139,6 +229,10 @@ export function AiConnectionSection() {
       setStatus('connected');
       setReplacing(false);
       resetInput();
+      setSelectedModel(data.model || selectedModel || DEFAULT_MODEL);
+      if (Array.isArray(data.models) && data.models.length > 0) {
+        setModels(data.models);
+      }
       notifyTrialCreditsUpdated();
       setMessage('API 연결이 저장되었습니다. 키는 브라우저에 저장되지 않습니다.');
     } catch {
@@ -265,16 +359,111 @@ export function AiConnectionSection() {
           암호화되어 저장되며 브라우저로 다시 전송되지 않고 <code>localStorage</code>에도 저장되지 않습니다.
         </p>
 
+        <div className="p-2.5 bg-[#faf8f4] border border-[#ded6c8] rounded-xs text-[11px] text-[#57544e]">
+          {connection?.connected || !connection?.operatorProvider || connection.operatorProvider === 'school_gateway' ? (
+            <>
+              기본 AI 모델 선택: 학교 BAZE Gateway 사용 시 아래에서 기본 모델을 직접 고를 수 있으며, 문제 생성 및 답안 채점 화면에서도{' '}
+              <strong className="font-academic-mono text-[#191817]">DeepSeek ({DEFAULT_MODEL})</strong>과{' '}
+              <strong className="font-academic-mono text-[#191817]">Sonnet ({DEFAULT_SONNET_MODEL})</strong> 중 원하는 모델을 직접 선택해 실행할 수 있습니다.
+            </>
+          ) : (
+            <>
+              현재 비학교 제공자(<strong className="font-academic-mono text-[#191817]">{connection.operatorProvider}</strong>
+              {connection.operatorModel ? ` · ${connection.operatorModel}` : ''})가 설정되어 있어 학교 모델을 별도로 선택할 수 없으며 기존 제공자 모델이 유지됩니다.
+            </>
+          )}
+        </div>
+
         {status === 'connected' && !replacing && (
-          <div className="space-y-1.5 p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs">
-            <div className="flex items-center gap-1.5 text-emerald-700 font-semibold">
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span>연결됨 · {connection?.keyHint || '••••'}</span>
+          <div className="space-y-2.5 p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-emerald-700 font-semibold">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>연결됨 · {connection?.keyHint || '••••'}</span>
+              </div>
+              {connection?.lastCheckedAt && (
+                <span className="text-[10.5px] text-[#827d73]">마지막 확인: {formatWhen(connection.lastCheckedAt)}</span>
+              )}
             </div>
-            <p className="text-[11px] text-[#57544e]">모델: <strong>{connection?.model}</strong></p>
-            {connection?.lastCheckedAt && (
-              <p className="text-[10.5px] text-[#827d73]">마지막 확인: {formatWhen(connection.lastCheckedAt)}</p>
-            )}
+            <p className="text-[11px] text-[#57544e]">
+              현재 저장된 기본 모델: <strong className="font-academic-mono text-[#191817]">{connection?.model || DEFAULT_MODEL}</strong>
+            </p>
+
+            <div className="space-y-1.5 pt-1 border-t border-[#e5dfd3]">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="connected-default-model-select" className="font-semibold text-[#191817]">
+                  기본 AI 모델 변경 (API 키 재입력 불필요)
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void fetchStoredKeyModels()}
+                  disabled={modelsLoading || modelSaveBusy || busy}
+                  className="text-[10.5px] text-[#57544e] hover:text-[#191817] underline disabled:opacity-50"
+                >
+                  {modelsLoading ? '목록 확인 중…' : '사용 가능 모델 새로고침'}
+                </button>
+              </div>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <select
+                  id="connected-default-model-select"
+                  aria-label="기본 AI 모델 선택"
+                  value={selectedModel}
+                  onChange={(e) => {
+                    setSelectedModel(e.target.value);
+                    setModelSaveStatus('idle');
+                    setModelSaveMessage('');
+                  }}
+                  disabled={modelSaveBusy || busy}
+                  className="flex-1 p-2 border border-[#ded6c8] rounded-xs bg-white font-mono text-[11px]"
+                >
+                  {Array.from(
+                    new Set(
+                      models.length > 0
+                        ? [connection?.model || DEFAULT_MODEL, ...models].filter(Boolean)
+                        : [connection?.model || DEFAULT_MODEL, DEFAULT_MODEL, DEFAULT_SONNET_MODEL].filter(Boolean)
+                    )
+                  ).map((m) => (
+                    <option key={m} value={m}>
+                      {formatModelOptionLabel(m, connection?.availableSchoolModels)}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => void handleSaveDefaultModel()}
+                  disabled={modelSaveBusy || busy || !selectedModel || selectedModel === connection?.model}
+                  className="flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#191817] text-white font-bold rounded-xs disabled:opacity-50 shrink-0"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{modelSaveBusy ? '저장 중…' : '기본 모델 저장'}</span>
+                </button>
+              </div>
+              {modelsError && (
+                <div className="p-2 bg-red-50 border border-red-200 rounded-xs text-[11px] text-red-800 flex items-center justify-between gap-2" role="alert">
+                  <span>{modelsError}</span>
+                  <button
+                    type="button"
+                    onClick={() => void fetchStoredKeyModels()}
+                    disabled={modelsLoading}
+                    className="px-2 py-0.5 border border-red-300 rounded-xs bg-white text-red-800 font-semibold shrink-0"
+                  >
+                    다시 시도
+                  </button>
+                </div>
+              )}
+              {modelSaveMessage && (
+                <p
+                  role="status"
+                  className={`p-2 border rounded-xs text-[11px] ${
+                    modelSaveStatus === 'error'
+                      ? 'bg-red-50 border-red-200 text-red-800'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  }`}
+                >
+                  {modelSaveMessage}
+                </p>
+              )}
+            </div>
           </div>
         )}
 
@@ -337,7 +526,7 @@ export function AiConnectionSection() {
               >
                 {models.map((m) => (
                   <option key={m} value={m}>
-                    {m}{m === DEFAULT_MODEL ? ' (기본 권장)' : ''}
+                    {formatModelOptionLabel(m, connection?.availableSchoolModels)}
                   </option>
                 ))}
               </select>

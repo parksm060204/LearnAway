@@ -2,7 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
-import { resolveAiConfigForUser, lookupConnectionSecret } from '../../../lib/aiCredentials';
+import { resolveAiConfigForUser, resolveOperatorAiConfig, DEFAULT_SCHOOL_MODEL } from '../../../lib/aiCredentials';
+import {
+  getAllowedSchoolModels,
+  resolveAndVerifyManualModelConfig,
+  resolveEffectiveModelForRequest,
+  validateRequestedModelInput,
+  type EffectiveModelResolutionSuccess,
+} from '../../../lib/aiModelPolicy';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
@@ -290,8 +297,37 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
       .join('\n\n===== 다음 자료 =====\n\n');
     const combinedSourceHash = computeAiTaskInputIdentifier(combinedSource, 'combined_v1');
 
-    // Authoritative normalized inputIdentifier using versioned SHA-256 over entire prompt context
-    const normalizedGenerationInput = {
+    const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+    let resolvedRequestedModel: string | undefined;
+    let effectiveModel = DEFAULT_SCHOOL_MODEL;
+    let preloadedLookupStatus: 'registered' | 'unregistered' | 'lookup_failed' = 'unregistered';
+    let pinnedModelResolution: EffectiveModelResolutionSuccess | undefined;
+
+    if (isSaveRetry) {
+      const val = validateRequestedModelInput(payload.selectedModel);
+      if (val.ok && val.model) {
+        resolvedRequestedModel = val.model;
+        effectiveModel = val.model;
+      }
+    } else {
+      const modelRes = await resolveEffectiveModelForRequest({
+        userId: auth.user.id,
+        requestedModel: payload.selectedModel,
+      });
+      if (!modelRes.ok) {
+        return NextResponse.json(
+          { success: false, error: modelRes.message, errorCode: modelRes.code },
+          { status: modelRes.status }
+        );
+      }
+      resolvedRequestedModel = modelRes.requestedModel;
+      effectiveModel = modelRes.effectiveModel;
+      preloadedLookupStatus = modelRes.lookup.status;
+      pinnedModelResolution = modelRes;
+    }
+
+    // Authoritative normalized inputIdentifier using versioned SHA-256 over entire prompt context (including selected model)
+    const normalizedGenerationBase = {
       promptVersion: GENERATE_PROBLEMS_PROMPT_VERSION,
       subjectId,
       subjectDomain,
@@ -303,7 +339,12 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
       sources: normalizedSources,
       combinedSourceHash,
     };
+    const normalizedGenerationInput = {
+      ...normalizedGenerationBase,
+      model: effectiveModel,
+    };
     const inputIdentifier = computeAiTaskInputIdentifier(normalizedGenerationInput, 'v1');
+    const legacyNoModelInputIdentifier = computeAiTaskInputIdentifier(normalizedGenerationBase, 'v1');
 
     // Backward compatibility: compute previous version hashes for lookup and recovery
     const conceptKey = concepts.map((c) => c.id).sort().join(',');
@@ -335,11 +376,23 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
     const legacyOriginalInputIdentifier = computeMarkdownHash(
       `${subjectId}:${conceptKey}:${problemType}:${difficulty}:${legacyMarkdownHash}`
     );
-    const legacyInputIdentifiers = [
-      legacyCb2bf1cInputIdentifier,
-      legacy2a16e49InputIdentifier,
-      legacyOriginalInputIdentifier,
-    ];
+    const retryCandidateModels = Array.from(
+      new Set([...getAllowedSchoolModels(), resolveOperatorAiConfig()?.model || '', effectiveModel].filter(Boolean))
+    );
+    const retryModelInputIdentifiers = isSaveRetry
+      ? retryCandidateModels
+          .map((m) => computeAiTaskInputIdentifier({ ...normalizedGenerationBase, model: m }, 'v1'))
+          .filter((id) => id !== inputIdentifier)
+      : [];
+    const legacyInputIdentifiers = Array.from(
+      new Set([
+        legacyNoModelInputIdentifier,
+        ...retryModelInputIdentifiers,
+        legacyCb2bf1cInputIdentifier,
+        legacy2a16e49InputIdentifier,
+        legacyOriginalInputIdentifier,
+      ])
+    ).filter((id) => id && id !== inputIdentifier);
 
     const isExplicitTaskId = Boolean(payload.taskId && typeof payload.taskId === 'string' && payload.taskId.trim());
     const explicitTaskId = isExplicitTaskId ? (payload.taskId as string).trim() : null;
@@ -347,6 +400,7 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
       explicitTaskId === `gen_${legacyOriginalInputIdentifier}` ||
       explicitTaskId === `gen_${legacy2a16e49InputIdentifier}` ||
       explicitTaskId === `gen_${legacyCb2bf1cInputIdentifier}` ||
+      explicitTaskId === `gen_${legacyNoModelInputIdentifier}` ||
       explicitTaskId === `gen_${inputIdentifier}` ||
       explicitTaskId === `gen_${auth.user.id}_${legacyOriginalInputIdentifier}` ||
       explicitTaskId === `gen_${auth.user.id}_${legacy2a16e49InputIdentifier}` ||
@@ -355,12 +409,13 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
     let taskId = effectiveExplicitTaskId || buildUserScopedTaskId(auth.user.id, 'gen', inputIdentifier);
     const legacyTaskId = buildLegacyTaskId('gen', legacyOriginalInputIdentifier);
     const legacyTaskIds = [
+      buildUserScopedTaskId(auth.user.id, 'gen', legacyNoModelInputIdentifier),
+      ...retryModelInputIdentifiers.map((id) => buildUserScopedTaskId(auth.user.id, 'gen', id)),
       buildUserScopedTaskId(auth.user.id, 'gen', legacyCb2bf1cInputIdentifier),
       buildUserScopedTaskId(auth.user.id, 'gen', legacy2a16e49InputIdentifier),
       legacyTaskId,
       buildLegacyTaskId('gen', legacy2a16e49InputIdentifier),
     ];
-    const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
 
     // Strict save retry path: must NEVER invoke external AI! Authoritative lookup of server-preserved results only.
     if (isSaveRetry) {
@@ -450,8 +505,7 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
     }
 
     // Check trial limits if user has no personal API key
-    const userLookup = await lookupConnectionSecret(auth.user.id);
-    if (userLookup.status === 'unregistered') {
+    if (preloadedLookupStatus === 'unregistered') {
       const trialVal = validateTrialProblemGenInput(count, combinedSource.length);
       if (!trialVal.ok) {
         return NextResponse.json(
@@ -534,6 +588,23 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
         { status: needsAiConnection ? 400 : 502 }
       );
     }
+
+    const routed = await resolveAndVerifyManualModelConfig({
+      baseConfig: cred.config,
+      requestedModel: resolvedRequestedModel,
+      pinnedResolution: pinnedModelResolution,
+      credSource: cred.source,
+    });
+    if (!routed.ok) {
+      if (cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, taskId, 'model_unavailable', cred.leaseToken);
+      }
+      return NextResponse.json(
+        { success: false, error: routed.message, errorCode: routed.code },
+        { status: routed.status }
+      );
+    }
+    const targetConfig = routed.config;
 
 
     // Build concepts contextual description
@@ -667,7 +738,7 @@ ${combinedSource}
       timeoutMs: cred.isTrial ? MAX_TRIAL_EXECUTION_TIMEOUT_MS : 60000,
       outputTokenCeiling: cred.isTrial ? MAX_TRIAL_OUTPUT_TOKENS : undefined,
       label: 'generate-problems',
-    }, cred.config);
+    }, targetConfig);
     const aiExecutionTimeMs = Date.now() - aiStartTime;
 
     if (!aiCall.ok) {
@@ -675,8 +746,8 @@ ${combinedSource}
         requestId: taskId || undefined,
         userId: auth.user.id,
         taskType: 'generate_problems',
-        provider: cred.config.provider,
-        model: cred.config.model,
+        provider: targetConfig.provider,
+        model: targetConfig.model,
         executionTimeMs: aiExecutionTimeMs,
         status: aiCall.error.code === 'timeout' ? 'timeout' : 'error',
         errorCode: aiCall.error.code,
@@ -698,8 +769,8 @@ ${combinedSource}
       requestId: taskId || undefined,
       userId: auth.user.id,
       taskType: 'generate_problems',
-      provider: cred.config.provider,
-      model: aiCall.model || cred.config.model,
+      provider: targetConfig.provider,
+      model: aiCall.model || targetConfig.model,
       inputTokens: aiCall.usage?.promptTokens,
       outputTokens: aiCall.usage?.completionTokens,
       inputText: userPrompt,
