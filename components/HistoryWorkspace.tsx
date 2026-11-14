@@ -18,6 +18,14 @@ import {
   Search,
 } from 'lucide-react';
 import { formatSeoulDate } from '../lib/dateUtils';
+import {
+  Badge,
+  EmptyState,
+  Input,
+  SectionCard,
+  Select,
+  WorkspaceHeader,
+} from './ui/WorkspacePrimitives';
 
 export interface HistoryWorkspaceProps {
   activeSubject?: Subject | null;
@@ -152,115 +160,85 @@ export function HistoryWorkspace({
 
   if (!activeSubject) {
     return (
-      <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-10 text-center shadow-2xs space-y-3">
-        <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto">
-          <BarChart3 className="w-6 h-6 stroke-1 text-[#827d73]" />
-        </div>
-        <h3 className="font-academic-serif font-bold text-base text-[#191817]">
-          선택된 과목이 없습니다.
-        </h3>
-        <p className="text-xs text-[#57544e] max-w-md mx-auto leading-relaxed">
-          과목을 추가하고 문제 풀이를 진행하면 이곳에 학습 기록 및 오답 분석 통계가 누적됩니다.
-        </p>
-      </div>
+      <EmptyState
+        icon={<BarChart3 className="w-5 h-5 stroke-1.5 text-[#827d73]" />}
+        title="선택된 과목이 없습니다."
+        description="과목을 추가하고 문제 풀이를 진행하면 이곳에 학습 기록 및 오답 분석 통계가 누적됩니다."
+      />
     );
   }
 
   return (
     <div className="w-full space-y-4">
       {/* Top Header */}
-      <div className="bg-white border border-[#e2ded6] rounded-xs p-5 shadow-2xs">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <BarChart3 className="w-5 h-5 text-indigo-600" />
-              <h2 className="text-base sm:text-lg font-bold font-academic-serif text-[#191817]">
-                {activeSubject.name} 학습 기록 및 분석
-              </h2>
-            </div>
-            <p className="text-xs text-[#827d73] font-academic-mono">
-              누적 풀이 {stats.total}회 · 평균 점수 {stats.avgScore}점 · 합격선 달성률 {stats.passRate}%
-            </p>
-          </div>
-
-          {/* Period Tabs */}
+      <WorkspaceHeader
+        icon={<BarChart3 className="w-5 h-5" />}
+        title={`${activeSubject.name} 학습 기록 및 분석`}
+        subtitle={`누적 풀이 ${stats.total}회 · 평균 점수 ${stats.avgScore}점 · 합격선 달성률 ${stats.passRate}%`}
+        actions={
           <div className="flex items-center gap-1 bg-[#faf8f4] border border-[#ded6c8] p-1 rounded-xs">
-            <button
-              type="button"
-              onClick={() => setPeriodFilter('7days')}
-              className={`px-3 py-1 text-xs font-academic-mono rounded-xs transition-colors ${
-                periodFilter === '7days' ? 'bg-[#191817] text-white font-bold' : 'text-[#57544e] hover:text-[#191817]'
-              }`}
-            >
-              최근 7일
-            </button>
-            <button
-              type="button"
-              onClick={() => setPeriodFilter('30days')}
-              className={`px-3 py-1 text-xs font-academic-mono rounded-xs transition-colors ${
-                periodFilter === '30days' ? 'bg-[#191817] text-white font-bold' : 'text-[#57544e] hover:text-[#191817]'
-              }`}
-            >
-              최근 30일
-            </button>
-            <button
-              type="button"
-              onClick={() => setPeriodFilter('all')}
-              className={`px-3 py-1 text-xs font-academic-mono rounded-xs transition-colors ${
-                periodFilter === 'all' ? 'bg-[#191817] text-white font-bold' : 'text-[#57544e] hover:text-[#191817]'
-              }`}
-            >
-              전체 기간
-            </button>
+            {[
+              { id: '7days' as const, label: '최근 7일' },
+              { id: '30days' as const, label: '최근 30일' },
+              { id: 'all' as const, label: '전체 기간' },
+            ].map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => setPeriodFilter(p.id)}
+                className={`px-3 py-1 text-xs rounded-xs whitespace-nowrap transition-colors ${
+                  periodFilter === p.id
+                    ? 'bg-[#191817] text-white font-semibold'
+                    : 'text-[#57544e] hover:text-[#191817]'
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
           </div>
-        </div>
-
+        }
+      >
         {/* Aggregate KPI Cards */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 pt-4 border-t border-[#f1ede4]">
-          <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs">
-            <div className="text-[11px] font-academic-mono text-[#827d73] mb-1">누적 풀이 횟수</div>
+          <div className="p-3 bg-[#faf8f4] border border-[#e2ded6] rounded-xs">
+            <div className="text-xs text-[#57544e] mb-1">누적 풀이 횟수</div>
             <div className="text-lg font-bold font-academic-mono text-[#191817]">{stats.total}회</div>
           </div>
-          <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs">
-            <div className="text-[11px] font-academic-mono text-[#827d73] mb-1">평균 루브릭 점수</div>
+          <div className="p-3 bg-[#faf8f4] border border-[#e2ded6] rounded-xs">
+            <div className="text-xs text-[#57544e] mb-1">평균 루브릭 점수</div>
             <div className="text-lg font-bold font-academic-mono text-[#191817]">{stats.avgScore}점</div>
           </div>
-          <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs">
-            <div className="text-[11px] font-academic-mono text-[#827d73] mb-1">70점 이상 달성률</div>
+          <div className="p-3 bg-[#faf8f4] border border-[#e2ded6] rounded-xs">
+            <div className="text-xs text-[#57544e] mb-1">70점 이상 달성률</div>
             <div className="text-lg font-bold font-academic-mono text-emerald-700">{stats.passRate}%</div>
           </div>
-          <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs">
-            <div className="text-[11px] font-academic-mono text-[#827d73] mb-1">취약 개념 (보완 요망)</div>
+          <div className="p-3 bg-[#faf8f4] border border-[#e2ded6] rounded-xs">
+            <div className="text-xs text-[#57544e] mb-1">취약 개념 (보완 요망)</div>
             <div className="text-xs font-semibold text-[#c52828] truncate">
               {stats.weakConcepts.length > 0 ? stats.weakConcepts.map((w) => w.title).join(', ') : '취약 개념 없음'}
             </div>
           </div>
         </div>
-      </div>
+      </WorkspaceHeader>
 
       {/* Main Content Area */}
       {subjectAttempts.length === 0 ? (
-        <div className="bg-white border border-[#e2ded6] rounded-xs p-12 text-center shadow-2xs">
-          <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto mb-3">
-            <BarChart3 className="w-6 h-6 stroke-1 text-[#827d73]" />
-          </div>
-          <h3 className="font-academic-serif font-bold text-sm text-[#191817] mb-1">
-            아직 완료된 학습 기록이 없습니다.
-          </h3>
-          <p className="text-xs text-[#57544e] max-w-md mx-auto mb-4 leading-relaxed">
-            오늘 학습에서 오늘의 복습을 시작하거나, 문제은행에서 서술·논술형 문제를 풀면 채점 스냅샷과 평가 결과가 이곳에 영구 보존됩니다.
-          </p>
-        </div>
+        <EmptyState
+          icon={<BarChart3 className="w-5 h-5 stroke-1.5 text-[#827d73]" />}
+          title="아직 완료된 학습 기록이 없습니다."
+          description="오늘 학습에서 복습을 시작하거나, 문제은행에서 서술·논술형 문제를 풀면 채점 스냅샷과 평가 결과가 이곳에 영구 보존됩니다."
+        />
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
           {/* Left Column: Attempt History List (5 cols) */}
-          <div className="lg:col-span-5 bg-white border border-[#e2ded6] rounded-xs p-4 shadow-2xs space-y-3">
+          <SectionCard padding="sm" className="lg:col-span-5 space-y-3">
             {/* Filter and search */}
-            <div className="flex flex-col sm:flex-row items-center gap-2">
-              <select
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+              <Select
                 value={conceptFilter}
                 onChange={(e) => setConceptFilter(e.target.value)}
-                className="w-full sm:w-1/2 px-2.5 py-1 text-xs border border-[#ded6c8] rounded-xs bg-[#faf8f4] text-[#191817]"
+                aria-label="개념 필터"
+                className="w-full sm:w-1/2 py-1.5 min-h-[34px]"
               >
                 <option value="all">전체 개념 ({concepts.length})</option>
                 {concepts.map((c) => (
@@ -268,15 +246,16 @@ export function HistoryWorkspace({
                     {c.title}
                   </option>
                 ))}
-              </select>
+              </Select>
               <div className="relative w-full sm:w-1/2">
-                <Search className="w-3.5 h-3.5 absolute left-2.5 top-2 text-[#827d73]" />
-                <input
+                <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-[#827d73] pointer-events-none" />
+                <Input
                   type="text"
                   placeholder="문제·답안 검색..."
+                  aria-label="문제 또는 답안 검색"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full pl-8 pr-2.5 py-1 text-xs border border-[#ded6c8] rounded-xs bg-[#faf8f4] text-[#191817]"
+                  className="pl-8 py-1.5 min-h-[34px]"
                 />
               </div>
             </div>
@@ -308,37 +287,34 @@ export function HistoryWorkspace({
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2 mb-1">
-                        <span className="text-[10px] font-academic-mono text-[#827d73]">
+                        <span className="text-[11px] font-academic-mono text-[#827d73]">
                           {formatSeoulDate(att.at)}
                         </span>
-                        <span
-                          className={`text-xs font-academic-mono font-bold px-1.5 py-0.2 rounded-2xs ${
+                        <Badge
+                          variant={
                             (att.calculatedScore || 0) >= 80
-                              ? 'bg-emerald-100 text-emerald-800'
+                              ? 'success'
                               : (att.calculatedScore || 0) >= 60
-                              ? 'bg-amber-100 text-amber-800'
-                              : 'bg-red-100 text-red-800'
-                          }`}
+                              ? 'warning'
+                              : 'danger'
+                          }
+                          mono
                         >
                           {att.calculatedScore ?? '-'}점
-                        </span>
+                        </Badge>
                       </div>
 
-                      <div className="font-semibold text-xs text-[#191817] truncate mb-1">
+                      <div className="font-semibold text-xs sm:text-[13px] text-[#191817] truncate mb-1">
                         {prob?.title || att.problemTitleSnapshot || '문제 제목 미확인'}
                       </div>
 
-                      <div className="flex items-center gap-1.5 text-[10px] font-academic-mono text-[#827d73]">
+                      <div className="flex items-center gap-1.5 text-[11px] text-[#827d73]">
                         <span className="truncate">#{conc?.title || att.conceptId}</span>
                         {att.mockExamSessionId && (
-                          <span className="text-purple-700 bg-purple-50 px-1 rounded-2xs border border-purple-200">
-                            모의시험
-                          </span>
+                          <Badge variant="neutral">모의시험</Badge>
                         )}
                         {att.attemptOrigin === 'rechallenge' && (
-                          <span className="text-blue-700 bg-blue-50 px-1 rounded-2xs border border-blue-200">
-                            재도전
-                          </span>
+                          <Badge variant="info">재도전</Badge>
                         )}
                       </div>
                     </button>
@@ -346,10 +322,10 @@ export function HistoryWorkspace({
                 })
               )}
             </div>
-          </div>
+          </SectionCard>
 
           {/* Right Column: Detailed Snapshot Viewer (7 cols) */}
-          <div className="lg:col-span-7 bg-white border border-[#e2ded6] rounded-xs p-5 shadow-2xs">
+          <SectionCard padding="md" className="lg:col-span-7">
             {activeSelectedAttempt && activeConcept ? (
               <div>
                 <div className="border-b border-[#f1ede4] pb-3 mb-4 flex items-center justify-between gap-2">
@@ -399,7 +375,7 @@ export function HistoryWorkspace({
                 왼쪽 목록에서 확인하려는 풀이 기록을 선택하세요.
               </div>
             )}
-          </div>
+          </SectionCard>
         </div>
       )}
     </div>

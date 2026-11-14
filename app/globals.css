@@ -13,13 +13,34 @@
   --paper-bg: #fcfbfa;
   --paper-card: #ffffff;
   --paper-card-subtle: #fbf9f5;
+  --paper-surface-muted: #faf8f4;
+  --paper-surface-subtle: #f4f1ea;
   --paper-border: #e2ded6;
   --paper-border-strong: #c8c2b5;
   --ink-primary: #191817;
   --ink-secondary: #57544e;
   --ink-muted: #827d73;
   --crimson-accent: #c52828;
+  --crimson-accent-hover: #a81f1f;
   --crimson-light: #fef2f2;
+
+  /* Semantic Status Tokens */
+  --status-success-bg: #ecfdf5;
+  --status-success-text: #065f46;
+  --status-success-border: #a7f3d0;
+  --status-warning-bg: #fffbeb;
+  --status-warning-text: #92400e;
+  --status-warning-border: #fde68a;
+  --status-danger-bg: #fef2f2;
+  --status-danger-text: #991b1b;
+  --status-danger-border: #fecaca;
+  --status-info-bg: #eff6ff;
+  --status-info-text: #1e40af;
+  --status-info-border: #bfdbfe;
+
+  /* Radius & Focus Tokens */
+  --radius-control: 2px;
+  --focus-ring-color: #c52828;
 }
 
 body {
@@ -40,6 +61,7 @@ h1, h2, h3, .subject-title, .font-academic-serif {
 
 .metric, .date, code, .font-academic-mono {
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 /* Long essay answer and reasoning text: Pretendard 16px, line-height 1.75 */
@@ -78,10 +100,12 @@ button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
-a:focus-visible {
-  outline: 2px solid #c52828;
-  outline-offset: 1px;
-  border-radius: 2px;
+a:focus-visible,
+summary:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
+  border-radius: var(--radius-control);
 }
 
 /* Respect reduced-motion preferences without ever delaying content. */

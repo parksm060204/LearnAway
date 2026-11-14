@@ -8,6 +8,7 @@ import {
 } from '../lib/retentionModel';
 import { Layers, Grid, AlertCircle } from 'lucide-react';
 import { formatSeoulDate } from '../lib/dateUtils';
+import { Badge, Button, SectionCard } from './ui/WorkspacePrimitives';
 
 interface ForgettingCurveChartProps {
   concept: Concept;
@@ -115,62 +116,55 @@ export function ForgettingCurveChart({
   );
 
   return (
-    <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 sm:p-5 shadow-2xs space-y-3">
+    <SectionCard padding="md" className="space-y-3">
       {/* Box Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-[#f1ede4]">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="font-academic-mono text-xs font-bold text-[#827d73]">ANALYSIS //</span>
-            <h2 className="text-sm sm:text-base font-bold text-[#191817] font-academic-serif">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-3 border-b border-[#f1ede4]">
+        <div className="min-w-0 space-y-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-sm sm:text-base font-bold text-[#191817] font-academic-serif break-keep">
               망각곡선 감쇠 궤적 분석: {concept.title}
             </h2>
             {concept.isDemo ? (
-              <span className="text-[10px] bg-amber-50 text-amber-800 border border-amber-200 px-1.5 py-0.5 rounded-2xs font-academic-mono">
+              <Badge variant="warning" mono>
                 데모 과목 기록
-              </span>
+              </Badge>
             ) : (
-              <span className="text-[10px] bg-emerald-50 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded-2xs font-academic-mono">
+              <Badge variant="success" mono>
                 실제 학습자 기록
-              </span>
+              </Badge>
             )}
           </div>
-          <div className="flex flex-wrap items-center gap-2 text-[11px] font-academic-mono text-[#827d73] mt-0.5">
-            <span>MODEL: R(t) = S₀ · (1 + t/τ)^(-α)</span>
-            <span className="text-[#c8c2b5]">·</span>
-            <span className="text-[#57544e]">
-              τ={settings.tau}D, α={settings.alpha}, 임계치={settings.threshold}점 (복습 우선순위 산정용 추정치)
+          <div className="flex flex-wrap items-center gap-2 text-xs font-academic-mono text-[#57544e]">
+            <span>R(t) = S₀ · (1 + t/τ)^(-α)</span>
+            <span className="text-[#c8c2b5]" aria-hidden="true">·</span>
+            <span>
+              τ={settings.tau}D, α={settings.alpha}, 임계치={settings.threshold}점
             </span>
           </div>
-          <div className="text-[10px] text-[#827d73] mt-0.5 font-sans">
-            ※ 본 곡선은 학술적 복습 우선순위 산정을 위한 추정 모델이며, 실제 시험 성적이나 기억 확률을 보증하지 않습니다.
-          </div>
+          <p className="text-xs text-[#827d73] font-sans">
+            복습 우선순위 산정용 추정치이며, 실제 시험 성적이나 기억 확률을 보증하지 않습니다.
+          </p>
         </div>
 
         {/* View toggle buttons */}
         <div className="flex items-center gap-1.5 self-start sm:self-auto shrink-0">
-          <button
+          <Button
+            variant={!isComparisonMode ? 'primary' : 'secondary'}
+            size="sm"
             onClick={() => isComparisonMode && onToggleComparisonMode()}
-            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-xs font-medium transition-all ${
-              !isComparisonMode
-                ? 'border border-[#191817] text-[#191817] bg-[#faf8f4] font-semibold'
-                : 'border border-[#ded6c8] text-[#57544e] hover:bg-[#faf8f4]'
-            }`}
           >
             <Grid className="w-3.5 h-3.5" />
             <span>단일 궤적</span>
-          </button>
+          </Button>
 
-          <button
+          <Button
+            variant={isComparisonMode ? 'accent' : 'secondary'}
+            size="sm"
             onClick={onToggleComparisonMode}
-            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-xs font-medium transition-all ${
-              isComparisonMode
-                ? 'border border-[#2563eb] text-[#2563eb] bg-[#eff6ff] font-semibold'
-                : 'border border-[#ded6c8] text-[#57544e] hover:bg-[#faf8f4]'
-            }`}
           >
             <Layers className="w-3.5 h-3.5" />
             <span>비교 모드 ({comparedConcepts.length}/3)</span>
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -544,6 +538,6 @@ export function ForgettingCurveChart({
           </div>
         </div>
       )}
-    </div>
+    </SectionCard>
   );
 }

@@ -22,6 +22,7 @@ import { TodayReviewPanel } from './TodayReviewPanel';
 import { ArchiveRecordDetail } from './ArchiveRecordDetail';
 import { BookOpen, Plus, Sparkles } from 'lucide-react';
 import { OnboardingFlow } from './OnboardingFlow';
+import { Badge, Button, SectionCard } from './ui/WorkspacePrimitives';
 
 export interface TodayWorkspaceProps {
   activeSubject?: Subject | null;
@@ -171,63 +172,67 @@ export function TodayWorkspace({
 
       {/* Empty State when no concepts exist */}
       {subjectConcepts.length === 0 ? (
-        <div className="bg-white border border-[#e2ded6] rounded-xs p-8 sm:p-10 text-center shadow-2xs space-y-5">
-          <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto">
-            <BookOpen className="w-6 h-6 stroke-1 text-[#827d73]" />
+        <SectionCard className="p-7 sm:p-10 text-center space-y-5">
+          <div className="w-11 h-11 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto">
+            <BookOpen className="w-5 h-5 stroke-1.5 text-[#827d73]" />
           </div>
           <div className="space-y-1.5">
-            <h3 className="font-academic-serif font-bold text-base text-[#191817]">
+            <h3 className="font-academic-serif font-bold text-base text-[#191817] break-keep">
               &lsquo;{activeSubject.name}&rsquo; 과목에 등록된 학습 개념이 없습니다.
             </h3>
-            <p className="text-xs text-[#57544e] max-w-lg mx-auto leading-relaxed">
-              강의 자료(PDF 교재 또는 녹음 전사본)를 등록하고 AI 개념 분석을 실행하면, 
-              시험 범위 내 핵심 개념이 자동으로 추출되고 망각곡선 복습 추천이 시작됩니다.
+            <p className="text-xs sm:text-[13px] text-[#57544e] max-w-lg mx-auto leading-relaxed break-keep">
+              강의 자료(PDF 교재 또는 녹음 전사본)를 등록하고 AI 개념 분석을 실행하면,
+              시험 범위 내 핵심 개념이 추출되고 망각곡선 복습 추천이 시작됩니다.
             </p>
           </div>
 
           {/* 3-Step Guided Roadmap */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 max-w-xl mx-auto text-left pt-1">
-            <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1">
-              <span className="text-[10px] font-academic-mono text-[#c52828] font-bold">STEP 01</span>
-              <p className="text-xs font-bold text-[#191817]">강의자료 등록</p>
-              <p className="text-[11px] text-[#827d73] leading-tight">PDF 교재 또는 강의 녹음 전사본 업로드</p>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 max-w-2xl mx-auto text-left pt-1">
+            <div className="p-3.5 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1.5">
+              <Badge variant="accent" mono>STEP 01</Badge>
+              <p className="text-xs sm:text-[13px] font-bold text-[#191817]">강의자료 등록</p>
+              <p className="text-xs text-[#57544e] leading-relaxed break-keep">PDF 교재 또는 강의 녹음 전사본 업로드</p>
             </div>
-            <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1">
-              <span className="text-[10px] font-academic-mono text-amber-700 font-bold">STEP 02</span>
-              <p className="text-xs font-bold text-[#191817]">AI 개념 분석</p>
-              <p className="text-[11px] text-[#827d73] leading-tight">정리, 공식, 알고리즘 자동 추출 및 승인</p>
+            <div className="p-3.5 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1.5">
+              <Badge variant="neutral" mono>STEP 02</Badge>
+              <p className="text-xs sm:text-[13px] font-bold text-[#191817]">AI 개념 분석</p>
+              <p className="text-xs text-[#57544e] leading-relaxed break-keep">정리, 공식, 알고리즘 자동 추출 및 승인</p>
             </div>
-            <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1">
-              <span className="text-[10px] font-academic-mono text-blue-700 font-bold">STEP 03</span>
-              <p className="text-xs font-bold text-[#191817]">문제 풀이 & 복습</p>
-              <p className="text-[11px] text-[#827d73] leading-tight">대학 시험 수준 문제 풀이 및 망각곡선 추적</p>
+            <div className="p-3.5 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1.5">
+              <Badge variant="neutral" mono>STEP 03</Badge>
+              <p className="text-xs sm:text-[13px] font-bold text-[#191817]">문제 풀이 및 복습</p>
+              <p className="text-xs text-[#57544e] leading-relaxed break-keep">대학 시험 수준 풀이 및 망각곡선 추적</p>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
-            <button
-              type="button"
-              onClick={onOpenUpload}
-              className="px-5 py-2.5 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs inline-flex items-center gap-2 shadow-xs transition-colors"
-            >
+          <div className="flex flex-wrap items-center justify-center gap-2.5 pt-2">
+            <Button variant="primary" size="md" onClick={onOpenUpload}>
               <Plus className="w-3.5 h-3.5 text-[#c52828]" />
               <span>강의 자료 등록하기 (PDF / Markdown)</span>
-            </button>
+            </Button>
             {onLoadDemoData && (
-              <button
-                type="button"
-                onClick={onLoadDemoData}
-                className="px-4 py-2.5 bg-white hover:bg-[#faf8f4] text-[#57544e] border border-[#ded6c8] text-xs font-bold rounded-xs inline-flex items-center gap-1.5 transition-colors"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+              <Button variant="secondary" size="md" onClick={onLoadDemoData}>
+                <Sparkles className="w-3.5 h-3.5 text-[#c52828]" />
                 <span>체험용 샘플 데이터 불러오기</span>
-              </button>
+              </Button>
             )}
           </div>
-        </div>
+        </SectionCard>
       ) : (
         <>
-          {/* ② Section 2: Forgetting Curve (Center, Full Width) */}
+          {/* ② Section 2: Today Study List first (Core daily learning actions) */}
+          <TodayStudyList
+            dayLabel={todayDayLabel}
+            items={todayDigest.items}
+            pendingCount={todayDigest.pendingCount}
+            estimatedMinutesText={todayDigest.estimateText}
+            hasActiveSession={hasActiveSession}
+            onStartItem={onStartPlanItem}
+            onResumeMock={onResumeMock}
+            onOpenAll={onOpenAllStudyPlan}
+          />
+
+          {/* ③ Section 3: Forgetting Curve (Analysis view below Today's actions) */}
           {selectedConcept ? (
             <ForgettingCurveChart
               concept={selectedConcept}
@@ -244,22 +249,10 @@ export function TodayWorkspace({
               hasExamDate={hasExamDate}
             />
           ) : (
-            <div className="bg-white border border-[#e2ded6] rounded-xs p-6 text-center text-xs text-[#827d73]">
+            <SectionCard className="p-6 text-center text-xs sm:text-[13px] text-[#827d73]">
               개념을 선택하면 망각곡선 그래프가 표시됩니다.
-            </div>
+            </SectionCard>
           )}
-
-          {/* ③ Section 3: Today Study List (Top 3~5 items + plan link) */}
-          <TodayStudyList
-            dayLabel={todayDayLabel}
-            items={todayDigest.items}
-            pendingCount={todayDigest.pendingCount}
-            estimatedMinutesText={todayDigest.estimateText}
-            hasActiveSession={hasActiveSession}
-            onStartItem={onStartPlanItem}
-            onResumeMock={onResumeMock}
-            onOpenAll={onOpenAllStudyPlan}
-          />
 
           {/* ④ Section 4: Auxiliary Information (Folded/Collapsible by default) */}
           <div className="space-y-3 pt-1">

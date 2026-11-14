@@ -181,6 +181,11 @@ export function AdminAiMetricsModal({ isOpen, onClose }: AdminAiMetricsModalProp
                   <div className="text-[11px] text-[#827d73] font-academic-mono">
                     ${summary.totalCostUsd.toFixed(4)} (환율 1,400원)
                   </div>
+                  {(summary.unverifiedPricingRequests ?? 0) > 0 && (
+                    <div className="text-[10px] text-amber-800">
+                      단가 미확인 {summary.unverifiedPricingRequests}건 제외
+                    </div>
+                  )}
                 </div>
 
                 <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1">
@@ -232,7 +237,7 @@ export function AdminAiMetricsModal({ isOpen, onClose }: AdminAiMetricsModalProp
                           <div key={model} className="flex items-center justify-between text-xs">
                             <span className="text-[#57544e] font-academic-mono">{model}</span>
                             <span className="font-bold text-[#191817] font-academic-mono">
-                              {tok.total.toLocaleString()} 토큰 (₩{Math.round(cost.krw)})
+                              {tok.total.toLocaleString()} 토큰 ({cost.pricingVerified === false ? '단가 미확인' : `₩${Math.round(cost.krw)}`})
                             </span>
                           </div>
                         );

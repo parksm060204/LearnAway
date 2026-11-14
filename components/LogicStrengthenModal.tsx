@@ -350,6 +350,9 @@ export function LogicStrengthenModal({
         body: JSON.stringify({
           subjectId: subject.id,
           domain: subject.domain || 'math_stats',
+          problemId: problem.id,
+          difficultyLevel: problem.difficultyLevel,
+          difficulty: problem.difficulty,
           problemTitle: base.problemTitleSnapshot,
           problemPrompt: base.problemPromptSnapshot,
           modelAnswer: base.modelAnswerSnapshot,
@@ -818,6 +821,9 @@ export function LogicStrengthenModal({
         body: JSON.stringify({
           subjectId: subject.id,
           domain: subject.domain || 'math_stats',
+          problemId: problem.id,
+          difficultyLevel: problem.difficultyLevel,
+          difficulty: problem.difficulty,
           problemTitle: base.problemTitleSnapshot,
           problemPrompt: base.problemPromptSnapshot,
           modelAnswer: base.modelAnswerSnapshot,
@@ -828,7 +834,6 @@ export function LogicStrengthenModal({
           vulnerableCriteria: vulnerable,
           concepts: [{ id: concept.id, title: concept.title }],
           problemType: problem.type,
-          difficulty: problem.difficulty || 'advanced_college',
         }),
       });
       const data = await res.json();

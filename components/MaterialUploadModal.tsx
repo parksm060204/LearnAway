@@ -615,17 +615,22 @@ export function MaterialUploadModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/60 backdrop-blur-xs overflow-y-auto">
-      <div className="w-full max-w-2xl bg-white border border-[#c8c2b5] rounded-xs shadow-2xl my-auto overflow-hidden flex flex-col max-h-[92vh]">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-label="학습 교재 및 전사본 자료 등록"
+    >
+      <div className="w-full max-w-2xl bg-white border border-[#c8c2b5] rounded-xs shadow-xl my-auto overflow-hidden flex flex-col max-h-[92vh]">
         {/* Header */}
-        <div className="bg-[#191817] text-white px-5 py-3.5 flex items-center justify-between border-b border-[#33302b]">
+        <div className="bg-[#191817] text-white px-5 py-3.5 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
             <Upload className="w-4 h-4 text-[#c52828]" />
-            <h3 className="font-academic-serif text-sm font-bold">
-              학습 교재 및 전사본 실제 자료 등록
+            <h3 className="font-academic-serif text-sm sm:text-[15px] font-bold">
+              학습 교재 및 전사본 자료 등록
             </h3>
           </div>
-          <button type="button" onClick={handleClose} className="text-[#ded6c8] hover:text-white" aria-label="닫기">
+          <button type="button" onClick={handleClose} className="text-[#ded6c8] hover:text-white p-1 rounded-xs transition-colors" aria-label="닫기">
             <X className="w-5 h-5" />
           </button>
         </div>

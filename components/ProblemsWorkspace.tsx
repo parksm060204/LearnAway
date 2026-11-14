@@ -33,6 +33,15 @@ import {
   CheckCheck,
   ShieldAlert,
 } from 'lucide-react';
+import {
+  Badge,
+  Button,
+  EmptyState,
+  Input,
+  SectionCard,
+  Select,
+  WorkspaceHeader,
+} from './ui/WorkspacePrimitives';
 
 export interface ProblemsWorkspaceProps {
   activeSubject?: Subject | null;
@@ -171,95 +180,68 @@ export function ProblemsWorkspace({
 
   if (!activeSubject) {
     return (
-      <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-10 text-center shadow-2xs space-y-3">
-        <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto">
-          <FileQuestion className="w-6 h-6 stroke-1 text-[#827d73]" />
-        </div>
-        <h3 className="font-academic-serif font-bold text-base text-[#191817]">
-          선택된 과목이 없습니다.
-        </h3>
-        <p className="text-xs text-[#57544e] max-w-md mx-auto leading-relaxed">
-          문제은행을 열고 문제를 풀거나 출제하려면 먼저 과목을 추가하거나 선택해 주세요.
-        </p>
-        {onOpenAddSubject && (
-          <button
-            type="button"
-            onClick={onOpenAddSubject}
-            className="px-4 py-2 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs inline-flex items-center gap-1.5 shadow-xs transition-colors"
-          >
-            <Plus className="w-3.5 h-3.5 text-[#c52828]" />
-            <span>+ 새 과목 추가하기</span>
-          </button>
-        )}
-      </div>
+      <EmptyState
+        icon={<FileQuestion className="w-5 h-5 stroke-1.5 text-[#827d73]" />}
+        title="선택된 과목이 없습니다."
+        description="문제은행을 열고 문제를 풀거나 출제하려면 먼저 과목을 추가하거나 선택해 주세요."
+        actions={
+          onOpenAddSubject ? (
+            <Button variant="primary" size="md" onClick={onOpenAddSubject}>
+              <Plus className="w-3.5 h-3.5 text-[#c52828]" />
+              <span>새 과목 추가하기</span>
+            </Button>
+          ) : undefined
+        }
+      />
     );
   }
 
   return (
     <div className="w-full space-y-4">
       {/* Top Header */}
-      <div className="bg-white border border-[#e2ded6] rounded-xs p-5 shadow-2xs">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <FileQuestion className="w-5 h-5 text-blue-600" />
-              <h2 className="text-base sm:text-lg font-bold font-academic-serif text-[#191817]">
-                {activeSubject.name} 문제은행
-              </h2>
-            </div>
-            <p className="text-xs text-[#827d73] font-academic-mono">
-              승인된 문제 {subjectProblems.length}건 · 미승인 초안 {subjectDrafts.filter((d) => !d.isApproved).length}건 · 품질/신고 검토 {subjectQualityCount}건
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={onOpenGenerator}
-              className="px-3.5 py-1.5 text-xs font-bold text-white bg-[#191817] hover:bg-[#33302b] rounded-xs flex items-center gap-1.5 shadow-xs transition-colors"
-            >
+      <WorkspaceHeader
+        icon={<FileQuestion className="w-5 h-5" />}
+        title={`${activeSubject.name} 문제은행`}
+        subtitle={`승인된 문제 ${subjectProblems.length}건 · 미승인 초안 ${subjectDrafts.filter((d) => !d.isApproved).length}건 · 품질/신고 검토 ${subjectQualityCount}건`}
+        actions={
+          <>
+            <Button variant="primary" size="md" onClick={onOpenGenerator}>
               <Sparkles className="w-3.5 h-3.5 text-amber-400" />
               <span>AI 고난도 출제</span>
-            </button>
-
-            <button
-              type="button"
+            </Button>
+            <Button
+              variant="secondary"
+              size="md"
               onClick={() => onStartProblemSession()}
-              className="px-3 py-1.5 text-xs font-semibold text-[#191817] bg-[#faf8f4] hover:bg-[#f1ede4] border border-[#ded6c8] rounded-xs flex items-center gap-1.5 transition-colors"
               title="서술·증명형 문제 풀기"
             >
               <Play className="w-3.5 h-3.5 text-[#c52828]" />
               <span>문제 풀기</span>
-            </button>
-
-            <button
-              type="button"
+            </Button>
+            <Button
+              variant="secondary"
+              size="md"
               onClick={onStartMockExam}
-              className="px-3 py-1.5 text-xs font-semibold text-purple-950 bg-purple-50 hover:bg-purple-100 border border-purple-300 rounded-xs flex items-center gap-1.5 transition-colors"
               title="혼합형 모의시험 응시"
             >
-              <Award className="w-3.5 h-3.5 text-purple-600" />
+              <Award className="w-3.5 h-3.5 text-[#57544e]" />
               <span>모의시험</span>
-            </button>
-          </div>
-        </div>
-
+            </Button>
+          </>
+        }
+      >
         {/* In-progress Mock Exam Alert Banner */}
         {hasActiveMockSession && onResumeMockExam && (
           <div className="mt-4 p-3 bg-purple-50 border border-purple-200 rounded-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5">
             <div className="flex items-center gap-2">
               <Award className="w-4 h-4 text-purple-700 shrink-0" />
-              <span className="text-xs text-purple-900 font-semibold">
+              <span className="text-xs text-purple-900 font-semibold break-keep">
                 이 과목에 진행 중인 모의시험 세션이 있습니다. 작성한 답안과 남은 시간이 안전하게 보존되어 있습니다.
               </span>
             </div>
-            <button
-              type="button"
-              onClick={onResumeMockExam}
-              className="px-3 py-1 text-xs font-bold text-white bg-purple-700 hover:bg-purple-800 rounded-xs shadow-2xs shrink-0 transition-colors"
-            >
+            <Button variant="primary" size="sm" onClick={onResumeMockExam} className="bg-purple-700 hover:bg-purple-800 shrink-0">
               이어서 풀기
-            </button>
+            </Button>
           </div>
         )}
 
@@ -268,26 +250,22 @@ export function ProblemsWorkspace({
           <div className="mt-4 p-3 bg-amber-50 border border-amber-300 rounded-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5">
             <div className="flex items-center gap-2">
               <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-              <span className="text-xs text-amber-900 font-semibold">
+              <span className="text-xs text-amber-900 font-semibold break-keep">
                 과목에 등록된 학습 개념이 없습니다. 대학 시험 문제를 AI로 출제하려면 먼저 강의자료를 등록하고 개념을 추출해 주세요.
               </span>
             </div>
             {onOpenUpload && (
-              <button
-                type="button"
-                onClick={onOpenUpload}
-                className="px-3 py-1 text-xs font-bold text-white bg-[#191817] hover:bg-[#33302b] rounded-xs shadow-2xs shrink-0 transition-colors"
-              >
+              <Button variant="primary" size="sm" onClick={onOpenUpload} className="shrink-0">
                 자료 등록하기
-              </button>
+              </Button>
             )}
           </div>
         )}
-      </div>
+      </WorkspaceHeader>
 
       {/* Main Sub-Tabs */}
-      <div className="bg-white border border-[#e2ded6] rounded-xs px-4 pt-3 border-b-0 shadow-2xs">
-        <div className="flex items-center gap-4 text-xs font-medium border-b border-[#e2ded6]">
+      <SectionCard padding="none" className="px-4 pt-3 border-b-0 overflow-x-auto">
+        <div className="flex items-center gap-4 text-xs font-medium border-b border-[#e2ded6] whitespace-nowrap">
           <button
             type="button"
             onClick={() => setSubTab('approved')}
@@ -298,9 +276,9 @@ export function ProblemsWorkspace({
             }`}
           >
             <span>승인된 시험 문제</span>
-            <span className="px-1.5 py-0.2 text-[10px] font-academic-mono bg-[#faf8f4] border border-[#ded6c8] text-[#57544e] rounded-full">
+            <Badge variant="neutral" mono>
               {subjectProblems.length}
-            </span>
+            </Badge>
           </button>
 
           <button
@@ -314,9 +292,9 @@ export function ProblemsWorkspace({
           >
             <span>AI 출제 초안 검토</span>
             {subjectDrafts.filter((d) => !d.isApproved).length > 0 && (
-              <span className="px-1.5 py-0.2 text-[10px] font-academic-mono bg-blue-100 text-blue-800 border border-blue-300 rounded-full font-bold">
+              <Badge variant="info" mono>
                 {subjectDrafts.filter((d) => !d.isApproved).length}
-              </span>
+              </Badge>
             )}
           </button>
 
@@ -331,26 +309,26 @@ export function ProblemsWorkspace({
           >
             <span>문제 품질 및 신고 관리</span>
             {subjectQualityCount > 0 && (
-              <span className="px-1.5 py-0.2 text-[10px] font-academic-mono bg-red-100 text-red-800 border border-red-300 rounded-full font-bold flex items-center gap-0.5">
-                <ShieldAlert className="w-2.5 h-2.5 text-red-600" />
+              <Badge variant="danger" mono>
+                <ShieldAlert className="w-2.5 h-2.5" />
                 {subjectQualityCount}
-              </span>
+              </Badge>
             )}
           </button>
         </div>
-      </div>
+      </SectionCard>
 
       {/* Sub-Tab 1: Approved Problems */}
       {subTab === 'approved' && (
         <div className="space-y-3">
           {/* Filters Bar */}
-          <div className="bg-white border border-[#e2ded6] rounded-xs p-3 shadow-2xs flex flex-col md:flex-row items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2 w-full md:w-auto">
-              {/* Concept Selector */}
-              <select
+          <SectionCard padding="sm" className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Select
                 value={conceptFilter}
                 onChange={(e) => setConceptFilter(e.target.value)}
-                className="px-2.5 py-1 text-xs border border-[#ded6c8] rounded-xs bg-[#faf8f4] text-[#191817]"
+                aria-label="개념 필터"
+                className="py-1.5 min-h-[34px]"
               >
                 <option value="all">전체 개념 ({concepts.length})</option>
                 {concepts.map((c) => (
@@ -358,13 +336,13 @@ export function ProblemsWorkspace({
                     {c.title}
                   </option>
                 ))}
-              </select>
+              </Select>
 
-              {/* Problem Type Selector */}
-              <select
+              <Select
                 value={typeFilter}
                 onChange={(e) => setTypeFilter(e.target.value)}
-                className="px-2.5 py-1 text-xs border border-[#ded6c8] rounded-xs bg-[#faf8f4] text-[#191817]"
+                aria-label="문제 유형 필터"
+                className="py-1.5 min-h-[34px]"
               >
                 <option value="all">전체 문제 유형</option>
                 <option value="essay_descriptive">논술·서술형</option>
@@ -375,47 +353,43 @@ export function ProblemsWorkspace({
                 <option value="algorithm_optimization">알고리즘 최적화</option>
                 <option value="complexity_proof">복잡도 증명</option>
                 <option value="debug_counterexample">디버깅·반례</option>
-              </select>
+              </Select>
             </div>
 
-            {/* Search Input */}
             <div className="relative w-full md:w-64">
-              <Search className="w-3.5 h-3.5 text-[#827d73] absolute left-2.5 top-1/2 -translate-y-1/2" />
-              <input
+              <Search className="w-3.5 h-3.5 text-[#827d73] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <Input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="문제 제목 또는 지문 검색..."
-                className="w-full pl-8 pr-3 py-1 text-xs border border-[#ded6c8] rounded-xs bg-[#faf8f4] text-[#191817] placeholder-[#827d73] focus:outline-hidden focus:border-[#191817] focus:bg-white"
+                aria-label="문제 제목 또는 지문 검색"
+                className="pl-8 py-1.5 min-h-[34px]"
               />
             </div>
-          </div>
+          </SectionCard>
 
           {/* Problems List */}
           {filteredApprovedProblems.length === 0 ? (
-            <div className="bg-white border border-[#e2ded6] rounded-xs p-12 text-center shadow-2xs">
-              <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto mb-3">
-                <FileQuestion className="w-6 h-6 stroke-1 text-[#827d73]" />
-              </div>
-              <h3 className="font-academic-serif font-bold text-sm text-[#191817] mb-1">
-                {searchQuery || conceptFilter !== 'all' || typeFilter !== 'all'
+            <EmptyState
+              icon={<FileQuestion className="w-5 h-5 stroke-1.5 text-[#827d73]" />}
+              title={
+                searchQuery || conceptFilter !== 'all' || typeFilter !== 'all'
                   ? '조건에 맞는 시험 문제가 없습니다.'
-                  : '승인된 시험 문제가 없습니다.'}
-              </h3>
-              <p className="text-xs text-[#57544e] max-w-md mx-auto mb-4 leading-relaxed">
-                {searchQuery || conceptFilter !== 'all' || typeFilter !== 'all'
+                  : '승인된 시험 문제가 없습니다.'
+              }
+              description={
+                searchQuery || conceptFilter !== 'all' || typeFilter !== 'all'
                   ? '필터 설정을 변경하거나 검색어를 비워보세요.'
-                  : 'AI 고난도 출제를 통해 대학 시험 수준의 논술·증명 문제를 생성하고 검토해 보세요.'}
-              </p>
-              <button
-                type="button"
-                onClick={onOpenGenerator}
-                className="px-4 py-2 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs inline-flex items-center gap-1.5 shadow-xs transition-colors"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                <span>AI 문제 출제하기</span>
-              </button>
-            </div>
+                  : 'AI 고난도 출제를 통해 대학 시험 수준의 논술·증명 문제를 생성하고 검토해 보세요.'
+              }
+              actions={
+                <Button variant="primary" size="md" onClick={onOpenGenerator}>
+                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                  <span>AI 문제 출제하기</span>
+                </Button>
+              }
+            />
           ) : (
             <div className="space-y-3">
               {filteredApprovedProblems.map((prob) => {

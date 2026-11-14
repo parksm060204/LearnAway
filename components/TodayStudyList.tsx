@@ -3,6 +3,7 @@
 import React from 'react';
 import { Play, CalendarCheck, ArrowRight, Award } from 'lucide-react';
 import type { StudyPlanItem } from '../lib/types';
+import { Badge, Button, SectionCard } from './ui/WorkspacePrimitives';
 
 interface TodayStudyListProps {
   /** Today's date label, e.g. '2026.10.05 (월)'. Falls back to '오늘'. */
@@ -36,33 +37,25 @@ export function TodayStudyList({
   onOpenAll,
 }: TodayStudyListProps) {
   return (
-    <section
-      id="today-review-panel"
-      aria-label="오늘 복습"
-      className="w-full bg-white border border-[#e2ded6] rounded-xs p-4 sm:p-5 shadow-2xs scroll-mt-20"
-    >
+    <SectionCard padding="md" id="today-review-panel" aria-label="오늘 복습" className="scroll-mt-20">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-        <div className="flex items-center gap-2">
-          <CalendarCheck className="w-4 h-4 text-[#c52828]" />
-          <h2 className="text-sm font-bold text-[#191817] font-academic-serif">오늘 복습</h2>
+        <div className="flex flex-wrap items-center gap-2">
+          <CalendarCheck className="w-4 h-4 text-[#c52828] shrink-0" />
+          <h2 className="text-sm sm:text-base font-bold text-[#191817] font-academic-serif">오늘 복습</h2>
           {dayLabel && (
-            <span className="text-[11px] font-academic-mono text-[#827d73]">{dayLabel}</span>
+            <span className="text-xs font-academic-mono text-[#827d73]">{dayLabel}</span>
           )}
           {estimatedMinutesText && (
-            <span className="text-[11px] font-academic-mono bg-[#faf8f4] border border-[#ded6c8] text-[#57544e] px-2 py-0.5 rounded">
+            <Badge variant="neutral" mono>
               {estimatedMinutesText}
-            </span>
+            </Badge>
           )}
         </div>
         {pendingCount > items.length && (
-          <button
-            type="button"
-            onClick={onOpenAll}
-            className="flex items-center gap-1 text-xs font-semibold text-[#57544e] hover:text-[#c52828] transition-colors"
-          >
+          <Button variant="ghost" size="sm" onClick={onOpenAll}>
             <span>전체 보기 ({pendingCount})</span>
             <ArrowRight className="w-3.5 h-3.5" />
-          </button>
+          </Button>
         )}
       </div>
 
@@ -70,10 +63,10 @@ export function TodayStudyList({
         <button
           type="button"
           onClick={onResumeMock}
-          className="w-full mb-2.5 flex items-center justify-between gap-2 px-3 py-2.5 bg-[#fef2f2] hover:bg-[#fee2e2] border border-[#fecaca] rounded-xs text-left transition-colors"
+          className="w-full mb-3 flex items-center justify-between gap-2 px-3.5 py-2.5 bg-[#fef2f2] hover:bg-[#fee2e2] border border-[#fecaca] rounded-xs text-left transition-colors"
         >
-          <span className="flex items-center gap-2 text-xs font-bold text-[#c52828]">
-            <Award className="w-4 h-4" />
+          <span className="flex items-center gap-2 text-xs sm:text-[13px] font-bold text-[#c52828]">
+            <Award className="w-4 h-4 shrink-0" />
             <span>진행 중인 모의시험 이어서 풀기</span>
           </span>
           <Play className="w-4 h-4 text-[#c52828] shrink-0" />
@@ -81,7 +74,7 @@ export function TodayStudyList({
       )}
 
       {items.length === 0 ? (
-        <p className="text-xs text-[#57544e] bg-[#faf8f4] border border-dashed border-[#ded6c8] rounded-xs px-3 py-4 text-center leading-relaxed">
+        <p className="text-xs sm:text-[13px] text-[#57544e] bg-[#faf8f4] border border-dashed border-[#ded6c8] rounded-xs px-4 py-5 text-center leading-relaxed break-keep">
           오늘 배정된 복습이 없습니다. 복습이 필요한 개념이 생기면 여기에 표시됩니다.
         </p>
       ) : (
@@ -89,40 +82,38 @@ export function TodayStudyList({
           {items.map((item) => (
             <li
               key={item.id}
-              className="flex items-center justify-between gap-3 px-3 py-2.5 bg-[#faf8f4] hover:bg-white border border-[#e2ded6] hover:border-[#191817] rounded-xs transition-all"
+              className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 px-3.5 py-2.5 bg-[#faf8f4] hover:bg-white border border-[#e2ded6] hover:border-[#c8c2b5] rounded-xs transition-colors"
             >
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  <span className="text-xs font-bold text-[#191817] truncate">{itemTitle(item)}</span>
+                  <span className="text-xs sm:text-[13px] font-bold text-[#191817] truncate">
+                    {itemTitle(item)}
+                  </span>
                   {typeof item.round === 'number' && (
-                    <span className="text-[10px] font-academic-mono bg-white border border-[#ded6c8] text-[#57544e] px-1.5 py-0.2 rounded">
+                    <Badge variant="neutral" mono>
                       {item.round}회차
-                    </span>
+                    </Badge>
                   )}
                 </div>
                 {item.priorityReason && (
-                  <p className="text-[11px] text-[#57544e] truncate mt-0.5" title={item.priorityReason}>
+                  <p className="text-xs text-[#57544e] truncate mt-0.5" title={item.priorityReason}>
                     {item.priorityReason}
                   </p>
                 )}
               </div>
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center gap-2.5 shrink-0">
                 {item.estimatedMinutes > 0 && (
-                  <span className="text-[11px] font-academic-mono text-[#827d73]">약 {item.estimatedMinutes}분</span>
+                  <span className="text-xs font-academic-mono text-[#827d73]">약 {item.estimatedMinutes}분</span>
                 )}
-                <button
-                  type="button"
-                  onClick={() => onStartItem(item)}
-                  className="flex items-center gap-1 px-3 py-1.5 text-xs font-bold text-white bg-[#191817] hover:bg-[#33302b] rounded-xs transition-colors"
-                >
+                <Button variant="primary" size="sm" onClick={() => onStartItem(item)}>
                   <Play className="w-3.5 h-3.5" />
                   <span>시작</span>
-                </button>
+                </Button>
               </div>
             </li>
           ))}
         </ul>
       )}
-    </section>
+    </SectionCard>
   );
 }

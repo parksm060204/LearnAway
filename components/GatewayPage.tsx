@@ -183,10 +183,10 @@ export function GatewayPage({ nextPath, initialError }: GatewayPageProps) {
         <main className="flex-1">
           {/* Hero */}
           <section className="max-w-3xl mx-auto px-4 sm:px-6 pt-16 sm:pt-24 pb-12 text-center">
-            <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold leading-snug tracking-tight text-balance">
+            <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold leading-snug tracking-tight text-balance break-keep">
               강의 자료를, 시험에서 풀 수 있는 실력으로.
             </h1>
-            <p className="mt-5 mx-auto max-w-xl text-sm sm:text-base text-[#57544e] leading-relaxed">
+            <p className="mt-5 mx-auto max-w-xl text-sm sm:text-base text-[#57544e] leading-relaxed break-keep">
               PDF와 강의 전사본을 바탕으로 대학 시험 수준의 문제를 풀고, 답안의 논리를 보완하며
               복습을 이어가세요.
             </p>

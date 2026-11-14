@@ -20,6 +20,14 @@ import {
   Trash2,
   RefreshCw,
 } from 'lucide-react';
+import {
+  Badge,
+  Button,
+  EmptyState,
+  Input,
+  SectionCard,
+  WorkspaceHeader,
+} from './ui/WorkspacePrimitives';
 
 export interface MaterialsWorkspaceProps {
   activeSubject?: Subject | null;
@@ -102,27 +110,19 @@ export function MaterialsWorkspace({
 
   if (!activeSubject) {
     return (
-      <div className="w-full bg-white border border-[#e2ded6] rounded-xs p-10 text-center shadow-2xs space-y-3">
-        <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto">
-          <FolderOpen className="w-6 h-6 stroke-1 text-[#827d73]" />
-        </div>
-        <h3 className="font-academic-serif font-bold text-base text-[#191817]">
-          선택된 과목이 없습니다.
-        </h3>
-        <p className="text-xs text-[#57544e] max-w-md mx-auto leading-relaxed">
-          강의 자료를 등록하고 관리하려면 먼저 과목 폴더를 생성하거나 선택해 주세요.
-        </p>
-        {onOpenAddSubject && (
-          <button
-            type="button"
-            onClick={onOpenAddSubject}
-            className="px-4 py-2 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs inline-flex items-center gap-1.5 shadow-xs transition-colors"
-          >
-            <Plus className="w-3.5 h-3.5 text-[#c52828]" />
-            <span>+ 새 과목 폴더 추가</span>
-          </button>
-        )}
-      </div>
+      <EmptyState
+        icon={<FolderOpen className="w-5 h-5 stroke-1.5 text-[#827d73]" />}
+        title="선택된 과목이 없습니다."
+        description="강의 자료를 등록하고 관리하려면 먼저 과목 폴더를 생성하거나 선택해 주세요."
+        actions={
+          onOpenAddSubject ? (
+            <Button variant="primary" size="md" onClick={onOpenAddSubject}>
+              <Plus className="w-3.5 h-3.5 text-[#c52828]" />
+              <span>새 과목 폴더 추가</span>
+            </Button>
+          ) : undefined
+        }
+      />
     );
   }
 
@@ -161,160 +161,106 @@ export function MaterialsWorkspace({
       />
 
       {/* Top Banner / Workspace Header */}
-      <div className="bg-white border border-[#e2ded6] rounded-xs p-5 shadow-2xs">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <FolderOpen className="w-5 h-5 text-[#c52828]" />
-              <h2 className="text-base sm:text-lg font-bold font-academic-serif text-[#191817]">
-                {activeSubject.name} 학습 자료 관리
-              </h2>
-            </div>
-            <p className="text-xs text-[#827d73] font-academic-mono">
-              총 {subjectMaterials.length}건 등록됨 (사용자 자료 {userCount}건 · 데모 자료 {demoCount}건)
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
+      <WorkspaceHeader
+        icon={<FolderOpen className="w-5 h-5" />}
+        title={`${activeSubject.name} 학습 자료 관리`}
+        subtitle={`총 ${subjectMaterials.length}건 등록됨 · 사용자 자료 ${userCount}건 · 데모 자료 ${demoCount}건`}
+        actions={
+          <>
             {onOpenConceptReview && (
-              <button
-                type="button"
+              <Button
+                variant="secondary"
+                size="md"
                 onClick={() => onOpenConceptReview()}
-                className="px-3 py-1.5 text-xs font-semibold text-[#191817] bg-[#faf8f4] hover:bg-[#f1ede4] border border-[#ded6c8] rounded-xs flex items-center gap-1.5 transition-colors"
                 title="AI 추출 개념 검토 및 승인"
               >
-                <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+                <Sparkles className="w-3.5 h-3.5 text-[#c52828]" />
                 <span>개념 검토 및 승인</span>
                 {pendingDraftsCount > 0 && (
-                  <span className="px-1.5 py-0.2 text-[10px] font-academic-mono bg-amber-100 text-amber-800 border border-amber-300 rounded-full font-bold">
+                  <Badge variant="warning" mono>
                     {pendingDraftsCount}
-                  </span>
+                  </Badge>
                 )}
-              </button>
+              </Button>
             )}
-
-            <button
-              type="button"
-              onClick={onOpenUpload}
-              className="px-3.5 py-1.5 text-xs font-bold text-white bg-[#191817] hover:bg-[#33302b] rounded-xs flex items-center gap-1.5 shadow-xs transition-colors"
-            >
+            <Button variant="primary" size="md" onClick={onOpenUpload}>
               <Plus className="w-3.5 h-3.5 text-[#c52828]" />
               <span>새 자료 등록</span>
-            </button>
-          </div>
-        </div>
-      </div>
+            </Button>
+          </>
+        }
+      />
 
       {/* Filter and Search Bar */}
-      <div className="bg-white border border-[#e2ded6] rounded-xs p-3 shadow-2xs flex flex-col sm:flex-row items-center justify-between gap-3">
+      <SectionCard padding="sm" className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
         {/* Category Filters */}
-        <div className="flex flex-wrap items-center gap-1 w-full sm:w-auto">
-          <button
-            type="button"
-            onClick={() => setFilterKind('all')}
-            className={`px-2.5 py-1 rounded-xs text-[11px] font-academic-mono transition-colors ${
-              filterKind === 'all'
-                ? 'bg-[#191817] text-white font-bold'
-                : 'text-[#57544e] hover:bg-[#faf8f4] border border-transparent'
-            }`}
-          >
-            전체 ({subjectMaterials.length})
-          </button>
-          <button
-            type="button"
-            onClick={() => setFilterKind('pdf')}
-            className={`px-2.5 py-1 rounded-xs text-[11px] font-academic-mono transition-colors ${
-              filterKind === 'pdf'
-                ? 'bg-[#191817] text-white font-bold'
-                : 'text-[#57544e] hover:bg-[#faf8f4] border border-transparent'
-            }`}
-          >
-            PDF 교재 ({pdfCount})
-          </button>
-          <button
-            type="button"
-            onClick={() => setFilterKind('transcript')}
-            className={`px-2.5 py-1 rounded-xs text-[11px] font-academic-mono transition-colors ${
-              filterKind === 'transcript'
-                ? 'bg-[#191817] text-white font-bold'
-                : 'text-[#57544e] hover:bg-[#faf8f4] border border-transparent'
-            }`}
-          >
-            녹음 전사본 ({transcriptCount})
-          </button>
-          <button
-            type="button"
-            onClick={() => setFilterKind('user')}
-            className={`px-2.5 py-1 rounded-xs text-[11px] font-academic-mono transition-colors ${
-              filterKind === 'user'
-                ? 'bg-[#191817] text-white font-bold'
-                : 'text-[#57544e] hover:bg-[#faf8f4] border border-transparent'
-            }`}
-          >
-            사용자 등록 ({userCount})
-          </button>
-          <button
-            type="button"
-            onClick={() => setFilterKind('demo')}
-            className={`px-2.5 py-1 rounded-xs text-[11px] font-academic-mono transition-colors ${
-              filterKind === 'demo'
-                ? 'bg-[#191817] text-white font-bold'
-                : 'text-[#57544e] hover:bg-[#faf8f4] border border-transparent'
-            }`}
-          >
-            데모 ({demoCount})
-          </button>
+        <div className="flex flex-wrap items-center gap-1">
+          {[
+            { id: 'all' as const, label: `전체 (${subjectMaterials.length})` },
+            { id: 'pdf' as const, label: `PDF 교재 (${pdfCount})` },
+            { id: 'transcript' as const, label: `녹음 전사본 (${transcriptCount})` },
+            { id: 'user' as const, label: `사용자 등록 (${userCount})` },
+            { id: 'demo' as const, label: `데모 (${demoCount})` },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setFilterKind(tab.id)}
+              className={`px-2.5 py-1.5 rounded-xs text-xs whitespace-nowrap transition-colors ${
+                filterKind === tab.id
+                  ? 'bg-[#191817] text-white font-semibold'
+                  : 'text-[#57544e] hover:bg-[#faf8f4] border border-transparent'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
 
         {/* Search input */}
         <div className="relative w-full sm:w-64">
-          <Search className="w-3.5 h-3.5 text-[#827d73] absolute left-2.5 top-1/2 -translate-y-1/2" />
-          <input
+          <Search className="w-3.5 h-3.5 text-[#827d73] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <Input
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="자료 제목 또는 출처 검색..."
-            className="w-full pl-8 pr-3 py-1 text-xs border border-[#ded6c8] rounded-xs bg-[#faf8f4] text-[#191817] placeholder-[#827d73] focus:outline-hidden focus:border-[#191817] focus:bg-white"
+            aria-label="자료 제목 또는 출처 검색"
+            className="pl-8 py-1.5 min-h-[34px]"
           />
         </div>
-      </div>
+      </SectionCard>
 
       {/* Materials List */}
       {filteredMaterials.length === 0 ? (
-        <div className="bg-white border border-[#e2ded6] rounded-xs p-12 text-center shadow-2xs">
-          <div className="w-12 h-12 bg-[#faf8f4] border border-[#ded6c8] rounded-full flex items-center justify-center text-[#827d73] mx-auto mb-3">
-            <FolderOpen className="w-6 h-6 stroke-1 text-[#827d73]" />
-          </div>
-          <h3 className="font-academic-serif font-bold text-sm text-[#191817] mb-1">
-            {searchQuery.trim() ? '검색 조건과 일치하는 학습 자료가 없습니다.' : '등록된 학습 자료가 없습니다.'}
-          </h3>
-          <p className="text-xs text-[#57544e] max-w-md mx-auto mb-4 leading-relaxed">
-            {searchQuery.trim()
+        <EmptyState
+          icon={<FolderOpen className="w-5 h-5 stroke-1.5 text-[#827d73]" />}
+          title={searchQuery.trim() ? '검색 조건과 일치하는 학습 자료가 없습니다.' : '등록된 학습 자료가 없습니다.'}
+          description={
+            searchQuery.trim()
               ? '다른 검색어를 입력하거나 필터를 전체로 변경해 보세요.'
-              : `선택한 과목(${activeSubject.name})에 강의 PDF나 녹음 전사본을 등록하여 PyMuPDF4LLM 변환 및 개념 추출을 시작하세요.`}
-          </p>
-          {searchQuery.trim() ? (
-            <button
-              type="button"
-              onClick={() => {
-                setSearchQuery('');
-                setFilterKind('all');
-              }}
-              className="px-3.5 py-1.5 bg-[#faf8f4] border border-[#ded6c8] text-xs font-semibold text-[#191817] rounded-xs hover:bg-[#f1ede4] transition-colors"
-            >
-              검색 초기화
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={onOpenUpload}
-              className="px-4 py-2 bg-[#191817] hover:bg-[#33302b] text-white text-xs font-bold rounded-xs inline-flex items-center gap-1.5 shadow-xs transition-colors"
-            >
-              <Plus className="w-3.5 h-3.5 text-[#c52828]" />
-              <span>첫 자료 등록하기</span>
-            </button>
-          )}
-        </div>
+              : `선택한 과목(${activeSubject.name})에 강의 PDF나 녹음 전사본을 등록하여 변환 및 개념 추출을 시작하세요.`
+          }
+          actions={
+            searchQuery.trim() ? (
+              <Button
+                variant="secondary"
+                size="md"
+                onClick={() => {
+                  setSearchQuery('');
+                  setFilterKind('all');
+                }}
+              >
+                검색 초기화
+              </Button>
+            ) : (
+              <Button variant="primary" size="md" onClick={onOpenUpload}>
+                <Plus className="w-3.5 h-3.5 text-[#c52828]" />
+                <span>첫 자료 등록하기</span>
+              </Button>
+            )
+          }
+        />
       ) : (
         <div className="space-y-3">
           {filteredMaterials.map((mat) => {
@@ -360,57 +306,47 @@ export function MaterialsWorkspace({
                         </span>
 
                         {mat.isDemo ? (
-                          <span className="text-[10px] font-academic-mono bg-[#f4f1ea] border border-[#ded6c8] text-[#827d73] px-1.5 py-0.5 rounded-2xs">
-                            데모
-                          </span>
+                          <Badge variant="neutral" mono>데모</Badge>
                         ) : (
-                          <span className="text-[10px] font-academic-mono bg-indigo-50 text-indigo-700 border border-indigo-200 px-1.5 py-0.5 rounded-2xs font-semibold">
-                            사용자 등록
-                          </span>
+                          <Badge variant="neutral">사용자 등록</Badge>
                         )}
 
                         {mat.status === 'ready' ? (
-                          <span className="text-[10px] font-academic-mono bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded-2xs flex items-center gap-1 font-semibold">
-                            <CheckCircle2 className="w-3 h-3 text-emerald-600" /> 변환 완료
-                          </span>
+                          <Badge variant="success">
+                            <CheckCircle2 className="w-3 h-3" /> 변환 완료
+                          </Badge>
                         ) : mat.status === 'needs_review' ? (
-                          <span className="text-[10px] font-academic-mono bg-amber-50 text-amber-800 border border-amber-300 px-1.5 py-0.5 rounded-2xs flex items-center gap-1 font-semibold">
-                            <AlertTriangle className="w-3 h-3 text-amber-600" /> 원본 확인 필요
-                          </span>
+                          <Badge variant="warning">
+                            <AlertTriangle className="w-3 h-3" /> 원본 확인 필요
+                          </Badge>
                         ) : mat.status === 'failed' ? (
-                          <span className="text-[10px] font-academic-mono bg-red-50 text-red-700 border border-red-200 px-1.5 py-0.5 rounded-2xs flex items-center gap-1 font-semibold">
-                            <AlertTriangle className="w-3 h-3 text-red-600" /> 변환 실패
-                          </span>
+                          <Badge variant="danger">
+                            <AlertTriangle className="w-3 h-3" /> 변환 실패
+                          </Badge>
                         ) : (
-                          <span className="text-[10px] font-academic-mono bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded-2xs">
-                            변환 중...
-                          </span>
+                          <Badge variant="info">변환 중...</Badge>
                         )}
 
                         {matDrafts.length > 0 ? (
-                          <span className="text-[10px] font-academic-mono bg-amber-50 text-amber-800 border border-amber-200 px-1.5 py-0.5 rounded-2xs font-semibold flex items-center gap-1">
-                            <Sparkles className="w-2.5 h-2.5 text-amber-600" />
+                          <Badge variant="warning">
+                            <Sparkles className="w-2.5 h-2.5" />
                             <span>개념 {matDrafts.length}건 ({approvedDrafts}건 승인)</span>
-                          </span>
+                          </Badge>
                         ) : mat.hasAiConcepts ? (
-                          <span className="text-[10px] font-academic-mono text-[#57544e] bg-[#faf8f4] border border-[#ded6c8] px-1.5 py-0.5 rounded-2xs">
-                            개념 연계됨
-                          </span>
+                          <Badge variant="neutral">개념 연계됨</Badge>
                         ) : (
-                          <span className="text-[10px] font-academic-mono text-amber-800 bg-amber-50/70 border border-amber-200 px-1.5 py-0.5 rounded-2xs">
-                            AI 개념 미추출
-                          </span>
+                          <Badge variant="warning">AI 개념 미추출</Badge>
                         )}
                       </div>
 
-                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-academic-mono text-[#827d73] mb-2">
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#827d73] mb-2">
                         <span>출처: {mat.sourceRefs}</span>
-                        {mat.pageCount && <span>· {mat.pageCount}페이지</span>}
-                        {mat.durationMinutes && <span>· {mat.durationMinutes}분</span>}
+                        {mat.pageCount && <span className="font-academic-mono">· {mat.pageCount}페이지</span>}
+                        {mat.durationMinutes && <span className="font-academic-mono">· {mat.durationMinutes}분</span>}
                         {mat.speakers && mat.speakers.length > 0 && (
                           <span>· 화자: {mat.speakers.join(', ')}</span>
                         )}
-                        <span>
+                        <span className="font-academic-mono">
                           · 등록일:{' '}
                           {new Date(mat.uploadedAt).toLocaleDateString('ko-KR', {
                             year: 'numeric',
@@ -423,16 +359,12 @@ export function MaterialsWorkspace({
                       {/* Storage Policy State Badges */}
                       <div className="flex flex-wrap gap-1.5 items-center">
                         {storageState.labels.map((label) => (
-                          <span
+                          <Badge
                             key={label}
-                            className={`text-[10px] font-academic-mono px-2 py-0.5 rounded-2xs border ${
-                              label.includes('재연결 필요')
-                                ? 'bg-amber-50 border-amber-300 text-amber-800 font-bold'
-                                : 'bg-[#faf8f4] border-[#ded6c8] text-[#57544e]'
-                            }`}
+                            variant={label.includes('재연결 필요') ? 'warning' : 'neutral'}
                           >
                             {label}
-                          </span>
+                          </Badge>
                         ))}
                       </div>
                     </div>

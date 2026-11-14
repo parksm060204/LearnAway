@@ -3,8 +3,10 @@
 import React, { useState } from 'react';
 import { Subject } from '../lib/types';
 import { buildSeoulIsoTimestamp, calculateDDay } from '../lib/dateUtils';
-import { X, Plus, Check } from 'lucide-react';
+import { Plus, Check } from 'lucide-react';
 import { TimeDialPicker } from './TimeDialPicker';
+import { Button, Input } from './ui/WorkspacePrimitives';
+import { ModalShell } from './ui/ModalShell';
 
 interface AddSubjectModalProps {
   isOpen: boolean;
@@ -78,35 +80,25 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/50 backdrop-blur-xs overflow-y-auto">
-      <div className="w-full max-w-lg bg-white border border-[#c8c2b5] rounded-xs shadow-xl my-auto overflow-hidden">
-        {/* Header */}
-        <div className="bg-[#191817] text-white px-5 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Plus className="w-4 h-4 text-[#c52828]" />
-            <h3 className="font-academic-serif text-sm font-bold">새 과목 폴더 생성 및 시험일 설정</h3>
-          </div>
-          <button onClick={onClose} className="text-[#ded6c8] hover:text-white" aria-label="닫기">
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        {/* Form Body */}
-        <form onSubmit={handleSubmit} className="p-5 space-y-4 text-xs font-sans">
+    <ModalShell
+      isOpen={isOpen}
+      onClose={onClose}
+      title="새 과목 폴더 생성 및 시험일 설정"
+      icon={<Plus className="w-4 h-4 text-[#c52828]" />}
+      maxWidthClass="max-w-lg"
+    >
+      {/* Form Body */}
+      <form onSubmit={handleSubmit} className="p-5 space-y-4 text-xs font-sans">
           {/* Live D-day preview banner */}
-          <div className="p-3 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1">
-            <div className="text-[11px] font-academic-mono text-[#827d73]">
-              실시간 D-Day 산출 미리보기 (Asia/Seoul 기준):
+          <div className="p-3.5 bg-[#faf8f4] border border-[#ded6c8] rounded-xs space-y-1">
+            <div className="text-xs text-[#57544e] font-medium">
+              실시간 D-Day 산출 미리보기 (Asia/Seoul 기준)
             </div>
-            <div className="flex items-baseline gap-2">
+            <div className="flex flex-wrap items-baseline gap-2">
               <span
                 className={`text-xl font-academic-serif font-bold ${
-                  ddayResult.isNotSet
+                  ddayResult.isNotSet || ddayResult.isOverdue
                     ? 'text-[#827d73]'
-                    : ddayResult.isOverdue
-                    ? 'text-[#827d73]'
-                    : ddayResult.isToday
-                    ? 'text-[#c52828]'
                     : 'text-[#c52828]'
                 }`}
               >
@@ -118,144 +110,142 @@ export function AddSubjectModal({ isOpen, onClose, onAddSubject }: AddSubjectMod
                 </span>
               )}
               {examDate ? (
-                <span className="text-[11px] text-[#57544e]">
+                <span className="text-xs font-academic-mono text-[#57544e]">
                   {examDate} {startTime} ~ {endTime}
                 </span>
               ) : (
-                <span className="text-[11px] text-[#827d73]">(시험일을 설정하지 않으면 &apos;시험일 설정&apos;으로 유지됩니다)</span>
+                <span className="text-xs text-[#827d73]">(시험일을 설정하지 않으면 &apos;시험일 설정&apos;으로 유지됩니다)</span>
               )}
             </div>
           </div>
 
           {/* Subject Name */}
           <div>
-            <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-              과목명 <span className="text-[#c52828]">*</span>:
+            <label htmlFor="add-subject-name" className="block text-xs font-semibold text-[#57544e] mb-1.5">
+              과목명 <span className="text-[#c52828]">*</span>
             </label>
-            <input
+            <Input
+              id="add-subject-name"
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="예: 수치해석학 및 프로그래밍"
               required
-              className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817] font-medium"
+              className="bg-white font-medium"
             />
           </div>
 
           {/* Domain Category */}
           <div>
-            <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-              시험 계열 (문제 유형 및 도메인 분류):
-            </label>
-            <div className="grid grid-cols-2 gap-2">
+            <span className="block text-xs font-semibold text-[#57544e] mb-1.5">
+              시험 계열 (문제 유형 및 도메인 분류)
+            </span>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <button
                 type="button"
                 onClick={() => setDomain('math_stats')}
-                className={`p-2 rounded-xs border text-left flex items-center justify-between ${
+                className={`p-2.5 rounded-xs border text-left flex items-center justify-between gap-2 transition-colors ${
                   domain === 'math_stats'
                     ? 'border-[#c52828] bg-[#fef2f2] text-[#c52828] font-bold'
-                    : 'border-[#ded6c8] bg-[#faf8f4] text-[#57544e]'
+                    : 'border-[#ded6c8] bg-[#faf8f4] text-[#57544e] hover:bg-white'
                 }`}
               >
                 <span>수학 / 수리통계 계열</span>
-                <span className="text-[10px] font-academic-mono text-[#827d73]">증명·유도</span>
+                <span className="text-[11px] font-academic-mono text-[#827d73]">증명·유도</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setDomain('computer_science')}
-                className={`p-2 rounded-xs border text-left flex items-center justify-between ${
+                className={`p-2.5 rounded-xs border text-left flex items-center justify-between gap-2 transition-colors ${
                   domain === 'computer_science'
                     ? 'border-[#c52828] bg-[#fef2f2] text-[#c52828] font-bold'
-                    : 'border-[#ded6c8] bg-[#faf8f4] text-[#57544e]'
+                    : 'border-[#ded6c8] bg-[#faf8f4] text-[#57544e] hover:bg-white'
                 }`}
               >
                 <span>컴퓨터공학 / 코딩 계열</span>
-                <span className="text-[10px] font-academic-mono text-[#827d73]">구현·알고리즘</span>
+                <span className="text-[11px] font-academic-mono text-[#827d73]">구현·알고리즘</span>
               </button>
             </div>
           </div>
 
           {/* Exam Date & Time (Optional) */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="space-y-3">
             <div>
-              <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-                시험일 (선택):
+              <label htmlFor="add-subject-exam-date" className="block text-xs font-semibold text-[#57544e] mb-1.5">
+                시험일 (선택)
               </label>
-              <input
+              <Input
+                id="add-subject-exam-date"
                 type="date"
                 value={examDate}
                 onChange={(e) => setExamDate(e.target.value)}
-                className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817]"
+                className="bg-white"
               />
             </div>
 
-            <div>
-              <TimeDialPicker
-                label="시작 시각:"
-                value={startTime}
-                onChange={setStartTime}
-                disabled={!examDate}
-              />
-            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <TimeDialPicker
+                  label="시작 시각"
+                  value={startTime}
+                  onChange={setStartTime}
+                  disabled={!examDate}
+                />
+              </div>
 
-            <div>
-              <TimeDialPicker
-                label="종료 시각:"
-                value={endTime}
-                onChange={setEndTime}
-                disabled={!examDate}
-              />
+              <div>
+                <TimeDialPicker
+                  label="종료 시각"
+                  value={endTime}
+                  onChange={setEndTime}
+                  disabled={!examDate}
+                />
+              </div>
             </div>
           </div>
 
           {/* Location */}
           <div>
-            <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-              시험 장소 / 고사장 (선택):
+            <label htmlFor="add-subject-location" className="block text-xs font-semibold text-[#57544e] mb-1.5">
+              시험 장소 / 고사장 (선택)
             </label>
-            <input
+            <Input
+              id="add-subject-location"
               type="text"
               value={location}
               onChange={(e) => setLocation(e.target.value)}
               placeholder="예: 공학관 301호 (실습실) 또는 301관 402호"
-              className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817]"
+              className="bg-white"
             />
           </div>
 
           {/* Scope */}
           <div>
-            <label className="block font-academic-mono text-[11px] text-[#57544e] mb-1">
-              시험 출제 범위 요약 (선택):
+            <label htmlFor="add-subject-scope" className="block text-xs font-semibold text-[#57544e] mb-1.5">
+              시험 출제 범위 요약 (선택)
             </label>
-            <input
+            <Input
+              id="add-subject-scope"
               type="text"
               value={scope}
               onChange={(e) => setScope(e.target.value)}
               placeholder="예: 제1장 ~ 제5장 [비선형방정식의 해, 오차론, 수치적분]"
-              className="w-full p-2 border border-[#ded6c8] rounded-xs bg-[#fefefe] text-[#191817]"
+              className="bg-white"
             />
           </div>
 
           {/* Footer buttons */}
-          <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#f1ede4]">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-3.5 py-2 text-xs border border-[#ded6c8] text-[#57544e] hover:bg-[#faf8f4] rounded-xs"
-            >
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#f1ede4]">
+            <Button variant="secondary" size="md" onClick={onClose}>
               취소
-            </button>
-            <button
-              type="submit"
-              className="flex items-center gap-1.5 px-4 py-2 text-xs bg-[#191817] hover:bg-[#33302b] text-white font-bold rounded-xs shadow-xs"
-            >
+            </Button>
+            <Button type="submit" variant="primary" size="md">
               <Check className="w-3.5 h-3.5 text-emerald-400" />
               <span>과목 생성 및 선택</span>
-            </button>
+            </Button>
           </div>
-        </form>
-      </div>
-    </div>
+      </form>
+    </ModalShell>
   );
 }
