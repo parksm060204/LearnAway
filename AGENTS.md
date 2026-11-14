@@ -21,6 +21,7 @@ LearnAway는 대학 강의 자료를 분석하고, 시험 수준의 문제 풀�
 - 사용자의 기존 변경을 임의로 되돌리지 않는다.
 - 요구사항이 불명확하면 기존 동작을 보존하는 방향으로 진행한다.
 - 데이터 삭제, 배포, 커밋·푸시는 사용자의 요청 범위에 따른다.
+- 검토·지시 담당은 직접 코드를 작성하지 않고 Antigravity 워커(gemini-4-hydrogen-medium)에게 구현과 검증을 위임한다(앱 AI 제공자 설정과는 별개이며, 사용자 변경 지시가 있을 때까지 유지).
 
 ## 데이터 보존
 
@@ -107,7 +108,7 @@ LearnAway는 대학 강의 자료를 분석하고, 시험 수준의 문제 풀�
 
 <!-- BEGIN:nextjs-agent-rules -->
 
-# This is NOT the Next.js you know
+## This is NOT the Next.js you know
 
 This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
 

@@ -8,6 +8,7 @@ import {
   MockExamSession,
   Problem,
   ProblemType,
+  ReviewEvent,
   Subject,
   isProblemAvailableForPractice,
   METHOD_REASON_RATING_LABELS,
@@ -18,25 +19,39 @@ import {
   autosaveMockExam,
   createMockExamOnServer,
   decideExpiredSubmit,
+  decideServerSnapshotAdoption,
+  executeResolveFromServer,
   fetchMockExamFromServer,
+  finalizeRecordedExamOnServer,
   planExpiredUrlOpen,
   planReconcile,
+  resolveExamSaveRetry,
   resolveLocalBaseVersion,
   saveMockExamGradingOnServer,
   shouldAutoSubmitExpired,
   submitExamAttemptOnServer,
   submitMockExamOnServer,
+  type FailedExamSaveOp,
 } from '../lib/cloud/mockExamSync';
 import {
+  answerFieldsEqual,
   applyPendingAnswers,
   clearConflictArchive,
   clearPendingExamAnswers,
-  loadConflictArchive,
-  loadPendingExamAnswers,
+  listOtherTabConflictArchives,
+  listOtherTabPendingExamAnswers,
+  loadConflictArchiveResult,
+  loadPendingExamAnswersResult,
   pendingAfterAutosave,
+  pendingDiffersFrom,
+  refreshExamTabLease,
+  releaseExamTabLease,
+  resolveExamTabId,
   saveConflictArchive,
+  saveImmutableConflictArchive,
   savePendingExamAnswers,
   type ExamConflictArchive,
+  type PendingExamAnswers,
 } from '../lib/cloud/pendingExamAnswers';
 import { AcademicMathView } from './AcademicMathView';
 import { X, Clock, Award, Compass, HelpCircle } from 'lucide-react';
@@ -146,8 +161,14 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
   const [syncBlocked, setSyncBlocked] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error' | 'conflict'>('idle');
   const [saveMessage, setSaveMessage] = useState('');
+  const [failedSaveOp, setFailedSaveOp] = useState<FailedExamSaveOp>(null);
   const [pendingAvailable, setPendingAvailable] = useState(false);
+  const [pendingReadFailed, setPendingReadFailed] = useState(false);
   const [pendingStale, setPendingStale] = useState(false);
+  const [otherTabPendings, setOtherTabPendings] = useState<PendingExamAnswers[]>([]);
+  const [otherTabReadError, setOtherTabReadError] = useState<string | null>(null);
+  const [otherTabArchives, setOtherTabArchives] = useState<ExamConflictArchive[]>([]);
+  const [otherTabArchiveError, setOtherTabArchiveError] = useState<string | null>(null);
   // A conflict between the local expired answers and a newer server snapshot
   // (URL deep link). While true, a plain submit is BLOCKED until the user
   // explicitly compares and chooses.
@@ -176,13 +197,39 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
   // Autosave/submit are serialized so an older request can never overwrite a
   // newer one, and a final submit always runs after pending autosaves.
   const syncChainRef = useRef<Promise<void>>(Promise.resolve());
-  // Bumped on unmount / account change so late responses never touch other UI.
+  // Bumped on unmount / account change / modal close / session switch so late responses never touch other UI.
   const opTokenRef = useRef(0);
   const sessionRef = useRef<MockExamSession | null>(session);
+  const userIdRef = useRef(userId);
+  const isOpenRef = useRef(isOpen);
+  const syncBlockedRef = useRef(syncBlocked);
+  const pendingReadFailedRef = useRef(pendingReadFailed);
+  const refreshGenRef = useRef(0);
+  const inputGenRef = useRef(0);
+  const finalizingRecordedRef = useRef(false);
+  const tabIdRef = useRef<string>('');
 
   const enqueue = useCallback((task: () => Promise<void>) => {
     syncChainRef.current = syncChainRef.current.then(task, task);
   }, []);
+
+  const enqueueResult = useCallback(<T,>(task: () => Promise<T>): Promise<T> => {
+    const next = syncChainRef.current.then(task, task);
+    syncChainRef.current = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  }, []);
+
+  const isOpValid = useCallback(
+    (token: number, expectedUserId: string, expectedSessionId: string): boolean =>
+      token === opTokenRef.current &&
+      isOpenRef.current &&
+      userIdRef.current === expectedUserId &&
+      sessionRef.current?.id === expectedSessionId,
+    []
+  );
 
   // Applies a server snapshot (answers + version + status + evaluations) as one
   // consistent unit, so a stale local answer set is never paired with a newer
@@ -195,20 +242,97 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
   // Persists an unsaved snapshot to the device FIRST, so a closed tab or a late
   // server response can never lose what the user typed. Returns whether the
   // device actually stored it.
-  const persistPending = (target: MockExamSession, baseVersion: number): boolean => {
-    if (!userId) return true;
-    const ok = savePendingExamAnswers(userId, target, baseVersion);
-    if (!ok) {
-      setSyncNotice('미저장 답안을 이 기기에 보존하지 못했습니다. 창을 닫지 말고 다시 시도해 주세요.');
-    }
-    return ok;
-  };
+  const persistPending = useCallback(
+    (target: MockExamSession, baseVersion: number): boolean => {
+      if (!userId) return true;
+      const ok = savePendingExamAnswers(userId, target, baseVersion, tabIdRef.current || undefined);
+      if (!ok) {
+        setSyncNotice('미저장 답안을 이 기기에 보존하지 못했습니다. 창을 닫지 말고 다시 시도해 주세요.');
+      }
+      return ok;
+    },
+    [userId]
+  );
+
+  const syncPendingAfterServerConfirm = useCallback(
+    (target: MockExamSession, confirmedVersion: number) => {
+      if (!userId) return;
+      const tabId = tabIdRef.current || undefined;
+      const current = sessionRef.current;
+      if (pendingAfterAutosave(target, current) === 'keep-current' && current) {
+        const saved = savePendingExamAnswers(userId, current, confirmedVersion, tabId);
+        if (!saved) {
+          setSyncNotice('서버 저장 후 새로 입력된 답안을 이 기기에 보존하지 못했습니다. 창을 닫지 말고 다시 시도해 주세요.');
+        }
+        const currentRead = loadPendingExamAnswersResult(userId, target.id, tabId);
+        setPendingAvailable(saved || !currentRead.ok || Boolean(currentRead.value));
+      } else {
+        const cleared = clearPendingExamAnswers(userId, target.id, tabId);
+        if (!cleared) {
+          setPendingAvailable(true);
+          setSyncNotice('서버 저장은 완료되었으나 기기의 임시 미저장 답안 정리에 실패했습니다. 다시 시도할 수 있습니다.');
+        } else {
+          setPendingAvailable(false);
+        }
+      }
+    },
+    [userId]
+  );
+
+  const refreshOtherTabRecords = useCallback(
+    (targetUserId: string | undefined, sessionId: string, tabId?: string) => {
+      if (!targetUserId) {
+        setOtherTabPendings([]);
+        setOtherTabReadError(null);
+        setOtherTabArchives([]);
+        setOtherTabArchiveError(null);
+        return;
+      }
+      const otherPendingRes = listOtherTabPendingExamAnswers(targetUserId, sessionId, tabId);
+      if (otherPendingRes.ok) {
+        setOtherTabPendings(otherPendingRes.value ?? []);
+        setOtherTabReadError(null);
+      } else {
+        // Keep existing list on read/corrupt failure so errors are never hidden as empty.
+        setOtherTabReadError(otherPendingRes.error);
+      }
+      const otherArchRes = listOtherTabConflictArchives(targetUserId, sessionId, tabId);
+      if (otherArchRes.ok) {
+        setOtherTabArchives(otherArchRes.value ?? []);
+        setOtherTabArchiveError(null);
+      } else {
+        setOtherTabArchiveError(otherArchRes.error);
+      }
+    },
+    []
+  );
+
+  const clearArchiveAfterConfirm = useCallback(
+    (sessionId: string): boolean => {
+      if (!userId) {
+        setConflictArchive(null);
+        return true;
+      }
+      const tabId = tabIdRef.current || undefined;
+      const cleared = clearConflictArchive(userId, sessionId, tabId);
+      if (cleared) {
+        setConflictArchive(null);
+        refreshOtherTabRecords(userId, sessionId, tabId);
+        return true;
+      }
+      const reload = loadConflictArchiveResult(userId, sessionId, tabId);
+      if (reload.ok && reload.value) setConflictArchive(reload.value);
+      setSyncNotice('제출·기록은 완료되었으나 기기에 보존된 충돌 답안을 정리하지 못했습니다.');
+      return false;
+    },
+    [userId, refreshOtherTabRecords]
+  );
 
   // Preserves the local conflicting answers as a reviewable archive BEFORE any
-  // server snapshot is adopted. An already-preserved copy for the same session
-  // is kept (never silently replaced); the pending slot is untouched. Returns
-  // false only when nothing is preserved AND nothing was preserved before, in
-  // which case the caller must NOT adopt the server snapshot.
+  // server snapshot is adopted. An already-preserved copy for the same tab is
+  // kept (never silently replaced); if newer local answers `B` differ from an
+  // existing archive `A`, `B` must be verified in pending or saved to a separate
+  // immutable recovery copy before returning true.
   const preserveLocalAsConflictArchive = useCallback(
     (
       local: MockExamSession,
@@ -219,6 +343,7 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         setSyncNotice('계정 정보가 없어 로컬 답안을 보존하지 못했습니다. 서버 답안을 적용하지 않았습니다.');
         return false;
       }
+      const tabId = tabIdRef.current || undefined;
       const archive: ExamConflictArchive = {
         sessionId: local.id,
         answers: { ...local.answers },
@@ -231,59 +356,92 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         comparedServerVersion: comparedVersion,
         savedAt: new Date().toISOString(),
       };
-      const result = saveConflictArchive(userId, archive);
+      const result = saveConflictArchive(userId, archive, tabId);
       if (result.ok) {
-        setConflictArchive(loadConflictArchive(userId, local.id));
+        const reload = loadConflictArchiveResult(userId, local.id, tabId);
+        setConflictArchive(reload.ok ? (reload.value ?? archive) : archive);
+        refreshOtherTabRecords(userId, local.id, tabId);
         return true;
       }
       if (result.reason === 'exists') {
-        // An earlier conflict already preserved a copy: keep showing THAT copy.
-        setConflictArchive(loadConflictArchive(userId, local.id));
-        return true;
+        const reload = loadConflictArchiveResult(userId, local.id, tabId);
+        if (!reload.ok || !reload.value) {
+          setSyncNotice(
+            `이미 보존된 로컬 답안을 불러오지 못했습니다(${reload.ok ? '항목 없음' : reload.error}). 기존 보존 상태를 보호하기 위해 서버 답안을 적용하지 않았습니다.`
+          );
+          return false;
+        }
+        setConflictArchive(reload.value);
+        // Same content as existing archive `A`: already preserved.
+        if (!pendingDiffersFrom(local, reload.value)) {
+          return true;
+        }
+        // Existing archive `A` differs from latest local `B`: verify `B` is
+        // already in this tab's pending OR save `B` into an immutable recovery copy.
+        const pendingRead = loadPendingExamAnswersResult(userId, local.id, tabId);
+        if (pendingRead.ok && pendingRead.value && !pendingDiffersFrom(local, pendingRead.value)) {
+          return true;
+        }
+        const immutableRes = saveImmutableConflictArchive(userId, archive, tabId);
+        if (immutableRes.ok) {
+          refreshOtherTabRecords(userId, local.id, tabId);
+          return true;
+        }
+        setSyncNotice(
+          `최신 로컬 답안의 추가 보존 사본을 저장하지 못했습니다(${immutableRes.error ?? '저장소 확인 불가'}). 현재 로컬 답안을 유지합니다.`
+        );
+        return false;
       }
       setSyncNotice(
         `로컬 답안 보존에 실패했습니다(${result.error ?? '저장소 확인 불가'}). 현재 로컬 답안을 유지하며, 서버 답안을 적용하지 않았습니다.`
       );
       return false;
     },
-    [userId]
+    [userId, refreshOtherTabRecords]
   );
 
   const runAutosave = (target: MockExamSession, token: number) => {
-    if (token !== opTokenRef.current) return Promise.resolve();
+    if (token !== opTokenRef.current || syncBlockedRef.current || pendingReadFailedRef.current) {
+      return Promise.resolve();
+    }
     setSaveState('saving');
     return autosaveMockExam(target, serverVersionRef.current).then((result) => {
-      if (token !== opTokenRef.current) return;
+      if (token !== opTokenRef.current || syncBlockedRef.current || pendingReadFailedRef.current) return;
       if (result.ok) {
         serverVersionRef.current = result.version;
+        syncBlockedRef.current = false;
         setSyncBlocked(false);
         setSaveState('saved');
-        if (userId) {
-          const current = sessionRef.current;
-          if (pendingAfterAutosave(target, current) === 'keep-current' && current) {
-            // Newer input arrived while this request was in flight: it is still
-            // unsaved, so keep it pending instead of clearing it.
-            savePendingExamAnswers(userId, current, result.version);
-            setPendingAvailable(true);
-          } else {
-            clearPendingExamAnswers(userId, target.id);
-            setPendingAvailable(false);
-          }
-        }
+        setSaveMessage('');
+        setFailedSaveOp(null);
+        syncPendingAfterServerConfirm(target, result.version);
       } else if (result.code === 'stale' || result.code === 'locked') {
         // Preserve the LATEST input, never the older request's snapshot.
-        persistPending(sessionRef.current ?? target, serverVersionRef.current);
-        setPendingAvailable(true);
+        const latest = sessionRef.current ?? target;
+        const preserved = persistPending(latest, serverVersionRef.current);
+        const existing = userId ? loadPendingExamAnswersResult(userId, latest.id, tabIdRef.current || undefined) : null;
+        setPendingAvailable(preserved || Boolean(existing && (!existing.ok || existing.value)));
+        syncBlockedRef.current = true;
+        flushAutosaveTimer();
         setSyncBlocked(true);
         setSaveState('conflict');
+        setFailedSaveOp(null);
       } else if (result.code === 'not_configured') {
         setSaveState('idle');
+        setFailedSaveOp(null);
       } else {
         // Preserve the LATEST input, never the older request's snapshot.
-        persistPending(sessionRef.current ?? target, serverVersionRef.current);
-        setPendingAvailable(true);
+        const latest = sessionRef.current ?? target;
+        const preserved = persistPending(latest, serverVersionRef.current);
+        const existing = userId ? loadPendingExamAnswersResult(userId, latest.id, tabIdRef.current || undefined) : null;
+        setPendingAvailable(preserved || Boolean(existing && (!existing.ok || existing.value)));
         setSaveState('error');
-        setSaveMessage('서버 자동 저장에 실패했습니다. 답안은 이 기기에 보존되며 다시 시도할 수 있습니다.');
+        setFailedSaveOp({ kind: 'autosave' });
+        setSaveMessage(
+          preserved
+            ? '서버 자동 저장에 실패했습니다. 답안은 이 기기에 보존되며 다시 시도할 수 있습니다.'
+            : '서버 자동 저장과 기기 임시 보존에 모두 실패했습니다. 창을 닫지 말고 다시 시도해 주세요.'
+        );
       }
     });
   };
@@ -299,15 +457,23 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       if (token !== opTokenRef.current) return;
       if (result.ok) {
         serverVersionRef.current = result.version;
+        syncBlockedRef.current = false;
         setSyncBlocked(false);
         setSaveState('saved');
+        setSaveMessage('');
+        setFailedSaveOp(null);
       } else if (result.code === 'stale' || result.code === 'locked') {
+        syncBlockedRef.current = true;
+        flushAutosaveTimer();
         setSyncBlocked(true);
         setSaveState('conflict');
+        setFailedSaveOp(null);
       } else if (result.code === 'not_configured') {
         setSaveState('idle');
+        setFailedSaveOp(null);
       } else {
         setSaveState('error');
+        setFailedSaveOp({ kind: 'grading', status });
         setSaveMessage('채점 결과를 서버에 저장하지 못했습니다. 다시 시도할 수 있습니다.');
       }
     });
@@ -322,9 +488,11 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
 
   const scheduleAutosave = (target: MockExamSession) => {
     flushAutosaveTimer();
+    if (syncBlockedRef.current || pendingReadFailedRef.current) return;
+    const scheduledToken = opTokenRef.current;
     autosaveTimerRef.current = window.setTimeout(() => {
-      const token = opTokenRef.current;
-      enqueue(() => runAutosave(sessionRef.current ?? target, token));
+      if (scheduledToken !== opTokenRef.current || syncBlockedRef.current || pendingReadFailedRef.current) return;
+      enqueue(() => runAutosave(sessionRef.current ?? target, scheduledToken));
     }, 800);
   };
 
@@ -340,23 +508,35 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         if (result.ok) {
           serverVersionRef.current = result.version;
           setSaveState('saved');
+          setSaveMessage('');
+          setFailedSaveOp(null);
           // A confirmed submit supersedes any preserved conflict copy.
-          if (userId) clearConflictArchive(userId, submitted.id);
-          setConflictArchive(null);
+          clearArchiveAfterConfirm(submitted.id);
+          syncPendingAfterServerConfirm(submitted, result.version);
         } else if (result.code === 'stale' || result.code === 'locked') {
-          if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
-          setPendingAvailable(true);
+          const latest = sessionRef.current ?? submitted;
+          const preserved = persistPending(latest, serverVersionRef.current);
+          const existing = userId ? loadPendingExamAnswersResult(userId, latest.id, tabIdRef.current || undefined) : null;
+          setPendingAvailable(preserved || Boolean(existing && (!existing.ok || existing.value)));
           setSyncBlocked(true);
           setSaveState('conflict');
+          setFailedSaveOp(null);
         } else if (result.code !== 'not_configured') {
-          if (userId) savePendingExamAnswers(userId, sessionRef.current ?? submitted, serverVersionRef.current);
-          setPendingAvailable(true);
+          const latest = sessionRef.current ?? submitted;
+          const preserved = persistPending(latest, serverVersionRef.current);
+          const existing = userId ? loadPendingExamAnswersResult(userId, latest.id, tabIdRef.current || undefined) : null;
+          setPendingAvailable(preserved || Boolean(existing && (!existing.ok || existing.value)));
           setSaveState('error');
-          setSaveMessage('제출을 서버에 저장하지 못했습니다. 다시 시도해 주세요.');
+          setFailedSaveOp({ kind: 'submit', session: submitted });
+          setSaveMessage(
+            preserved
+              ? '제출을 서버에 저장하지 못했습니다. 답안은 이 기기에 보존되며 다시 시도할 수 있습니다.'
+              : '제출 저장과 기기 임시 보존에 모두 실패했습니다. 창을 닫지 말고 다시 시도해 주세요.'
+          );
         }
       });
     },
-    [enqueue, userId]
+    [enqueue, userId, clearArchiveAfterConfirm, syncPendingAfterServerConfirm, persistPending]
   );
 
   // Persist local, then mirror to the server according to the exam phase.
@@ -365,10 +545,16 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
     saveMockExam(updated);
     setSession(updated);
     const token = opTokenRef.current;
-    if (updated.status === 'in_progress' && !syncBlocked) {
-      // Preserve the edit BEFORE scheduling the debounced server save.
-      persistPending(updated, serverVersionRef.current);
-      scheduleAutosave(updated);
+    if (updated.status === 'in_progress') {
+      inputGenRef.current += 1;
+      // Preserve edits into pending whenever storage is readable, even while
+      // syncBlocked (do NOT schedule server autosaves while blocked/unreadable).
+      if (!pendingReadFailedRef.current) {
+        persistPending(updated, serverVersionRef.current);
+      }
+      if (!syncBlockedRef.current && !pendingReadFailedRef.current) {
+        scheduleAutosave(updated);
+      }
     } else if (updated.status === 'submitted' && previousStatus === 'in_progress') {
       // A keystroke landed after the deadline: the session just became
       // submitted. Preserve the answers; the idempotent submit is enqueued
@@ -393,22 +579,56 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
     enqueue(() => runGrading(updated, 'submitted', token));
   };
 
-  // Keep the ref in sync for async callbacks without touching refs during render.
+  // Keep refs in sync for async callbacks without touching refs during render.
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
 
   useEffect(() => {
+    userIdRef.current = userId;
+  }, [userId]);
+
+  useEffect(() => {
+    isOpenRef.current = isOpen;
+  }, [isOpen]);
+
+  useEffect(() => {
+    syncBlockedRef.current = syncBlocked;
+    if (syncBlocked) flushAutosaveTimer();
+  }, [syncBlocked]);
+
+  useEffect(() => {
+    pendingReadFailedRef.current = pendingReadFailed;
+    if (pendingReadFailed) flushAutosaveTimer();
+  }, [pendingReadFailed]);
+
+  // Keep per-tab lease fresh and release on pagehide so refreshes keep the same tab id
+  // while duplicated tabs fork to a distinct tab id.
+  useEffect(() => {
+    if (!isOpen || typeof window === 'undefined') return;
+    if (!tabIdRef.current) tabIdRef.current = resolveExamTabId();
+    const tabId = tabIdRef.current;
+    refreshExamTabLease(tabId);
+    const heartbeat = window.setInterval(() => refreshExamTabLease(tabId), 5000);
+    const onPageHide = () => releaseExamTabLease(tabId);
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      window.clearInterval(heartbeat);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }, [isOpen]);
+
+  // Invalidate in-flight work and cancel pending autosaves on unmount,
+  // modal close, account change, or session switch.
+  useEffect(() => {
     return () => {
       opTokenRef.current += 1;
+      refreshGenRef.current += 1;
+      finalizingRecordedRef.current = false;
       flushAutosaveTimer();
+      setBusy(false);
     };
-  }, []);
-
-  // Account change: invalidate in-flight work so results don't leak to another UI.
-  useEffect(() => {
-    opTokenRef.current += 1;
-  }, [userId]);
+  }, [isOpen, session?.id, userId]);
 
   useEffect(() => {
     if (!isOpen || session?.status !== 'in_progress') return;
@@ -421,7 +641,7 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
           const submitted = expireMockExam(previous, tick);
           saveMockExam(submitted);
           // Preserve the submitted answers so a failed/expired submit is not lost.
-          if (userId && !savePendingExamAnswers(userId, submitted, serverVersionRef.current)) {
+          if (userId && !savePendingExamAnswers(userId, submitted, serverVersionRef.current, tabIdRef.current || undefined)) {
             setSyncNotice('미저장 답안을 이 기기에 보존하지 못했습니다. 창을 닫지 말고 다시 시도해 주세요.');
           }
           // A session that was ALREADY expired at open never auto-submits from
@@ -465,7 +685,27 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       // snapshot, and require an EXPLICIT comparison/choice when the local
       // answers differ from the server's (never let a plain submit overwrite).
       if (deferExpiredSubmit && local && local.status === 'submitted' && server.status === 'in_progress') {
-        const pending = userId ? loadPendingExamAnswers(userId, server.id) : null;
+        const pendingRead = userId
+          ? loadPendingExamAnswersResult(userId, server.id, tabIdRef.current || undefined)
+          : null;
+        const adoption = decideServerSnapshotAdoption(pendingRead);
+        if (!adoption.adopt) {
+          flushAutosaveTimer();
+          syncBlockedRef.current = true;
+          pendingReadFailedRef.current = true;
+          setServerSnapshot(null);
+          setExpiredConflict(false);
+          setSyncBlocked(true);
+          setPendingAvailable(true);
+          setPendingReadFailed(true);
+          setSyncNotice(
+            `로컬 미저장 답안을 읽지 못했습니다(${adoption.error}). 기존 로컬 데이터를 유지하며 서버 답안을 적용하지 않았습니다.`
+          );
+          return;
+        }
+        pendingReadFailedRef.current = false;
+        setPendingReadFailed(false);
+        const pending = adoption.pending;
         const decision = planExpiredUrlOpen({
           local,
           server,
@@ -501,7 +741,27 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       }
       setExpiredConflict(false);
       setServerSnapshot(null);
-      const pending = userId ? loadPendingExamAnswers(userId, server.id) : null;
+      const tabId = tabIdRef.current || undefined;
+      refreshOtherTabRecords(userId, server.id, tabId);
+      const pendingRead = userId ? loadPendingExamAnswersResult(userId, server.id, tabId) : null;
+      const adoption = decideServerSnapshotAdoption(pendingRead);
+      if (!adoption.adopt) {
+        // Do NOT overwrite in-memory session, primary cache, or serverVersionRef
+        // when local pending answers could not be verified.
+        flushAutosaveTimer();
+        syncBlockedRef.current = true;
+        pendingReadFailedRef.current = true;
+        setPendingAvailable(true);
+        setPendingReadFailed(true);
+        setSyncBlocked(true);
+        setSyncNotice(
+          `로컬 미저장 답안을 읽지 못했습니다(${adoption.error}). 기존 로컬 데이터를 보존하기 위해 서버 답안을 적용하지 않았습니다.`
+        );
+        return;
+      }
+      pendingReadFailedRef.current = false;
+      setPendingReadFailed(false);
+      const pending = adoption.pending;
       const plan = planReconcile(local, server, result.version, pending);
       serverVersionRef.current = result.version;
 
@@ -511,6 +771,7 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       if (server.status !== 'in_progress') {
         // The server already holds the terminal state: no local submit is pending.
         setSaveState('saved');
+        setFailedSaveOp(null);
       }
 
       if (plan.unsaved) {
@@ -531,7 +792,15 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       }
 
       // No real unsaved changes: discard stale pending and adopt the server copy.
-      if (plan.clearPending && userId) clearPendingExamAnswers(userId, server.id);
+      if (plan.clearPending && userId) {
+        const cleared = clearPendingExamAnswers(userId, server.id, tabId);
+        if (!cleared) {
+          setPendingAvailable(true);
+          setPendingStale(false);
+          setSyncNotice('서버와 동일한 미저장 답안을 기기에서 정리하지 못했습니다. 기존 데이터는 보존됩니다.');
+          return;
+        }
+      }
       setPendingAvailable(false);
       setPendingStale(false);
       if (plan.notify) {
@@ -543,39 +812,65 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
       }
     });
     return () => { cancelled = true; };
-  }, [isOpen, session?.id, userId, deferExpiredSubmit, preserveLocalAsConflictArchive]);
+  }, [isOpen, session?.id, userId, deferExpiredSubmit, preserveLocalAsConflictArchive, refreshOtherTabRecords]);
 
   const resolveFromServer = async () => {
-    const local = sessionRef.current;
-    if (!local) return;
-    const result = await fetchMockExamFromServer(local.id);
-    if (!result.ok) {
-      setSyncNotice('서버 기록을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.');
-      return;
-    }
-    // Apply the server snapshot; NEVER merge pending into it or delete pending.
-    const pending = userId ? loadPendingExamAnswers(userId, local.id) : null;
-    applySnapshot(result.session);
-    serverVersionRef.current = result.version;
-    setSyncBlocked(false);
-    setSaveState('saved');
-    if (pending) {
-      setPendingAvailable(true);
-      setSyncNotice(
-        result.session.status === 'in_progress'
-          ? '서버의 최신 기록을 불러왔습니다. 미저장 답안은 별도로 보존되어 복구할 수 있습니다.'
-          : '서버에서 이미 제출되어 종료된 시험입니다. 미저장 답안은 제출 답안과 별도로 보존됩니다.'
-      );
-    } else {
-      setPendingAvailable(false);
-      setSyncNotice('서버의 최신 기록으로 동기화했습니다.');
-    }
+    const localAtStart = sessionRef.current;
+    if (!localAtStart) return;
+    const token = opTokenRef.current;
+    const targetUserId = userId;
+    const targetSessionId = localAtStart.id;
+    const tabId = tabIdRef.current || undefined;
+    const requestGen = ++refreshGenRef.current;
+    await enqueueResult(async () => {
+      await executeResolveFromServer({
+        sessionId: targetSessionId,
+        getCurrentLocal: () => sessionRef.current,
+        getInputGen: () => inputGenRef.current,
+        userId: targetUserId,
+        hadPendingReadFailure: pendingReadFailedRef.current,
+        requestGen,
+        getCurrentRequestGen: () => refreshGenRef.current,
+        isStillValid: () => isOpValid(token, targetUserId, targetSessionId),
+        fetchServer: fetchMockExamFromServer,
+        readPending: (uid, sid) => loadPendingExamAnswersResult(uid, sid, tabId),
+        savePending: (uid, s, ver) => savePendingExamAnswers(uid, s, ver, tabId),
+        flushAutosaveTimer,
+        applySnapshot,
+        setServerVersion: (v) => {
+          serverVersionRef.current = v;
+        },
+        setSyncBlocked: (blocked) => {
+          syncBlockedRef.current = blocked;
+          setSyncBlocked(blocked);
+        },
+        setSaveState,
+        setFailedSaveOp,
+        setPendingAvailable,
+        setPendingReadFailed: (failed) => {
+          pendingReadFailedRef.current = failed;
+          setPendingReadFailed(failed);
+        },
+        setSyncNotice,
+      });
+      if (isOpValid(token, targetUserId, targetSessionId)) {
+        refreshOtherTabRecords(targetUserId, targetSessionId, tabId);
+      }
+    });
   };
 
   const restorePending = () => {
     const local = sessionRef.current;
-    const pending = userId && local ? loadPendingExamAnswers(userId, local.id) : null;
-    if (!local || !pending) return;
+    if (!userId || !local) return;
+    const pendingRead = loadPendingExamAnswersResult(userId, local.id, tabIdRef.current || undefined);
+    if (!pendingRead.ok) {
+      setPendingReadFailed(true);
+      setSyncNotice(`미저장 답안을 읽지 못했습니다(${pendingRead.error}). 기존 로컬 데이터는 보존됩니다.`);
+      return;
+    }
+    setPendingReadFailed(false);
+    const pending = pendingRead.value;
+    if (!pending) return;
     if (local.status !== 'in_progress') {
       setSyncNotice('제출·채점이 끝난 시험에는 미저장 답안을 적용할 수 없습니다. 미저장 내용은 별도로 보존됩니다.');
       return;
@@ -589,6 +884,45 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
     scheduleAutosave(merged);
   };
 
+  const applyOtherTabSnapshot = (item: PendingExamAnswers | ExamConflictArchive, label: string) => {
+    const local = sessionRef.current;
+    if (!local || local.status !== 'in_progress') return;
+    const merged = applyPendingAnswers(local, item);
+    if (!userId) {
+      setSyncNotice('계정 정보가 없어 다른 탭 답안을 이 탭에 안전하게 저장할 수 없습니다.');
+      return;
+    }
+    const tabId = tabIdRef.current || undefined;
+    // If this tab already holds a different unsaved draft, preserve it in conflict
+    // archive before overwriting the working copy with the user-selected snapshot.
+    const currentPendingRead = loadPendingExamAnswersResult(userId, local.id, tabId);
+    if (!currentPendingRead.ok) {
+      setSyncNotice(`현재 탭의 미저장 답안을 확인하지 못했습니다(${currentPendingRead.error}). 기존 입력을 보호합니다.`);
+      return;
+    }
+    const hasDifferentLocal =
+      !answerFieldsEqual(local, merged) &&
+      (Boolean(currentPendingRead.value) || pendingAvailable);
+    if (hasDifferentLocal) {
+      const preserved = preserveLocalAsConflictArchive(local, serverVersionRef.current, serverVersionRef.current);
+      if (!preserved) return;
+    }
+    // Verify the selected snapshot is persisted into THIS tab's pending BEFORE
+    // overwriting the working copy or scheduling any server save.
+    const saved = savePendingExamAnswers(userId, merged, serverVersionRef.current, tabId);
+    const verified = saved ? loadPendingExamAnswersResult(userId, merged.id, tabId) : null;
+    if (!saved || !verified || !verified.ok || !verified.value || pendingDiffersFrom(merged, verified.value)) {
+      setSyncNotice('선택한 답안을 이 탭의 미저장 영역에 보존하지 못했습니다. 기존 입력을 유지합니다.');
+      return;
+    }
+    applySnapshot(merged);
+    syncBlockedRef.current = false;
+    setSyncBlocked(false);
+    setPendingAvailable(true);
+    setSyncNotice(`${label}을(를) 이 탭 작업본으로 불러왔습니다. 서버 저장을 다시 시도합니다.`);
+    scheduleAutosave(merged);
+  };
+
   // Explicit choice: adopt the SERVER answers (recommended). The local expired
   // copy is preserved as a reviewable archive FIRST — adopting never deletes
   // it, never submits anything, and never touches the pending slot. If the
@@ -597,7 +931,19 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
   const adoptServerSnapshot = () => {
     const local = sessionRef.current;
     if (!local || !serverSnapshot) return;
-    const pending = userId ? loadPendingExamAnswers(userId, local.id) : null;
+    const pendingRead = userId ? loadPendingExamAnswersResult(userId, local.id, tabIdRef.current || undefined) : null;
+    const adoption = decideServerSnapshotAdoption(pendingRead);
+    if (!adoption.adopt) {
+      setPendingAvailable(true);
+      setPendingReadFailed(true);
+      setSyncBlocked(true);
+      setSyncNotice(
+        `로컬 미저장 답안을 읽지 못했습니다(${adoption.error}). 안전을 위해 서버 답안을 적용하지 않았습니다.`
+      );
+      return;
+    }
+    setPendingReadFailed(false);
+    const pending = adoption.pending;
     const baseVersion =
       conflictBaseVersion ??
       resolveLocalBaseVersion({
@@ -630,8 +976,15 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
   // exam keeps its terminal state and the archive stays for review.
   const restoreConflictArchive = () => {
     const local = sessionRef.current;
-    const archived = userId && local ? loadConflictArchive(userId, local.id) : null;
-    if (!local || !archived) return;
+    if (!userId || !local) return;
+    const tabId = tabIdRef.current || undefined;
+    const archiveRead = loadConflictArchiveResult(userId, local.id, tabId);
+    if (!archiveRead.ok) {
+      setSyncNotice(`보존된 로컬 답안을 읽지 못했습니다(${archiveRead.error}). 기존 보존 데이터는 유지됩니다.`);
+      return;
+    }
+    const archived = archiveRead.value;
+    if (!archived) return;
     if (local.status !== 'in_progress') {
       setSyncNotice('제출·채점이 끝난 시험에는 보존된 답안을 적용할 수 없습니다. 보존 내용은 계속 확인할 수 있습니다.');
       return;
@@ -650,7 +1003,12 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
     const local = sessionRef.current;
     if (!userId || !local) return;
     if (!window.confirm('보존된 로컬 답안을 삭제할까요? 현재 작업본에는 영향이 없습니다.')) return;
-    clearConflictArchive(userId, local.id);
+    const tabId = tabIdRef.current || undefined;
+    const cleared = clearConflictArchive(userId, local.id, tabId);
+    if (!cleared) {
+      setSyncNotice('보존된 로컬 답안을 삭제하지 못했습니다. 다시 시도해 주세요.');
+      return;
+    }
     setConflictArchive(null);
     setSyncNotice('보존된 로컬 답안을 삭제했습니다.');
   };
@@ -783,53 +1141,59 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         serverVersionRef.current = result.version;
         setSaveState('saved');
         setSaveMessage('');
+        setFailedSaveOp(null);
         // A confirmed submit supersedes any preserved conflict copy.
-        if (userId) clearConflictArchive(userId, submitted.id);
-        setConflictArchive(null);
-        if (userId) {
-          const current = sessionRef.current;
-          if (pendingAfterAutosave(submitted, current) === 'keep-current' && current) {
-            savePendingExamAnswers(userId, current, result.version);
-            setPendingAvailable(true);
-          } else {
-            clearPendingExamAnswers(userId, submitted.id);
-            setPendingAvailable(false);
-          }
-        }
+        clearArchiveAfterConfirm(submitted.id);
+        syncPendingAfterServerConfirm(submitted, result.version);
       } else if (result.code === 'stale' || result.code === 'locked') {
-        persistPending(sessionRef.current ?? submitted, serverVersionRef.current);
-        setPendingAvailable(true);
+        const latest = sessionRef.current ?? submitted;
+        const preserved = persistPending(latest, serverVersionRef.current);
+        const existing = userId ? loadPendingExamAnswersResult(userId, latest.id, tabIdRef.current || undefined) : null;
+        setPendingAvailable(preserved || Boolean(existing && (!existing.ok || existing.value)));
         setSyncBlocked(true);
         setSaveState('conflict');
+        setFailedSaveOp(null);
       } else if (result.code === 'not_configured') {
         setSaveState('idle');
+        setFailedSaveOp(null);
       } else {
-        persistPending(sessionRef.current ?? submitted, serverVersionRef.current);
-        setPendingAvailable(true);
+        const latest = sessionRef.current ?? submitted;
+        const preserved = persistPending(latest, serverVersionRef.current);
+        const existing = userId ? loadPendingExamAnswersResult(userId, latest.id, tabIdRef.current || undefined) : null;
+        setPendingAvailable(preserved || Boolean(existing && (!existing.ok || existing.value)));
         setSaveState('error');
-        setSaveMessage('제출을 서버에 저장하지 못했습니다. 로컬에 보존되며 다시 시도할 수 있습니다.');
+        setFailedSaveOp({ kind: 'submit', session: submitted });
+        setSaveMessage(
+          preserved
+            ? '제출을 서버에 저장하지 못했습니다. 로컬에 보존되며 다시 시도할 수 있습니다.'
+            : '제출 저장과 기기 임시 보존에 모두 실패했습니다. 창을 닫지 말고 다시 시도해 주세요.'
+        );
       }
     });
   };
 
   const gradeExam = async () => {
     if (!session || session.status !== 'submitted' || busy || blocked.length) return;
+    const token = opTokenRef.current;
+    const targetUserId = userId;
+    const targetSession = session;
     setBusy(true); setError('');
-    const evaluations = { ...session.evaluations };
+    const evaluations = { ...targetSession.evaluations };
     try {
-      for (const problem of session.problems) {
-        const answer = session.answers[problem.id]?.trim();
+      for (const problem of targetSession.problems) {
+        if (!isOpValid(token, targetUserId, targetSession.id)) return;
+        const answer = targetSession.answers[problem.id]?.trim();
         if (!answer || evaluations[problem.id]) continue;
 
-        const reason = session.reasons?.[problem.id]?.trim();
-        const isNotApplicable = Boolean(session.isReasonNotApplicable?.[problem.id]);
-        const reasonJustification = session.reasonNotApplicableJustification?.[problem.id]?.trim();
+        const reason = targetSession.reasons?.[problem.id]?.trim();
+        const isNotApplicable = Boolean(targetSession.isReasonNotApplicable?.[problem.id]);
+        const reasonJustification = targetSession.reasonNotApplicableJustification?.[problem.id]?.trim();
 
         const response = await fetch('/api/evaluate-answer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            mockExamSessionId: session.id,
+            mockExamSessionId: targetSession.id,
             problemId: problem.id,
             problemVersion: problem.version ?? 1,
             conceptId: problem.conceptIds[0],
@@ -852,110 +1216,167 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
             reasonNotApplicableJustification: isNotApplicable ? reasonJustification : undefined,
           }),
         });
+        if (!isOpValid(token, targetUserId, targetSession.id)) return;
         const data = await response.json();
+        if (!isOpValid(token, targetUserId, targetSession.id)) return;
         if (!response.ok || !data.success) throw new Error(`문항 「${problem.title}」: ${data.error || '평가 실패'}`);
         evaluations[problem.id] = data.evaluation as EvaluationResult;
         // Persist each completed evaluation (server + local) so a failure midway
         // can be recovered without re-calling the paid AI.
-        saveGradingProgress({ ...session, evaluations: { ...evaluations } });
+        saveGradingProgress({ ...targetSession, evaluations: { ...evaluations } });
       }
-      save({ ...session, evaluations, status: 'graded' });
-    } catch (cause) { setError(cause instanceof Error ? cause.message : '평가에 실패했습니다. 완료된 문항은 보존했습니다.'); }
-    finally { setBusy(false); }
+      if (!isOpValid(token, targetUserId, targetSession.id)) return;
+      save({ ...targetSession, evaluations, status: 'graded' });
+    } catch (cause) {
+      if (isOpValid(token, targetUserId, targetSession.id)) {
+        setError(cause instanceof Error ? cause.message : '평가에 실패했습니다. 완료된 문항은 보존했습니다.');
+      }
+    } finally {
+      if (token === opTokenRef.current && userIdRef.current === targetUserId) {
+        setBusy(false);
+      }
+    }
   };
+
+  const finalizeRecorded = useCallback(
+    async (recordedSession: MockExamSession, token: number, targetUserId: string) => {
+      if (finalizingRecordedRef.current) return false;
+      finalizingRecordedRef.current = true;
+      try {
+        return await enqueueResult(() =>
+          finalizeRecordedExamOnServer({
+            recordedSession,
+            getExpectedVersion: () => serverVersionRef.current,
+            isStillValid: () => isOpValid(token, targetUserId, recordedSession.id),
+            saveGradingServer: saveMockExamGradingOnServer,
+            applyRecordedLocal: (s) => {
+              saveMockExam(s);
+              setSession(s);
+            },
+            setServerVersion: (v) => {
+              serverVersionRef.current = v;
+            },
+            setSyncBlocked: (b) => {
+              syncBlockedRef.current = b;
+              setSyncBlocked(b);
+            },
+            setSaveState,
+            setSaveMessage,
+            setFailedSaveOp,
+            setError,
+            setSyncNotice,
+            clearArchiveAfterConfirm,
+            onExamRecorded,
+          })
+        );
+      } finally {
+        finalizingRecordedRef.current = false;
+      }
+    },
+    [clearArchiveAfterConfirm, enqueueResult, isOpValid, onExamRecorded]
+  );
 
   const recordExam = async () => {
     if (!session || session.status !== 'graded' || blocked.length || busy) return;
+    const token = opTokenRef.current;
+    const targetUserId = userId;
+    const targetSession = session;
     setBusy(true);
     setError('');
     try {
-    const settings = loadStoredSettings();
-    let partialCount = 0;
-    const serverSyncs: Array<Promise<{ ok: boolean; code?: string }>> = [];
-    for (const problem of session.problems) {
-      const answer = session.answers[problem.id]?.trim();
-      const evaluation = session.evaluations[problem.id];
-      if (!answer || !evaluation || !problem.conceptIds.length) continue;
-      const id = `att-exam-${session.id}-${problem.id}`;
-      // Always (re)record: the storage layer is idempotent and will recover an
-      // Attempt whose review event was lost to a previous partial failure.
+      const settings = loadStoredSettings();
+      let partialCount = 0;
+      const syncPayloads: Array<{ attemptRecord: Attempt; event: ReviewEvent }> = [];
+      for (const problem of targetSession.problems) {
+        const answer = targetSession.answers[problem.id]?.trim();
+        const evaluation = targetSession.evaluations[problem.id];
+        if (!answer || !evaluation || !problem.conceptIds.length) continue;
+        const id = `att-exam-${targetSession.id}-${problem.id}`;
+        // Always (re)record: the storage layer is idempotent and will recover an
+        // Attempt whose review event was lost to a previous partial failure.
 
-      const isNotApplicable = Boolean(session.isReasonNotApplicable?.[problem.id]);
-      const reason = session.reasons?.[problem.id];
-      const justification = session.reasonNotApplicableJustification?.[problem.id];
+        const isNotApplicable = Boolean(targetSession.isReasonNotApplicable?.[problem.id]);
+        const reason = targetSession.reasons?.[problem.id];
+        const justification = targetSession.reasonNotApplicableJustification?.[problem.id];
 
-      const attemptRecord: Attempt = {
-        id,
-        mockExamSessionId: session.id,
-        problemId: problem.id,
-        conceptId: problem.conceptIds[0],
-        conceptIds: [...problem.conceptIds],
-        subjectId: subject.id,
-        at: session.submittedAt || new Date().toISOString(),
-        answer,
-        confidence: 3,
-        errorType: evaluation.recommendedErrorType || 'none',
-        hintCount: 0,
-        reasoningNotes: '혼합형 모의시험 답안',
-        calculatedScore: evaluation.calculatedScore,
-        rubricResults: evaluation.rubricResults,
-        evaluatorFeedback: evaluation.feedback,
-        strengths: evaluation.strengths,
-        criticalImprovements: evaluation.criticalImprovements,
-        staticAnalysisNotice: evaluation.staticAnalysisNotice,
-        needsReview: evaluation.needsReview,
-        isAiEvaluated: evaluation.isAiEvaluated,
-        problemVersion: problem.version ?? 1,
-        problemTitleSnapshot: problem.title,
-        problemPromptSnapshot: problem.promptText,
-        modelAnswerSnapshot: problem.modelAnswer,
-        rubricSnapshot: structuredClone(problem.rubric),
-        // Stage 8 fields
-        solvingReason: isNotApplicable ? undefined : reason,
-        isReasonNotApplicable: isNotApplicable,
-        reasonNotApplicableJustification: isNotApplicable ? justification : undefined,
-        methodSelectionDiagnosis: evaluation.methodSelectionDiagnosis,
-      };
-      const result = recordAttemptAndUpdateConcept(attemptRecord, settings);
-      if (result.partial) partialCount += 1;
-      const concept = result.updatedConcepts.find((c) => c.id === problem.conceptIds[0]);
-      const event = concept?.events.find((e) => e.attemptId === id);
-      if (event) serverSyncs.push(submitExamAttemptOnServer(attemptRecord, event));
-    }
-    if (partialCount > 0) {
-      // 계획 연결만 실패한 부분 저장: recorded로 확정하지 않고(재시도 가능) 실제 상태를 안내한다.
-      // Attempt/ReviewEvent는 이미 저장되어 있고 재시도는 멱등하므로 중복 생성되지 않는다.
-      setError(
-        `일부 문항(${partialCount}건)의 학습 계획 연결 저장이 완료되지 않았습니다. 다시 시도하면 누락된 계획 연결만 복구됩니다. 평가 결과는 보존됩니다.`
+        const attemptRecord: Attempt = {
+          id,
+          mockExamSessionId: targetSession.id,
+          problemId: problem.id,
+          conceptId: problem.conceptIds[0],
+          conceptIds: [...problem.conceptIds],
+          subjectId: subject.id,
+          at: targetSession.submittedAt || new Date().toISOString(),
+          answer,
+          confidence: 3,
+          errorType: evaluation.recommendedErrorType || 'none',
+          hintCount: 0,
+          reasoningNotes: '혼합형 모의시험 답안',
+          calculatedScore: evaluation.calculatedScore,
+          rubricResults: evaluation.rubricResults,
+          evaluatorFeedback: evaluation.feedback,
+          strengths: evaluation.strengths,
+          criticalImprovements: evaluation.criticalImprovements,
+          staticAnalysisNotice: evaluation.staticAnalysisNotice,
+          needsReview: evaluation.needsReview,
+          isAiEvaluated: evaluation.isAiEvaluated,
+          problemVersion: problem.version ?? 1,
+          problemTitleSnapshot: problem.title,
+          problemPromptSnapshot: problem.promptText,
+          modelAnswerSnapshot: problem.modelAnswer,
+          rubricSnapshot: structuredClone(problem.rubric),
+          // Stage 8 fields
+          solvingReason: isNotApplicable ? undefined : reason,
+          isReasonNotApplicable: isNotApplicable,
+          reasonNotApplicableJustification: isNotApplicable ? justification : undefined,
+          methodSelectionDiagnosis: evaluation.methodSelectionDiagnosis,
+        };
+        const result = recordAttemptAndUpdateConcept(attemptRecord, settings);
+        if (result.partial) partialCount += 1;
+        const concept = result.updatedConcepts.find((c) => c.id === problem.conceptIds[0]);
+        const event = concept?.events.find((e) => e.attemptId === id);
+        if (event) syncPayloads.push({ attemptRecord, event });
+      }
+      if (partialCount > 0) {
+        // 계획 연결만 실패한 부분 저장: recorded로 확정하지 않고(재시도 가능) 실제 상태를 안내한다.
+        // Attempt/ReviewEvent는 이미 저장되어 있고 재시도는 멱등하므로 중복 생성되지 않는다.
+        setError(
+          `일부 문항(${partialCount}건)의 학습 계획 연결 저장이 완료되지 않았습니다. 다시 시도하면 누락된 계획 연결만 복구됩니다. 평가 결과는 보존됩니다.`
+        );
+        return;
+      }
+      // Verify server persistence BEFORE confirming 'recorded'. A dropped response
+      // is recovered by re-reading (submit_attempt is idempotent by attempt id).
+      const results = await Promise.all(
+        syncPayloads.map(({ attemptRecord, event }) =>
+          submitExamAttemptOnServer(attemptRecord, event).catch(() => ({ ok: false as const, code: 'error' as const }))
+        )
       );
-      return;
-    }
-    // Verify server persistence BEFORE confirming 'recorded'. A dropped response
-    // is recovered by re-reading (submit_attempt is idempotent by attempt id).
-    const results = await Promise.all(serverSyncs);
-    const failed = results.filter((r) => !r.ok && r.code !== 'not_configured').length;
-    if (failed > 0) {
-      setSaveState('error');
-      setSaveMessage('일부 풀이가 서버에 저장되지 않아 기록 완료를 보류했습니다. 다시 시도하면 누락분만 저장됩니다.');
-      setError('서버 저장이 완료되지 않아 기록 완료로 확정하지 않았습니다. 다시 시도해 주세요.');
-      return;
-    }
-    save({
-      ...session,
-      status: 'recorded',
-      recordedAttemptIds: session.problems
-        .filter((p) => Boolean(session.answers[p.id]?.trim() && session.evaluations[p.id]))
-        .map((p) => `att-exam-${session.id}-${p.id}`),
-    });
-    // A recorded exam is terminal: any preserved conflict copy is superseded.
-    if (userId) clearConflictArchive(userId, session.id);
-    setConflictArchive(null);
-    setSyncNotice('');
-    onExamRecorded();
+      if (!isOpValid(token, targetUserId, targetSession.id)) return;
+      const failed = results.filter((r) => !r.ok && r.code !== 'not_configured').length;
+      if (failed > 0) {
+        setSaveState('error');
+        setFailedSaveOp({ kind: 'record_attempts' });
+        setSaveMessage('일부 풀이가 서버에 저장되지 않아 기록 완료를 보류했습니다. 다시 시도하면 누락분만 저장됩니다.');
+        setError('서버 저장이 완료되지 않아 기록 완료로 확정하지 않았습니다. 다시 시도해 주세요.');
+        return;
+      }
+      const recordedSession: MockExamSession = {
+        ...targetSession,
+        status: 'recorded',
+        recordedAttemptIds: targetSession.problems
+          .filter((p) => Boolean(targetSession.answers[p.id]?.trim() && targetSession.evaluations[p.id]))
+          .map((p) => `att-exam-${targetSession.id}-${p.id}`),
+      };
+      await finalizeRecorded(recordedSession, token, targetUserId);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '학습 이력 저장에 실패했습니다.');
+      if (isOpValid(token, targetUserId, targetSession.id)) {
+        setError(cause instanceof Error ? cause.message : '학습 이력 저장에 실패했습니다.');
+      }
     } finally {
-      setBusy(false);
+      if (token === opTokenRef.current && userIdRef.current === targetUserId) {
+        setBusy(false);
+      }
     }
   };
 
@@ -971,9 +1392,9 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
         {error && <p role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800">{error}</p>}
         {syncNotice && <p className="p-2 bg-[#faf8f4] border border-[#e2ded6] text-xs text-[#57544e]">{syncNotice}</p>}
         {saveState !== 'idle' && (
-          <p
+          <div
             role="status"
-            className={`p-2 border text-xs ${
+            className={`p-2 border text-xs flex flex-wrap items-center justify-between gap-2 ${
               saveState === 'error'
                 ? 'bg-red-50 border-red-200 text-red-800'
                 : saveState === 'conflict'
@@ -981,30 +1402,144 @@ export function MockExamModal({ isOpen, onClose, variant = 'modal', subject, con
                 : 'bg-[#faf8f4] border-[#e2ded6] text-[#57544e]'
             }`}
           >
-            {saveState === 'saving' && '서버에 저장 중...'}
-            {saveState === 'saved' && '서버 저장 완료'}
-            {saveState === 'error' && (saveMessage || '서버 저장에 실패했습니다.')}
-            {saveState === 'conflict' && '서버 기록과 충돌했습니다.'}
-          </p>
+            <span>
+              {saveState === 'saving' && '서버에 저장 중...'}
+              {saveState === 'saved' && '서버 저장 완료'}
+              {saveState === 'error' && (saveMessage || '서버 저장에 실패했습니다.')}
+              {saveState === 'conflict' && '서버 기록과 충돌했습니다.'}
+            </span>
+            {saveState === 'error' && resolveExamSaveRetry(failedSaveOp, session) && (
+              <button
+                type="button"
+                onClick={() => {
+                  const retry = resolveExamSaveRetry(failedSaveOp, sessionRef.current ?? session);
+                  if (!retry) return;
+                  const token = opTokenRef.current;
+                  if (retry.kind === 'autosave') {
+                    persistPending(retry.session, serverVersionRef.current);
+                    enqueue(() => runAutosave(retry.session, token));
+                  } else if (retry.kind === 'submit') {
+                    persistPending(retry.session, serverVersionRef.current);
+                    enqueueSubmitSession(retry.session);
+                  } else if (retry.kind === 'grading') {
+                    enqueue(() => runGrading(retry.session, retry.status, token));
+                  } else if (retry.kind === 'record_attempts') {
+                    void recordExam();
+                  } else if (retry.kind === 'record_finalize') {
+                    void finalizeRecorded(retry.session, token, userId);
+                  }
+                }}
+                className="border border-red-300 bg-white px-2.5 py-1 font-bold text-red-900"
+              >
+                다시 저장 시도
+              </button>
+            )}
+          </div>
         )}
         {pendingAvailable && (
           <div role="alert" className="p-3 bg-[#faf8f4] border border-[#e2ded6] text-xs space-y-2 text-[#57544e]">
             <p>
-              이 기기에 저장되지 않은 답안이 있습니다. 삭제하지 않고 별도로 보존 중입니다.
-              {session && session.status !== 'in_progress'
+              {pendingReadFailed
+                ? '이 기기의 미저장 답안을 읽지 못했습니다. 기존 데이터를 보호하기 위해 서버 답안을 덮어쓰지 않았습니다.'
+                : '이 기기에 저장되지 않은 답안이 있습니다. 삭제하지 않고 별도로 보존 중입니다.'}
+              {!pendingReadFailed && session && session.status !== 'in_progress'
                 ? ' 제출·채점이 끝난 시험에는 적용할 수 없어 제출 답안과 구분해 보관합니다.'
-                : pendingStale
+                : !pendingReadFailed && pendingStale
                 ? ' 서버 버전이 달라 자동 저장하지 않으며, 확인 후 복구할 수 있습니다.'
                 : ''}
             </p>
-            {session?.status === 'in_progress' && (
+            {pendingReadFailed ? (
               <button
                 type="button"
-                onClick={restorePending}
+                onClick={() => void resolveFromServer()}
                 className="border border-[#c8c2b5] bg-white px-3 py-1 font-bold"
               >
-                {pendingStale ? '미저장 답안 복구 (서버 변경 확인)' : '미저장 답안 복구'}
+                미저장 답안 다시 확인
               </button>
+            ) : (
+              session?.status === 'in_progress' && (
+                <button
+                  type="button"
+                  onClick={restorePending}
+                  className="border border-[#c8c2b5] bg-white px-3 py-1 font-bold"
+                >
+                  {pendingStale ? '미저장 답안 복구 (서버 변경 확인)' : '미저장 답안 복구'}
+                </button>
+              )
+            )}
+          </div>
+        )}
+        {(otherTabPendings.length > 0 || otherTabReadError) && session && (
+          <div role="region" aria-label="다른 탭의 미저장 답안" className="p-3 bg-[#faf8f4] border border-[#e2ded6] text-xs space-y-2 text-[#57544e]">
+            {otherTabReadError && (
+              <div className="flex flex-wrap items-center justify-between gap-2 text-amber-800">
+                <span>다른 탭의 미저장 답안을 확인하지 못했습니다({otherTabReadError}).</span>
+                <button
+                  type="button"
+                  onClick={() => refreshOtherTabRecords(userId, session.id, tabIdRef.current || undefined)}
+                  className="border border-amber-400 bg-white px-2.5 py-1 font-bold"
+                >
+                  다시 확인
+                </button>
+              </div>
+            )}
+            {otherTabPendings.length > 0 && (
+              <>
+                <p className="font-bold">다른 탭에서 입력 중이던 미저장 답안({otherTabPendings.length}건)이 별도로 보존되어 있습니다. 자동 병합·자동 삭제되지 않습니다.</p>
+                <ul className="space-y-1">
+                  {otherTabPendings.map((item, idx) => (
+                    <li key={item.tabId || `other-${idx}`} className="flex flex-wrap items-center justify-between gap-2 border-t border-[#e2ded6] pt-1">
+                      <span>저장 시각: {item.savedAt ? new Date(item.savedAt).toLocaleString('ko-KR') : '이전 기록'}</span>
+                      {session.status === 'in_progress' && (
+                        <button
+                          type="button"
+                          onClick={() => applyOtherTabSnapshot(item, '다른 탭의 미저장 답안')}
+                          className="border border-[#c8c2b5] bg-white px-2.5 py-1 font-bold"
+                        >
+                          이 탭으로 복구
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </div>
+        )}
+        {(otherTabArchives.length > 0 || otherTabArchiveError) && session && (
+          <div role="region" aria-label="다른 탭의 충돌 보관함" className="p-3 bg-[#faf8f4] border border-[#e2ded6] text-xs space-y-2 text-[#57544e]">
+            {otherTabArchiveError && (
+              <div className="flex flex-wrap items-center justify-between gap-2 text-amber-800">
+                <span>다른 탭의 충돌 보관함을 확인하지 못했습니다({otherTabArchiveError}).</span>
+                <button
+                  type="button"
+                  onClick={() => refreshOtherTabRecords(userId, session.id, tabIdRef.current || undefined)}
+                  className="border border-amber-400 bg-white px-2.5 py-1 font-bold"
+                >
+                  다시 확인
+                </button>
+              </div>
+            )}
+            {otherTabArchives.length > 0 && (
+              <>
+                <p className="font-bold">다른 탭 또는 추가 보존 사본({otherTabArchives.length}건)이 별도로 보관되어 있습니다.</p>
+                <ul className="space-y-1">
+                  {otherTabArchives.map((item, idx) => (
+                    <li key={item.archiveId || item.tabId || `arch-${idx}`} className="flex flex-wrap items-center justify-between gap-2 border-t border-[#e2ded6] pt-1">
+                      <span>보관 시각: {item.savedAt ? new Date(item.savedAt).toLocaleString('ko-KR') : '이전 기록'}</span>
+                      {session.status === 'in_progress' && (
+                        <button
+                          type="button"
+                          onClick={() => applyOtherTabSnapshot(item, '보관된 다른 탭 답안')}
+                          className="border border-[#c8c2b5] bg-white px-2.5 py-1 font-bold"
+                        >
+                          이 탭으로 복구
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
           </div>
         )}

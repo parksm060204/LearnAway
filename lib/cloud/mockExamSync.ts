@@ -3,7 +3,13 @@
 import type { Attempt, MockExamSession, ReviewEvent } from '../types';
 import { isSupabaseConfigured } from '../supabase/config';
 import { createClient } from '../supabase/client';
-import { pendingDiffersFrom, type PendingExamAnswers } from './pendingExamAnswers';
+import {
+  answerFieldsEqual,
+  pendingDiffersFrom,
+  type PendingExamAnswers,
+  type PendingStorageReadFailureReason,
+  type PendingStorageReadResult,
+} from './pendingExamAnswers';
 import {
   getMockExamSession,
   saveMockExamGrading,
@@ -306,6 +312,266 @@ export async function fetchMockExamFromServer(
     session: result.data,
     version: result.data.serverVersion ?? 1,
   };
+}
+
+export type ServerSnapshotAdoptionDecision =
+  | { adopt: true; pending: PendingExamAnswers | null }
+  | { adopt: false; reason: PendingStorageReadFailureReason; error: string };
+
+/**
+ * Guards server snapshot adoption on verifying the local pending store first.
+ * If reading the pending store failed or found corrupt data, the caller MUST
+ * keep the existing in-memory/cache session and version untouched.
+ */
+export function decideServerSnapshotAdoption(
+  pendingRead: PendingStorageReadResult<PendingExamAnswers> | null
+): ServerSnapshotAdoptionDecision {
+  if (pendingRead && !pendingRead.ok) {
+    return { adopt: false, reason: pendingRead.reason, error: pendingRead.error };
+  }
+  return { adopt: true, pending: pendingRead?.value ?? null };
+}
+
+export type FailedExamSaveOp =
+  | null
+  | { kind: 'autosave' }
+  | { kind: 'submit'; session: MockExamSession }
+  | { kind: 'grading'; status: MockExamSyncStatus }
+  | { kind: 'record_attempts' }
+  | { kind: 'record_finalize'; session: MockExamSession };
+
+export type ExamSaveRetryAction =
+  | null
+  | { kind: 'autosave'; session: MockExamSession }
+  | { kind: 'submit'; session: MockExamSession }
+  | { kind: 'grading'; session: MockExamSession; status: MockExamSyncStatus }
+  | { kind: 'record_attempts'; session: MockExamSession }
+  | { kind: 'record_finalize'; session: MockExamSession };
+
+/**
+ * Resolves the exact retry action from the tracked failed operation so a
+ * failed submit or failed attempt-recording is never silently replaced by a
+ * grading RPC.
+ */
+export function resolveExamSaveRetry(
+  failedOp: FailedExamSaveOp,
+  currentSession: MockExamSession | null
+): ExamSaveRetryAction {
+  if (!failedOp || !currentSession) return null;
+  switch (failedOp.kind) {
+    case 'autosave':
+      return { kind: 'autosave', session: currentSession };
+    case 'submit':
+      return { kind: 'submit', session: failedOp.session };
+    case 'grading':
+      return { kind: 'grading', session: currentSession, status: failedOp.status };
+    case 'record_attempts':
+      return { kind: 'record_attempts', session: currentSession };
+    case 'record_finalize':
+      return { kind: 'record_finalize', session: failedOp.session };
+  }
+}
+
+export interface ResolveFromServerDeps {
+  sessionId: string;
+  getCurrentLocal: () => MockExamSession | null;
+  getInputGen?: () => number;
+  userId: string;
+  hadPendingReadFailure: boolean;
+  requestGen: number;
+  getCurrentRequestGen: () => number;
+  isStillValid: () => boolean;
+  fetchServer: (sessionId: string) => Promise<MockExamFetchResult>;
+  readPending: (userId: string, sessionId: string) => PendingStorageReadResult<PendingExamAnswers>;
+  savePending: (userId: string, session: MockExamSession, baseVersion?: number) => boolean;
+  flushAutosaveTimer: () => void;
+  applySnapshot: (session: MockExamSession) => void;
+  setServerVersion: (version: number) => void;
+  setSyncBlocked: (blocked: boolean) => void;
+  setSaveState: (state: 'idle' | 'saving' | 'saved' | 'error' | 'conflict') => void;
+  setFailedSaveOp: (op: FailedExamSaveOp) => void;
+  setPendingAvailable: (available: boolean) => void;
+  setPendingReadFailed: (failed: boolean) => void;
+  setSyncNotice: (notice: string) => void;
+}
+
+/**
+ * Orchestrates explicit server refresh (`resolveFromServer`) with pre- and
+ * post-await scope/generation checks, pending-read verification BEFORE adopting
+ * server state, and preservation of the LATEST in-memory edits (`getCurrentLocal`)
+ * including edits typed while `fetchServer` is in flight.
+ */
+export async function executeResolveFromServer(deps: ResolveFromServerDeps): Promise<void> {
+  if (!deps.isStillValid() || deps.requestGen !== deps.getCurrentRequestGen()) return;
+  deps.flushAutosaveTimer();
+  const inputGenAtStart = deps.getInputGen?.() ?? 0;
+  const localAtStart = deps.getCurrentLocal();
+
+  const result = await deps.fetchServer(deps.sessionId);
+  if (!deps.isStillValid() || deps.requestGen !== deps.getCurrentRequestGen()) return;
+  if (!result.ok) {
+    deps.setSyncNotice('서버 기록을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.');
+    return;
+  }
+
+  const latestLocal = deps.getCurrentLocal();
+  const inputGenAfter = deps.getInputGen?.() ?? 0;
+  const typedDuringFetch =
+    inputGenAfter !== inputGenAtStart ||
+    (localAtStart !== null &&
+      latestLocal !== null &&
+      localAtStart.id === deps.sessionId &&
+      latestLocal.id === deps.sessionId &&
+      !answerFieldsEqual(localAtStart, latestLocal));
+
+  const pendingRead = deps.userId ? deps.readPending(deps.userId, deps.sessionId) : null;
+  const adoption = decideServerSnapshotAdoption(pendingRead);
+  if (!adoption.adopt) {
+    deps.flushAutosaveTimer();
+    deps.setPendingAvailable(true);
+    deps.setPendingReadFailed(true);
+    deps.setSyncBlocked(true);
+    deps.setSyncNotice(
+      `기기의 미저장 답안을 읽지 못했습니다(${adoption.error}). 기존 로컬 데이터를 보존하기 위해 서버 답안을 적용하지 않았습니다.`
+    );
+    return;
+  }
+
+  deps.setPendingReadFailed(false);
+  let pending = adoption.pending;
+
+  // Preserve latest in-memory edits (`latestLocal`) whenever storage was
+  // unreadable OR the user typed new edits while `fetchServer` was in flight.
+  // An untouched old server cache (`!hadPendingReadFailure && !typedDuringFetch`)
+  // is NOT falsely treated as unsaved when `pending` is empty.
+  const hasUnsavedInMemoryEdits =
+    (deps.hadPendingReadFailure || typedDuringFetch) &&
+    latestLocal !== null &&
+    latestLocal.id === deps.sessionId &&
+    latestLocal.status === 'in_progress' &&
+    !answerFieldsEqual(latestLocal, result.session);
+
+  if (hasUnsavedInMemoryEdits && deps.userId && latestLocal) {
+    const saved = deps.savePending(deps.userId, latestLocal, result.version);
+    const reloaded = saved ? deps.readPending(deps.userId, deps.sessionId) : null;
+    if (!saved || !reloaded || !reloaded.ok || !reloaded.value || pendingDiffersFrom(latestLocal, reloaded.value)) {
+      deps.flushAutosaveTimer();
+      deps.setPendingAvailable(true);
+      deps.setSyncBlocked(true);
+      deps.setSyncNotice(
+        '메모리에 있던 최신 답안을 기기에 보존하지 못해 서버 답안을 적용하지 않았습니다. 다시 시도해 주세요.'
+      );
+      return;
+    }
+    pending = reloaded.value;
+  }
+
+  const hasPendingDiff = Boolean(pending && pendingDiffersFrom(result.session, pending));
+
+  // Cancel any autosave timer (including one scheduled by typing during fetchServer)
+  // BEFORE adopting the server snapshot so a queued/timer autosave never writes `S`
+  // back to the server and clears pending `L2`.
+  deps.flushAutosaveTimer();
+  deps.applySnapshot(result.session);
+  deps.setServerVersion(result.version);
+
+  if (hasUnsavedInMemoryEdits || hasPendingDiff) {
+    deps.setSyncBlocked(true);
+    deps.setSaveState('saved');
+    deps.setFailedSaveOp(null);
+    deps.setPendingAvailable(true);
+    deps.setSyncNotice(
+      hasUnsavedInMemoryEdits
+        ? '서버의 최신 기록을 불러왔습니다. 이 기기에서 입력 중이던 최신 답안은 미저장 영역에 보존되어 복구할 수 있습니다.'
+        : result.session.status === 'in_progress'
+        ? '서버의 최신 기록을 불러왔습니다. 미저장 답안은 별도로 보존되어 복구할 수 있습니다.'
+        : '서버에서 이미 제출되어 종료된 시험입니다. 미저장 답안은 제출 답안과 별도로 보존됩니다.'
+    );
+    return;
+  }
+
+  deps.setSyncBlocked(false);
+  deps.setSaveState('saved');
+  deps.setFailedSaveOp(null);
+  deps.setPendingAvailable(Boolean(pending));
+  deps.setSyncNotice('서버의 최신 기록으로 동기화했습니다.');
+}
+
+export interface FinalizeRecordedDeps {
+  recordedSession: MockExamSession;
+  getExpectedVersion: () => number;
+  isStillValid: () => boolean;
+  saveGradingServer: (
+    session: MockExamSession,
+    expectedVersion: number,
+    status: MockExamSyncStatus
+  ) => Promise<MockExamSyncResult>;
+  applyRecordedLocal: (session: MockExamSession) => void;
+  setServerVersion: (version: number) => void;
+  setSyncBlocked: (blocked: boolean) => void;
+  setSaveState: (state: 'idle' | 'saving' | 'saved' | 'error' | 'conflict') => void;
+  setSaveMessage: (msg: string) => void;
+  setFailedSaveOp: (op: FailedExamSaveOp) => void;
+  setError: (err: string) => void;
+  setSyncNotice: (notice: string) => void;
+  clearArchiveAfterConfirm: (sessionId: string) => boolean;
+  onExamRecorded: () => void;
+}
+
+/**
+ * Awaits the authoritative `save_mock_exam_grading(..., 'recorded')` RPC
+ * BEFORE transitioning the local session to `'recorded'`, clearing conflict
+ * archives, or closing the modal via `onExamRecorded`.
+ */
+export async function finalizeRecordedExamOnServer(deps: FinalizeRecordedDeps): Promise<boolean> {
+  if (!deps.isStillValid()) return false;
+  deps.setSaveState('saving');
+  const result = await deps.saveGradingServer(
+    deps.recordedSession,
+    deps.getExpectedVersion(),
+    'recorded'
+  );
+  if (!deps.isStillValid()) return false;
+
+  if (result.ok) {
+    deps.setServerVersion(result.version);
+    deps.setSyncBlocked(false);
+    deps.applyRecordedLocal(deps.recordedSession);
+    deps.setSaveState('saved');
+    deps.setSaveMessage('');
+    deps.setFailedSaveOp(null);
+    deps.setSyncNotice('');
+    if (deps.clearArchiveAfterConfirm(deps.recordedSession.id)) {
+      deps.onExamRecorded();
+    }
+    return true;
+  }
+
+  if (result.code === 'not_configured') {
+    deps.applyRecordedLocal(deps.recordedSession);
+    deps.setSaveState('idle');
+    deps.setSaveMessage('');
+    deps.setFailedSaveOp(null);
+    deps.setSyncNotice('');
+    if (deps.clearArchiveAfterConfirm(deps.recordedSession.id)) {
+      deps.onExamRecorded();
+    }
+    return true;
+  }
+
+  if (result.code === 'stale' || result.code === 'locked') {
+    deps.setSyncBlocked(true);
+    deps.setSaveState('conflict');
+    deps.setFailedSaveOp(null);
+    deps.setError('서버의 모의시험 상태와 충돌하여 기록 완료를 확정하지 못했습니다. 최신 서버 기록을 확인해 주세요.');
+    return false;
+  }
+
+  deps.setSaveState('error');
+  deps.setFailedSaveOp({ kind: 'record_finalize', session: deps.recordedSession });
+  deps.setSaveMessage('모의시험 기록 완료 상태를 서버에 저장하지 못했습니다. 다시 시도할 수 있습니다.');
+  deps.setError('모의시험 기록 완료 상태를 서버에 저장하지 못했습니다. 평가·풀이 이력은 보존되며 다시 시도해 주세요.');
+  return false;
 }
 
 /**
