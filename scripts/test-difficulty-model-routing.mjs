@@ -50,6 +50,7 @@ try {
       path.join(root, 'app', 'api', 'review-problem-quality', 'route.ts'),
       path.join(root, 'app', 'api', 'logic-questions', 'route.ts'),
       path.join(root, 'app', 'api', 'evaluate-answer', 'route.ts'),
+      path.join(root, 'app', 'api', 'analyze-concepts', 'route.ts'),
     ],
     { cwd: root, encoding: 'utf8' }
   );
@@ -384,6 +385,25 @@ try {
                   },
                 };
               },
+            };
+          }
+          if (table === 'subjects') {
+            return {
+              select: () => ({
+                eq: (_col, val) => ({
+                  eq: (_c2, uid) => ({
+                    maybeSingle: async () => ({ data: { id: val, user_id: uid }, error: null }),
+                  }),
+                  maybeSingle: async () => ({ data: { id: val, user_id: state.user?.id }, error: null }),
+                }),
+              }),
+            };
+          }
+          if (table === 'concepts' || table === 'materials') {
+            return {
+              select: () => ({
+                in: async () => ({ data: [], error: null }),
+              }),
             };
           }
           if (table === 'problem_drafts') {
@@ -1200,6 +1220,394 @@ try {
       assert.equal(resTampered.status, 400);
       assert.equal(h.state.aiChatCalls.length, 1);
     } finally {
+      h.cleanup();
+    }
+  });
+
+  await check('13. analyze-concepts validates manual model, isolates Sonnet options, and blocks concurrent resume with 409', async () => {
+    const h = createRouteHarness();
+    const origCreateClient = supabaseServerMod.createClient;
+    const origCreateAdmin = supabaseAdminMod.createAdminClient;
+    try {
+      h.setUserKey('deepseek-v4.1-flash');
+      h.state.gatewayModels = ['deepseek-v4.1-flash', 'claude-sonnet-5-5'];
+
+      const wrapClient = (baseClient) => ({
+        ...baseClient,
+        from(table) {
+          if (table === 'materials') {
+            return {
+              select: () => ({
+                eq: () => ({ maybeSingle: async () => ({ data: { id: 'mat-1', user_id: h.state.user.id, subject_id: 'sub-1' }, error: null }) }),
+                in: async () => ({ data: [], error: null }),
+              }),
+            };
+          }
+          if (table === 'analysis_jobs') {
+            return {
+              select: () => ({
+                eq: () => ({
+                  eq: () => ({ maybeSingle: async () => ({ data: null, error: null }) }),
+                  maybeSingle: async () => ({ data: null, error: null }),
+                }),
+              }),
+            };
+          }
+          if (table === 'analysis_job_chunks') {
+            return {
+              select: () => ({ eq: async () => ({ data: [], error: null }) }),
+            };
+          }
+          if (table === 'concept_drafts') {
+            const chain = {
+              in: async (_col, ids) => ({ data: (ids || []).map((id) => ({ id })), error: null }),
+              select: () => chain,
+              upsert: () => chain,
+            };
+            return chain;
+          }
+          return baseClient.from(table);
+        },
+        async rpc(fn, params = {}) {
+          if (fn === 'init_analysis_job_and_chunks') return { data: { success: true }, error: null };
+          if (fn === 'claim_analysis_chunk_lease') return { data: { acquired: true, lease_token: 'lt-chunk-1' }, error: null };
+          if (fn === 'commit_analysis_chunk_result') return { data: { committed: true }, error: null };
+          return baseClient.rpc(fn, params);
+        },
+      });
+      supabaseServerMod.createClient = async () => wrapClient(await origCreateClient());
+      supabaseAdminMod.createAdminClient = () => wrapClient(origCreateAdmin());
+
+      const analyzeRoute = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+
+      // Tampered model -> 400 before AI call
+      const resTampered = await analyzeRoute.POST(
+        h.makeReq({
+          action: 'process',
+          subjectId: 'sub-1',
+          materialId: 'mat-1',
+          domain: 'math_stats',
+          markdown: '[PAGE 1]\nTheorem: sample theorem for testing model validation.',
+          selectedModel: '55sonnet',
+        })
+      );
+      assert.equal(resTampered.status, 400);
+      assert.equal(h.state.aiChatCalls.length, 0);
+
+      // Explicit Sonnet model -> uses claude-sonnet-5-5 without DeepSeek's max_tokens=16000
+      const origFetch = global.fetch;
+      global.fetch = async (url, init = {}) => {
+        const res = await origFetch(url, init);
+        if (String(url).includes('/chat/completions')) {
+          return Response.json({
+            id: 'chat-test',
+            model: 'claude-sonnet-5-5',
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    concepts: [
+                      {
+                        title: 'Sample Theorem',
+                        description: 'Theorem description',
+                        coreDefinitionFormulaOrAlgorithm: '$a^2 + b^2 = c^2$',
+                        prerequisites: [],
+                        relatedConcepts: [],
+                        commonMisconceptions: [],
+                        examples: [],
+                        sourceEvidence: { type: 'page', pageNumber: 1, quote: 'sample theorem' },
+                      },
+                    ],
+                  }),
+                },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+          });
+        }
+        return res;
+      };
+      const resSonnet = await analyzeRoute.POST(
+        h.makeReq({
+          action: 'process',
+          subjectId: 'sub-1',
+          materialId: 'mat-1',
+          domain: 'math_stats',
+          markdown: '[PAGE 1]\nTheorem: sample theorem for testing model validation.',
+          selectedModel: 'claude-sonnet-5-5',
+        })
+      );
+      assert.equal(resSonnet.status, 200);
+      assert.equal(h.state.aiChatCalls.length, 1);
+      assert.equal(h.state.aiChatCalls[0].body.model, 'claude-sonnet-5-5');
+      assert.equal(h.state.aiChatCalls[0].body.max_tokens, undefined);
+
+      // Concurrent resume -> 409 CONCURRENT_EXECUTION_BLOCKED before resume_analysis_job or AI call
+      let resumeRpcCalls = 0;
+      const origWrappedClient = supabaseServerMod.createClient;
+      const origWrappedAdmin = supabaseAdminMod.createAdminClient;
+      const wrapWithConcurrent = (client) => ({
+        ...client,
+        async rpc(fn, params = {}) {
+          if (fn === 'resume_analysis_job') {
+            resumeRpcCalls++;
+            return { data: { success: true }, error: null };
+          }
+          if (fn === 'register_ai_task') {
+            return {
+              data: {
+                allowed: false,
+                status: 'concurrent_in_progress',
+                error_code: 'CONCURRENT_EXECUTION_BLOCKED',
+                message: '이미 진행 중입니다.',
+              },
+              error: null,
+            };
+          }
+          return client.rpc(fn, params);
+        },
+      });
+      supabaseServerMod.createClient = async () => wrapWithConcurrent(await origWrappedClient());
+      supabaseAdminMod.createAdminClient = () => wrapWithConcurrent(origWrappedAdmin());
+      const resConcurrentResume = await analyzeRoute.POST(
+        h.makeReq({
+          action: 'resume',
+          subjectId: 'sub-1',
+          materialId: 'mat-1',
+          domain: 'math_stats',
+          markdown: '[PAGE 1]\nTheorem: sample theorem for testing model validation.',
+        })
+      );
+      const concurrentBody = await resConcurrentResume.json();
+      assert.equal(resConcurrentResume.status, 409);
+      assert.equal(concurrentBody.errorCode, 'CONCURRENT_EXECUTION_BLOCKED');
+      assert.equal(resumeRpcCalls, 0);
+      assert.equal(h.state.aiChatCalls.length, 1);
+
+      // Resume with already_completed -> 200 fromCache with 0 AI calls
+      const wrapWithCompleted = (client) => ({
+        ...client,
+        async rpc(fn, params = {}) {
+          if (fn === 'register_ai_task') {
+            return {
+              data: {
+                allowed: false,
+                status: 'already_completed',
+                db_status: 'settled',
+                task_id: params.p_task_id,
+                cached_result: {
+                  userId: h.state.user.id,
+                  subjectId: 'sub-1',
+                  materialId: 'mat-1',
+                  totalChunks: 1,
+                  completedChunks: 1,
+                  isAllComplete: true,
+                  drafts: [{ id: 'd-cached-1', subjectId: 'sub-1', materialId: 'mat-1', title: 'Cached Concept' }],
+                },
+              },
+              error: null,
+            };
+          }
+          return client.rpc(fn, params);
+        },
+      });
+      supabaseServerMod.createClient = async () => wrapWithCompleted(await origWrappedClient());
+      supabaseAdminMod.createAdminClient = () => wrapWithCompleted(origWrappedAdmin());
+      const resAlreadyCompleted = await analyzeRoute.POST(
+        h.makeReq({
+          action: 'resume',
+          subjectId: 'sub-1',
+          materialId: 'mat-1',
+          domain: 'math_stats',
+          markdown: '[PAGE 1]\nTheorem: sample theorem for testing model validation.',
+        })
+      );
+      const completedBody = await resAlreadyCompleted.json();
+      assert.equal(resAlreadyCompleted.status, 200);
+      assert.equal(completedBody.fromCache, true);
+      assert.equal(h.state.aiChatCalls.length, 1);
+    } finally {
+      supabaseServerMod.createClient = origCreateClient;
+      supabaseAdminMod.createAdminClient = origCreateAdmin;
+      h.cleanup();
+    }
+  });
+
+  await check('14. analyze-concepts existing DB job resume: saved default drift, unavailable pinned model, provider drift, and early-failure lease release', async () => {
+    const h = createRouteHarness();
+    const origCreateClient = supabaseServerMod.createClient;
+    const origCreateAdmin = supabaseAdminMod.createAdminClient;
+    try {
+      // User switched saved default to deepseek-v4.1-flash, while existing DB job is pinned to claude-sonnet-5-5
+      h.setUserKey('deepseek-v4.1-flash');
+      h.state.gatewayModels = ['deepseek-v4.1-flash', 'claude-sonnet-5-5'];
+      const dbJobRow = {
+        id: 'job-pinned-sonnet',
+        user_id: h.state.user.id,
+        subject_id: 'sub-1',
+        material_id: 'mat-1',
+        domain: 'math_stats',
+        markdown_hash: 'ignored-in-test',
+        model_id: 'claude-sonnet-5-5',
+        prompt_version: 'v2',
+        chunking_version: 'v1',
+        total_chunks: 1,
+        status: 'paused',
+      };
+      const { computeMarkdownHash } = load(path.join(output, 'lib/markdownUtils.js'));
+      const md = '[PAGE 1]\nTheorem: pinned sonnet resume test.';
+      dbJobRow.markdown_hash = computeMarkdownHash(md);
+
+      let failInitJob = false;
+      let releaseCalls = 0;
+
+      const wrapClient = (baseClient) => ({
+        ...baseClient,
+        from(table) {
+          if (table === 'materials') {
+            return {
+              select: () => ({
+                eq: () => ({ maybeSingle: async () => ({ data: { id: 'mat-1', user_id: h.state.user.id, subject_id: 'sub-1' }, error: null }) }),
+                in: async () => ({ data: [], error: null }),
+              }),
+            };
+          }
+          if (table === 'analysis_jobs') {
+            return {
+              select: () => ({
+                eq: () => ({
+                  eq: () => ({ maybeSingle: async () => ({ data: dbJobRow, error: null }) }),
+                  maybeSingle: async () => ({ data: dbJobRow, error: null }),
+                }),
+              }),
+              update: () => ({ eq: () => ({ eq: async () => ({ error: null }) }) }),
+            };
+          }
+          if (table === 'analysis_job_chunks') {
+            return {
+              select: () => ({ eq: async () => ({ data: [], error: null }) }),
+            };
+          }
+          if (table === 'concept_drafts') {
+            const chain = {
+              in: async (_col, ids) => ({ data: (ids || []).map((id) => ({ id })), error: null }),
+              select: () => chain,
+              upsert: () => chain,
+            };
+            return chain;
+          }
+          return baseClient.from(table);
+        },
+        async rpc(fn, params = {}) {
+          if (fn === 'resume_analysis_job') return { data: { success: true }, error: null };
+          if (fn === 'init_analysis_job_and_chunks') {
+            return failInitJob
+              ? { data: { success: false, error: 'injected init failure' }, error: null }
+              : { data: { success: true }, error: null };
+          }
+          if (fn === 'claim_analysis_chunk_lease') return { data: { acquired: true, lease_token: 'lt-chunk-1' }, error: null };
+          if (fn === 'commit_analysis_chunk_result') return { data: { committed: true }, error: null };
+          if (fn === 'release_trial_credit') {
+            releaseCalls++;
+            return baseClient.rpc(fn, params);
+          }
+          return baseClient.rpc(fn, params);
+        },
+      });
+      supabaseServerMod.createClient = async () => wrapClient(await origCreateClient());
+      supabaseAdminMod.createAdminClient = () => wrapClient(origCreateAdmin());
+
+      const origFetch = global.fetch;
+      global.fetch = async (url, init = {}) => {
+        const res = await origFetch(url, init);
+        if (String(url).includes('/chat/completions')) {
+          return Response.json({
+            id: 'chat-sonnet',
+            model: 'claude-sonnet-5-5',
+            choices: [{ message: { content: '{"concepts":[]}' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          });
+        }
+        return res;
+      };
+
+      const analyzeRoute = load(path.join(output, 'app/api/analyze-concepts/route.js'));
+
+      // 1) Resume omitting model when saved default is deepseek-v4.1-flash -> uses claude-sonnet-5-5 WITHOUT max_tokens: 16000
+      const resResume = await analyzeRoute.POST(
+        h.makeReq({
+          action: 'resume',
+          jobKey: dbJobRow.id,
+          subjectId: 'sub-1',
+          materialId: 'mat-1',
+          domain: 'math_stats',
+          markdown: md,
+        })
+      );
+      assert.equal(resResume.status, 200);
+      assert.equal(h.state.aiChatCalls.length, 1);
+      assert.equal(h.state.aiChatCalls[0].body.model, 'claude-sonnet-5-5');
+      assert.equal(h.state.aiChatCalls[0].body.max_tokens, undefined);
+
+      // 2) Early failure after lease acquisition (init_analysis_job_and_chunks fails) -> 500 AND releases trial lease
+      h.state.userConnection = null;
+      h.state.trialBalance = 3;
+      h.state.tasks.clear();
+      failInitJob = true;
+      const resInitFail = await analyzeRoute.POST(
+        h.makeReq({
+          action: 'resume',
+          jobKey: dbJobRow.id,
+          subjectId: 'sub-1',
+          materialId: 'mat-1',
+          domain: 'math_stats',
+          markdown: md,
+        })
+      );
+      assert.equal(resInitFail.status, 500);
+      assert.equal(releaseCalls, 1);
+      assert.equal(h.state.aiChatCalls.length, 1);
+      failInitJob = false;
+
+      // 3) Unavailable pinned model -> 400 MODEL_NOT_AVAILABLE, 0 new AI calls, releases trial lease
+      h.state.gatewayModels = ['deepseek-v4.1-flash'];
+      const resUnavailable = await analyzeRoute.POST(
+        h.makeReq({
+          action: 'resume',
+          jobKey: dbJobRow.id,
+          subjectId: 'sub-1',
+          materialId: 'mat-1',
+          domain: 'math_stats',
+          markdown: md,
+        })
+      );
+      const unavailBody = await resUnavailable.json();
+      assert.equal(resUnavailable.status, 400);
+      assert.equal(unavailBody.errorCode, 'MODEL_NOT_AVAILABLE');
+      assert.equal(releaseCalls, 2);
+      assert.equal(h.state.aiChatCalls.length, 1);
+
+      // 4) Provider drift (user switched to non-school provider openai) -> 400 MODEL_SELECTION_NOT_SUPPORTED_FOR_PROVIDER, 0 new AI calls
+      h.setUserKey('gpt-4o');
+      h.state.userConnection.provider = 'openai';
+      const resProviderDrift = await analyzeRoute.POST(
+        h.makeReq({
+          action: 'resume',
+          jobKey: dbJobRow.id,
+          subjectId: 'sub-1',
+          materialId: 'mat-1',
+          domain: 'math_stats',
+          markdown: md,
+        })
+      );
+      const driftBody = await resProviderDrift.json();
+      assert.equal(resProviderDrift.status, 400);
+      assert.equal(driftBody.errorCode, 'MODEL_SELECTION_NOT_SUPPORTED_FOR_PROVIDER');
+      assert.equal(h.state.aiChatCalls.length, 1);
+    } finally {
+      supabaseServerMod.createClient = origCreateClient;
+      supabaseAdminMod.createAdminClient = origCreateAdmin;
       h.cleanup();
     }
   });

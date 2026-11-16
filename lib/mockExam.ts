@@ -2,41 +2,80 @@ import { Concept, MockExamSession, Problem, ProblemType, Subject, isProblemAvail
 import { scopedStorageKey } from './storageScope';
 
 const STORAGE_KEY = 'mock_exam_sessions_v1';
-let inMemoryMockStore: MockExamSession[] = [];
+const inMemoryMockStoreByKey = new Map<string, MockExamSession[]>();
+const dirtyInMemoryKeys = new Set<string>();
+
+function readPersistedMockExams(key: string): { available: boolean; valid: boolean; items: MockExamSession[] } {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = localStorage.getItem(key);
+      if (raw === null) return { available: true, valid: true, items: [] };
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return { available: true, valid: true, items: parsed as MockExamSession[] };
+      }
+      return { available: true, valid: false, items: [] };
+    }
+    return { available: false, valid: true, items: [] };
+  } catch {
+    return { available: true, valid: false, items: [] };
+  }
+}
 
 export function loadMockExams(): MockExamSession[] {
   const key = scopedStorageKey(STORAGE_KEY);
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      const parsed: unknown = JSON.parse(localStorage.getItem(key) || '[]');
-      return Array.isArray(parsed) ? (parsed as MockExamSession[]) : [];
-    }
-    return inMemoryMockStore;
-  } catch {
-    return inMemoryMockStore;
+  if (dirtyInMemoryKeys.has(key)) {
+    return [...(inMemoryMockStoreByKey.get(key) ?? [])];
   }
+  const persisted = readPersistedMockExams(key);
+  if (persisted.available && persisted.valid) {
+    return persisted.items;
+  }
+  return [...(inMemoryMockStoreByKey.get(key) ?? [])];
 }
 
 export function saveMockExam(session: MockExamSession): void {
   const key = scopedStorageKey(STORAGE_KEY);
-  const existing = loadMockExams();
-  const updated = [session, ...existing.filter((item) => item.id !== session.id)];
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
+  const persisted = readPersistedMockExams(key);
+  if (persisted.available && !persisted.valid) {
+    // Preserve potentially recoverable/corrupt localStorage instead of overwriting it.
+    const mem = inMemoryMockStoreByKey.get(key) ?? [];
+    inMemoryMockStoreByKey.set(key, [session, ...mem.filter((item) => item.id !== session.id)]);
+    dirtyInMemoryKeys.add(key);
+    return;
+  }
+
+  const base = dirtyInMemoryKeys.has(key)
+    ? (inMemoryMockStoreByKey.get(key) ?? [])
+    : persisted.available
+      ? persisted.items
+      : (inMemoryMockStoreByKey.get(key) ?? []);
+
+  const updated = [session, ...base.filter((item) => item.id !== session.id)];
+  inMemoryMockStoreByKey.set(key, updated);
+
+  if (persisted.available) {
+    try {
       localStorage.setItem(key, JSON.stringify(updated));
+      dirtyInMemoryKeys.delete(key);
+    } catch {
+      dirtyInMemoryKeys.add(key);
     }
-  } catch {}
-  inMemoryMockStore = updated;
+  }
 }
 
 export function clearMockExams(): void {
   const key = scopedStorageKey(STORAGE_KEY);
+  inMemoryMockStoreByKey.delete(key);
+  dirtyInMemoryKeys.delete(key);
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       localStorage.removeItem(key);
     }
-  } catch {}
-  inMemoryMockStore = [];
+  } catch {
+    dirtyInMemoryKeys.add(key);
+    inMemoryMockStoreByKey.set(key, []);
+  }
 }
 
 /** Deterministic selection favors distinct topics and formats, then weak concepts. */

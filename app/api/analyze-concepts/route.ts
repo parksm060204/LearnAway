@@ -1,7 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiUser } from '../../../lib/auth/apiAuth';
 import { callAiChat, httpStatusForAiError } from '../../../lib/aiClient';
-import { resolveAiConfigForUser } from '../../../lib/aiCredentials';
+import { resolveAiConfigForUser, lookupConnectionSecret, resolveOperatorAiConfig, DEFAULT_SCHOOL_MODEL } from '../../../lib/aiCredentials';
+import {
+  resolveAndVerifyManualModelConfig,
+  resolveEffectiveModelForRequest,
+  validateRequestedModelInput,
+  type EffectiveModelResolutionSuccess,
+} from '../../../lib/aiModelPolicy';
 import { recordAiUsageTelemetry } from '../../../lib/aiCostTelemetry';
 
 export const dynamic = 'force-dynamic';
@@ -552,7 +558,6 @@ export async function POST(req: NextRequest) {
     const totalChunksCount = (dbJobForIdentity?.total_chunks as number) || chunks.length || 1;
 
     // Validate trial limits before reserving credit if user has no personal API key
-    const { lookupConnectionSecret, resolveOperatorAiConfig } = await import('../../../lib/aiCredentials');
     const userLookup = await lookupConnectionSecret(auth.user.id);
 
     if (action !== 'status' && action !== 'retry_save' && action !== 'pause') {
@@ -572,15 +577,54 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    let effectiveModel = (dbJobForIdentity?.model_id as string) || '';
-    if (!effectiveModel) {
-      if (typeof payload.model === 'string' && payload.model.trim()) {
-        effectiveModel = payload.model.trim();
-      } else if (userLookup.status === 'registered' && userLookup.secret?.model) {
-        effectiveModel = userLookup.secret.model;
-      } else {
-        effectiveModel = resolveOperatorAiConfig()?.model || 'deepseek-v4.1-flash';
+    const executesAi = action === 'process' || action === 'resume';
+    const rawRequestedModel = payload.selectedModel ?? payload.model;
+    let resolvedRequestedModel: string | undefined;
+    let pinnedModelResolution: EffectiveModelResolutionSuccess | undefined;
+    let effectiveModel = (dbJobForIdentity?.model_id as string) || DEFAULT_SCHOOL_MODEL;
+
+    if (action === 'retry_save' || action === 'status' || action === 'pause') {
+      const val = validateRequestedModelInput(rawRequestedModel);
+      if (val.ok && val.model) {
+        resolvedRequestedModel = val.model;
+        if (!dbJobForIdentity?.model_id) {
+          effectiveModel = val.model;
+        }
       }
+    } else {
+      const val = validateRequestedModelInput(rawRequestedModel);
+      if (!val.ok) {
+        return NextResponse.json(
+          { success: false, error: val.message, errorCode: val.code },
+          { status: val.status }
+        );
+      }
+      if (dbJobForIdentity?.model_id && val.model && val.model !== dbJobForIdentity.model_id) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `기존 분석 작업은 모델(${dbJobForIdentity.model_id})로 진행되었습니다. 새 모델(${val.model})을 적용하려면 새 분석 작업을 시작해 주세요. 이전 작업 결과와 새 모델 결과를 하나의 작업에 혼합할 수 없습니다.`,
+            errorCode: 'JOB_MODEL_MISMATCH',
+            jobModel: dbJobForIdentity.model_id,
+            currentModel: val.model,
+          },
+          { status: 400 }
+        );
+      }
+      const modelForResolution = (dbJobForIdentity?.model_id as string | undefined) || rawRequestedModel;
+      const modelRes = await resolveEffectiveModelForRequest({
+        userId: auth.user.id,
+        requestedModel: modelForResolution,
+      });
+      if (!modelRes.ok) {
+        return NextResponse.json(
+          { success: false, error: modelRes.message, errorCode: modelRes.code },
+          { status: modelRes.status }
+        );
+      }
+      resolvedRequestedModel = modelRes.requestedModel;
+      pinnedModelResolution = modelRes;
+      effectiveModel = modelRes.effectiveModel;
     }
 
     const expectedJobKey = clientJobKey && dbJobForIdentity
@@ -611,7 +655,6 @@ export async function POST(req: NextRequest) {
     // registration deducts trial credit, opens a 60s execution lease and counts an attempt.
     // init/status/pause must stay side-effect free, otherwise init -> process is blocked
     // by CONCURRENT_EXECUTION_BLOCKED and status polling burns retry attempts.
-    const executesAi = action === 'process' || action === 'resume';
     const cred = action === 'retry_save'
       ? await resolveAiConfigForUser(auth.user.id, {
           taskId: expectedJobKey,
@@ -629,7 +672,7 @@ export async function POST(req: NextRequest) {
           })
         : await resolveAiConfigForUser(auth.user.id);
 
-    if (!cred.ok && action === 'process') {
+    if (!cred.ok && executesAi) {
       if (cred.code === 'concurrent_in_progress') {
         return NextResponse.json(
           {
@@ -655,10 +698,13 @@ export async function POST(req: NextRequest) {
     }
     const resolvedModelId =
       (dbJobForIdentity?.model_id as string) ||
-      (cred.ok ? cred.config.model : resolveOperatorAiConfig()?.model || 'deepseek-v4.1-flash');
+      (cred.ok ? (resolvedRequestedModel || cred.config.model) : resolveOperatorAiConfig()?.model || DEFAULT_SCHOOL_MODEL);
 
     if (dbJobForIdentity?.model_id && cred.ok && cred.config.model !== dbJobForIdentity.model_id) {
-      if (payload.model && payload.model !== dbJobForIdentity.model_id) {
+      if (rawRequestedModel && rawRequestedModel !== dbJobForIdentity.model_id) {
+        if (cred.leaseToken) {
+          await releaseTrialCredit(auth.user.id, expectedJobKey, 'job_model_mismatch', cred.leaseToken).catch(() => {});
+        }
         return NextResponse.json(
           {
             success: false,
@@ -1381,6 +1427,9 @@ export async function POST(req: NextRequest) {
     if (supabaseClient) {
       const initJobRes = await syncJobToSupabase(supabaseClient, auth.user.id, session);
       if (!initJobRes.ok) {
+        if (cred.ok && cred.leaseToken) {
+          await releaseTrialCredit(auth.user.id, jobKey, 'init_job_failed', cred.leaseToken).catch(() => {});
+        }
         return NextResponse.json(
           {
             success: false,
@@ -1407,6 +1456,9 @@ export async function POST(req: NextRequest) {
     }
 
     if (!hasRecoverySigningSecret()) {
+      if (cred.ok && cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, jobKey, 'signing_secret_unconfigured', cred.leaseToken).catch(() => {});
+      }
       return NextResponse.json(
         {
           success: false,
@@ -1429,12 +1481,25 @@ export async function POST(req: NextRequest) {
         { status: needsAiConnection ? 400 : 502 }
       );
     }
-    const aiConfig = {
-      ...cred.config,
-      model: resolvedModelId,
-    };
 
-    let responseModel = resolvedModelId;
+    const routed = await resolveAndVerifyManualModelConfig({
+      baseConfig: cred.config,
+      requestedModel: (dbJobForIdentity?.model_id as string | undefined) || resolvedRequestedModel,
+      pinnedResolution: pinnedModelResolution,
+      credSource: cred.source,
+    });
+    if (!routed.ok) {
+      if (cred.leaseToken) {
+        await releaseTrialCredit(auth.user.id, jobKey, 'model_unavailable', cred.leaseToken).catch(() => {});
+      }
+      return NextResponse.json(
+        { success: false, error: routed.message, errorCode: routed.code },
+        { status: routed.status }
+      );
+    }
+    const aiConfig = routed.config;
+
+    let responseModel = aiConfig.model;
     const workerId = `w_${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
     // System instruction prompt

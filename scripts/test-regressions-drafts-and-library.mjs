@@ -5,21 +5,41 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import Module from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const load = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = fs.mkdtempSync(path.join(os.tmpdir(), 'redcall-regressions-drafts-'));
 
+const origLoad = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (request === 'next/headers') {
+    return { cookies: async () => ({ getAll: () => [], set: () => {} }) };
+  }
+  if (request.startsWith('@/')) {
+    return origLoad.call(this, path.join(output, request.slice(2)), parent, isMain);
+  }
+  return origLoad.call(this, request, parent, isMain);
+};
+
 const compile = spawnSync(
   process.execPath,
   [
     path.join(root, 'node_modules/typescript/bin/tsc'),
     'lib/types.ts',
+    'lib/mockExam.ts',
+    'lib/storageScope.ts',
+    'lib/auth/redirects.ts',
     'lib/practiceAnswerDraft.ts',
     'lib/cloud/types.ts',
     'lib/cloud/mappers.ts',
     'lib/cloud/library.ts',
+    'lib/cloud/learningMigration.ts',
+    'lib/cloud/learningPlan.ts',
+    'lib/cloud/learningLibrary.ts',
+    'lib/cloud/learningRepository.ts',
+    'lib/cloud/learningOriginals.ts',
     'components/ProblemSessionModal.tsx',
     '--jsx',
     'react-jsx',
@@ -42,6 +62,32 @@ const compile = spawnSync(
 if (compile.status !== 0) {
   throw new Error(compile.stdout + compile.stderr);
 }
+
+spawnSync(
+  process.execPath,
+  [
+    path.join(root, 'node_modules/typescript/bin/tsc'),
+    'app/api/persist-drafts/route.ts',
+    'app/api/drive/upload/route.ts',
+    'lib/drive/googleDrive.ts',
+    'lib/materialPolicy.ts',
+    'lib/auth/apiAuth.ts',
+    'lib/supabase/server.ts',
+    '--rootDir',
+    root,
+    '--outDir',
+    output,
+    '--module',
+    'commonjs',
+    '--target',
+    'ES2020',
+    '--moduleResolution',
+    'node',
+    '--esModuleInterop',
+    '--skipLibCheck',
+  ],
+  { cwd: root, encoding: 'utf8' }
+);
 
 function createMockStorage(initial = {}) {
   const map = new Map(Object.entries(initial));
@@ -358,6 +404,541 @@ async function run() {
       isStale: () => switched,
     });
     assert.equal(staleRes.ok, false);
+  });
+
+  await checkAsync('learningMigration: problem insert 후 버전 upload 실패 시 재시도 복구 및 v1/초안 검증', async () => {
+    const learningMigration = load(path.join(output, 'lib/cloud/learningMigration.js'));
+    const userId = 'mig-retry-user';
+    const userPrefix = `redcall_user_${encodeURIComponent(userId)}__`;
+
+    const origWindow = global.window;
+    const origLocalStorage = global.localStorage;
+    const store = new Map();
+    const memStorage = {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => { store.set(k, String(v)); },
+      removeItem: (k) => { store.delete(k); },
+      clear: () => { store.clear(); },
+      key: (i) => Array.from(store.keys())[i] ?? null,
+      get length() { return store.size; },
+    };
+    global.window = { localStorage: memStorage };
+    global.localStorage = memStorage;
+
+    try {
+      // Seed subjects/materials migration marker + local problem (v1) + draft
+      store.set(`${userPrefix}cloud_migration_v1`, JSON.stringify({ completed: true }));
+      const localProblem = {
+        id: 'prob-mig-1',
+        subjectId: 'subj-1',
+        conceptIds: ['c-1'],
+        title: '이관 문제 1',
+        type: 'essay_descriptive',
+        difficulty: 'advanced_college',
+        promptText: '증명하시오.',
+        modelAnswer: '증명 완료',
+        rubric: [{ id: 'r1', label: '논리', maxScore: 100, weight: 1, description: '엄밀성' }],
+        hints: ['힌트'],
+        version: 1,
+        isApproved: true,
+        isDemo: false,
+        createdAt: '2026-01-01T00:00:00.000Z',
+      };
+      const localConceptDraft = {
+        id: 'cd-mig-1',
+        subjectId: 'subj-1',
+        materialId: 'mat-1',
+        title: '초안 개념',
+        description: '설명',
+        coreDefinitionFormulaOrAlgorithm: '정의',
+        prerequisites: [],
+        relatedConcepts: [],
+        commonMisconceptions: [],
+        examples: [],
+        sourceEvidence: { type: 'page', pageNumber: 1, quote: '근거' },
+        status: 'pending',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        needsSourceReview: false,
+      };
+      store.set(`${userPrefix}problems_v1`, JSON.stringify([localProblem]));
+      store.set(`${userPrefix}concept_drafts_v1`, JSON.stringify([localConceptDraft]));
+      store.set(`${userPrefix}concepts_v1`, JSON.stringify([]));
+      store.set(`${userPrefix}problem_drafts_v1`, JSON.stringify([]));
+
+      // Fake Supabase where problem_versions upsert fails on attempt 1, succeeds on attempt 2
+      const dbState = {
+        concepts: [],
+        concept_drafts: [],
+        problems: [],
+        problem_drafts: [],
+        problem_versions: [],
+      };
+      let failVersionUpsert = true;
+
+      const makeFakeClient = () => ({
+        auth: { getUser: async () => ({ data: { user: { id: userId } }, error: null }) },
+        from(table) {
+          let filters = [];
+          let rangeBounds = null;
+          const runSelect = () => {
+            let rows = [...(dbState[table] || [])];
+            for (const [col, val, op] of filters) {
+              if (op === 'in') rows = rows.filter((r) => val.includes(r[col]));
+              else rows = rows.filter((r) => r[col] === val);
+            }
+            if (rangeBounds) {
+              rows = rows.slice(rangeBounds[0], rangeBounds[1] + 1);
+            }
+            return { data: rows, error: null };
+          };
+          const builder = {
+            select() { return builder; },
+            eq(col, val) { filters.push([col, val, 'eq']); return builder; },
+            in(col, val) { filters.push([col, val, 'in']); return builder; },
+            order() { return builder; },
+            range(from, to) { rangeBounds = [from, to]; return builder; },
+            then(resolve) { return Promise.resolve(runSelect()).then(resolve); },
+            upsert(rows, opts) {
+              if (table === 'problem_versions' && failVersionUpsert) {
+                return Promise.resolve({ data: null, error: { message: 'injected version upload failure' } });
+              }
+              const arr = Array.isArray(rows) ? rows : [rows];
+              const inserted = [];
+              for (const row of arr) {
+                const keyField = table === 'problem_versions' ? 'problem_id' : 'id';
+                const exists = dbState[table].some((r) =>
+                  table === 'problem_versions'
+                    ? r.problem_id === row.problem_id && r.version === row.version
+                    : r[keyField] === row[keyField]
+                );
+                if (!exists) {
+                  const storedRow = {
+                    ...row,
+                    user_id: userId,
+                    created_at: row.created_at ?? row.payload?.createdAt ?? '2026-01-01T00:00:00.000Z',
+                    updated_at: row.updated_at ?? '2026-01-01T00:00:00.000Z',
+                    payload: row.payload ?? row,
+                  };
+                  dbState[table].push(storedRow);
+                  inserted.push(storedRow);
+                } else if (!opts?.ignoreDuplicates) {
+                  const idx = dbState[table].findIndex((r) => r[keyField] === row[keyField]);
+                  dbState[table][idx] = {
+                    ...row,
+                    user_id: userId,
+                    created_at: row.created_at ?? row.payload?.createdAt ?? '2026-01-01T00:00:00.000Z',
+                    updated_at: row.updated_at ?? '2026-01-01T00:00:00.000Z',
+                    payload: row.payload ?? row,
+                  };
+                  inserted.push(dbState[table][idx]);
+                }
+              }
+              return {
+                select: () => Promise.resolve({ data: inserted, error: null }),
+                then: (resolve) => Promise.resolve({ data: inserted, error: null }).then(resolve),
+              };
+            },
+          };
+          return builder;
+        },
+      });
+
+      const fakeSupabase = makeFakeClient();
+
+      // Attempt 1: problem row is inserted, version upload fails -> must NOT write completion marker
+      const firstRes = await learningMigration.migrateLocalLearningToCloud(userId, fakeSupabase);
+      assert.equal(firstRes.ok, false, `버전 업로드 실패 시 이관은 실패해야 함: ${firstRes.message}`);
+      assert.equal(dbState.problems.length, 1, `문제 본체는 이미 삽입됨 (${firstRes.message})`);
+      assert.equal(dbState.problem_versions.length, 0, '버전 스냅샷은 아직 없음');
+      assert.equal(store.has(`${userPrefix}cloud_learning_migration_v1`), false, '검증 전 완료 표시가 기록되면 안 됨');
+
+      // Attempt 2: retry (problem is skipped by planLearningMigration, yet version v1 must be recovered!)
+      failVersionUpsert = false;
+      const retryRes = await learningMigration.migrateLocalLearningToCloud(userId, fakeSupabase);
+      assert.equal(retryRes.ok, true, `재시도 성공해야 함: ${retryRes.message}`);
+      assert.equal(dbState.problem_versions.length, 1, '누락된 v1 버전 스냅샷이 독립 복구되어야 함');
+      assert.equal(dbState.problem_versions[0].version, 1);
+      assert.equal(store.has(`${userPrefix}cloud_learning_migration_v1`), true, '검증 통과 후 완료 표시 기록');
+
+      // Legacy falsely-completed marker without verifiedVersion=2 & missing v1 version -> detected and repaired
+      dbState.problem_versions = [];
+      store.set(`${userPrefix}cloud_learning_migration_v1`, JSON.stringify({ completed: true, uploaded: 1 }));
+      const legacyState = learningMigration.getLearningMigrationState(userId);
+      assert.equal(legacyState.imported, false, '구형 미검증 완료 표시는 재검증 대상으로 탐지되어야 함');
+      assert.equal(legacyState.resume, true);
+
+      const repairRes = await learningMigration.migrateLocalLearningToCloud(userId, fakeSupabase);
+      assert.equal(repairRes.ok, true, `구형 미검증 마커 복구 성공해야 함: ${repairRes.message}`);
+      assert.equal(dbState.problem_versions.length, 1, '구형 마커 복구 시 누락 v1 버전 복원');
+
+      // Same-version snapshot content conflict -> verifyMigration MUST reject and NOT write completion marker
+      store.delete(`${userPrefix}cloud_learning_migration_v1`);
+      dbState.problem_versions[0].snapshot = {
+        ...dbState.problem_versions[0].snapshot,
+        promptText: '변조된 다른 지문 내용',
+      };
+      const conflictSnapRes = await learningMigration.migrateLocalLearningToCloud(userId, fakeSupabase);
+      assert.equal(conflictSnapRes.ok, false, '동일 버전 다른 스냅샷 내용은 완료 처리되면 안 됨');
+      assert.equal(store.has(`${userPrefix}cloud_learning_migration_v1`), false, '스냅샷 내용 충돌 시 완료 마커 금지');
+
+      // JSONB key reordering identical content -> MUST succeed
+      const reverseKeys = (obj) => {
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+        return Object.fromEntries(Object.keys(obj).reverse().map((k) => [k, reverseKeys(obj[k])]));
+      };
+      dbState.problems[0].payload = reverseKeys(localProblem);
+      dbState.concept_drafts[0].payload = reverseKeys(localConceptDraft);
+      dbState.problem_versions[0].snapshot = reverseKeys({
+        ...localProblem,
+        version: 1,
+        editedAt: localProblem.createdAt,
+        editReason: 'migrated',
+      });
+      const reorderedRes = await learningMigration.migrateLocalLearningToCloud(userId, fakeSupabase);
+      assert.equal(reorderedRes.ok, true, `JSONB 키 재정렬 동일 내용은 성공해야 함: ${reorderedRes.message}`);
+
+      // Pagination & ID chunking test for listProblemVersionsByProblemIds (>1000 rows / >100 IDs)
+      const learningRepo = load(path.join(output, 'lib/cloud/learningRepository.js'));
+      const manyIds = Array.from({ length: 120 }, (_, i) => `prob-page-${i}`);
+      const origVersions = dbState.problem_versions;
+      dbState.problem_versions = manyIds.flatMap((pid) => [
+        { problem_id: pid, version: 1, snapshot: { version: 1, title: pid, promptText: 'p', type: 'essay_descriptive', conceptIds: ['c1'], hints: ['h'], modelAnswer: 'a', rubric: [{ id: 'r1', label: 'l', maxScore: 100 }] } },
+        { problem_id: pid, version: 2, snapshot: { version: 2, title: pid, promptText: 'p2', type: 'essay_descriptive', conceptIds: ['c1'], hints: ['h'], modelAnswer: 'a', rubric: [{ id: 'r1', label: 'l', maxScore: 100 }] } },
+      ]);
+      const pagedVersionsRes = await learningRepo.listProblemVersionsByProblemIds(fakeSupabase, manyIds);
+      assert.equal(pagedVersionsRes.ok, true, '청크+페이지네이션 버전 조회 성공해야 함');
+      assert.equal(Object.keys(pagedVersionsRes.data).length, 120, '120개 문제 모두 조회되어야 함');
+      assert.equal(pagedVersionsRes.data['prob-page-119'].length, 2, '마지막 문제 v1/v2 모두 포함');
+      dbState.problem_versions = origVersions;
+    } finally {
+      global.window = origWindow;
+      global.localStorage = origLocalStorage;
+    }
+  });
+
+  await check('mockExam scopes in-memory store per account and never overwrites corrupt localStorage', async () => {
+    const scopeMod = load(path.join(output, 'lib/storageScope.js'));
+    const mockExamMod = load(path.join(output, 'lib/mockExam.js'));
+    const origWindow = global.window;
+    const origLocalStorage = global.localStorage;
+    try {
+      // 1. Without localStorage, account A and B must have isolated in-memory stores
+      global.window = undefined;
+      global.localStorage = undefined;
+      scopeMod.setStorageScope({ kind: 'user', userId: 'mock-user-a' });
+      mockExamMod.saveMockExam({
+        id: 'exam-a',
+        subjectId: 'sub-a',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        endsAt: '2026-01-01T01:00:00.000Z',
+        durationMinutes: 60,
+        status: 'in_progress',
+        selectedConceptIds: [],
+        selectedTypes: [],
+        problems: [],
+        answers: {},
+        evaluations: {},
+      });
+      assert.equal(mockExamMod.loadMockExams().length, 1);
+
+      scopeMod.setStorageScope({ kind: 'user', userId: 'mock-user-b' });
+      assert.equal(mockExamMod.loadMockExams().length, 0, '계정 B는 계정 A의 인메모리 모의고사를 보지 않아야 함');
+
+      // 2. Corrupt localStorage must not be overwritten by saveMockExam
+      const corruptRaw = '{corrupt-json';
+      const backing = new Map([['redcall_user_mock-user-b__mock_exam_sessions_v1', corruptRaw]]);
+      const fakeLs = {
+        getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+        setItem: (k, v) => { backing.set(k, v); },
+        removeItem: (k) => { backing.delete(k); },
+      };
+      global.window = { localStorage: fakeLs };
+      global.localStorage = fakeLs;
+      mockExamMod.saveMockExam({
+        id: 'exam-b',
+        subjectId: 'sub-b',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        endsAt: '2026-01-01T01:00:00.000Z',
+        durationMinutes: 60,
+        status: 'in_progress',
+        selectedConceptIds: [],
+        selectedTypes: [],
+        problems: [],
+        answers: {},
+        evaluations: {},
+      });
+      assert.equal(
+        backing.get('redcall_user_mock-user-b__mock_exam_sessions_v1'),
+        corruptRaw,
+        '손상된 localStorage 모의고사 데이터는 덮어쓰지 않고 보존되어야 함'
+      );
+      assert.equal(mockExamMod.loadMockExams().length, 1, '손상 시에도 인메모리 최신 저장본을 반환해야 함');
+
+      // 3. setItem quota failure -> subsequent save -> storage recovery -> same-ID latest-content
+      scopeMod.setStorageScope({ kind: 'user', userId: 'mock-user-c' });
+      let throwQuota = true;
+      const quotaLs = {
+        getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+        setItem: (k, v) => {
+          if (throwQuota) throw new Error('QuotaExceededError');
+          backing.set(k, v);
+        },
+        removeItem: (k) => { backing.delete(k); },
+      };
+      global.window = { localStorage: quotaLs };
+      global.localStorage = quotaLs;
+
+      mockExamMod.saveMockExam({
+        id: 'exam-c1',
+        subjectId: 'sub-c',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        endsAt: '2026-01-01T01:00:00.000Z',
+        durationMinutes: 60,
+        status: 'in_progress',
+        selectedConceptIds: [],
+        selectedTypes: [],
+        problems: [],
+        answers: { p1: 'first' },
+        evaluations: {},
+      });
+      assert.equal(mockExamMod.loadMockExams().length, 1, 'setItem 실패 후에도 loadMockExams가 최신 메모리 항목을 반환해야 함');
+      assert.equal(mockExamMod.loadMockExams()[0].answers.p1, 'first');
+
+      // Subsequent save while quota still failing must preserve previous unsaved exam
+      mockExamMod.saveMockExam({
+        id: 'exam-c2',
+        subjectId: 'sub-c',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        endsAt: '2026-01-01T01:00:00.000Z',
+        durationMinutes: 60,
+        status: 'in_progress',
+        selectedConceptIds: [],
+        selectedTypes: [],
+        problems: [],
+        answers: { p2: 'second' },
+        evaluations: {},
+      });
+      assert.equal(mockExamMod.loadMockExams().length, 2, '연속 setItem 실패 시 이전 미저장 모의고사도 보존되어야 함');
+
+      // Storage recovers & same-ID update keeps latest content
+      throwQuota = false;
+      mockExamMod.saveMockExam({
+        id: 'exam-c1',
+        subjectId: 'sub-c',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        endsAt: '2026-01-01T01:00:00.000Z',
+        durationMinutes: 60,
+        status: 'submitted',
+        selectedConceptIds: [],
+        selectedTypes: [],
+        problems: [],
+        answers: { p1: 'updated' },
+        evaluations: {},
+      });
+      const recovered = mockExamMod.loadMockExams();
+      assert.equal(recovered.length, 2);
+      assert.equal(recovered.find((e) => e.id === 'exam-c1')?.answers.p1, 'updated');
+      assert.equal(recovered.find((e) => e.id === 'exam-c1')?.status, 'submitted');
+      const persistedParsed = JSON.parse(backing.get('redcall_user_mock-user-c__mock_exam_sessions_v1'));
+      assert.equal(persistedParsed.length, 2, '저장소 복구 시 누적된 모의고사 전체가 localStorage에 반영되어야 함');
+    } finally {
+      global.window = origWindow;
+      global.localStorage = origLocalStorage;
+    }
+  });
+
+  await check('resolveAuthCallbackOrigin enforces http/https schemes, valid host/port syntax, and safe fallbacks', async () => {
+    const { resolveAuthCallbackOrigin } = load(path.join(output, 'lib/auth/redirects.js'));
+    assert.equal(
+      resolveAuthCallbackOrigin({ siteUrl: 'https://learnaway.example.com/some/path', fallbackOrigin: 'http://localhost:3000' }),
+      'https://learnaway.example.com'
+    );
+    assert.equal(
+      resolveAuthCallbackOrigin({ siteUrl: 'javascript:alert(1)', fallbackOrigin: 'http://localhost:3000' }),
+      'http://localhost:3000'
+    );
+    assert.equal(
+      resolveAuthCallbackOrigin({ siteUrl: 'ftp://files.example.com', fallbackOrigin: 'http://localhost:3000' }),
+      'http://localhost:3000'
+    );
+    assert.equal(
+      resolveAuthCallbackOrigin({ siteUrl: 'not-a-valid-url', fallbackOrigin: 'http://localhost:3000' }),
+      'http://localhost:3000'
+    );
+    assert.equal(
+      resolveAuthCallbackOrigin({
+        forwardedHost: 'proxy.example.com:8443',
+        forwardedProto: 'https',
+        fallbackOrigin: 'http://localhost:3000',
+      }),
+      'https://proxy.example.com:8443'
+    );
+    assert.equal(
+      resolveAuthCallbackOrigin({
+        forwardedHost: 'evil.com/path',
+        forwardedProto: 'https',
+        fallbackOrigin: 'http://localhost:3000',
+      }),
+      'http://localhost:3000'
+    );
+    assert.equal(
+      resolveAuthCallbackOrigin({
+        forwardedHost: 'user@evil.com',
+        forwardedProto: 'https',
+        fallbackOrigin: 'http://localhost:3000',
+      }),
+      'http://localhost:3000'
+    );
+    assert.equal(
+      resolveAuthCallbackOrigin({
+        forwardedHost: 'proxy.example.com',
+        forwardedProto: 'javascript',
+        fallbackOrigin: 'http://localhost:3000',
+      }),
+      'https://proxy.example.com'
+    );
+  });
+
+  await check('persist-drafts rejects invalid draft array items with 400 before DB write and accepts valid items', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server.js'));
+    const apiAuthMod = load(path.join(output, 'lib/auth/apiAuth.js'));
+    const supaServerMod = load(path.join(output, 'lib/supabase/server.js'));
+    const learningRepoMod = load(path.join(output, 'lib/cloud/learningRepository.js'));
+
+    const origRequireApiUser = apiAuthMod.requireApiUser;
+    const origCreateClient = supaServerMod.createClient;
+    const origUpsertConceptDrafts = learningRepoMod.upsertConceptDrafts;
+
+    let createClientCalls = 0;
+    apiAuthMod.requireApiUser = async () => ({ ok: true, user: { id: 'u-persist-1', email: 'u@example.com' } });
+    supaServerMod.createClient = async () => {
+      createClientCalls++;
+      return {};
+    };
+    learningRepoMod.upsertConceptDrafts = async (_supa, drafts) => ({ ok: true, data: drafts });
+
+    try {
+      const persistRoute = load(path.join(output, 'app/api/persist-drafts/route.js'));
+      const invalidPayloads = [
+        { kind: 'concept', drafts: [null] },
+        { kind: 'concept', drafts: [{ id: '', subjectId: 'sub-1' }] },
+        { kind: 'problem', drafts: [{ id: 'd-1' }] },
+        { kind: 'problem', drafts: [['nested']] },
+      ];
+      for (const body of invalidPayloads) {
+        const req = new NextRequest('http://localhost/api/persist-drafts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const res = await persistRoute.POST(req);
+        assert.equal(res.status, 400);
+      }
+      assert.equal(createClientCalls, 0, '잘못된 초안 배열은 DB 클라이언트 생성 전에 차단되어야 함');
+
+      const validReq = new NextRequest('http://localhost/api/persist-drafts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'concept', drafts: [{ id: 'd-ok', subjectId: 'sub-1', title: 'Valid' }] }),
+      });
+      const validRes = await persistRoute.POST(validReq);
+      assert.equal(validRes.status, 200);
+      assert.equal(createClientCalls, 1);
+    } finally {
+      apiAuthMod.requireApiUser = origRequireApiUser;
+      supaServerMod.createClient = origCreateClient;
+      learningRepoMod.upsertConceptDrafts = origUpsertConceptDrafts;
+    }
+  });
+
+  await check('drive upload persists refreshed OAuth cookie on init and intermediate chunk responses', async () => {
+    const { NextRequest } = load(path.join(root, 'node_modules/next/server.js'));
+    const apiAuthMod = load(path.join(output, 'lib/auth/apiAuth.js'));
+    const driveLibMod = load(path.join(output, 'lib/drive/googleDrive.js'));
+
+    const origRequireApiUser = apiAuthMod.requireApiUser;
+    const origGetConfig = driveLibMod.getGoogleDriveConfig;
+    const origDecrypt = driveLibMod.decryptPayload;
+    const origEncrypt = driveLibMod.encryptPayload;
+    const origRefresh = driveLibMod.refreshGoogleAccessToken;
+    const origFindFolder = driveLibMod.findOrCreateBackupFolder;
+    const origCreateResumable = driveLibMod.createResumableUploadSession;
+    const origUploadChunk = driveLibMod.uploadResumableChunk;
+
+    apiAuthMod.requireApiUser = async () => ({ ok: true, user: { id: 'u-drive-1', email: 'd@example.com' } });
+    driveLibMod.getGoogleDriveConfig = () => ({ configured: true, clientId: 'cid', clientSecret: 'csec', redirectUri: 'http://localhost/cb' });
+    driveLibMod.decryptPayload = (token) => {
+      if (token === 'enc-expired-session') {
+        return JSON.stringify({
+          userId: 'u-drive-1',
+          googleEmail: 'd@example.com',
+          accessToken: 'old-access',
+          expiresAt: Date.now() - 60_000,
+          refreshToken: 'refresh-tok-1',
+        });
+      }
+      if (token === 'enc-upload-session') {
+        return JSON.stringify({
+          userId: 'u-drive-1',
+          jobId: 'job-1',
+          resumableUri: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=abc',
+          totalBytes: 10,
+          fileName: 'backup.json',
+          completeness: 'complete',
+          totalMaterials: 1,
+          withFiles: 1,
+          createdAt: Date.now(),
+        });
+      }
+      return null;
+    };
+    driveLibMod.encryptPayload = (raw) => `enc:${Buffer.from(raw, 'utf8').toString('base64')}`;
+    driveLibMod.refreshGoogleAccessToken = async () => ({ accessToken: 'new-access-tok', expiresIn: 3600 });
+    driveLibMod.findOrCreateBackupFolder = async () => 'folder-1';
+    driveLibMod.createResumableUploadSession = async () => 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=abc';
+    driveLibMod.uploadResumableChunk = async () => ({ complete: false, range: 'bytes=0-4' });
+
+    try {
+      const driveUploadRoute = load(path.join(output, 'app/api/drive/upload/route.js'));
+
+      // 1. init with expired session -> refreshes token and sets updated cookie
+      const initReq = new NextRequest('http://localhost/api/drive/upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          cookie: `${driveLibMod.DRIVE_SESSION_COOKIE_NAME}=enc-expired-session`,
+        },
+        body: JSON.stringify({ action: 'init', totalBytes: 10, totalMaterials: 1, withFiles: 1 }),
+      });
+      const initRes = await driveUploadRoute.POST(initReq);
+      assert.equal(initRes.status, 200);
+      const initSetCookie = initRes.headers.get('set-cookie') || '';
+      assert.ok(initSetCookie.includes(driveLibMod.DRIVE_SESSION_COOKIE_NAME), 'init 응답에 갱신된 Drive 쿠키가 포함되어야 함');
+
+      // 2. intermediate chunk with expired session -> refreshes token and sets updated cookie
+      const chunkReq = new NextRequest('http://localhost/api/drive/upload', {
+        method: 'POST',
+        headers: {
+          cookie: `${driveLibMod.DRIVE_SESSION_COOKIE_NAME}=enc-expired-session`,
+          'x-upload-session': 'enc-upload-session',
+          'content-range': 'bytes 0-4/10',
+        },
+        body: Buffer.from('hello'),
+      });
+      const chunkRes = await driveUploadRoute.POST(chunkReq);
+      assert.equal(chunkRes.status, 200);
+      const chunkSetCookie = chunkRes.headers.get('set-cookie') || '';
+      assert.ok(chunkSetCookie.includes(driveLibMod.DRIVE_SESSION_COOKIE_NAME), '중간 청크 응답에도 갱신된 Drive 쿠키가 포함되어야 함');
+    } finally {
+      apiAuthMod.requireApiUser = origRequireApiUser;
+      driveLibMod.getGoogleDriveConfig = origGetConfig;
+      driveLibMod.decryptPayload = origDecrypt;
+      driveLibMod.encryptPayload = origEncrypt;
+      driveLibMod.refreshGoogleAccessToken = origRefresh;
+      driveLibMod.findOrCreateBackupFolder = origFindFolder;
+      driveLibMod.createResumableUploadSession = origCreateResumable;
+      driveLibMod.uploadResumableChunk = origUploadChunk;
+    }
   });
 
   console.log(`${passed} draft/library regression checks passed`);

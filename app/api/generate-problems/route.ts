@@ -40,6 +40,8 @@ import {
   SourceVerificationStatus,
 } from '../../../lib/types';
 import { computeMarkdownHash, computeAiTaskInputIdentifier, verifyPageGrounding } from '../../../lib/markdownUtils';
+import { validateEvaluationRubric } from '../../../lib/evaluationValidation';
+import { materialContentHash } from '../../../lib/cloud/hash';
 export { verifyPageGrounding };
 
 interface SourceInput {
@@ -298,6 +300,296 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
     const combinedSourceHash = computeAiTaskInputIdentifier(combinedSource, 'combined_v1');
 
     const isSaveRetry = Boolean(payload.isSaveRetry || payload.action === 'retry_save');
+
+    // Pre-AI & pre-credit-reservation ownership and source hash verification (fail-closed: never skip DB check)
+    let supabaseForValidation: Awaited<ReturnType<typeof createClient>>;
+    try {
+      supabaseForValidation = await createClient();
+    } catch {
+      return NextResponse.json(
+        { success: false, error: '서버 데이터베이스 연결을 초기화할 수 없습니다.', errorCode: 'DB_QUERY_ERROR' },
+        { status: 500 }
+      );
+    }
+    if (!supabaseForValidation || typeof supabaseForValidation.from !== 'function') {
+      return NextResponse.json(
+        { success: false, error: '서버 데이터베이스 클라이언트가 유효하지 않습니다.', errorCode: 'DB_QUERY_ERROR' },
+        { status: 500 }
+      );
+    }
+
+    const changedMaterialIds = new Set<string>();
+    const serverVerifiedMaterialIds = new Set<string>();
+    const serverVerifiedConceptIds = new Set<string>();
+    let hasPreCheckHashMismatch = false;
+    let hasPreCheckStorageError = false;
+    try {
+      const { data: subRow, error: subErr } = await supabaseForValidation
+        .from('subjects')
+        .select('id, user_id')
+        .eq('id', subjectId)
+        .eq('user_id', auth.user.id)
+        .maybeSingle();
+
+      if (subErr) {
+        return NextResponse.json(
+          { success: false, error: '과목 정보를 확인하는 중 데이터베이스 오류가 발생했습니다.', errorCode: 'DB_QUERY_ERROR' },
+          { status: 500 }
+        );
+      }
+      if (!subRow) {
+        return NextResponse.json(
+          { success: false, error: '과목 또는 자료를 찾을 수 없거나 접근 권한이 없습니다.', errorCode: 'NOT_FOUND_OR_FORBIDDEN' },
+          { status: 404 }
+        );
+      }
+
+      const conceptIdsToCheck = Array.from(new Set(concepts.map((c) => c.id).filter(Boolean)));
+      if (conceptIdsToCheck.length > 0) {
+        const { data: conceptRows, error: conceptErr } = await supabaseForValidation
+          .from('concepts')
+          .select('id, user_id, subject_id')
+          .in('id', conceptIdsToCheck);
+
+        if (conceptErr) {
+          return NextResponse.json(
+            { success: false, error: '개념 정보를 확인하는 중 데이터베이스 오류가 발생했습니다.', errorCode: 'DB_QUERY_ERROR' },
+            { status: 500 }
+          );
+        }
+        for (const cRow of (conceptRows ?? []) as Array<{ id: string; user_id?: string; subject_id?: string }>) {
+          if (cRow.user_id && cRow.user_id !== auth.user.id) {
+            return NextResponse.json(
+              { success: false, error: '과목 또는 개념을 찾을 수 없거나 접근 권한이 없습니다.', errorCode: 'NOT_FOUND_OR_FORBIDDEN' },
+              { status: 404 }
+            );
+          }
+          if (cRow.subject_id && cRow.subject_id !== subjectId) {
+            return NextResponse.json(
+              { success: false, error: '선택한 개념 중 현재 과목에 속하지 않는 개념이 포함되어 있습니다.', errorCode: 'SUBJECT_MISMATCH' },
+              { status: 400 }
+            );
+          }
+          serverVerifiedConceptIds.add(cRow.id);
+        }
+      }
+
+      const materialIdsToCheck = Array.from(
+        new Set(sources.map((s) => s.materialId).filter((id) => id && id !== 'unknown' && id !== 'legacy'))
+      );
+      if (materialIdsToCheck.length > 0) {
+        const { data: matRows, error: matErr } = await supabaseForValidation
+          .from('materials')
+          .select('id, user_id, subject_id, content_hash, sync_body, markdown_path, pages_path, transcript_path')
+          .in('id', materialIdsToCheck);
+
+        if (matErr) {
+          return NextResponse.json(
+            { success: false, error: '자료 정보를 확인하는 중 데이터베이스 오류가 발생했습니다.', errorCode: 'DB_QUERY_ERROR' },
+            { status: 500 }
+          );
+        }
+        const matMap = new Map(
+          ((matRows ?? []) as Array<{
+            id: string;
+            user_id?: string;
+            subject_id?: string;
+            content_hash?: string | null;
+            sync_body?: boolean;
+            markdown_path?: string | null;
+            pages_path?: string | null;
+            transcript_path?: string | null;
+          }>).map((r) => [r.id, r])
+        );
+
+        for (const src of sources) {
+          const matRow = matMap.get(src.materialId);
+          // If !matRow (RLS filtered foreign ID or unregistered local material),
+          // it is NOT added to serverVerifiedMaterialIds so provenance stays 'unverified'.
+          if (!matRow) continue;
+          if (matRow.user_id && matRow.user_id !== auth.user.id) {
+            return NextResponse.json(
+              { success: false, error: '과목 또는 자료를 찾을 수 없거나 접근 권한이 없습니다.', errorCode: 'NOT_FOUND_OR_FORBIDDEN' },
+              { status: 404 }
+            );
+          }
+          if (matRow.subject_id && matRow.subject_id !== subjectId) {
+            return NextResponse.json(
+              { success: false, error: '자료가 현재 과목에 속하지 않습니다.', errorCode: 'SUBJECT_MISMATCH' },
+              { status: 400 }
+            );
+          }
+
+          let hashMismatch = false;
+          let verifiedByServer = false;
+
+          if (matRow.sync_body) {
+            if (matRow.markdown_path) {
+              if (typeof supabaseForValidation.storage?.from !== 'function') {
+                hasPreCheckStorageError = true;
+                changedMaterialIds.add(src.materialId);
+                continue;
+              }
+              const { data: blobData, error: dlErr } = await supabaseForValidation.storage
+                .from('materials')
+                .download(matRow.markdown_path);
+              if (dlErr || !blobData || typeof (blobData as Blob).text !== 'function') {
+                hasPreCheckStorageError = true;
+                changedMaterialIds.add(src.materialId);
+                continue;
+              }
+              const serverMarkdown = await (blobData as Blob).text();
+              if (computeMarkdownHash(serverMarkdown) !== computeMarkdownHash(src.markdown)) {
+                hashMismatch = true;
+              } else {
+                verifiedByServer = true;
+              }
+            } else if (matRow.content_hash) {
+              if (matRow.content_hash.startsWith('h_')) {
+                if (computeMarkdownHash(src.markdown) !== matRow.content_hash) {
+                  hashMismatch = true;
+                } else {
+                  verifiedByServer = true;
+                }
+              } else if (matRow.content_hash.startsWith('mh_') && !matRow.pages_path && !matRow.transcript_path) {
+                if (materialContentHash({ markdown: src.markdown }) !== matRow.content_hash) {
+                  hashMismatch = true;
+                } else {
+                  verifiedByServer = true;
+                }
+              }
+              // If mh_ with pages_path/transcript_path and no markdown_path, cannot verify
+              // markdown-only body against mh_, so verifiedByServer remains false (unverified).
+            }
+          } else {
+            // Owned local-only material (sync_body: false)
+            verifiedByServer = true;
+          }
+
+          if (hashMismatch) {
+            hasPreCheckHashMismatch = true;
+            changedMaterialIds.add(src.materialId);
+          } else if (verifiedByServer) {
+            serverVerifiedMaterialIds.add(src.materialId);
+          }
+        }
+      }
+    } catch {
+      return NextResponse.json(
+        { success: false, error: '소유권 및 자료 무결성 검증 중 오류가 발생했습니다.', errorCode: 'DB_QUERY_ERROR' },
+        { status: 500 }
+      );
+    }
+
+    const reconcileCachedDraftsSourceStatus = async (drafts: ProblemDraft[]): Promise<ProblemDraft[]> => {
+      const refIds = Array.from(
+        new Set(
+          drafts.flatMap((d) => [
+            ...(d.sourceMaterialId ? [d.sourceMaterialId] : []),
+            ...((d.sourceMaterials ?? []).map((m) => m.materialId)),
+          ]).filter((id) => id && id !== 'unknown' && id !== 'legacy')
+        )
+      );
+      const latestMatMap = new Map<
+        string,
+        { id: string; user_id?: string; subject_id?: string; content_hash?: string | null; sync_body?: boolean; markdown_path?: string | null }
+      >();
+      let lookupFailed = false;
+      if (refIds.length > 0) {
+        try {
+          const { data: rows, error: matLookupErr } = await supabaseForValidation
+            .from('materials')
+            .select('id, user_id, subject_id, content_hash, sync_body, markdown_path')
+            .in('id', refIds);
+          if (matLookupErr) {
+            lookupFailed = true;
+          } else {
+            for (const r of (rows ?? []) as Array<{
+              id: string;
+              user_id?: string;
+              subject_id?: string;
+              content_hash?: string | null;
+              sync_body?: boolean;
+              markdown_path?: string | null;
+            }>) {
+              latestMatMap.set(r.id, r);
+            }
+          }
+        } catch {
+          lookupFailed = true;
+        }
+      }
+      if (lookupFailed) {
+        return drafts.map((draft) => ({
+          ...draft,
+          needsSourceReview: true,
+          sourceVerificationStatus: 'needs_review',
+        }));
+      }
+
+      // If any synced material has markdown_path, check its latest body hash against draft refs
+      const latestServerHashById = new Map<string, string>();
+      for (const [id, row] of latestMatMap.entries()) {
+        if (row.sync_body && row.markdown_path && typeof supabaseForValidation.storage?.from === 'function') {
+          try {
+            const { data: blobData, error: dlErr } = await supabaseForValidation.storage
+              .from('materials')
+              .download(row.markdown_path);
+            if (dlErr || !blobData || typeof (blobData as Blob).text !== 'function') {
+              changedMaterialIds.add(id);
+            } else {
+              latestServerHashById.set(id, computeMarkdownHash(await (blobData as Blob).text()));
+            }
+          } catch {
+            changedMaterialIds.add(id);
+          }
+        }
+      }
+
+      const requestSourceHashById = new Map(sources.map((s) => [s.materialId, computeMarkdownHash(s.markdown)]));
+      return drafts.map((draft) => {
+        const refs = draft.sourceMaterials ?? [];
+        const hasChangedFromRequest =
+          refs.some((r) => changedMaterialIds.has(r.materialId)) ||
+          (draft.sourceMaterialId ? changedMaterialIds.has(draft.sourceMaterialId) : false) ||
+          refs.some((r) => {
+            const reqHash = requestSourceHashById.get(r.materialId);
+            return Boolean(reqHash && r.markdownHash && reqHash !== r.markdownHash);
+          }) ||
+          refs.some((r) => {
+            const srvHash = latestServerHashById.get(r.materialId);
+            return Boolean(srvHash && r.markdownHash && srvHash !== r.markdownHash);
+          });
+        const hasDeletedOrMovedMat = refs.some((r) => {
+          const row = latestMatMap.get(r.materialId);
+          if (!row) {
+            // Material missing/deleted from server (even if stale request sources still carry it):
+            // if the draft previously claimed verified/server provenance, require source review.
+            return draft.sourceVerificationStatus === 'verified' || Boolean(draft.sourceContentVersion);
+          }
+          return (row.subject_id && row.subject_id !== subjectId) || (row.user_id && row.user_id !== auth.user.id);
+        });
+        const primaryMissingOrMoved =
+          draft.sourceMaterialId &&
+          draft.sourceMaterialId !== 'unknown' &&
+          draft.sourceMaterialId !== 'legacy' &&
+          (() => {
+            const row = latestMatMap.get(draft.sourceMaterialId!);
+            if (!row) {
+              return draft.sourceVerificationStatus === 'verified' || Boolean(draft.sourceContentVersion);
+            }
+            return (row.subject_id && row.subject_id !== subjectId) || (row.user_id && row.user_id !== auth.user.id);
+          })();
+        if (hasChangedFromRequest || hasDeletedOrMovedMat || primaryMissingOrMoved) {
+          return {
+            ...draft,
+            needsSourceReview: true,
+            sourceVerificationStatus: 'needs_review',
+          };
+        }
+        return draft;
+      });
+    };
     let resolvedRequestedModel: string | undefined;
     let effectiveModel = DEFAULT_SCHOOL_MODEL;
     let preloadedLookupStatus: 'registered' | 'unregistered' | 'lookup_failed' = 'unregistered';
@@ -460,8 +752,8 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
       }
       const cached = saved.cachedResult as { drafts?: ProblemDraft[]; count?: number; generationJobId?: string } | null;
       const generationJobId = cached?.generationJobId || taskId || randomUUID();
-      const drafts = Array.isArray(cached?.drafts) ? cached.drafts : [];
-      if (drafts.length === 0) {
+      const rawCachedDrafts = Array.isArray(cached?.drafts) ? cached.drafts : [];
+      if (rawCachedDrafts.length === 0) {
         return NextResponse.json(
           {
             success: false,
@@ -471,6 +763,7 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
           { status: 400 }
         );
       }
+      const drafts = await reconcileCachedDraftsSourceStatus(rawCachedDrafts);
       let outcome: { persisted: boolean; drafts: ProblemDraft[]; persistError?: string } = {
         persisted: false,
         drafts,
@@ -502,6 +795,76 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
         fromCache: true,
         taskId: saved.taskId || taskId,
       });
+    }
+
+    // If source hash changed or synced storage body could not be downloaded on server,
+    // allow recovering an already-completed server task (flagged needsSourceReview)
+    // without calling AI, or reject before reserving any credit.
+    if (hasPreCheckHashMismatch || hasPreCheckStorageError) {
+      const saved = await lookupSavedTaskResult(
+        auth.user.id,
+        taskId,
+        'generate_problems',
+        inputIdentifier,
+        legacyInputIdentifiers
+      );
+      if (saved.success && saved.cachedResult && typeof saved.cachedResult === 'object') {
+        const cached = saved.cachedResult as { drafts?: ProblemDraft[]; count?: number; generationJobId?: string };
+        const generationJobId = cached.generationJobId || taskId || randomUUID();
+        const rawCachedDrafts = Array.isArray(cached.drafts) ? cached.drafts : [];
+        if (rawCachedDrafts.length > 0) {
+          const drafts = await reconcileCachedDraftsSourceStatus(rawCachedDrafts);
+          let outcome: { persisted: boolean; drafts: ProblemDraft[]; persistError?: string } = {
+            persisted: false,
+            drafts,
+            persistError: undefined,
+          };
+          try {
+            const supabase = await createClient();
+            outcome = await persistProblemDraftsForResponse(supabase, drafts, generationJobId);
+          } catch (e) {
+            outcome = {
+              persisted: false,
+              drafts,
+              persistError: e instanceof Error ? e.message : '초안 저장에 실패했습니다.',
+            };
+          }
+          let isSettled = false;
+          if (outcome.persisted && saved.leaseToken && saved.creditSource === 'operator_trial') {
+            const settleResult = await settleTrialCredit(auth.user.id, taskId, saved.leaseToken);
+            isSettled = settleResult.success;
+          }
+          return NextResponse.json({
+            success: true,
+            drafts: outcome.drafts,
+            count: outcome.drafts.length,
+            generationJobId,
+            persisted: outcome.persisted,
+            settled: isSettled,
+            persistError: outcome.persistError,
+            fromCache: true,
+            taskId: saved.taskId || taskId,
+          });
+        }
+      }
+      if (hasPreCheckHashMismatch) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: '전달된 자료 본문이 서버에 저장된 최신 원문 해시와 일치하지 않습니다. 자료를 새로고침한 뒤 다시 시도해 주세요.',
+            errorCode: 'SOURCE_HASH_MISMATCH',
+          },
+          { status: 400 }
+        );
+      }
+      return NextResponse.json(
+        {
+          success: false,
+          error: '서버에 동기화된 자료 본문을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.',
+          errorCode: 'SOURCE_VERIFICATION_FAILED',
+        },
+        { status: 502 }
+      );
     }
 
     // Check trial limits if user has no personal API key
@@ -550,7 +913,8 @@ const GENERATE_PROBLEMS_PROMPT_VERSION = 'v2';
       if (cred.code === 'already_completed' && cred.cachedResult && typeof cred.cachedResult === 'object') {
         const cached = cred.cachedResult as { drafts?: ProblemDraft[]; count?: number; generationJobId?: string };
         const generationJobId = cached.generationJobId || taskId || randomUUID();
-        const drafts = Array.isArray(cached.drafts) ? cached.drafts : [];
+        const rawCachedDrafts = Array.isArray(cached.drafts) ? cached.drafts : [];
+        const drafts = await reconcileCachedDraftsSourceStatus(rawCachedDrafts);
         let outcome: { persisted: boolean; drafts: ProblemDraft[]; persistError?: string } = {
           persisted: false,
           drafts,
@@ -822,28 +1186,19 @@ ${combinedSource}
         const raw = asRecord(rawProblems[i]);
         if (!raw) continue;
 
-        // Rubric normalization with type guards
-        const rawRubric = Array.isArray(raw.rubric) ? raw.rubric : [];
-        let scoreSum = 0;
-        const normalizedRubric: RubricCriterion[] = rawRubric
-          .map((entry) => asRecord(entry))
-          .filter((entry): entry is Record<string, unknown> => entry !== null)
-          .map((entry, rIdx) => {
-            const maxScore =
-              typeof entry.maxScore === 'number' && Number.isFinite(entry.maxScore) && entry.maxScore > 0
-                ? entry.maxScore
-                : 25;
-            scoreSum += maxScore;
-            return {
-              id: asString(entry.id, `r-${rIdx + 1}`),
-              label: asString(entry.label, `${rIdx + 1}. 평가 항목`),
-              maxScore,
-              weight: typeof entry.weight === 'number' ? entry.weight : maxScore / 100,
-              description: asString(entry.description, '논리적 서술 및 단계별 엄밀성'),
-            };
-          });
-
-        const isScore100 = normalizedRubric.length > 0 && scoreSum === 100;
+        // Strict rubric schema validation (reuses validateEvaluationRubric: no 25-point coercion)
+        let normalizedRubric: RubricCriterion[] = [];
+        try {
+          normalizedRubric = validateEvaluationRubric(raw.rubric).map((c) => ({
+            ...c,
+            weight: c.maxScore / 100,
+          }));
+        } catch {
+          // Invalid/incomplete rubric must never be coerced to 25 or marked verified/settled
+          continue;
+        }
+        const scoreSum = normalizedRubric.reduce((acc, c) => acc + c.maxScore, 0);
+        const isScore100 = normalizedRubric.length > 0 && Math.abs(scoreSum - 100) < 0.001;
         const finalRubric = normalizedRubric;
 
         const title = asString(raw.title).trim();
@@ -858,7 +1213,11 @@ ${combinedSource}
         const conceptIds = asStringArray(raw.conceptIds).filter((id) =>
           concepts.some((c) => c.id === id)
         );
+        const effectiveConceptIds = conceptIds.length > 0 ? conceptIds : concepts.map((c) => c.id);
         const hasConceptLink = conceptIds.length > 0;
+        const hasServerVerifiedConcepts =
+          effectiveConceptIds.length > 0 &&
+          effectiveConceptIds.every((id) => serverVerifiedConceptIds.has(id));
 
         const quote = (asString(raw.sourceExcerpt) || asString(raw.sourceEvidenceQuote)).trim();
         const normalize = (value: string) => value.replace(/\s+/g, ' ').trim();
@@ -881,12 +1240,25 @@ ${combinedSource}
           sourceVerificationStatus = 'unverified';
           verificationNotes.push('원문 인용 근거 없음');
         } else if (matchingSources.length === 1) {
-          // Exactly one source material confirmed!
-          isSourceVerified = true;
-          sourceVerificationStatus = 'verified';
           const matchedSource = matchingSources[0];
           sourceMaterialId = matchedSource.materialId;
           sourceContentVersion = computeMarkdownHash(matchedSource.markdown);
+
+          if (serverVerifiedMaterialIds.has(matchedSource.materialId) && hasServerVerifiedConcepts) {
+            // Both source material and all linked concepts are confirmed on server
+            isSourceVerified = true;
+            sourceVerificationStatus = 'verified';
+          } else if (serverVerifiedMaterialIds.has(matchedSource.materialId) && !hasServerVerifiedConcepts) {
+            // Owned material quote matched, but one or more selected concepts were not confirmed on server (RLS-missing/unregistered)
+            isSourceVerified = false;
+            sourceVerificationStatus = 'unverified';
+            verificationNotes.push('선택한 개념 중 서버에서 소유권·과목을 확인할 수 없는 개념이 포함되어 있습니다 (미검증 연결)');
+          } else {
+            // Unregistered / RLS-unconfirmed material ID must never receive 'verified' provenance
+            isSourceVerified = false;
+            sourceVerificationStatus = 'unverified';
+            verificationNotes.push('서버에 등록되지 않았거나 소유권·본문 해시를 확인할 수 없는 자료입니다 (미검증 출처)');
+          }
 
           // Verify page grounding if provided: do NOT fill arbitrary page without reliable evidence
           sourcePage = verifyPageGrounding({
@@ -953,7 +1325,14 @@ ${combinedSource}
           verificationNotes.push('동일 생성 배치 내 중복 또는 유사 문제 감지');
         }
 
-        const isVerified = hasRequiredFields && isScore100 && hasConceptLink && isSourceVerified && isDifficultyStructureConsistent && !isDuplicate;
+        const isVerified =
+          hasRequiredFields &&
+          isScore100 &&
+          hasConceptLink &&
+          hasServerVerifiedConcepts &&
+          isSourceVerified &&
+          isDifficultyStructureConsistent &&
+          !isDuplicate;
         const conceptTitles = asStringArray(raw.conceptTitles);
 
         const draft: ProblemDraft = {

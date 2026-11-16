@@ -154,6 +154,49 @@ export async function listProblemVersions(
   }
 }
 
+export async function listProblemVersionsByProblemIds(
+  supabase: SupabaseClient,
+  problemIds: string[]
+): Promise<RepoResult<Record<string, ProblemVersionSnapshot[]>>> {
+  try {
+    if (problemIds.length === 0) return repoOk({});
+    const uniqueIds = Array.from(new Set(problemIds));
+    const CHUNK_SIZE = 100;
+    const grouped: Record<string, ProblemVersionSnapshot[]> = {};
+    for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+      const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
+      const pageRes = await fetchAllPages<Omit<ProblemVersionRow, 'id'> & { id: string }>(async (page) => {
+        const { data, error } = await supabase
+          .from('problem_versions')
+          .select('*')
+          .in('problem_id', chunk)
+          .order('problem_id', { ascending: true })
+          .order('version', { ascending: true })
+          .range(page.from, page.to);
+        if (error) return repoError(error.message);
+        const normalized = ((data as ProblemVersionRow[]) ?? []).map((r) => ({
+          ...r,
+          id: String(r.id ?? `${r.problem_id}:${r.version}`),
+        }));
+        return repoOk(normalized);
+      });
+      if (!pageRes.ok) return pageRes;
+      for (const row of pageRes.data) {
+        const rawSnap = (row.snapshot ?? {}) as unknown as ProblemVersionSnapshot;
+        const authoritativeSnap: ProblemVersionSnapshot = {
+          ...rawSnap,
+          version: Number(row.version ?? rawSnap.version),
+        };
+        if (!grouped[row.problem_id]) grouped[row.problem_id] = [];
+        grouped[row.problem_id].push(authoritativeSnap);
+      }
+    }
+    return repoOk(grouped);
+  } catch (error) {
+    return repoError(message(error, '문제 버전 이력을 불러오지 못했습니다.'));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Draft writes
 // ---------------------------------------------------------------------------
@@ -320,6 +363,14 @@ export async function upsertProblemDrafts(
     for (const draft of drafts) {
       const existing = existingMap.get(draft.id);
       if (existing) {
+        if (draft.needsSourceReview === true || draft.sourceVerificationStatus === 'needs_review') {
+          const { error: rpcErr } = await supabase.rpc('mark_problem_draft_source_review', {
+            p_draft_id: draft.id,
+            p_expected_source_content_version: draft.sourceContentVersion ?? null,
+            p_expected_source_materials: draft.sourceMaterials ?? null,
+          });
+          if (rpcErr) return repoError(rpcErr.message);
+        }
         continue;
       }
 
@@ -366,7 +417,10 @@ export async function upsertConceptDraftsFull(
   try {
     if (drafts.length === 0) return repoOk([]);
     const rows = drafts.map((draft) => ({ ...conceptDraftToUpsert(draft), generation_job_id: jobId ?? null }));
-    const { data, error } = await supabase.from('concept_drafts').upsert(rows, { onConflict: 'id,user_id' }).select('*');
+    const { data, error } = await supabase
+      .from('concept_drafts')
+      .upsert(rows, { onConflict: 'id,user_id', ignoreDuplicates: true })
+      .select('*');
     if (error) return repoError(error.message);
     return repoOk(((data as ConceptDraftRow[]) ?? []).map(rowToConceptDraft));
   } catch (error) {
@@ -382,7 +436,10 @@ export async function upsertProblemDraftsFull(
   try {
     if (drafts.length === 0) return repoOk([]);
     const rows = drafts.map((draft) => ({ ...problemDraftToUpsert(draft), generation_job_id: jobId ?? null }));
-    const { data, error } = await supabase.from('problem_drafts').upsert(rows, { onConflict: 'id,user_id' }).select('*');
+    const { data, error } = await supabase
+      .from('problem_drafts')
+      .upsert(rows, { onConflict: 'id,user_id', ignoreDuplicates: true })
+      .select('*');
     if (error) return repoError(error.message);
     return repoOk(((data as ProblemDraftRow[]) ?? []).map(rowToProblemDraft));
   } catch (error) {
@@ -1361,7 +1418,7 @@ export async function upsertConcepts(supabase: SupabaseClient, concepts: Concept
     if (concepts.length === 0) return repoOk([]);
     const { data, error } = await supabase
       .from('concepts')
-      .upsert(concepts.map(conceptToUpsert), { onConflict: 'id,user_id' })
+      .upsert(concepts.map(conceptToUpsert), { onConflict: 'id,user_id', ignoreDuplicates: true })
       .select('*');
     if (error) return repoError(error.message);
     return repoOk(((data as ConceptRow[]) ?? []).map(rowToConcept));

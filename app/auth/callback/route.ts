@@ -1,19 +1,9 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
-import { safeInternalPath } from '@/lib/auth/redirects';
+import { resolveAuthCallbackOrigin, safeInternalPath } from '@/lib/auth/redirects';
 import { readSupabaseEnv } from '@/lib/supabase/config';
 
 export const dynamic = 'force-dynamic';
-
-function resolveOrigin(request: NextRequest, fallback: string): string {
-  const forwardedHost = request.headers.get('x-forwarded-host');
-  const forwardedProto = request.headers.get('x-forwarded-proto');
-  if (forwardedHost) {
-    const proto = forwardedProto || 'https';
-    return `${proto}://${forwardedHost}`;
-  }
-  return fallback;
-}
 
 function errorRedirect(origin: string, errorCode: string): NextResponse {
   const url = new URL('/login', origin);
@@ -23,7 +13,12 @@ function errorRedirect(origin: string, errorCode: string): NextResponse {
 
 export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url);
-  const base = resolveOrigin(request, origin);
+  const base = resolveAuthCallbackOrigin({
+    forwardedHost: request.headers.get('x-forwarded-host'),
+    forwardedProto: request.headers.get('x-forwarded-proto'),
+    fallbackOrigin: origin,
+    siteUrl: process.env.NEXT_PUBLIC_SITE_URL,
+  });
 
   const code = searchParams.get('code');
   const providerError = searchParams.get('error');

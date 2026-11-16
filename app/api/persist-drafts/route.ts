@@ -33,6 +33,22 @@ export async function POST(req: NextRequest) {
   if (drafts.length === 0) {
     return NextResponse.json({ success: true, persisted: true, drafts: [], count: 0 });
   }
+  const validDrafts = drafts.every(
+    (d) =>
+      d &&
+      typeof d === 'object' &&
+      !Array.isArray(d) &&
+      typeof (d as Record<string, unknown>).id === 'string' &&
+      ((d as Record<string, unknown>).id as string).trim().length > 0 &&
+      typeof (d as Record<string, unknown>).subjectId === 'string' &&
+      ((d as Record<string, unknown>).subjectId as string).trim().length > 0
+  );
+  if (!validDrafts) {
+    return NextResponse.json(
+      { success: false, persisted: false, error: '초안 목록에 필수 식별자(id, subjectId)가 누락된 항목이 있습니다.' },
+      { status: 400 }
+    );
+  }
 
   try {
     const supabase = await createClient();

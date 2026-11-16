@@ -112,6 +112,7 @@ export async function POST(request: NextRequest) {
   // 4. Token expiration & refresh check
   const config = getGoogleDriveConfig();
   let accessToken = sessionData.accessToken;
+  let sessionRefreshed = false;
 
   if (Date.now() >= sessionData.expiresAt) {
     if (sessionData.refreshToken && config.configured) {
@@ -120,6 +121,7 @@ export async function POST(request: NextRequest) {
         accessToken = refreshed.accessToken;
         sessionData.accessToken = refreshed.accessToken;
         sessionData.expiresAt = Date.now() + Math.max(60, refreshed.expiresIn - 60) * 1000;
+        sessionRefreshed = true;
       } catch {
         const res = NextResponse.json(
           {
@@ -263,11 +265,26 @@ export async function POST(request: NextRequest) {
         return res;
       }
 
-      return NextResponse.json({
+      const res = NextResponse.json({
         ok: true,
         complete: false,
         range: result.range,
       });
+      if (sessionRefreshed) {
+        const updatedEncrypted = encryptPayload(JSON.stringify(sessionData));
+        if (updatedEncrypted) {
+          res.cookies.set({
+            name: DRIVE_SESSION_COOKIE_NAME,
+            value: updatedEncrypted,
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'lax',
+            maxAge: 7 * 24 * 60 * 60,
+            path: '/',
+          });
+        }
+      }
+      return res;
     } catch (chunkErr) {
       return NextResponse.json(
         {
@@ -382,12 +399,27 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      return NextResponse.json({
+      const res = NextResponse.json({
         ok: true,
         sessionToken,
         chunkSize: 2 * 1024 * 1024, // 2MB chunks well under Vercel 4.5MB limit
         fileName,
       });
+      if (sessionRefreshed) {
+        const updatedEncrypted = encryptPayload(JSON.stringify(sessionData));
+        if (updatedEncrypted) {
+          res.cookies.set({
+            name: DRIVE_SESSION_COOKIE_NAME,
+            value: updatedEncrypted,
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'lax',
+            maxAge: 7 * 24 * 60 * 60,
+            path: '/',
+          });
+        }
+      }
+      return res;
     } catch (initErr) {
       return NextResponse.json(
         {

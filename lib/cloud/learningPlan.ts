@@ -1,4 +1,19 @@
-import type { Concept, ConceptDraft, Problem, ProblemDraft } from '../types';
+import type { Concept, ConceptDraft, Problem, ProblemDraft, ProblemVersionSnapshot } from '../types';
+import { stableStringify } from './hash';
+
+function stripUndefined(value: unknown): unknown {
+  if (value === null || value === undefined || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(stripUndefined);
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (v !== undefined) out[k] = stripUndefined(v);
+  }
+  return out;
+}
+
+function canonicalJson(value: unknown): string {
+  return stableStringify(stripUndefined(value));
+}
 
 export interface LearningConflict {
   kind: 'concept' | 'conceptDraft' | 'problem' | 'problemDraft';
@@ -37,7 +52,13 @@ export function conceptIdentity(concept: Concept): string {
   void events; void currentScore; void baseScore; void lastAttemptAt; void lastAttemptDayOffset;
   void firstLearnedAt; void firstLearnedDayOffset; void recommendedReviewAt; void lastCalculatedAt;
   void postponedUntil;
-  return JSON.stringify(definition);
+  return canonicalJson({
+    ...definition,
+    order: definition.order ?? 0,
+    status: definition.status ?? 'unstudied',
+    isLearned: Boolean(definition.isLearned),
+    isDemo: Boolean(definition.isDemo),
+  });
 }
 
 /** Evaluation-relevant identity of a problem (version history / quality meta excluded). */
@@ -55,7 +76,12 @@ export function problemIdentity(problem: Problem): string {
   } = problem;
   void versionHistory; void reports; void isOutdated; void needsSourceReview;
   void qualityStatus; void version; void lastReviewedAt; void reviewNotes;
-  return JSON.stringify(evaluation);
+  return canonicalJson({
+    ...evaluation,
+    isApproved: evaluation.isApproved !== false,
+    isDemo: Boolean(evaluation.isDemo),
+    isTransfer: Boolean(evaluation.isTransfer),
+  });
 }
 
 /**
@@ -63,14 +89,35 @@ export function problemIdentity(problem: Problem): string {
  * token and timestamps are server-authoritative and must not turn an identical
  * draft into a conflict.
  */
-function draftIdentity(draft: Record<string, unknown>): string {
+export function draftIdentity(draft: Record<string, unknown>): string {
   const {
     updatedAt, status, isApproved, approvalState, approvedConceptId, approvedProblemId,
-    contentVersion, ...rest
+    contentVersion, needsSourceReview, ...rest
   } = draft;
   void updatedAt; void status; void isApproved; void approvalState;
-  void approvedConceptId; void approvedProblemId; void contentVersion;
-  return JSON.stringify(rest);
+  void approvedConceptId; void approvedProblemId; void contentVersion; void needsSourceReview;
+  return canonicalJson({
+    ...rest,
+    isDemo: Boolean(rest.isDemo),
+  });
+}
+
+/** Content-based identity of a problem version snapshot (ignores non-semantic timestamps/reasons). */
+export function problemSnapshotIdentity(snapshot: ProblemVersionSnapshot): string {
+  return canonicalJson({
+    version: Number(snapshot.version),
+    title: snapshot.title,
+    promptText: snapshot.promptText,
+    type: snapshot.type,
+    conceptIds: snapshot.conceptIds,
+    appliedConditionNote: snapshot.appliedConditionNote,
+    mathFormula: snapshot.mathFormula,
+    codeSnippet: snapshot.codeSnippet,
+    timeStandardMinutes: snapshot.timeStandardMinutes,
+    hints: snapshot.hints,
+    modelAnswer: snapshot.modelAnswer,
+    rubric: snapshot.rubric,
+  });
 }
 
 function planEntity<T extends { id: string }>(

@@ -11,8 +11,16 @@ import { setStorageScope } from '../storageScope';
 import type { Concept, ConceptDraft, Problem, ProblemDraft, ProblemVersionSnapshot } from '../types';
 import { loadLearningLibrary } from './learningLibrary';
 import { loadLearningOriginals, recordMigratedIds } from './learningOriginals';
-import { conceptIdentity, planLearningMigration, problemIdentity, type LearningConflict } from './learningPlan';
 import {
+  conceptIdentity,
+  draftIdentity,
+  planLearningMigration,
+  problemIdentity,
+  problemSnapshotIdentity,
+  type LearningConflict,
+} from './learningPlan';
+import {
+  listProblemVersionsByProblemIds,
   upsertConceptDraftsFull,
   upsertConcepts,
   upsertProblemDraftsFull,
@@ -24,6 +32,7 @@ const USER_PREFIX = 'redcall_user_';
 const JOB_BASE = 'cloud_learning_migration_job_v1';
 const MARKER_BASE = 'cloud_learning_migration_v1';
 const DECLINED_BASE = 'cloud_learning_migration_declined_v1';
+const VERIFIED_MARKER_VERSION = 2;
 
 interface LearningMigrationJob {
   jobId: string;
@@ -129,34 +138,56 @@ function hasSubjectsMaterialsMigrated(storage: Storage, userId: string): boolean
 }
 
 function problemSnapshots(problem: Problem): ProblemVersionSnapshot[] {
-  if (problem.versionHistory && problem.versionHistory.length > 0) return problem.versionHistory;
-  return [
-    {
-      version: problem.version ?? 1,
-      title: problem.title,
-      promptText: problem.promptText,
-      type: problem.type,
-      conceptIds: problem.conceptIds,
-      appliedConditionNote: problem.appliedConditionNote,
-      mathFormula: problem.mathFormula,
-      codeSnippet: problem.codeSnippet,
-      timeStandardMinutes: problem.timeStandardMinutes,
-      hints: problem.hints,
-      modelAnswer: problem.modelAnswer,
-      rubric: problem.rubric,
-      editedAt: problem.createdAt ?? new Date().toISOString(),
-      editReason: 'migrated',
-    },
-  ];
+  const currentVersion = problem.version ?? 1;
+  const currentSnap: ProblemVersionSnapshot = {
+    version: currentVersion,
+    title: problem.title,
+    promptText: problem.promptText,
+    type: problem.type,
+    conceptIds: problem.conceptIds,
+    appliedConditionNote: problem.appliedConditionNote,
+    mathFormula: problem.mathFormula,
+    codeSnippet: problem.codeSnippet,
+    timeStandardMinutes: problem.timeStandardMinutes,
+    hints: problem.hints,
+    modelAnswer: problem.modelAnswer,
+    rubric: problem.rubric,
+    editedAt: problem.createdAt ?? new Date().toISOString(),
+    editReason: 'migrated',
+  };
+  if (problem.versionHistory && problem.versionHistory.length > 0) {
+    const byVer = new Map<number, ProblemVersionSnapshot>();
+    for (const snap of problem.versionHistory) {
+      byVer.set(snap.version, snap);
+    }
+    if (!byVer.has(currentVersion)) {
+      byVer.set(currentVersion, currentSnap);
+    }
+    return Array.from(byVer.values()).sort((a, b) => a.version - b.version);
+  }
+  return [currentSnap];
+}
+
+function isMarkerVerified(storage: Storage, userId: string): boolean {
+  try {
+    const raw = storage.getItem(userBaseKey(userId, MARKER_BASE));
+    if (!raw) return false;
+    const parsed = JSON.parse(raw) as { completed?: boolean; verifiedVersion?: number } | null;
+    return Boolean(parsed?.completed && parsed?.verifiedVersion === VERIFIED_MARKER_VERSION);
+  } catch {
+    return false;
+  }
 }
 
 export function getLearningMigrationState(userId: string): LearningMigrationState {
   const storage = getStorage();
   if (!storage) return { imported: false, declined: false, hasLocalData: false, resume: false };
-  let imported = false;
+  let rawMarkerPresent = false;
+  let markerVerified = false;
   let declined = false;
   try {
-    imported = storage.getItem(userBaseKey(userId, MARKER_BASE)) !== null;
+    rawMarkerPresent = storage.getItem(userBaseKey(userId, MARKER_BASE)) !== null;
+    markerVerified = isMarkerVerified(storage, userId);
     declined = storage.getItem(userBaseKey(userId, DECLINED_BASE)) !== null;
   } catch {
     // ignore
@@ -172,8 +203,10 @@ export function getLearningMigrationState(userId: string): LearningMigrationStat
   } catch {
     hasLocalData = true;
   }
+  const imported = markerVerified || (rawMarkerPresent && !hasLocalData);
   const job = readJob(storage, userId);
-  return { imported, declined, hasLocalData, resume: job !== null && !imported };
+  const needsRepairFromLegacyMarker = rawMarkerPresent && !markerVerified && hasLocalData;
+  return { imported, declined, hasLocalData, resume: (job !== null || needsRepairFromLegacyMarker) && !imported };
 }
 
 export function declineLearningMigration(userId: string): void {
@@ -203,12 +236,59 @@ async function verifyMigration(
       return { ok: false, error: `개념 ${concept.id}의 내용이 원본과 다릅니다.` };
     }
   }
+  const conceptDraftById = new Map(cloud.data.conceptDrafts.map((d) => [d.id, d]));
+  for (const draft of local.conceptDrafts) {
+    const remote = conceptDraftById.get(draft.id);
+    if (!remote) return { ok: false, error: `개념 초안 ${draft.id}가 서버에서 확인되지 않습니다.` };
+    if (
+      draftIdentity(remote as unknown as Record<string, unknown>) !==
+      draftIdentity(draft as unknown as Record<string, unknown>)
+    ) {
+      return { ok: false, error: `개념 초안 ${draft.id}의 내용이 원본과 다릅니다.` };
+    }
+  }
   const problemById = new Map(cloud.data.problems.map((p) => [p.id, p]));
   for (const problem of local.problems) {
     const remote = problemById.get(problem.id);
     if (!remote) return { ok: false, error: `문제 ${problem.id}가 서버에서 확인되지 않습니다.` };
     if (problemIdentity(remote) !== problemIdentity(problem)) {
       return { ok: false, error: `문제 ${problem.id}의 평가 내용이 원본과 다릅니다.` };
+    }
+  }
+  if (local.problems.length > 0) {
+    const versionsRes = await listProblemVersionsByProblemIds(
+      supabase,
+      local.problems.map((p) => p.id)
+    );
+    if (!versionsRes.ok) return { ok: false, error: `문제 버전 검증 조회 실패: ${versionsRes.error}` };
+    for (const problem of local.problems) {
+      const serverByVer = new Map((versionsRes.data[problem.id] ?? []).map((v) => [Number(v.version), v]));
+      for (const expected of problemSnapshots(problem)) {
+        const remoteSnap = serverByVer.get(expected.version);
+        if (!remoteSnap) {
+          return {
+            ok: false,
+            error: `문제 ${problem.id}의 버전 v${expected.version} 이력이 서버에서 확인되지 않습니다.`,
+          };
+        }
+        if (problemSnapshotIdentity(remoteSnap) !== problemSnapshotIdentity(expected)) {
+          return {
+            ok: false,
+            error: `문제 ${problem.id}의 버전 v${expected.version} 이력 내용이 원본과 다릅니다.`,
+          };
+        }
+      }
+    }
+  }
+  const problemDraftById = new Map(cloud.data.problemDrafts.map((d) => [d.id, d]));
+  for (const draft of local.problemDrafts) {
+    const remote = problemDraftById.get(draft.id);
+    if (!remote) return { ok: false, error: `문제 초안 ${draft.id}가 서버에서 확인되지 않습니다.` };
+    if (
+      draftIdentity(remote as unknown as Record<string, unknown>) !==
+      draftIdentity(draft as unknown as Record<string, unknown>)
+    ) {
+      return { ok: false, error: `문제 초안 ${draft.id}의 내용이 원본과 다릅니다.` };
     }
   }
   return { ok: true };
@@ -231,7 +311,7 @@ export async function migrateLocalLearningToCloud(
   if (!storage) return failure('브라우저 로컬 저장소를 사용할 수 없습니다.', false);
 
   try {
-    if (storage.getItem(userBaseKey(userId, MARKER_BASE)) !== null) {
+    if (isMarkerVerified(storage, userId)) {
       return { ok: true, conflict: false, resume: false, partial: false, uploaded: 0, conflicts: [], message: '이미 학습 콘텐츠 이전이 완료되었습니다.' };
     }
   } catch {
@@ -251,7 +331,7 @@ export async function migrateLocalLearningToCloud(
 
   if (localEmpty) {
     const marked = writeVerified(storage, userId, MARKER_BASE, {
-      completed: true, completedAt: now, jobId: existingJob?.jobId ?? null, uploaded: 0,
+      completed: true, verifiedVersion: VERIFIED_MARKER_VERSION, completedAt: now, jobId: existingJob?.jobId ?? null, uploaded: 0,
     });
     if (!marked) return failure('완료 표시를 저장하지 못했습니다. 다시 시도해 주세요.', resuming);
     return { ok: true, conflict: false, resume: resuming, partial: false, uploaded: 0, conflicts: [], message: '이전할 로컬 학습 콘텐츠가 없습니다.' };
@@ -316,11 +396,30 @@ export async function migrateLocalLearningToCloud(
       return failure(`문제 저장 실패: ${saved.error}`, resuming);
     }
     uploaded += saved.data.length;
-    for (const problem of plan.problems) {
-      const versions = await upsertProblemVersions(supabase, problem.id, problem.subjectId, problemSnapshots(problem));
-      if (!versions.ok) {
-        writeVerified(storage, userId, JOB_BASE, { ...job, updatedAt: new Date().toISOString() });
-        return failure(`문제 버전 저장 실패: ${versions.error}`, resuming);
+  }
+
+  // Independently recover missing version snapshots (including v1) for ALL
+  // local problems, even when a problem row was already inserted in an earlier
+  // partial run and skipped by planLearningMigration. Insert-only preserves
+  // existing server snapshots.
+  if (local.problems.length > 0) {
+    const existingVersionsRes = await listProblemVersionsByProblemIds(
+      supabase,
+      local.problems.map((p) => p.id)
+    );
+    if (!existingVersionsRes.ok) {
+      writeVerified(storage, userId, JOB_BASE, { ...job, updatedAt: new Date().toISOString() });
+      return failure(`문제 버전 조회 실패: ${existingVersionsRes.error}`, resuming);
+    }
+    for (const problem of local.problems) {
+      const existingNums = new Set((existingVersionsRes.data[problem.id] ?? []).map((v) => v.version));
+      const missingSnapshots = problemSnapshots(problem).filter((snap) => !existingNums.has(snap.version));
+      if (missingSnapshots.length > 0) {
+        const versions = await upsertProblemVersions(supabase, problem.id, problem.subjectId, missingSnapshots);
+        if (!versions.ok) {
+          writeVerified(storage, userId, JOB_BASE, { ...job, updatedAt: new Date().toISOString() });
+          return failure(`문제 버전 저장 실패: ${versions.error}`, resuming);
+        }
       }
     }
   }
@@ -347,7 +446,7 @@ export async function migrateLocalLearningToCloud(
   ].map((record) => record.id));
 
   const marked = writeVerified(storage, userId, MARKER_BASE, {
-    completed: true, completedAt: new Date().toISOString(), jobId: job.jobId, uploaded,
+    completed: true, verifiedVersion: VERIFIED_MARKER_VERSION, completedAt: new Date().toISOString(), jobId: job.jobId, uploaded,
   });
   if (!marked) {
     writeVerified(storage, userId, JOB_BASE, { ...job, updatedAt: new Date().toISOString() });

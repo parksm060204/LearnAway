@@ -931,6 +931,23 @@ exports.requireApiUser = async () => {
         if (name === 'consume_ai_call_budget') {
           return Promise.resolve({ data: { allowed: true, remaining: 99, retryAfterSeconds: 60 }, error: null });
         }
+        if (name === 'mark_problem_draft_source_review') {
+          const rows = Array.isArray(state.problem_drafts) ? state.problem_drafts : [];
+          const uid = state.user?.id;
+          const row = rows.find((r) => r.id === params?.p_draft_id && (!r.user_id || r.user_id === uid));
+          if (!row) return Promise.resolve({ data: { updated: false, reason: 'NOT_FOUND' }, error: null });
+          if (row.is_approved || row.status === 'approved' || row.status === 'rejected' || row.approval_state === 'approved') {
+            return Promise.resolve({ data: { updated: false, reason: 'ALREADY_DECIDED' }, error: null });
+          }
+          const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
+          if (payload.sourceVerificationStatus === 'verified' && !payload.needsSourceReview) {
+            if (params?.p_expected_source_content_version && payload.sourceContentVersion && payload.sourceContentVersion !== params.p_expected_source_content_version) {
+              return Promise.resolve({ data: { updated: false, reason: 'REVERIFIED_NEWER_SOURCE' }, error: null });
+            }
+          }
+          row.payload = { ...payload, needsSourceReview: true, sourceVerificationStatus: 'needs_review' };
+          return Promise.resolve({ data: { updated: true, reason: 'FLAGGED' }, error: null });
+        }
         if (name === 'get_ai_connection_secret') {
           return Promise.resolve({ data: null, error: null });
         }
@@ -10037,17 +10054,32 @@ exports.requireApiUser = async () => {
       return { ok: true, content: '{"concepts":[]}', model: config.model };
     };
 
-    // User settings returned from resolveAiConfigForUser is Model B ('gpt-4o')
+    // User settings returned from resolveAiConfigForUser is Model B ('claude-sonnet-5-5') on school_gateway
     const aiCredPath = path.join(output, 'lib', 'aiCredentials.js');
     const credModule = load(aiCredPath);
     const originalResolveAiConfigForUser = credModule.resolveAiConfigForUser;
+    const originalLookupConnectionSecret = credModule.lookupConnectionSecret;
+    credModule.lookupConnectionSecret = async () => ({
+      status: 'registered',
+      secret: { provider: 'school_gateway', model: 'claude-sonnet-5-5', ciphertext: 'enc', iv: 'iv', tag: 'tag' },
+    });
     credModule.resolveAiConfigForUser = async () => ({
       ok: true,
+      source: 'user',
       config: {
-        provider: 'openai',
+        provider: 'school_gateway',
         apiKey: 'sk-test',
-        model: 'gpt-4o', // Model B
+        model: 'claude-sonnet-5-5', // Model B
+        apiBase: 'https://factchat-cloud.mindlogic.ai/v1/gateway',
+        minOutputTokens: 0,
+        jsonMode: 'none',
       },
+    });
+    const origVerifyGateway = aiModule.verifyGatewayModelForKey;
+    aiModule.verifyGatewayModelForKey = async () => ({
+      ok: true,
+      hasModel: true,
+      modelIds: ['deepseek-v4.1-flash', 'claude-sonnet-5-5'],
     });
 
     try {
@@ -10108,7 +10140,7 @@ exports.requireApiUser = async () => {
             subjectId: fakeSubjectId,
             domain: 'math_stats',
             markdown: p6Markdown,
-            model: 'gpt-4o', // User tries to mix Model B into Job A!
+            model: 'claude-sonnet-5-5', // User tries to mix Model B into Job A!
           }),
         });
 
@@ -10148,7 +10180,9 @@ exports.requireApiUser = async () => {
       });
     } finally {
       aiModule.callAiChat = originalCallAiChat;
+      aiModule.verifyGatewayModelForKey = origVerifyGateway;
       credModule.resolveAiConfigForUser = originalResolveAiConfigForUser;
+      credModule.lookupConnectionSecret = originalLookupConnectionSecret;
     }
   });
 
@@ -13068,6 +13102,7 @@ exports.requireApiUser = async () => {
     // Scenario 1: DB persistence fails
     await withFakeSupabase({
       user: { id: 'user-problem-gen' },
+      subjects: [{ id: 'sub-math', user_id: 'user-problem-gen' }],
       fail: { upsert: true },
       rpcImpl: (fn) => {
         if (fn === 'reserve_trial_credit') {
@@ -13107,6 +13142,7 @@ exports.requireApiUser = async () => {
     // Scenario 2: DB persistence succeeds on retry without re-calling AI
     await withFakeSupabase({
       user: { id: 'user-problem-gen' },
+      subjects: [{ id: 'sub-math', user_id: 'user-problem-gen' }],
       problem_drafts: [],
       rpcImpl: (fn) => {
         if (fn === 'reserve_trial_credit') {
@@ -13225,6 +13261,7 @@ exports.requireApiUser = async () => {
       // 2. 일반 사용자의 /api/convert를 통한 cleanup_expired_temp_files 호출 시 거부
       await withFakeSupabase({
         user: { id: 'test-user' },
+        subjects: [{ id: 'cs-sub-1', user_id: 'test-user' }],
         isAdmin: true,
       }, async () => {
         const req = new NextRequest('http://localhost/api/convert', {
@@ -13284,6 +13321,7 @@ exports.requireApiUser = async () => {
       storageRemoveCalls = [];
       await withFakeSupabase({
         user: { id: 'test-user' },
+        subjects: [{ id: 'cs-sub-1', user_id: 'test-user' }],
         isAdmin: true,
         storage: fakeStorage,
         temp_pdf_conversion_jobs: [
@@ -13349,6 +13387,7 @@ exports.requireApiUser = async () => {
 
       await withFakeSupabase({
         user: { id: 'test-user' },
+        subjects: [{ id: 'cs-sub-1', user_id: 'test-user' }],
         isAdmin: true,
         ai_trial_credits: [{ user_id: 'test-user', balance: 0, granted_credits: 1 }],
         ai_trial_reservations: reservations,
@@ -16073,7 +16112,25 @@ exports.requireApiUser = async () => {
       }
       return { data: null, error: null };
     },
-    from: () => ({
+    from: (table) => {
+      if (table === 'subjects') {
+        return {
+          select: () => ({
+            eq: (_c, val) => ({
+              eq: (_c2, uid) => ({ maybeSingle: async () => ({ data: { id: val, user_id: uid }, error: null }) }),
+              maybeSingle: async () => ({ data: { id: val, user_id: 'test-user' }, error: null }),
+            }),
+          }),
+        };
+      }
+      if (table === 'concepts' || table === 'materials') {
+        return {
+          select: () => ({
+            in: async () => ({ data: [], error: null }),
+          }),
+        };
+      }
+      return {
       insert: () => ({ error: null }),
       select: () => {
         const query = {
@@ -16121,7 +16178,8 @@ exports.requireApiUser = async () => {
         };
         return query;
       },
-    }),
+    };
+    },
   };
   globalThis.__fakeSupabaseClient = defaultFakeSupabase;
 
@@ -16271,6 +16329,8 @@ exports.requireApiUser = async () => {
 
       // Verify trial credit cache retry does not trigger extra AI call
       globalThis.__fakeSupabaseClient = {
+        auth: defaultFakeSupabase.auth,
+        from: defaultFakeSupabase.from,
         rpc: async (name) => {
           if (name === 'lookup_saved_ai_task_result') {
             return {
@@ -22972,6 +23032,569 @@ exports.requireApiUser = async () => {
         storageScope.setStorageScope({ kind: 'legacy' });
       }
     });
+  });
+
+  await checkAsync('Fix 3 & 4: generate-problems 엄격 루브릭 스키마 검증 및 사전 소유권/해시/재시도 출처 보존 검증', async () => {
+    const { POST: generateProblems } = load(path.join(output, 'app/api/generate-problems/route.js'));
+    const aiClientModule = load(path.join(output, 'lib/aiClient.js'));
+    const hashMod = load(path.join(output, 'lib/cloud/hash.js'));
+    const mdUtils = load(path.join(output, 'lib/markdownUtils.js'));
+    const origCallAiChat = aiClientModule.callAiChat;
+
+    let aiCalls = 0;
+    let nextAiProblems = [];
+    aiClientModule.callAiChat = async () => {
+      aiCalls += 1;
+      return {
+        ok: true,
+        content: JSON.stringify({ problems: nextAiProblems }),
+        model: 'deepseek-v4.1-flash',
+        usage: { promptTokens: 50, completionTokens: 80 },
+      };
+    };
+
+    const userId = 'user-gen-sec';
+    const validMarkdown = '라그랑주 승수법은 제약 조건 하의 최적화 정리를 제공한다.';
+    const validConcept = { id: 'c-sec-1', subjectId: 'subj-sec-1', title: '라그랑주 승수법' };
+    const validSource = { materialId: 'mat-sec-1', title: '최적화 노트', markdown: validMarkdown };
+
+    const makeBody = (overrides = {}) => ({
+      subjectId: 'subj-sec-1',
+      subjectDomain: 'math_stats',
+      problemType: 'essay_descriptive',
+      difficultyLevel: 2,
+      problemCount: 1,
+      concepts: [validConcept],
+      sources: [validSource],
+      ...overrides,
+    });
+
+    try {
+      // 1. Pre-AI ownership & hash checks: 0 AI calls, 0 credit reservations
+      const invalidPreChecks = [
+        {
+          label: '타인/미존재 subjectId',
+          opts: { user: { id: userId }, subjects: [], ai_trial_credits: [{ user_id: userId, balance: 3, granted_credits: 3 }] },
+          body: makeBody({ subjectId: 'subj-other', concepts: [{ ...validConcept, subjectId: 'subj-other' }] }),
+          expectedStatus: 404,
+        },
+        {
+          label: '다른 과목 concept',
+          opts: {
+            user: { id: userId },
+            subjects: [{ id: 'subj-sec-1', user_id: userId }],
+            concepts: [{ id: 'c-sec-1', user_id: userId, subject_id: 'subj-other' }],
+          },
+          body: makeBody(),
+          expectedStatus: 400,
+        },
+        {
+          label: '타인 material',
+          opts: {
+            user: { id: userId },
+            subjects: [{ id: 'subj-sec-1', user_id: userId }],
+            materials: [{ id: 'mat-sec-1', user_id: 'other-user', subject_id: 'subj-sec-1', content_hash: null }],
+          },
+          body: makeBody(),
+          expectedStatus: 404,
+        },
+        {
+          label: '서버 material 해시 불일치 (mh_)',
+          opts: {
+            user: { id: userId },
+            subjects: [{ id: 'subj-sec-1', user_id: userId }],
+            materials: [{
+              id: 'mat-sec-1',
+              user_id: userId,
+              subject_id: 'subj-sec-1',
+              sync_body: true,
+              content_hash: hashMod.materialContentHash({ markdown: '서버의 다른 원문 내용' }),
+            }],
+          },
+          body: makeBody(),
+          expectedStatus: 400,
+        },
+      ];
+
+      for (const tc of invalidPreChecks) {
+        let reserveCalls = 0;
+        aiCalls = 0;
+        await withFakeSupabase({
+          ...tc.opts,
+          rpcImpl: (fn) => {
+            if (fn === 'reserve_trial_credit') reserveCalls += 1;
+            return { data: null, error: null };
+          },
+        }, async () => {
+          const req = new NextRequest('http://localhost/api/generate-problems', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(tc.body),
+          });
+          const res = await generateProblems(req);
+          assert.equal(res.status, tc.expectedStatus, `${tc.label}: status`);
+          assert.equal(aiCalls, 0, `${tc.label}: AI 호출 0회여야 함`);
+          assert.equal(reserveCalls, 0, `${tc.label}: 크레딧 예약 0회여야 함`);
+        });
+      }
+
+      // 2. Fix 3: Malformed rubric variants must NOT be coerced to 25 or settled
+      const badRubrics = [
+        [
+          { id: 'r1', label: 'A' },
+          { id: 'r2', label: 'B' },
+          { id: 'r3', label: 'C' },
+          { id: 'r4', label: 'D' },
+        ],
+        [
+          { id: 'r1', label: 'A', maxScore: '25' },
+          { id: 'r2', label: 'B', maxScore: 75 },
+        ],
+        [
+          { id: 'r1', label: 'A', maxScore: 0 },
+          { id: 'r2', label: 'B', maxScore: 100 },
+        ],
+        [
+          { id: 'r1', label: 'A', maxScore: -10 },
+          { id: 'r2', label: 'B', maxScore: 110 },
+        ],
+        [
+          { id: 'dup', label: 'A', maxScore: 50 },
+          { id: 'dup', label: 'B', maxScore: 50 },
+        ],
+      ];
+
+      for (let idx = 0; idx < badRubrics.length; idx++) {
+        let settled = 0;
+        let released = 0;
+        nextAiProblems = [{
+          title: '잘못된 루브릭 문제',
+          promptText: '지문',
+          modelAnswer: '답안',
+          hints: ['힌트'],
+          sourceExcerpt: '라그랑주 승수법은 제약 조건 하의 최적화 정리를 제공한다.',
+          rubric: badRubrics[idx],
+        }];
+        await withFakeSupabase({
+          user: { id: userId },
+          subjects: [{ id: 'subj-sec-1', user_id: userId }],
+          materials: [{ id: 'mat-sec-1', user_id: userId, subject_id: 'subj-sec-1', sync_body: false, content_hash: null }],
+          rpcImpl: (fn) => {
+            if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+            if (fn === 'reserve_trial_credit' || fn === 'register_ai_task') {
+              return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lt-bad-rubric', task_id: `t-bad-${idx}`, credit_source: 'operator_trial' }, error: null };
+            }
+            if (fn === 'release_trial_credit') {
+              released += 1;
+              return { data: { refunded: true, balance: 3 }, error: null };
+            }
+            if (fn === 'settle_trial_credit') {
+              settled += 1;
+              return { data: { settled: true }, error: null };
+            }
+            return { data: null, error: null };
+          },
+        }, async () => {
+          const req = new NextRequest('http://localhost/api/generate-problems', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(makeBody({ taskId: `t-bad-${idx}` })),
+          });
+          const res = await generateProblems(req);
+          assert.equal(res.status, 502, `비정상 루브릭 케이스 #${idx}는 502 거부되어야 함`);
+          assert.equal(settled, 0, `비정상 루브릭 케이스 #${idx}는 과금 정산되면 안 됨`);
+          assert.equal(released, 1, `비정상 루브릭 케이스 #${idx}는 크레딧 해제되어야 함`);
+        });
+      }
+
+      // 3. Normal 100-point rubric with local-only material (sync_body: false) succeeds
+      nextAiProblems = [{
+        title: '정상 루브릭 문제',
+        promptText: '라그랑주 승수법의 필요조건을 유도하시오.',
+        modelAnswer: '기울기 벡터의 선형 결합',
+        hints: ['극값 조건 확인'],
+        sourceExcerpt: '라그랑주 승수법은 제약 조건 하의 최적화 정리를 제공한다.',
+        rubric: [
+          { id: 'r1', label: '조건 설정', maxScore: 40, description: '제약식 정리' },
+          { id: 'r2', label: '유도 과정', maxScore: 60, description: '라그랑지안 미분' },
+        ],
+      }];
+      aiCalls = 0;
+      await withFakeSupabase({
+        user: { id: userId },
+        subjects: [{ id: 'subj-sec-1', user_id: userId }],
+        materials: [{ id: 'mat-sec-1', user_id: userId, subject_id: 'subj-sec-1', sync_body: false, content_hash: null }],
+        problem_drafts: [],
+        rpcImpl: (fn) => {
+          if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+          if (fn === 'reserve_trial_credit' || fn === 'register_ai_task') {
+            return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lt-ok', task_id: 't-ok-rubric', credit_source: 'operator_trial' }, error: null };
+          }
+          if (fn === 'settle_trial_credit') return { data: { settled: true }, error: null };
+          if (fn === 'record_trial_result_ready' || fn === 'record_ai_task_result_ready') return { data: { success: true, ok: true, status: 'result_ready' }, error: null };
+          return { data: { ok: true }, error: null };
+        },
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody({ taskId: 't-ok-rubric' })),
+        });
+        const res = await generateProblems(req);
+        const data = await res.json();
+        assert.equal(res.status, 200, `정상 100점 루브릭 + 로컬 전용 자료는 200 성공해야 함: ${JSON.stringify(data)}`);
+        assert.equal(data.drafts[0].verificationStatus.isScore100, true);
+        assert.equal(aiCalls, 1);
+      });
+
+      // 4. retry_save after source material changed/deleted -> 0 AI calls, original preserved, needsSourceReview=true
+      aiCalls = 0;
+      const savedDraftFromBefore = {
+        id: 'draft-retry-src-1',
+        subjectId: 'subj-sec-1',
+        title: '기존 생성 문제',
+        type: 'essay_descriptive',
+        difficulty: 'intermediate',
+        difficultyLevel: 2,
+        promptText: '원본 지문',
+        modelAnswer: '원본 답안',
+        hints: ['힌트'],
+        rubric: [{ id: 'r1', label: '기준', maxScore: 100, weight: 1, description: '설명' }],
+        sourceMaterialId: 'mat-sec-1',
+        sourceMaterials: [{ materialId: 'mat-sec-1', title: '최적화 노트', markdownHash: mdUtils.computeMarkdownHash(validMarkdown) }],
+        sourceVerificationStatus: 'verified',
+        status: 'draft',
+        isApproved: false,
+        isDemo: false,
+      };
+      await withFakeSupabase({
+        user: { id: userId },
+        subjects: [{ id: 'subj-sec-1', user_id: userId }],
+        materials: [{
+          id: 'mat-sec-1',
+          user_id: userId,
+          subject_id: 'subj-sec-1',
+          sync_body: true,
+          content_hash: hashMod.materialContentHash({ markdown: '수정된 서버 원문!' }),
+        }],
+        problem_drafts: [],
+        rpcImpl: (fn) => {
+          if (fn === 'lookup_saved_ai_task_result') {
+            return {
+              data: {
+                success: true,
+                status: 'result_ready',
+                task_id: 't-retry-src',
+                lease_token: 'lt-retry-src',
+                credit_source: 'operator_trial',
+                cached_result: { drafts: [savedDraftFromBefore], generationJobId: 'gen-retry-src' },
+              },
+              error: null,
+            };
+          }
+          if (fn === 'settle_trial_credit') return { data: { settled: true }, error: null };
+          return { data: null, error: null };
+        },
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody({ isSaveRetry: true, taskId: 't-retry-src' })),
+        });
+        const res = await generateProblems(req);
+        const data = await res.json();
+        assert.equal(res.status, 200);
+        assert.equal(aiCalls, 0, '저장 재시도는 AI를 재호출하지 않아야 함');
+        assert.equal(data.drafts[0].promptText, '원본 지문', '기존 생성 원본 보존');
+        assert.equal(data.drafts[0].needsSourceReview, true, '원문 변경 후 재시도 시 needsSourceReview=true');
+        assert.equal(data.drafts[0].sourceVerificationStatus, 'needs_review');
+      });
+
+      // 5. Item C: sync_body=true with markdown_path where storage download fails -> 502, 0 AI calls, 0 reservations
+      {
+        let reserveCalls = 0;
+        aiCalls = 0;
+        await withFakeSupabase({
+          user: { id: userId },
+          subjects: [{ id: 'subj-sec-1', user_id: userId }],
+          materials: [{
+            id: 'mat-sec-1',
+            user_id: userId,
+            subject_id: 'subj-sec-1',
+            sync_body: true,
+            markdown_path: 'missing/body.md',
+            content_hash: hashMod.materialContentHash({ markdown: validMarkdown }),
+          }],
+          objects: {},
+          rpcImpl: (fn) => {
+            if (fn === 'reserve_trial_credit' || fn === 'register_ai_task') reserveCalls += 1;
+            return { data: null, error: null };
+          },
+        }, async () => {
+          const req = new NextRequest('http://localhost/api/generate-problems', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(makeBody()),
+          });
+          const res = await generateProblems(req);
+          assert.equal(res.status, 502, '동기화 본문 다운로드 실패 시 502 차단되어야 함');
+          assert.equal(aiCalls, 0, '다운로드 실패 시 AI 호출 0회여야 함');
+          assert.equal(reserveCalls, 0, '다운로드 실패 시 크레딧 예약 0회여야 함');
+        });
+      }
+
+      // 6. Item D: RLS empty result (foreign/unregistered ID returns []) -> NEVER 'verified'
+      aiCalls = 0;
+      await withFakeSupabase({
+        user: { id: userId },
+        subjects: [{ id: 'subj-sec-1', user_id: userId }],
+        materials: [],
+        concepts: [],
+        problem_drafts: [],
+        rpcImpl: (fn) => {
+          if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+          if (fn === 'reserve_trial_credit' || fn === 'register_ai_task') {
+            return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lt-rls', task_id: 't-rls-unverified', credit_source: 'operator_trial' }, error: null };
+          }
+          if (fn === 'record_trial_result_ready' || fn === 'record_ai_task_result_ready') return { data: { success: true, ok: true, status: 'result_ready' }, error: null };
+          if (fn === 'settle_trial_credit') return { data: { settled: true }, error: null };
+          return { data: { ok: true }, error: null };
+        },
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody({ taskId: 't-rls-unverified' })),
+        });
+        const res = await generateProblems(req);
+        const data = await res.json();
+        assert.equal(res.status, 200);
+        assert.equal(data.drafts[0].sourceVerificationStatus, 'unverified', 'RLS 미확인/미등록 자료는 verified를 받으면 안 됨');
+      });
+
+      // 7. Item E & F: retry_save with EXISTING problem_drafts row + deleted server material (request still has old text) -> persists needsSourceReview in DB row
+      aiCalls = 0;
+      const existingDraftRow = {
+        id: 'draft-retry-src-1',
+        user_id: userId,
+        subject_id: 'subj-sec-1',
+        title: '기존 생성 문제',
+        type: 'essay_descriptive',
+        status: 'draft',
+        is_approved: false,
+        is_demo: false,
+        content_version: 1,
+        approval_state: 'pending',
+        payload: { ...savedDraftFromBefore },
+      };
+      await withFakeSupabase({
+        user: { id: userId },
+        subjects: [{ id: 'subj-sec-1', user_id: userId }],
+        materials: [], // deleted on server even though request still passes validSource
+        problem_drafts: [existingDraftRow],
+        rpcImpl: (fn) => {
+          if (fn === 'lookup_saved_ai_task_result') {
+            return {
+              data: {
+                success: true,
+                status: 'result_ready',
+                task_id: 't-retry-del',
+                lease_token: 'lt-retry-del',
+                credit_source: 'operator_trial',
+                cached_result: { drafts: [savedDraftFromBefore], generationJobId: 'gen-retry-del' },
+              },
+              error: null,
+            };
+          }
+          if (fn === 'settle_trial_credit') return { data: { settled: true }, error: null };
+          return { data: null, error: null };
+        },
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody({ isSaveRetry: true, taskId: 't-retry-del' })),
+        });
+        const res = await generateProblems(req);
+        const data = await res.json();
+        assert.equal(res.status, 200);
+        assert.equal(aiCalls, 0);
+        assert.equal(data.persisted, true, '기존 초안 row 업데이트가 영속화되어야 함');
+        assert.equal(data.drafts[0].needsSourceReview, true, '자료 삭제 후 재조회된 DB row도 needsSourceReview=true');
+        assert.equal(data.drafts[0].sourceVerificationStatus, 'needs_review');
+      });
+
+      // 8. Item E: already_completed (isSaveRetry=false) after source changed on server -> recovers without AI call & flags needsSourceReview
+      aiCalls = 0;
+      let newReserveCalls = 0;
+      await withFakeSupabase({
+        user: { id: userId },
+        subjects: [{ id: 'subj-sec-1', user_id: userId }],
+        materials: [{
+          id: 'mat-sec-1',
+          user_id: userId,
+          subject_id: 'subj-sec-1',
+          sync_body: true,
+          content_hash: hashMod.materialContentHash({ markdown: '서버에서 변경된 원문!' }),
+        }],
+        problem_drafts: [],
+        rpcImpl: (fn) => {
+          if (fn === 'reserve_trial_credit' || fn === 'register_ai_task') newReserveCalls += 1;
+          if (fn === 'lookup_saved_ai_task_result') {
+            return {
+              data: {
+                success: true,
+                status: 'result_ready',
+                task_id: 't-already-comp',
+                lease_token: 'lt-already-comp',
+                credit_source: 'operator_trial',
+                cached_result: { drafts: [savedDraftFromBefore], generationJobId: 'gen-already-comp' },
+              },
+              error: null,
+            };
+          }
+          if (fn === 'settle_trial_credit') return { data: { settled: true }, error: null };
+          return { data: null, error: null };
+        },
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody({ taskId: 't-already-comp' })),
+        });
+        const res = await generateProblems(req);
+        const data = await res.json();
+        assert.equal(res.status, 200, 'already_completed 캐시는 원문 변경 후에도 AI 재호출 없이 복구되어야 함');
+        assert.equal(aiCalls, 0);
+        assert.equal(newReserveCalls, 0);
+        assert.equal(data.fromCache, true);
+        assert.equal(data.drafts[0].needsSourceReview, true);
+        assert.equal(data.drafts[0].sourceVerificationStatus, 'needs_review');
+      });
+
+      // 9. Owned material + RLS-missing concept ID -> NEVER 'verified' / 'draft'
+      aiCalls = 0;
+      nextAiProblems = [{
+        title: '타인 개념 위조 테스트',
+        promptText: '라그랑주 승수법의 조건을 서술하시오.',
+        modelAnswer: '기울기 벡터 비례',
+        hints: ['힌트'],
+        conceptIds: ['c-sec-1'],
+        sourceExcerpt: '라그랑주 승수법은 제약 조건 하의 최적화 정리를 제공한다.',
+        rubric: [
+          { id: 'r1', label: '조건', maxScore: 50, description: '조건 서술' },
+          { id: 'r2', label: '결론', maxScore: 50, description: '결론 도출' },
+        ],
+      }];
+      await withFakeSupabase({
+        user: { id: userId },
+        subjects: [{ id: 'subj-sec-1', user_id: userId }],
+        materials: [{ id: 'mat-sec-1', user_id: userId, subject_id: 'subj-sec-1', sync_body: false, content_hash: null }],
+        concepts: [], // RLS filtered foreign or unregistered concept
+        problem_drafts: [],
+        rpcImpl: (fn) => {
+          if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+          if (fn === 'reserve_trial_credit' || fn === 'register_ai_task') {
+            return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lt-c-rls', task_id: 't-c-rls', credit_source: 'operator_trial' }, error: null };
+          }
+          if (fn === 'record_trial_result_ready' || fn === 'record_ai_task_result_ready') return { data: { success: true, ok: true, status: 'result_ready' }, error: null };
+          if (fn === 'settle_trial_credit') return { data: { settled: true }, error: null };
+          return { data: { ok: true }, error: null };
+        },
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody({ taskId: 't-c-rls' })),
+        });
+        const res = await generateProblems(req);
+        const data = await res.json();
+        assert.equal(res.status, 200);
+        assert.equal(data.drafts[0].sourceVerificationStatus, 'unverified', '소유 자료라도 개념이 RLS 미확인(빈목록)이면 verified 불가');
+        assert.equal(data.drafts[0].verificationStatus.isSourceVerified, false, '미확인 개념은 isSourceVerified=false여야 함');
+      });
+
+      // 10. Owned material + owned concept -> verified + draft
+      aiCalls = 0;
+      await withFakeSupabase({
+        user: { id: userId },
+        subjects: [{ id: 'subj-sec-1', user_id: userId }],
+        materials: [{ id: 'mat-sec-1', user_id: userId, subject_id: 'subj-sec-1', sync_body: false, content_hash: null }],
+        concepts: [{ id: 'c-sec-1', user_id: userId, subject_id: 'subj-sec-1' }],
+        problem_drafts: [],
+        rpcImpl: (fn) => {
+          if (fn === 'get_ai_connection_secret') return { data: null, error: null };
+          if (fn === 'reserve_trial_credit' || fn === 'register_ai_task') {
+            return { data: { allowed: true, status: 'reserved', remaining: 2, lease_token: 'lt-both-ok', task_id: 't-both-ok', credit_source: 'operator_trial' }, error: null };
+          }
+          if (fn === 'record_trial_result_ready' || fn === 'record_ai_task_result_ready') return { data: { success: true, ok: true, status: 'result_ready' }, error: null };
+          if (fn === 'settle_trial_credit') return { data: { settled: true }, error: null };
+          return { data: { ok: true }, error: null };
+        },
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody({ taskId: 't-both-ok' })),
+        });
+        const res = await generateProblems(req);
+        const data = await res.json();
+        assert.equal(res.status, 200);
+        assert.equal(data.drafts[0].sourceVerificationStatus, 'verified', '소유 자료 + 소유 개념이면 verified');
+        assert.equal(data.drafts[0].verificationStatus.isSourceVerified, true, '소유 자료 + 소유 개념이면 isSourceVerified=true');
+      });
+
+      // 11. already_completed (isSaveRetry=false) recovers even when Storage download returns { error, data: null }
+      aiCalls = 0;
+      let reserveOnStorageErr = 0;
+      await withFakeSupabase({
+        user: { id: userId },
+        subjects: [{ id: 'subj-sec-1', user_id: userId }],
+        materials: [{
+          id: 'mat-sec-1',
+          user_id: userId,
+          subject_id: 'subj-sec-1',
+          sync_body: true,
+          markdown_path: 'missing/body.md',
+        }],
+        objects: {},
+        problem_drafts: [],
+        rpcImpl: (fn) => {
+          if (fn === 'reserve_trial_credit' || fn === 'register_ai_task') reserveOnStorageErr += 1;
+          if (fn === 'lookup_saved_ai_task_result') {
+            return {
+              data: {
+                success: true,
+                status: 'result_ready',
+                task_id: 't-storage-err-cache',
+                lease_token: 'lt-storage-err-cache',
+                credit_source: 'operator_trial',
+                cached_result: { drafts: [savedDraftFromBefore], generationJobId: 'gen-storage-err' },
+              },
+              error: null,
+            };
+          }
+          if (fn === 'settle_trial_credit') return { data: { settled: true }, error: null };
+          return { data: null, error: null };
+        },
+      }, async () => {
+        const req = new NextRequest('http://localhost/api/generate-problems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody({ taskId: 't-storage-err-cache' })),
+        });
+        const res = await generateProblems(req);
+        const data = await res.json();
+        assert.equal(res.status, 200, 'Storage 조회 실패 시에도 기존 완료 캐시가 있으면 502로 막지 않고 복구해야 함');
+        assert.equal(aiCalls, 0);
+        assert.equal(reserveOnStorageErr, 0);
+        assert.equal(data.fromCache, true);
+        assert.equal(data.drafts[0].needsSourceReview, true, 'Storage {error, data:null} 시 needsSourceReview=true');
+        assert.equal(data.drafts[0].sourceVerificationStatus, 'needs_review');
+      });
+    } finally {
+      aiClientModule.callAiChat = origCallAiChat;
+    }
   });
 
   if (savedFallbackPlan03 === undefined) delete process.env.AI_ALLOW_OPERATOR_FALLBACK;

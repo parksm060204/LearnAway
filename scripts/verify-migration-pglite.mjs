@@ -1973,11 +1973,260 @@ async function testUpgradePath() {
   }
   console.log('✓ Cross-user quality update and revision rejected (PROBLEM_NOT_FOUND)');
 
-  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33~39) Passed Successfully! ===\n');
+  // =========================================================================
+  // SCENARIO V: Migration 40 (20260101000040_mock_exam_immutability.sql)
+  // =========================================================================
+  console.log('\n--- Scenario V: Migration 40 Mock Exam Post-Submission Immutability ---');
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, '20260101000040_mock_exam_immutability.sql'));
+  console.log('✓ Applied 20260101000040_mock_exam_immutability.sql');
+
+  const mockSubjectId = 'subj-mock-40';
+  const mockSessionId = 'mock-sess-40';
+  const mockUserUuid = '11111111-1111-1111-1111-111111111111';
+  // Ensure subject exists for user (as owner before switching to authenticated role)
+  await db.query(
+    `insert into public.subjects (id, user_id, name, domain) values ($1, $2::uuid, 'Mock Subj 40', 'math_stats') on conflict (id, user_id) do nothing`,
+    [mockSubjectId, mockUserUuid]
+  );
+  await db.exec(`grant select on public.subjects to authenticated; grant select, insert, update on public.mock_exam_sessions to authenticated;`);
+  await setAuthContext(db, { uid: mockUserUuid, role: 'authenticated' });
+  await db.exec(`set role authenticated;`);
+
+  const baseMockPayload = {
+    id: mockSessionId,
+    subjectId: mockSubjectId,
+    createdAt: '2026-11-16T00:00:00.000Z',
+    endsAt: '2026-11-16T01:00:00.000Z',
+    durationMinutes: 60,
+    status: 'in_progress',
+    selectedConceptIds: ['c1'],
+    selectedTypes: ['essay_descriptive'],
+    problems: [{ id: 'p1', title: 'Frozen Q1', promptText: 'Prove X', modelAnswer: 'Ans X', rubric: [{ id: 'r1', label: 'Step', maxScore: 100 }] }],
+    answers: { p1: 'draft answer 1' },
+    evaluations: {},
+    reasons: { p1: 'reason 1' },
+    isReasonNotApplicable: { p1: false },
+    reasonNotApplicableJustification: { p1: '' },
+  };
+
+  // 1. Create -> Autosave -> Submit
+  const createRes = (await db.query(`select public.create_mock_exam_session($1::jsonb) as res`, [JSON.stringify(baseMockPayload)])).rows[0].res;
+  if (!createRes.created || createRes.version !== 1) throw new Error(`Expected mock create v1, got ${JSON.stringify(createRes)}`);
+
+  const autosavePayload = { ...baseMockPayload, answers: { p1: 'autosaved answer 2' } };
+  const autosaveRes = (await db.query(`select public.save_mock_exam_answers($1, 1, $2::jsonb) as res`, [mockSessionId, JSON.stringify(autosavePayload)])).rows[0].res;
+  if (autosaveRes.version !== 2) throw new Error(`Expected autosave v2, got ${JSON.stringify(autosaveRes)}`);
+
+  const submittedPayload = {
+    ...autosavePayload,
+    status: 'submitted',
+    submittedAt: '2026-11-16T00:30:00.000Z',
+    answers: { p1: 'final submitted answer' },
+    reasons: { p1: 'final reason' },
+  };
+  const submitRes = (await db.query(`select public.submit_mock_exam($1, 2, $2::jsonb) as res`, [mockSessionId, JSON.stringify(submittedPayload)])).rows[0].res;
+  if (submitRes.version !== 3 || submitRes.alreadySubmitted !== false) throw new Error(`Expected submit v3, got ${JSON.stringify(submitRes)}`);
+
+  // Idempotent submit retry
+  const submitRetryRes = (await db.query(`select public.submit_mock_exam($1, 2, $2::jsonb) as res`, [mockSessionId, JSON.stringify(submittedPayload)])).rows[0].res;
+  if (submitRetryRes.version !== 3 || submitRetryRes.alreadySubmitted !== true) throw new Error(`Expected idempotent submit retry v3, got ${JSON.stringify(submitRetryRes)}`);
+  console.log('✓ Normal create -> autosave (v2) -> submit (v3) -> idempotent submit retry verified');
+
+  // 2. Actual rowToMockExamSession round-trip (+00:00 vs Z and server submitted_at vs local submittedAt)
+  const serverSubmittedRow = (await db.query(
+    `select id, user_id, subject_id, status, duration_minutes, created_at, ends_at, submitted_at, version, payload, updated_at
+     from public.mock_exam_sessions where id = $1 and user_id = $2::uuid`,
+    [mockSessionId, mockUserUuid]
+  )).rows[0];
+  // Simulate rowToMockExamSession(row) from lib/cloud/historyMappers.ts where DB timestamptz
+  // overwrites payload.createdAt / endsAt / submittedAt (and Postgres REST returns +00:00)
+  const toOffsetIso = (val) => (val instanceof Date ? val.toISOString().replace('Z', '+00:00') : String(val));
+  const mappedSessionFromDb = {
+    ...serverSubmittedRow.payload,
+    id: serverSubmittedRow.id,
+    subjectId: serverSubmittedRow.subject_id,
+    status: serverSubmittedRow.status,
+    durationMinutes: serverSubmittedRow.duration_minutes,
+    createdAt: toOffsetIso(serverSubmittedRow.created_at),
+    endsAt: toOffsetIso(serverSubmittedRow.ends_at),
+    submittedAt: toOffsetIso(serverSubmittedRow.submitted_at),
+    serverVersion: Number(serverSubmittedRow.version),
+    serverUpdatedAt: toOffsetIso(serverSubmittedRow.updated_at),
+  };
+
+  // Normal grading -> v4 using the mapped session from DB
+  const gradedPayload = {
+    ...mappedSessionFromDb,
+    status: 'graded',
+    evaluations: { p1: { calculatedScore: 85, feedback: 'Good' } },
+  };
+  const gradeRes = (await db.query(`select public.save_mock_exam_grading($1, 3, $2::jsonb, 'graded') as res`, [mockSessionId, JSON.stringify(gradedPayload)])).rows[0].res;
+  if (gradeRes.version !== 4) throw new Error(`Expected grade v4, got ${JSON.stringify(gradeRes)}`);
+
+  let staleBlocked = false;
+  try {
+    await db.query(`select public.save_mock_exam_grading($1, 3, $2::jsonb, 'graded')`, [mockSessionId, JSON.stringify(gradedPayload)]);
+  } catch (err) {
+    staleBlocked = /MOCK_SESSION_STALE/i.test(err.message);
+  }
+  if (!staleBlocked) throw new Error('Stale version grading must fail with MOCK_SESSION_STALE');
+
+  const recordedPayload = { ...gradedPayload, status: 'recorded', recordedAttemptIds: ['att-1'] };
+  const recordRes = (await db.query(`select public.save_mock_exam_grading($1, 4, $2::jsonb, 'recorded') as res`, [mockSessionId, JSON.stringify(recordedPayload)])).rows[0].res;
+  if (recordRes.version !== 5) throw new Error(`Expected record v5, got ${JSON.stringify(recordRes)}`);
+  console.log('✓ rowToMockExamSession round-trip (+00:00 vs Z, server submitted_at), grading (v4), stale check, and recorded (v5) verified');
+
+  // 3. RPC tampering attempts MUST fail with MOCK_SESSION_IMMUTABLE (never silently succeed)
+  const tamperCases = [
+    ['answers', { ...recordedPayload, answers: { p1: 'tampered answer' } }],
+    ['reasons', { ...recordedPayload, reasons: { p1: 'tampered reason' } }],
+    ['isReasonNotApplicable', { ...recordedPayload, isReasonNotApplicable: { p1: true } }],
+    ['reasonNotApplicableJustification', { ...recordedPayload, reasonNotApplicableJustification: { p1: 'tampered just' } }],
+    ['problems', { ...recordedPayload, problems: [{ id: 'p1', title: 'Tampered Q1' }] }],
+    ['durationMinutes', { ...recordedPayload, durationMinutes: 999 }],
+    ['createdAt', { ...recordedPayload, createdAt: '2026-11-16T00:00:01.000Z' }],
+    ['endsAt', { ...recordedPayload, endsAt: '2099-01-01T00:00:00.000Z' }],
+    ['submittedAt', { ...recordedPayload, submittedAt: '2026-11-16T00:35:00.000Z' }],
+    ['malformed endsAt', { ...recordedPayload, endsAt: 'not-a-timestamp' }],
+  ];
+  for (const [label, tampered] of tamperCases) {
+    let blocked = false;
+    try {
+      await db.query(`select public.save_mock_exam_grading($1, 5, $2::jsonb, 'recorded')`, [mockSessionId, JSON.stringify(tampered)]);
+    } catch (err) {
+      blocked = /MOCK_SESSION_IMMUTABLE/i.test(err.message);
+    }
+    if (!blocked) throw new Error(`RPC tampering of ${label} must raise MOCK_SESSION_IMMUTABLE`);
+  }
+  console.log('✓ save_mock_exam_grading rejects tampering of answers, reasons, Stage8 flags, frozen problems, and config');
+
+  // 4. Direct table UPDATE tampering MUST also fail via trigger
+  let directPayloadTamperBlocked = false;
+  try {
+    await db.query(
+      `update public.mock_exam_sessions set payload = jsonb_set(payload, '{answers,p1}', '"direct-sql-tamper"'::jsonb), version = 6 where id = $1 and user_id = $2::uuid`,
+      [mockSessionId, mockUserUuid]
+    );
+  } catch (err) {
+    directPayloadTamperBlocked = /MOCK_SESSION_IMMUTABLE/i.test(err.message);
+  }
+  let directColTamperBlocked = false;
+  try {
+    await db.query(
+      `update public.mock_exam_sessions set duration_minutes = 120, version = 6 where id = $1 and user_id = $2::uuid`,
+      [mockSessionId, mockUserUuid]
+    );
+  } catch (err) {
+    directColTamperBlocked = /MOCK_SESSION_IMMUTABLE/i.test(err.message);
+  }
+  await db.exec(`reset role;`);
+  if (!directPayloadTamperBlocked || !directColTamperBlocked) {
+    throw new Error('Direct UPDATE tampering on submitted mock_exam_sessions must be blocked by guard trigger');
+  }
+
+  const finalMockRow = (await db.query(`select status, version, payload from public.mock_exam_sessions where id = $1 and user_id = $2::uuid`, [mockSessionId, mockUserUuid])).rows[0];
+  if (
+    finalMockRow.status !== 'recorded' ||
+    finalMockRow.version !== 5 ||
+    finalMockRow.payload.answers.p1 !== 'final submitted answer' ||
+    finalMockRow.payload.problems[0].title !== 'Frozen Q1' ||
+    finalMockRow.payload.evaluations.p1.calculatedScore !== 85 ||
+    finalMockRow.payload.recordedAttemptIds[0] !== 'att-1'
+  ) {
+    throw new Error(`Final mock exam state corrupted: ${JSON.stringify(finalMockRow)}`);
+  }
+  console.log('✓ Direct table UPDATE tampering blocked; submitted answers, frozen problems, and grading preserved');
+
+  // =========================================================================
+  // SCENARIO W: Migration 41 (20260101000041_problem_draft_source_review_merge.sql)
+  // =========================================================================
+  console.log('\n--- Scenario W: Migration 41 Problem Draft Source Review Merge ---');
+  await runSqlFile(db, path.join(MIGRATIONS_DIR, '20260101000041_problem_draft_source_review_merge.sql'));
+  console.log('✓ Applied 20260101000041_problem_draft_source_review_merge.sql');
+
+  const draftUserUuid = '11111111-1111-1111-1111-111111111111';
+  const otherDraftUserUuid = '22222222-2222-2222-2222-222222222222';
+  const draftSubjectId = 'subj-mock-40';
+
+  // Seed 3 drafts:
+  // 1) User-edited unapproved draft (content_version = 2)
+  // 2) Already approved draft
+  // 3) Draft already re-verified against a newer source
+  await db.exec(`grant select, update on public.problem_drafts to authenticated;`);
+  await db.query(
+    `insert into public.problem_drafts (id, user_id, subject_id, title, type, status, is_approved, content_version, approval_state, payload)
+     values
+       ('pd-41-edited', $1::uuid, $2, 'User Edited Title', 'essay_descriptive', 'draft', false, 2, 'pending',
+        '{"id":"pd-41-edited","title":"User Edited Title","promptText":"User Edited Prompt","editedByUser":true,"sourceContentVersion":"h_old","sourceVerificationStatus":"verified","needsSourceReview":false}'::jsonb),
+       ('pd-41-approved', $1::uuid, $2, 'Approved Title', 'essay_descriptive', 'approved', true, 1, 'approved',
+        '{"id":"pd-41-approved","title":"Approved Title","sourceContentVersion":"h_old","sourceVerificationStatus":"verified","needsSourceReview":false}'::jsonb),
+       ('pd-41-reverified', $1::uuid, $2, 'Reverified Title', 'essay_descriptive', 'draft', false, 2, 'pending',
+        '{"id":"pd-41-reverified","title":"Reverified Title","sourceContentVersion":"h_newer","sourceVerificationStatus":"verified","needsSourceReview":false}'::jsonb)`,
+    [draftUserUuid, draftSubjectId]
+  );
+
+  // Verify anon is denied
+  await db.exec(`set role anon;`);
+  let anonBlocked41 = false;
+  try {
+    await db.query(`select public.mark_problem_draft_source_review('pd-41-edited', null, null);`);
+  } catch (err) {
+    anonBlocked41 = /permission denied|42501/i.test(err.message);
+  }
+  await db.exec(`reset role;`);
+  if (!anonBlocked41) throw new Error('anon must be denied on mark_problem_draft_source_review');
+
+  // Verify cross-user isolation
+  await setAuthContext(db, { uid: otherDraftUserUuid, role: 'authenticated' });
+  await db.exec(`set role authenticated;`);
+  const crossUserMerge = (await db.query(`select public.mark_problem_draft_source_review('pd-41-edited', 'h_old', null) as res;`)).rows[0].res;
+  if (crossUserMerge.updated !== false || crossUserMerge.reason !== 'NOT_FOUND') {
+    throw new Error(`Expected NOT_FOUND for cross-user merge, got ${JSON.stringify(crossUserMerge)}`);
+  }
+  await db.exec(`reset role;`);
+
+  // Verify owner calls
+  await setAuthContext(db, { uid: draftUserUuid, role: 'authenticated' });
+  await db.exec(`set role authenticated;`);
+
+  const editedRes = (await db.query(`select public.mark_problem_draft_source_review('pd-41-edited', 'h_old', null) as res;`)).rows[0].res;
+  if (editedRes.updated !== true || editedRes.reason !== 'FLAGGED') {
+    throw new Error(`Expected FLAGGED for user-edited unapproved draft, got ${JSON.stringify(editedRes)}`);
+  }
+
+  const approvedRes = (await db.query(`select public.mark_problem_draft_source_review('pd-41-approved', 'h_old', null) as res;`)).rows[0].res;
+  if (approvedRes.updated !== false || approvedRes.reason !== 'ALREADY_DECIDED') {
+    throw new Error(`Expected ALREADY_DECIDED for approved draft, got ${JSON.stringify(approvedRes)}`);
+  }
+
+  const reverifiedRes = (await db.query(`select public.mark_problem_draft_source_review('pd-41-reverified', 'h_old', null) as res;`)).rows[0].res;
+  if (reverifiedRes.updated !== false || reverifiedRes.reason !== 'REVERIFIED_NEWER_SOURCE') {
+    throw new Error(`Expected REVERIFIED_NEWER_SOURCE, got ${JSON.stringify(reverifiedRes)}`);
+  }
+  await db.exec(`reset role;`);
+
+  const pdRows = (await db.query(
+    `select id, is_approved, status, content_version, payload from public.problem_drafts where id in ('pd-41-edited', 'pd-41-approved', 'pd-41-reverified') order by id`
+  )).rows;
+  const byId41 = Object.fromEntries(pdRows.map((r) => [r.id, r]));
+  if (
+    byId41['pd-41-edited'].payload.title !== 'User Edited Title' ||
+    byId41['pd-41-edited'].payload.promptText !== 'User Edited Prompt' ||
+    byId41['pd-41-edited'].payload.needsSourceReview !== true ||
+    byId41['pd-41-edited'].payload.sourceVerificationStatus !== 'needs_review' ||
+    byId41['pd-41-approved'].payload.needsSourceReview !== false ||
+    byId41['pd-41-reverified'].payload.needsSourceReview !== false ||
+    byId41['pd-41-reverified'].payload.sourceContentVersion !== 'h_newer'
+  ) {
+    throw new Error(`Unexpected post-merge problem_drafts state: ${JSON.stringify(byId41)}`);
+  }
+  console.log('✓ Migration 41 mark_problem_draft_source_review preserves user edits, approved state, and newer re-verifications while flagging source review');
+
+  console.log('\n=== All Upgrade Path & Scenario Tests (including Migrations 33~41) Passed Successfully! ===\n');
 }
 
 async function testFreshInstallPath() {
-  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~39) ===');
+  console.log('=== [2] Testing Fresh Install Path: Clean DB -> Run All Migrations (00~41) ===');
   const db = new PGlite();
   await setupSupabaseMocks(db);
 
